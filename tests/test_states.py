@@ -7,6 +7,7 @@ import pytest
 
 from agent_factory.adapters.fake_llm import FakeLLM
 from agent_factory.adapters.memory_store import MemoryEventStore
+from agent_factory.domain.events import EventType
 from agent_factory.domain.models import ApprovalEvent
 from agent_factory.domain.states import (
     IllegalTransition,
@@ -295,3 +296,60 @@ def test_orchestrator_handle_interview_message_rejected_when_not_in_interview() 
         orchestrator.handle_interview_message(project_id, "evt-2", "Late interview message")
 
     assert orchestrator.get_status(project_id).state == ProjectState.BUILDING
+
+
+def test_orchestrator_create_project_twice_with_same_id_fails_without_corrupting_log() -> None:
+    """N-03 (INV-04, INV-11): Calling create_project twice with the same project_id fails without poisoning the log."""
+    store = MemoryEventStore()
+    orchestrator = Orchestrator(store=store, llm=FakeLLM())
+    project_id = "proj-dup-create"
+
+    first_status = orchestrator.create_project(
+        project_id=project_id,
+        name="Original Name",
+        objective="Original Objective",
+    )
+    assert first_status.state == ProjectState.INTERVIEW
+    assert len(store.get_events(project_id)) == 1
+
+    with pytest.raises((IllegalTransition, ValueError)):
+        orchestrator.create_project(
+            project_id=project_id,
+            name="Duplicate Name",
+            objective="Duplicate Objective",
+        )
+
+    assert len(store.get_events(project_id)) == 1
+    status_after = orchestrator.get_status(project_id)
+    assert status_after.state == ProjectState.INTERVIEW
+    assert status_after.name == "Original Name"
+    assert status_after.objective == "Original Objective"
+
+
+def test_orchestrator_record_state_call_when_already_failed_is_rejected_without_duplicating_failed_event() -> None:
+    """N-04 (INV-04, INV-11): Calling record_state_call on a FAILED project raises IllegalTransition and never duplicates PROJECT_FAILED."""
+    store = MemoryEventStore()
+    orchestrator = Orchestrator(store=store, llm=FakeLLM())
+    project_id = "proj-record-after-failed"
+
+    orchestrator.create_project(project_id=project_id, name="Failed Guard", objective="Converter")
+    for _ in range(7):
+        orchestrator.record_state_call(project_id, ProjectState.INTERVIEW)
+
+    assert orchestrator.get_status(project_id).state == ProjectState.FAILED
+    failed_events_before = [
+        e for e in store.get_events(project_id) if e.type == EventType.PROJECT_FAILED
+    ]
+    assert len(failed_events_before) == 1
+
+    with pytest.raises(IllegalTransition):
+        orchestrator.record_state_call(project_id, ProjectState.INTERVIEW)
+
+    with pytest.raises(IllegalTransition):
+        orchestrator.record_state_call(project_id, ProjectState.BUILDING)
+
+    failed_events_after = [
+        e for e in store.get_events(project_id) if e.type == EventType.PROJECT_FAILED
+    ]
+    assert len(failed_events_after) == 1
+    assert orchestrator.get_status(project_id).state == ProjectState.FAILED

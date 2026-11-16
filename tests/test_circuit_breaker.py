@@ -194,3 +194,41 @@ def test_mediation_step_enforces_mediation_circuit_breaker_budget() -> None:
     assert breaker.get_calls(project_id, ProjectState.MEDIATION) == 2
     # 1 interview + 2 debate + 2 mediation = 5 total LLM calls (3rd mediation call blocked)
     assert len(fake_llm.calls) == 5
+
+
+def test_circuit_breaker_never_resets_across_redebates_and_trips_on_cumulative_budget() -> None:
+    """AC-1.8 / N-02 (INV-17): CircuitBreaker counters are cumulative per project and never reset on re-debate."""
+    breaker = CircuitBreaker(config_path=Path("config/limits.toml"))
+    store = MemoryEventStore()
+    fake_llm = FakeLLM(
+        responses=[
+            _complete_spec_response(),
+            # First run_debate: 2 DEBATE calls + 1 MEDIATION call -> WAITING_APPROVAL
+            _pragmatist_dict(),
+            _structuralist_dict(),
+            _plan_dict(),
+            # Second run_debate (adjustment): Pragmatist is 3rd cumulative DEBATE call,
+            # Structuralist is 4th cumulative DEBATE call -> exceeds DEBATE=3!
+            _pragmatist_dict(),
+            _structuralist_dict(),
+            _plan_dict(),
+        ]
+    )
+    orchestrator = Orchestrator(store=store, llm=fake_llm, circuit_breaker=breaker)
+    project_id = "proj-cumulative-cb"
+
+    orchestrator.create_project(project_id=project_id, name="Cumulative CB", objective="Converter")
+    orchestrator.handle_interview_message(project_id, "evt-int-1", "Complete converter spec")
+
+    first_debate_status = orchestrator.run_debate(project_id)
+    assert first_debate_status.state == ProjectState.WAITING_APPROVAL
+    assert breaker.get_calls(project_id, ProjectState.DEBATE) == 2
+    assert breaker.get_calls(project_id, ProjectState.MEDIATION) == 1
+
+    second_debate_status = orchestrator.run_debate(project_id)
+    assert second_debate_status.state == ProjectState.FAILED
+    assert second_debate_status.failure_reason is not None
+    assert "DEBATE" in second_debate_status.failure_reason
+    assert breaker.get_calls(project_id, ProjectState.DEBATE) == 3
+    # 1 interview + 3 first debate/mediation + 1 second debate pragmatist = 5 calls
+    assert len(fake_llm.calls) == 5

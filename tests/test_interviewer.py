@@ -1,12 +1,15 @@
-"""Tests for Interviewer agent and Orchestrator interview state (AC-1.2, F-17, F-18)."""
+"""Tests for Interviewer agent and Orchestrator interview state (AC-1.2, F-17, F-18, N-08)."""
+
+from pathlib import Path
 
 import pytest
 
 from agent_factory.adapters.fake_llm import FakeLLM
 from agent_factory.adapters.memory_store import MemoryEventStore
+from agent_factory.adapters.sqlite_store import SqliteEventStore
 from agent_factory.agents.interviewer import MAX_QUESTIONS_PER_ROUND, Interviewer
 from agent_factory.domain.models import Spec
-from agent_factory.domain.states import IllegalTransition
+from agent_factory.domain.states import IllegalTransition, ProjectState
 from agent_factory.orchestrator import Orchestrator
 
 
@@ -224,3 +227,85 @@ def test_orchestrator_handle_interview_message_rejects_nonexistent_project() -> 
             event_id="evt-ghost-1",
             user_message="Hola",
         )
+
+
+def test_two_orchestrators_sharing_sqlite_store_preserve_objective_and_sync_spec(
+    tmp_path: Path,
+) -> None:
+    """N-08 (INV-11): Two Orchestrators sharing a SqliteEventStore preserve initial objective and reconstruct the same Spec."""
+    db_file = tmp_path / "shared_orchestrators.db"
+    store = SqliteEventStore(db_path=db_file)
+    fake_llm = FakeLLM(
+        responses=[
+            {
+                "spec": {
+                    "objective": "PreservedInitialObjectiveMarker",
+                    "users": ["Gabriel"],
+                    "features": ["Offline sync"],
+                    "business_rules": ["Deterministic state"],
+                    "edge_cases": ["Process restart"],
+                    "constraints": ["Zero backend"],
+                    "success_criteria": ["Consistent spec across instances"],
+                    "assumptions": [],
+                },
+                "questions": [],
+            },
+            {
+                "approach": "Simple static SPA",
+                "components": ["app.ts"],
+                "tradeoffs": ["Local only"],
+            },
+            {
+                "critique": ["State sync"],
+                "robust_proposal": "Event log projection",
+                "architectural_safeguards": ["Strict schema"],
+            },
+            {
+                "summary": "Shared SQLite Spec App",
+                "rationale": "Event-sourced spec reconstruction",
+                "template_id": "static-app",
+                "files": [
+                    {
+                        "path": "src/app.ts",
+                        "purpose": "Main logic",
+                        "contract": "export function init(): void",
+                        "depends_on": [],
+                    }
+                ],
+                "acceptance_tests": [
+                    {
+                        "id": "AT-01",
+                        "description": "Reconstructs state accurately",
+                        "type": "unit",
+                    }
+                ],
+                "risks": ["None"],
+                "deployment_target": "github-pages",
+            },
+        ]
+    )
+    project_id = "proj-shared-sqlite-spec"
+
+    orch_1 = Orchestrator(store=store, llm=fake_llm)
+    orch_2 = Orchestrator(store=store, llm=fake_llm)
+
+    orch_1.create_project(
+        project_id=project_id,
+        name="Shared Spec App",
+        objective="PreservedInitialObjectiveMarker",
+    )
+
+    # orch_2 (which did not call create_project) handles round 1 and must see initial objective from store
+    orch_2.handle_interview_message(
+        project_id=project_id,
+        event_id="evt-shared-1",
+        user_message="Completa la especificación.",
+    )
+    first_call_prompt = str(fake_llm.calls[0]["messages"])
+    assert "PreservedInitialObjectiveMarker" in first_call_prompt
+
+    # orch_1 (which cached initial incomplete Spec in create_project) must see the updated complete Spec from store
+    debate_status = orch_1.run_debate(project_id)
+    store.close()
+
+    assert debate_status.state == ProjectState.WAITING_APPROVAL

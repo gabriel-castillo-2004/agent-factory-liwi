@@ -24,6 +24,7 @@ INVALID_PROJECT_IDS: tuple[str, ...] = (
     "has_underscore",
     "has space",
     "a" * 64,
+    "abc\n",
 )
 
 

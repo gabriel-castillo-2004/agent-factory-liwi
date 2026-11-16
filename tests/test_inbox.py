@@ -1,4 +1,4 @@
-"""Tests for input event idempotency in Inbox and Orchestrator (AC-1.9, INV-16, F-08)."""
+"""Tests for input event idempotency in Inbox and Orchestrator (AC-1.9, INV-16, F-08, N-09)."""
 
 from pathlib import Path
 
@@ -7,6 +7,7 @@ import pytest
 from agent_factory.adapters.fake_llm import FakeLLM
 from agent_factory.adapters.memory_store import MemoryEventStore
 from agent_factory.adapters.sqlite_store import SqliteEventStore
+from agent_factory.domain.states import ProjectState
 from agent_factory.inbox import Inbox
 from agent_factory.orchestrator import Orchestrator
 
@@ -159,3 +160,89 @@ def test_same_event_id_after_closing_and_reopening_sqlite_store_makes_zero_llm_c
 
     assert len(fake_llm.calls) == 1
     assert status_2 == status_1
+
+
+def test_duplicate_event_id_after_leaving_interview_is_ignored_without_error() -> None:
+    """N-09 (INV-16): A duplicate event_id arriving after project left INTERVIEW is ignored without raising IllegalTransition."""
+    store = MemoryEventStore()
+    fake_llm = FakeLLM(
+        responses=[
+            {
+                "spec": {
+                    "objective": "Static timer",
+                    "users": ["Gabriel"],
+                    "features": ["Countdown"],
+                    "business_rules": ["Positive seconds"],
+                    "edge_cases": ["Zero"],
+                    "constraints": ["Static web"],
+                    "success_criteria": ["Works offline"],
+                    "assumptions": [],
+                },
+                "questions": [],
+            },
+            {
+                "approach": "Vanilla JS timer",
+                "components": ["timer.ts"],
+                "tradeoffs": ["Simple"],
+            },
+            {
+                "critique": ["Tab drift"],
+                "robust_proposal": "Monotonic timestamp delta",
+                "architectural_safeguards": ["Visibility API sync"],
+            },
+            {
+                "summary": "Timer app",
+                "rationale": "Timestamp delta",
+                "template_id": "static-app",
+                "files": [
+                    {
+                        "path": "src/timer.ts",
+                        "purpose": "Timer logic",
+                        "contract": "export function startTimer(sec: number): void",
+                        "depends_on": [],
+                    }
+                ],
+                "acceptance_tests": [
+                    {
+                        "id": "AT-01",
+                        "description": "Counts down to zero",
+                        "type": "unit",
+                    }
+                ],
+                "risks": ["None"],
+                "deployment_target": "github-pages",
+            },
+        ]
+    )
+    orchestrator = Orchestrator(store=store, llm=fake_llm)
+    project_id = "proj-dup-after-interview"
+
+    orchestrator.create_project(project_id=project_id, name="Timer", objective="Static timer")
+    orchestrator.handle_interview_message(
+        project_id=project_id,
+        event_id="telegram-update-late-dup-77",
+        user_message="Quiero un temporizador completo.",
+    )
+    waiting_status = orchestrator.run_debate(project_id=project_id)
+    assert waiting_status.state == ProjectState.WAITING_APPROVAL
+    assert len(fake_llm.calls) == 4
+
+    # Redelivery of already-processed event_id after leaving INTERVIEW must be ignored (no IllegalTransition)
+    dup_status = orchestrator.handle_interview_message(
+        project_id=project_id,
+        event_id="telegram-update-late-dup-77",
+        user_message="Quiero un temporizador completo.",
+    )
+    assert dup_status.state == ProjectState.WAITING_APPROVAL
+    assert dup_status == waiting_status
+    assert len(fake_llm.calls) == 4
+
+    # Same after simulated restart with a new Orchestrator instance
+    restarted_orchestrator = Orchestrator(store=store, llm=fake_llm)
+    dup_after_restart = restarted_orchestrator.handle_interview_message(
+        project_id=project_id,
+        event_id="telegram-update-late-dup-77",
+        user_message="Quiero un temporizador completo.",
+    )
+    assert dup_after_restart.state == ProjectState.WAITING_APPROVAL
+    assert len(fake_llm.calls) == 4

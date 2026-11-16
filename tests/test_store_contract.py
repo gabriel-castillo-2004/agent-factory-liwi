@@ -163,9 +163,15 @@ def test_store_events_are_immutable_and_defend_against_payload_tampering(
 
     event_store.append(event)
 
-    # Attempt in-place mutation of retrieved event payload
+    # Attempt mutation of original_payload and event.payload right after append (kills X6a)
+    original_payload["name"] = "MUTATED_AFTER_APPEND"
+    original_payload["nested"].append("v2")
+    event.payload["name"] = "MUTATED_VIA_EVENT_REF"
+
+    # Attempt in-place mutation of retrieved event payload (kills X6b)
     fetched_first = event_store.get_events("proj-immutable")
+    assert fetched_first[0].payload == {"name": "ImmutableApp", "nested": ["v1"]}
     fetched_first[0].payload["name"] = "HACKED_NAME"
 
     fetched_second = event_store.get_events("proj-immutable")
-    assert fetched_second[0].payload["name"] == "ImmutableApp"
+    assert fetched_second[0].payload == {"name": "ImmutableApp", "nested": ["v1"]}

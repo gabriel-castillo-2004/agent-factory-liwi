@@ -5,7 +5,11 @@ from typing import Any, Protocol, runtime_checkable
 from pydantic import BaseModel
 
 
-class InvalidLLMResponseError(Exception):
+class LLMError(Exception):
+    """Base exception for LLM adapter and transport failures (INV-09, AC-1.13)."""
+
+
+class InvalidLLMResponseError(LLMError):
     """Raised when an LLM returns malformed JSON or violates the requested schema."""
 
 

@@ -347,3 +347,169 @@ def test_failed_state_preserves_last_progress_value(
     status = project_status_from_events("proj-fail", events)
     assert status.state == ProjectState.FAILED
     assert status.progress_pct == expected_preserved_pct
+
+
+@pytest.mark.parametrize(
+    "invalid_plan_state",
+    [
+        ProjectState.INTERVIEW,
+        ProjectState.BUILDING,
+        ProjectState.VERIFYING,
+    ],
+)
+def test_projection_rejects_plan_created_outside_debate_or_mediation(
+    invalid_plan_state: ProjectState,
+) -> None:
+    """N-07 (INV-11, INV-05): project_status_from_events rejects PLAN_CREATED outside DEBATE/MEDIATION."""
+    project_id = f"proj-bad-plan-{invalid_plan_state.value.lower()}"
+    events = _events_up_to_state(
+        project_id=project_id,
+        target_state=invalid_plan_state,
+        passed_tests=2,
+        total_tests=4,
+    )
+    events.append(
+        Event(
+            id="evt-rogue-plan",
+            project_id=project_id,
+            type=EventType.PLAN_CREATED,
+            payload={"plan_hash": "rogue-tampered-hash", "total_tests": 1},
+            at=datetime(2026, 11, 16, 16, 0, tzinfo=UTC),
+        )
+    )
+
+    with pytest.raises((IllegalTransition, ValueError)):
+        project_status_from_events(project_id, events)
+
+
+@pytest.mark.parametrize(
+    ("prior_state", "rogue_target"),
+    [
+        (ProjectState.WAITING_APPROVAL, ProjectState.DEBATE),
+        (ProjectState.VERIFYING, ProjectState.DELIVERED),
+    ],
+)
+def test_projection_rejects_approval_recorded_with_target_other_than_building(
+    prior_state: ProjectState,
+    rogue_target: ProjectState,
+) -> None:
+    """N-07 (INV-05, INV-11): APPROVAL_RECORDED must only target BUILDING from WAITING_APPROVAL."""
+    project_id = f"proj-bad-app-target-{rogue_target.value.lower()}"
+    events = _events_up_to_state(
+        project_id=project_id,
+        target_state=prior_state,
+        passed_tests=4,
+        total_tests=4,
+    )
+    events.append(
+        Event(
+            id="evt-rogue-approval-target",
+            project_id=project_id,
+            type=EventType.APPROVAL_RECORDED,
+            payload={
+                "plan_hash": "abc123hash",
+                "decision": "rejected",
+                "to": rogue_target,
+            },
+            at=datetime(2026, 11, 16, 16, 5, tzinfo=UTC),
+        )
+    )
+
+    with pytest.raises((IllegalTransition, ValueError)):
+        project_status_from_events(project_id, events)
+
+
+@pytest.mark.parametrize(
+    "premature_event",
+    [
+        Event(
+            id="evt-pre-inv",
+            project_id="proj-pre-create",
+            type=EventType.AGENT_INVOKED,
+            payload={"state": "INTERVIEW"},
+            at=datetime(2026, 11, 16, 11, 0, tzinfo=UTC),
+        ),
+        Event(
+            id="evt-pre-tests",
+            project_id="proj-pre-create",
+            type=EventType.TESTS_UPDATED,
+            payload={"passed": 1, "failed": 0, "total": 1},
+            at=datetime(2026, 11, 16, 11, 0, tzinfo=UTC),
+        ),
+        Event(
+            id="evt-pre-ci",
+            project_id="proj-pre-create",
+            type=EventType.CI_ROUND_COMPLETED,
+            payload={"ci_rounds": 1},
+            at=datetime(2026, 11, 16, 11, 0, tzinfo=UTC),
+        ),
+        Event(
+            id="evt-pre-spec",
+            project_id="proj-pre-create",
+            type=EventType.SPEC_UPDATED,
+            payload={"spec": {"objective": "Premature"}},
+            at=datetime(2026, 11, 16, 11, 0, tzinfo=UTC),
+        ),
+        Event(
+            id="evt-pre-fail",
+            project_id="proj-pre-create",
+            type=EventType.PROJECT_FAILED,
+            payload={"reason": "Premature fail from IDLE"},
+            at=datetime(2026, 11, 16, 11, 0, tzinfo=UTC),
+        ),
+    ],
+)
+def test_projection_rejects_events_before_project_created_and_illegal_failed_transitions(
+    premature_event: Event,
+) -> None:
+    """N-07 / X9 (INV-04, INV-11): Reject events prior to PROJECT_CREATED and illegal transitions to FAILED."""
+    with pytest.raises((IllegalTransition, ValueError)):
+        project_status_from_events("proj-pre-create", [premature_event])
+
+    # Also verify duplicate PROJECT_FAILED (FAILED -> FAILED) is rejected (kills X9)
+    fail_events = _events_up_to_state("proj-dup-fail", ProjectState.INTERVIEW)
+    fail_events.append(
+        Event(
+            id="evt-f1",
+            project_id="proj-dup-fail",
+            type=EventType.PROJECT_FAILED,
+            payload={"reason": "First failure"},
+            at=datetime(2026, 11, 16, 13, 0, tzinfo=UTC),
+        )
+    )
+    fail_events.append(
+        Event(
+            id="evt-f2",
+            project_id="proj-dup-fail",
+            type=EventType.PROJECT_FAILED,
+            payload={"reason": "Second failure"},
+            at=datetime(2026, 11, 16, 13, 1, tzinfo=UTC),
+        )
+    )
+    with pytest.raises(IllegalTransition):
+        project_status_from_events("proj-dup-fail", fail_events)
+
+
+def test_projection_accepts_legitimate_verifying_to_building_transition() -> None:
+    """N-07 (Section 4, INV-04): Projection accepts legitimate VERIFYING -> BUILDING self-correction transition."""
+    project_id = "proj-verify-to-building"
+    events = _events_up_to_state(
+        project_id=project_id,
+        target_state=ProjectState.VERIFYING,
+        passed_tests=2,
+        total_tests=4,
+    )
+    events.append(
+        Event(
+            id="evt-reenter-building",
+            project_id=project_id,
+            type=EventType.STATE_TRANSITIONED,
+            payload={"from": ProjectState.VERIFYING, "to": ProjectState.BUILDING},
+            at=datetime(2026, 11, 16, 12, 35, tzinfo=UTC),
+        )
+    )
+
+    status = project_status_from_events(project_id, events)
+    assert status.state == ProjectState.BUILDING
+    assert status.progress_pct == 62
+    assert status.plan_hash == "abc123hash"
