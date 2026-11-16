@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 from agent_factory.agents.pragmatist import PragmatistProposal
 from agent_factory.domain.models import Spec
 from agent_factory.ports.clock import Clock
-from agent_factory.ports.llm import LLM, InvalidLLMResponseError
+from agent_factory.ports.llm import LLM, LLMError
 
 
 class StructuralistCritique(BaseModel):
@@ -48,7 +48,7 @@ class Structuralist:
             try:
                 data = self.llm.complete(messages=messages, schema=StructuralistCritique)
                 return StructuralistCritique.model_validate(data)
-            except (InvalidLLMResponseError, ValueError, TimeoutError) as err:
+            except (LLMError, ValueError, TimeoutError, OSError) as err:
                 last_err = err
                 if attempt < self.max_retries and self.clock is not None and hasattr(self.clock, "sleep"):
                     self.clock.sleep(0.1 * (2**attempt))

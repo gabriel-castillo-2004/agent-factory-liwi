@@ -6,6 +6,7 @@ from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime
 from pathlib import Path
 
+from agent_factory.adapters.system_clock import SystemClock
 from agent_factory.agents.interviewer import Interviewer
 from agent_factory.agents.mediator import PlanValidationError, run_debate_pipeline
 from agent_factory.domain.events import EventType, create_event
@@ -21,7 +22,7 @@ from agent_factory.domain.progress import project_status_from_events
 from agent_factory.domain.states import IllegalTransition, ProjectState, validate_transition
 from agent_factory.inbox import Inbox
 from agent_factory.ports.clock import Clock
-from agent_factory.ports.llm import LLM, InvalidLLMResponseError
+from agent_factory.ports.llm import LLM, LLMError
 from agent_factory.ports.publisher import StatusPublisher
 from agent_factory.ports.store import EventStore
 
@@ -117,7 +118,7 @@ class Orchestrator:
         self.circuit_breaker = (
             circuit_breaker if circuit_breaker is not None else CircuitBreaker()
         )
-        self.clock = clock
+        self.clock = clock if clock is not None else SystemClock()
         self.valid_templates = valid_templates
         self._specs: dict[str, Spec] = {}
 
@@ -125,15 +126,22 @@ class Orchestrator:
         return self.clock.now() if self.clock else datetime.now(UTC)
 
     def _get_spec(self, project_id: str) -> Spec:
-        if project_id in self._specs:
-            return self._specs[project_id]
         events = self.store.get_events(project_id)
-        for e in reversed(events):
-            if e.type == EventType.SPEC_UPDATED and "spec" in e.payload:
+        spec: Spec | None = None
+        initial_objective = ""
+        for e in events:
+            if e.type == EventType.PROJECT_CREATED:
+                initial_objective = e.payload.get("objective", "")
+            elif e.type == EventType.SPEC_UPDATED and "spec" in e.payload:
                 spec = Spec.model_validate(e.payload["spec"])
-                self._specs[project_id] = spec
-                return spec
-        return Spec()
+        if spec is not None:
+            if not spec.objective and initial_objective:
+                spec.objective = initial_objective
+            self._specs[project_id] = spec
+            return spec
+        fallback = Spec(objective=initial_objective)
+        self._specs[project_id] = fallback
+        return fallback
 
     def create_project(
         self,
@@ -143,6 +151,11 @@ class Orchestrator:
     ) -> ProjectStatus:
         """Create a new project in INTERVIEW state and append initial events."""
         validate_project_id(project_id)
+        existing_events = self.store.get_events(project_id)
+        if existing_events:
+            current_status = self.get_status(project_id)
+            validate_transition(current_status.state, ProjectState.INTERVIEW)
+            raise ValueError(f"Project '{project_id}' already exists")
         validate_transition(ProjectState.IDLE, ProjectState.INTERVIEW)
         event = create_event(
             project_id=project_id,
@@ -167,8 +180,6 @@ class Orchestrator:
             raise ValueError(f"Project '{project_id}' does not exist")
 
         current_status = self.get_status(project_id)
-        if current_status.state != ProjectState.INTERVIEW:
-            raise IllegalTransition(current_status.state, ProjectState.INTERVIEW)
 
         if self.inbox.is_processed(event_id) or any(
             e.payload.get("incoming_event_id") == event_id for e in events
@@ -176,11 +187,15 @@ class Orchestrator:
             self.inbox.mark_processed(event_id)
             return current_status
 
+        if current_status.state != ProjectState.INTERVIEW:
+            raise IllegalTransition(current_status.state, ProjectState.INTERVIEW)
+
         self.inbox.mark_processed(event_id)
 
         try:
             self.circuit_breaker.record_call(project_id, ProjectState.INTERVIEW)
         except CircuitBreakerTrippedError as err:
+            validate_transition(current_status.state, ProjectState.FAILED)
             fail_evt = create_event(
                 project_id=project_id,
                 event_type=EventType.PROJECT_FAILED,
@@ -204,7 +219,14 @@ class Orchestrator:
             interviewer = Interviewer(llm=self.llm)
             round_result = interviewer.run_round(current_spec, user_message)
             self._specs[project_id] = round_result.spec
-        except (InvalidLLMResponseError, ValueError, TimeoutError, RuntimeError) as err:
+        except (
+            LLMError,
+            ValueError,
+            TimeoutError,
+            OSError,
+            RuntimeError,
+        ) as err:
+            validate_transition(current_status.state, ProjectState.FAILED)
             fail_evt = create_event(
                 project_id=project_id,
                 event_type=EventType.PROJECT_FAILED,
@@ -252,9 +274,6 @@ class Orchestrator:
         if not current_spec.is_complete():
             raise ValueError("Spec checklist is incomplete")
 
-        self.circuit_breaker.reset(project_id, ProjectState.DEBATE)
-        self.circuit_breaker.reset(project_id, ProjectState.MEDIATION)
-
         self.store.append(
             create_event(
                 project_id=project_id,
@@ -288,11 +307,12 @@ class Orchestrator:
                 on_transition=_on_transition,
             )
         except (
-            InvalidLLMResponseError,
+            LLMError,
             PlanValidationError,
             ValueError,
             TimeoutError,
             CircuitBreakerTrippedError,
+            OSError,
             RuntimeError,
         ) as err:
             self.store.append(
@@ -382,6 +402,12 @@ class Orchestrator:
     ) -> ProjectStatus:
         """Record a call in the given state or transition to FAILED if budget exceeded (INV-17)."""
         validate_project_id(project_id)
+        events = self.store.get_events(project_id)
+        if not events:
+            raise ValueError(f"Project '{project_id}' does not exist")
+        current_status = self.get_status(project_id)
+        if current_status.state == ProjectState.FAILED:
+            raise IllegalTransition(ProjectState.FAILED, state)
         try:
             self.circuit_breaker.record_call(project_id, state)
             self.store.append(
@@ -393,6 +419,7 @@ class Orchestrator:
                 )
             )
         except CircuitBreakerTrippedError as err:
+            validate_transition(current_status.state, ProjectState.FAILED)
             self.store.append(
                 create_event(
                     project_id=project_id,

@@ -10,12 +10,12 @@ from pydantic import BaseModel, Field, field_validator
 
 from agent_factory.domain.states import ProjectState
 
-PROJECT_ID_REGEX: re.Pattern[str] = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+PROJECT_ID_REGEX: re.Pattern[str] = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}\Z")
 
 
 def validate_project_id(project_id: str) -> str:
     """Validate project_id strictly according to INV-22 (AC-1.12, F-05)."""
-    if not isinstance(project_id, str) or not PROJECT_ID_REGEX.match(project_id):
+    if not isinstance(project_id, str) or not PROJECT_ID_REGEX.fullmatch(project_id):
         raise ValueError(
             f"Invalid project_id '{project_id}': must match ^[a-z0-9][a-z0-9-]{{0,62}}$ "
             "(lowercase alphanumeric and hyphens, 1-63 chars, start with alphanumeric)"

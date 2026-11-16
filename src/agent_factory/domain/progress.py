@@ -56,6 +56,13 @@ def project_status_from_events(project_id: str, events: Sequence[Event]) -> Proj
         updated_at = event.at
         payload = event.payload or {}
 
+        if current_state == ProjectState.IDLE and event.type != EventType.PROJECT_CREATED:
+            if event.type == EventType.PROJECT_FAILED:
+                validate_transition(current_state, ProjectState.FAILED)
+            raise ValueError(
+                f"Invalid event log: cannot process '{event.type}' prior to PROJECT_CREATED"
+            )
+
         if event.type == EventType.PROJECT_CREATED:
             name = payload.get("name", name)
             objective = payload.get("objective", objective)
@@ -72,7 +79,7 @@ def project_status_from_events(project_id: str, events: Sequence[Event]) -> Proj
 
         elif event.type == EventType.STATE_TRANSITIONED:
             next_state = ProjectState(payload["to"])
-            if next_state == ProjectState.BUILDING:
+            if next_state == ProjectState.BUILDING and current_state != ProjectState.VERIFYING:
                 raise ValueError(
                     "Cannot transition to BUILDING via STATE_TRANSITIONED without valid APPROVAL_RECORDED"
                 )
@@ -86,13 +93,16 @@ def project_status_from_events(project_id: str, events: Sequence[Event]) -> Proj
             )
 
         elif event.type == EventType.PLAN_CREATED:
+            if current_state not in (ProjectState.DEBATE, ProjectState.MEDIATION):
+                raise ValueError(
+                    f"Cannot create plan in state {current_state}: PLAN_CREATED only valid in DEBATE or MEDIATION"
+                )
+            next_state = ProjectState(payload.get("to", ProjectState.WAITING_APPROVAL))
+            validate_transition(current_state, next_state)
+            current_state = next_state
             plan_hash = payload.get("plan_hash", plan_hash)
             if "total_tests" in payload:
                 tests.total = payload["total_tests"]
-            if "to" in payload:
-                next_state = ProjectState(payload["to"])
-                validate_transition(current_state, next_state)
-                current_state = next_state
             last_progress = calculate_progress(
                 current_state,
                 passed_tests=tests.passed,
@@ -101,16 +111,20 @@ def project_status_from_events(project_id: str, events: Sequence[Event]) -> Proj
             )
 
         elif event.type == EventType.APPROVAL_RECORDED:
-            approved_hash = payload.get("plan_hash")
+            target_to = payload.get("to", ProjectState.BUILDING)
+            next_state = ProjectState(target_to) if not isinstance(target_to, ProjectState) else target_to
+            if next_state != ProjectState.BUILDING:
+                raise ValueError(f"APPROVAL_RECORDED cannot transition to '{next_state}': must target BUILDING")
+            if current_state != ProjectState.WAITING_APPROVAL:
+                raise ValueError(f"Cannot record approval in state '{current_state}': must be WAITING_APPROVAL")
             decision = payload.get("decision")
-            next_state = ProjectState(payload.get("to", ProjectState.BUILDING))
-            if next_state == ProjectState.BUILDING:
-                if decision != "approved":
-                    raise ValueError(f"Cannot transition to BUILDING: approval decision is '{decision}'")
-                if not plan_hash or approved_hash != plan_hash:
-                    raise ValueError(
-                        f"Cannot transition to BUILDING: plan_hash mismatch ('{approved_hash}' != '{plan_hash}')"
-                    )
+            if decision != "approved":
+                raise ValueError(f"Cannot transition to BUILDING: approval decision is '{decision}'")
+            approved_hash = payload.get("plan_hash")
+            if not plan_hash or approved_hash != plan_hash:
+                raise ValueError(
+                    f"Cannot transition to BUILDING: plan_hash mismatch ('{approved_hash}' != '{plan_hash}')"
+                )
             validate_transition(current_state, next_state)
             current_state = next_state
             plan_hash = approved_hash

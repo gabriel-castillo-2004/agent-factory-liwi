@@ -11,7 +11,7 @@ from agent_factory.agents.structuralist import Structuralist, StructuralistCriti
 from agent_factory.domain.models import VALID_TEMPLATES, Plan, Spec
 from agent_factory.domain.states import ProjectState
 from agent_factory.ports.clock import Clock
-from agent_factory.ports.llm import LLM, InvalidLLMResponseError
+from agent_factory.ports.llm import LLM, LLMError
 
 
 class PlanValidationError(ValueError):
@@ -104,7 +104,7 @@ class Mediator:
             except PlanValidationError:
                 # Direct validation errors must propagate or fail
                 raise
-            except (InvalidLLMResponseError, ValueError, TimeoutError) as err:
+            except (LLMError, ValueError, TimeoutError, OSError) as err:
                 last_err = err
                 if attempts <= self.max_retries and self.clock is not None and hasattr(self.clock, "sleep"):
                     self.clock.sleep(0.1 * (2 ** (attempts - 1)))
@@ -172,10 +172,11 @@ def run_debate_pipeline(
             llm_calls=wrapper.call_count,
         )
     except (
-        InvalidLLMResponseError,
+        LLMError,
         PlanValidationError,
         ValueError,
         TimeoutError,
+        OSError,
         RuntimeError,
     ) as err:
         return DebatePipelineResult(

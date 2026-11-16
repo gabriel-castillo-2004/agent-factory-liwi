@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 
 from agent_factory.domain.models import Spec
 from agent_factory.ports.clock import Clock
-from agent_factory.ports.llm import LLM, InvalidLLMResponseError
+from agent_factory.ports.llm import LLM, LLMError
 
 
 class PragmatistProposal(BaseModel):
@@ -47,7 +47,7 @@ class Pragmatist:
             try:
                 data = self.llm.complete(messages=messages, schema=PragmatistProposal)
                 return PragmatistProposal.model_validate(data)
-            except (InvalidLLMResponseError, ValueError, TimeoutError) as err:
+            except (LLMError, ValueError, TimeoutError, OSError) as err:
                 last_err = err
                 if attempts <= self.max_retries and self.clock is not None and hasattr(self.clock, "sleep"):
                     self.clock.sleep(0.1 * (2 ** (attempts - 1)))
