@@ -1,5 +1,7 @@
 """Pydantic v2 data contracts for the Agent Factory domain (Section 5)."""
 
+import hashlib
+import json
 from datetime import datetime
 from enum import StrEnum
 
@@ -34,15 +36,32 @@ class Spec(BaseModel):
 
     def missing_fields(self) -> list[str]:
         """Return list of checklist field names that are still empty."""
-        raise NotImplementedError
+        missing: list[str] = []
+        for field in SPEC_CHECKLIST_FIELDS:
+            val = getattr(self, field)
+            if (isinstance(val, str) and not val.strip()) or (isinstance(val, list) and len(val) == 0):
+                missing.append(field)
+        return missing
 
     def is_complete(self) -> bool:
         """Deterministic completeness check across all required Spec fields."""
-        raise NotImplementedError
+        return len(self.missing_fields()) == 0
 
     def fill_gaps_with_assumptions(self) -> "Spec":
         """Fill missing checklist fields with explicit assumptions (Section 7.3)."""
-        raise NotImplementedError
+        updated_data = self.model_dump()
+        assumptions = list(self.assumptions)
+        missing = self.missing_fields()
+
+        for field in missing:
+            assumption_text = f"Explicit assumption for {field}: standard defaults applied."
+            assumptions.append(assumption_text)
+            updated_data[field] = (
+                f"Standard default for {field}" if field == "objective" else [f"Standard default for {field}"]
+            )
+
+        updated_data["assumptions"] = assumptions
+        return Spec.model_validate(updated_data)
 
 
 class AcceptanceTestType(StrEnum):
@@ -83,7 +102,9 @@ class Plan(BaseModel):
 
     def compute_hash(self) -> str:
         """Compute deterministic SHA-256 hash of this Plan (INV-05)."""
-        raise NotImplementedError
+        data = self.model_dump(mode="json")
+        canonical_json = json.dumps(data, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
 
 class ApprovalEvent(BaseModel):

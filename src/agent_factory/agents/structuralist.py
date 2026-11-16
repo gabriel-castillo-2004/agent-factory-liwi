@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 
 from agent_factory.agents.pragmatist import PragmatistProposal
 from agent_factory.domain.models import Spec
-from agent_factory.ports.llm import LLM
+from agent_factory.ports.llm import LLM, InvalidLLMResponseError
 
 
 class StructuralistCritique(BaseModel):
@@ -24,4 +24,30 @@ class Structuralist:
 
     def critique(self, spec: Spec, proposal: PragmatistProposal) -> StructuralistCritique:
         """Critique proposal and suggest robust architecture with bounded retries."""
-        raise NotImplementedError
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are Structuralist, an architectural agent. Critique the pragmatic proposal, "
+                    "identify failure modes, and propose robust architectural safeguards."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Specification:\n{spec.model_dump_json()}\n\n"
+                    f"Pragmatist Proposal:\n{proposal.model_dump_json()}"
+                ),
+            },
+        ]
+
+        last_err: Exception | None = None
+        for _ in range(self.max_retries + 1):
+            try:
+                data = self.llm.complete(messages=messages, schema=StructuralistCritique)
+                return StructuralistCritique.model_validate(data)
+            except (InvalidLLMResponseError, ValueError) as err:
+                last_err = err
+
+        assert last_err is not None
+        raise last_err

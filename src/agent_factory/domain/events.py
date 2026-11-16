@@ -1,6 +1,7 @@
 """Append-only event log models (INV-11, Section 5)."""
 
-from datetime import datetime
+import uuid
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -44,4 +45,10 @@ def create_event(
     at: datetime | None = None,
 ) -> Event:
     """Create a new Event instance."""
-    raise NotImplementedError
+    return Event(
+        id=event_id or f"evt-{uuid.uuid4().hex[:12]}",
+        project_id=project_id,
+        type=event_type,
+        payload=payload or {},
+        at=at or datetime.now(UTC),
+    )

@@ -56,9 +56,12 @@ ALLOWED_TRANSITIONS: dict[ProjectState, frozenset[ProjectState]] = {
 
 def can_transition(current: ProjectState, target: ProjectState) -> bool:
     """Return True if transitioning from current to target is allowed."""
-    raise NotImplementedError
+    allowed = ALLOWED_TRANSITIONS.get(current, frozenset())
+    return target in allowed
 
 
 def validate_transition(current: ProjectState, target: ProjectState) -> ProjectState:
     """Validate transition from current to target or raise IllegalTransition."""
-    raise NotImplementedError
+    if not can_transition(current, target):
+        raise IllegalTransition(current, target)
+    return target

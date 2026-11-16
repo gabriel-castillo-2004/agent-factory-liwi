@@ -34,7 +34,54 @@ class Interviewer:
         round_number: int = 1,
     ) -> InterviewRoundResult:
         """Process one user message, update Spec, and return at most 3 questions."""
-        raise NotImplementedError
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert product interviewer. Interview the user to specify a software project. "
+                    "Ask at most 3 clear questions per round focusing on missing specification areas."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Current Spec:\n{current_spec.model_dump_json()}\n\n"
+                    f"User Message:\n{user_message}"
+                ),
+            },
+        ]
+
+        response = self.llm.complete(messages=messages, schema=None)
+        spec_data = response.get("spec", response)
+        questions = list(response.get("questions", []))[:MAX_QUESTIONS_PER_ROUND]
+        new_spec = Spec.model_validate(spec_data)
+
+        if new_spec.is_complete():
+            return InterviewRoundResult(
+                spec=new_spec,
+                questions=[],
+                is_complete=True,
+                terminated_by_limit=False,
+                rounds_used=round_number,
+            )
+
+        if round_number >= self.max_rounds:
+            completed_spec = new_spec.fill_gaps_with_assumptions()
+            return InterviewRoundResult(
+                spec=completed_spec,
+                questions=[],
+                is_complete=True,
+                terminated_by_limit=True,
+                rounds_used=round_number,
+            )
+
+        return InterviewRoundResult(
+            spec=new_spec,
+            questions=questions,
+            is_complete=False,
+            terminated_by_limit=False,
+            rounds_used=round_number,
+        )
 
     def conduct_interview(
         self,
@@ -42,4 +89,14 @@ class Interviewer:
         user_replies: Sequence[str] = (),
     ) -> InterviewRoundResult:
         """Run multi-round interview until Spec checklist is complete or max_rounds reached."""
-        raise NotImplementedError
+        current_spec = Spec()
+        all_messages = [initial_message, *user_replies]
+        last_result: InterviewRoundResult | None = None
+
+        for idx, msg in enumerate(all_messages, start=1):
+            last_result = self.run_round(current_spec, msg, round_number=idx)
+            current_spec = last_result.spec
+            if last_result.is_complete or idx >= self.max_rounds:
+                break
+
+        return last_result  # type: ignore[return-value]

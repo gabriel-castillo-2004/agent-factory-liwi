@@ -3,7 +3,7 @@
 from pydantic import BaseModel, Field
 
 from agent_factory.domain.models import Spec
-from agent_factory.ports.llm import LLM
+from agent_factory.ports.llm import LLM, InvalidLLMResponseError
 
 
 class PragmatistProposal(BaseModel):
@@ -23,4 +23,30 @@ class Pragmatist:
 
     def propose(self, spec: Spec) -> PragmatistProposal:
         """Generate pragmatic proposal with bounded retries on invalid JSON."""
-        raise NotImplementedError
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are Pragmatist, an architectural agent. Propose the simplest, most direct "
+                    "implementation route with minimal dependencies and zero unnecessary abstraction."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Specification:\n{spec.model_dump_json()}",
+            },
+        ]
+
+        attempts = 0
+        last_err: Exception | None = None
+
+        while attempts <= self.max_retries:
+            attempts += 1
+            try:
+                data = self.llm.complete(messages=messages, schema=PragmatistProposal)
+                return PragmatistProposal.model_validate(data)
+            except (InvalidLLMResponseError, ValueError) as err:
+                last_err = err
+
+        assert last_err is not None
+        raise last_err

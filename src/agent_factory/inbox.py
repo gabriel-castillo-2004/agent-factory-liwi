@@ -14,12 +14,18 @@ class Inbox:
 
     def is_processed(self, event_id: str) -> bool:
         """Return True if event_id has already been registered."""
-        raise NotImplementedError
+        return event_id in self._processed_ids
 
     def mark_processed(self, event_id: str) -> bool:
         """Register event_id as processed. Return True if new, False if duplicate."""
-        raise NotImplementedError
+        if event_id in self._processed_ids:
+            return False
+        self._processed_ids.add(event_id)
+        return True
 
     def process_once(self, event_id: str, handler: Callable[[], T]) -> T | None:
         """Mark event_id processed BEFORE calling handler; skip and return None if duplicate."""
-        raise NotImplementedError
+        if self.is_processed(event_id):
+            return None
+        self.mark_processed(event_id)
+        return handler()
