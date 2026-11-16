@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from agent_factory.domain.models import ProjectStatus
+from agent_factory.domain.models import ProjectStatus, validate_project_id
 from agent_factory.domain.progress import project_status_from_events
 from agent_factory.ports.store import EventStore
 
@@ -15,10 +15,15 @@ class FileStatusPublisher:
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     def _file_path(self, project_id: str) -> Path:
-        return self.base_dir / f"{project_id}.json"
+        validate_project_id(project_id)
+        path = (self.base_dir / f"{project_id}.json").resolve()
+        if not path.is_relative_to(self.base_dir.resolve()):
+            raise ValueError(f"Path traversal detected for project_id '{project_id}'")
+        return path
 
     def publish(self, status: ProjectStatus) -> None:
         """Write status JSON file for status.project_id."""
+        validate_project_id(status.project_id)
         path = self._file_path(status.project_id)
         path.write_text(status.model_dump_json(indent=2), encoding="utf-8")
 

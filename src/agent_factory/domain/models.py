@@ -2,12 +2,25 @@
 
 import hashlib
 import json
+import re
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from agent_factory.domain.states import ProjectState
+
+PROJECT_ID_REGEX: re.Pattern[str] = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+
+
+def validate_project_id(project_id: str) -> str:
+    """Validate project_id strictly according to INV-22 (AC-1.12, F-05)."""
+    if not isinstance(project_id, str) or not PROJECT_ID_REGEX.match(project_id):
+        raise ValueError(
+            f"Invalid project_id '{project_id}': must match ^[a-z0-9][a-z0-9-]{{0,62}}$ "
+            "(lowercase alphanumeric and hyphens, 1-63 chars, start with alphanumeric)"
+        )
+    return project_id
 
 VALID_TEMPLATES: frozenset[str] = frozenset({"static-app"})
 
@@ -138,7 +151,7 @@ class ProjectStatus(BaseModel):
     objective: str = ""
     state: ProjectState = ProjectState.IDLE
     phase: str = "IDLE"
-    progress_pct: int = 0
+    progress_pct: int = Field(default=0, ge=0, le=100)
     plan_hash: str | None = None
     tests: TestCounts = Field(default_factory=TestCounts)
     agent_invocations: int = 0
@@ -147,6 +160,11 @@ class ProjectStatus(BaseModel):
     last_event: str | None = None
     updated_at: datetime | None = None
     failure_reason: str | None = None
+
+    @field_validator("project_id")
+    @classmethod
+    def _validate_project_id(cls, v: str) -> str:
+        return validate_project_id(v)
 
 
 class BuildReport(BaseModel):

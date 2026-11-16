@@ -1,6 +1,8 @@
 """Mediator agent and fixed 3-step debate pipeline (Section 4, Section 7.4, AC-1.3, AC-1.4)."""
 
+from collections.abc import Callable
 from collections.abc import Set as AbstractSet
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -8,6 +10,7 @@ from agent_factory.agents.pragmatist import Pragmatist, PragmatistProposal
 from agent_factory.agents.structuralist import Structuralist, StructuralistCritique
 from agent_factory.domain.models import VALID_TEMPLATES, Plan, Spec
 from agent_factory.domain.states import ProjectState
+from agent_factory.ports.clock import Clock
 from agent_factory.ports.llm import LLM, InvalidLLMResponseError
 
 
@@ -56,10 +59,12 @@ class Mediator:
         llm: LLM,
         max_retries: int = 2,
         valid_templates: AbstractSet[str] = VALID_TEMPLATES,
+        clock: Clock | None = None,
     ) -> None:
         self.llm = llm
         self.max_retries = max_retries
         self.valid_templates = valid_templates
+        self.clock = clock
 
     def mediate(
         self,
@@ -99,11 +104,33 @@ class Mediator:
             except PlanValidationError:
                 # Direct validation errors must propagate or fail
                 raise
-            except (InvalidLLMResponseError, ValueError) as err:
+            except (InvalidLLMResponseError, ValueError, TimeoutError) as err:
                 last_err = err
+                if attempts <= self.max_retries and self.clock is not None and hasattr(self.clock, "sleep"):
+                    self.clock.sleep(0.1 * (2 ** (attempts - 1)))
 
         assert last_err is not None
         raise last_err
+
+
+class _PipelineLLMWrapper:
+    """Counting and breaker-aware LLM wrapper for debate pipeline (F-06, F-12)."""
+
+    def __init__(
+        self,
+        inner: LLM,
+        on_call: Callable[[ProjectState], None] | None = None,
+    ) -> None:
+        self.inner = inner
+        self.on_call = on_call
+        self.current_state = ProjectState.DEBATE
+        self.call_count = 0
+
+    def complete(self, messages: list[dict[str, str]], schema: type[Any] | None = None) -> Any:
+        if self.on_call is not None:
+            self.on_call(self.current_state)
+        self.call_count += 1
+        return self.inner.complete(messages=messages, schema=schema)
 
 
 def run_debate_pipeline(
@@ -111,42 +138,51 @@ def run_debate_pipeline(
     llm: LLM,
     max_retries: int = 2,
     valid_templates: AbstractSet[str] = VALID_TEMPLATES,
+    clock: Clock | None = None,
+    on_llm_call: Callable[[ProjectState], None] | None = None,
+    on_transition: Callable[[ProjectState, ProjectState], None] | None = None,
 ) -> DebatePipelineResult:
     """Execute the fixed 3-call pipeline: Pragmatist -> Structuralist -> Mediator (AC-1.3)."""
-    pragmatist = Pragmatist(llm=llm, max_retries=max_retries)
-    structuralist = Structuralist(llm=llm, max_retries=max_retries)
-    mediator = Mediator(llm=llm, max_retries=max_retries, valid_templates=valid_templates)
-
-    start_calls = len(getattr(llm, "calls", []))
+    wrapper = _PipelineLLMWrapper(inner=llm, on_call=on_llm_call)
+    pragmatist = Pragmatist(llm=wrapper, max_retries=max_retries, clock=clock)
+    structuralist = Structuralist(llm=wrapper, max_retries=max_retries, clock=clock)
+    mediator = Mediator(
+        llm=wrapper,
+        max_retries=max_retries,
+        valid_templates=valid_templates,
+        clock=clock,
+    )
 
     try:
         proposal = pragmatist.propose(spec)
         critique = structuralist.critique(spec, proposal)
+
+        if on_transition is not None:
+            on_transition(ProjectState.DEBATE, ProjectState.MEDIATION)
+        wrapper.current_state = ProjectState.MEDIATION
+
         plan = mediator.mediate(spec, proposal, critique)
 
-        total_calls = len(getattr(llm, "calls", [])) - start_calls
         return DebatePipelineResult(
             state=ProjectState.WAITING_APPROVAL,
             proposal=proposal,
             critique=critique,
             plan=plan,
             failure_cause=None,
-            llm_calls=total_calls,
+            llm_calls=wrapper.call_count,
         )
     except (
         InvalidLLMResponseError,
         PlanValidationError,
         ValueError,
+        TimeoutError,
         RuntimeError,
-        KeyError,
-        TypeError,
     ) as err:
-        total_calls = len(getattr(llm, "calls", [])) - start_calls
         return DebatePipelineResult(
             state=ProjectState.FAILED,
             proposal=None,
             critique=None,
             plan=None,
             failure_cause=str(err),
-            llm_calls=total_calls,
+            llm_calls=wrapper.call_count,
         )

@@ -99,4 +99,5 @@ class Interviewer:
             if last_result.is_complete or idx >= self.max_rounds:
                 break
 
-        return last_result  # type: ignore[return-value]
+        assert last_result is not None
+        return last_result

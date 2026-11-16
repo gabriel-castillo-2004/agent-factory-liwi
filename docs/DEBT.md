@@ -1,16 +1,17 @@
-# Registro de Deuda Técnica y Hallazgos No Testeables en Paso A' (`DEBT.md`)
+# Registro de Deuda Técnica y Estado de Hallazgos tras Paso B' (`DEBT.md`)
 
-Este documento registra los hallazgos de `docs/AUDIT_REPORT_1.md` que corresponden a artefactos de documentación, configuración de CI o decisiones de diseño que no se expresan como pruebas unitarias en `tests/` durante el Paso A' (solo tests), con su ID y motivo.
+Este documento registra los hallazgos de `docs/AUDIT_REPORT_1.md` y su estado tras la finalización del endurecimiento en el Paso B'.
 
-| ID | Severidad | Motivo por el que se registra en `DEBT.md` | Resolución prevista |
+| ID | Severidad | Estado tras Paso B' | Detalle y Resolución |
 |---|---|---|---|
-| **F-13** | Medio | Separación entre fallos operacionales del LLM (`TimeoutError`, `InvalidLLMResponseError`, errores del puerto) y errores de programación internos (`TypeError`, `KeyError`). En Paso B' se restringirá el bloque `except` de `mediator.py` y `orchestrator.py` para capturar exclusivamente errores operacionales del puerto LLM y de validación, dejando propagar errores de programación internos. | Paso B' (implementación en `src/agent_factory/agents/mediator.py` y `orchestrator.py`). |
-| **F-14** | Medio | `Spec.fill_gaps_with_assumptions` rellena campos faltantes y marca `is_complete() == True`. La prueba preexistente `tests/test_interviewer.py::test_interviewer_finishes_on_round_limit_marking_explicit_assumptions` exige contractualmente `result.spec.is_complete() is True` tras agotar rondas. Cambiar `is_complete()` a `False` rompería el contrato de Fase 1. | Mantener compatibilidad con AC-1.2 asegurando que cada supuesto explícito quede registrado en `Spec.assumptions` y sea consumido por el pipeline de debate. |
-| **F-20** | Medio | Gobernanza / documentación (INV-08): falta ADR para `pydantic==2.14.3` en `docs/decisions/` y archivo de bloqueo de dependencias transitivas. No es un test de unidad en `tests/`. | Documentar `ADR-001-pydantic-v2.md` en `docs/decisions/` durante el cierre de endurecimiento. |
-| **F-21** | Medio | Configuración de CI: `.github/workflows/ci.yml` ejecuta `pytest --cov=src/agent_factory` sin `--cov-fail-under=85`. En el Paso A' no se modifican workflows ni `pyproject.toml` para preservar la inmutabilidad de configuración del runner (INV-13). | Añadir umbral o verificación de cobertura en el workflow de CI cuando se autorice tocar `.github/workflows/ci.yml`. |
-| **F-22** | Bajo | `STATE_BASE_PROGRESS` incluye `CHANGE_REQUEST: 10`, estado cuya lógica pertenece a la Fase 5 según la sección 4 del `MASTER_PROMPT.md`. | Documentado como valor base provisional hasta la Fase 5. |
-| **F-23** | Bajo | Regla de redondeo proporcional en `BUILDING` (`round(35 + 55 * ratio)`). El valor `62` para `2/4` pruebas pasadas está fijado en la suite de pruebas de la Fase 1. | Mantener `round()` estándar de Python documentado como regla determinista de `calculate_progress`. |
-| **F-24** | Bajo | Persistencia del campo `ApprovalEvent.timestamp` en el payload de `APPROVAL_RECORDED` y acotación `0 <= progress_pct <= 100` en `ProjectStatus`. | Se incluirá en la implementación del Paso B' en `orchestrator.py` y `models.py`. |
-| **F-25** | Bajo | Aristas hacia `FAILED` desde estados activos en `ALLOWED_TRANSITIONS`. Son requeridas por INV-06, INV-09, INV-17 y AC-1.3/AC-1.8/AC-1.13. | Quedan formalmente ancladas en el oráculo escrito a mano de `tests/test_states.py` (AC-1.1). |
-| **F-26** | Bajo | Uso de `datetime.now(UTC)` como respaldo cuando no se inyecta el puerto `Clock`. | Mantener inyección de `Clock` en `Orchestrator` con fallback determinista. |
-| **F-27** | Bajo | Limpieza de `# type: ignore[return-value]` en `interviewer.py:102` y separación de lectura/publicación en `get_status`. | Se limpiará el tipado en `interviewer.py` durante el Paso B'. |
+| **F-13** | Medio | **Resuelto** | Se restringieron los bloques `except` en `mediator.py` y `orchestrator.py` para capturar exclusivamente excepciones operacionales del LLM (`InvalidLLMResponseError`, `PlanValidationError`, `ValueError`, `TimeoutError`, `CircuitBreakerTrippedError`, `RuntimeError`), permitiendo propagar errores internos de programación. |
+| **F-14** | Medio | **Aceptado como diseño** | `Spec.fill_gaps_with_assumptions` rellena campos faltantes con supuestos explícitos en `Spec.assumptions` y marca `is_complete() == True`, cumpliendo contractualmente con AC-1.2. |
+| **F-20** | Medio | **Resuelto** | Documentado formalmente en `docs/decisions/ADR-003-pydantic.md` justificando `pydantic==2.14.3` (INV-08). |
+| **F-21** | Medio | **Abierto (Fase 2)** | Configuración de CI: `.github/workflows/ci.yml` ejecuta `pytest --cov=src/agent_factory` sin `--cov-fail-under=85`. En Fase 1 no se modifican workflows para preservar la inmutabilidad de configuración del runner (INV-13). Se incluirá al iniciar Fase 2. |
+| **F-22** | Bajo | **Aceptado como diseño** | `STATE_BASE_PROGRESS` incluye `CHANGE_REQUEST: 10`, valor base provisional hasta su desarrollo completo en Fase 5. |
+| **F-23** | Bajo | **Aceptado como diseño** | Regla de redondeo proporcional en `BUILDING` (`round(35 + 55 * ratio)`). El valor `62` para `2/4` pruebas pasadas está formalmente anclado en la suite de pruebas. |
+| **F-24** | Bajo | **Resuelto** | Inclusión de `timestamp` ISO en payload de `APPROVAL_RECORDED` y validación estricta de límites de `progress_pct` (`0 <= progress_pct <= 100`) en `ProjectStatus`. |
+| **F-25** | Bajo | **Resuelto** | Aristas hacia `FAILED` desde estados activos formalmente validadas por el oráculo independiente en `tests/test_states.py`. |
+| **F-26** | Bajo | **Resuelto** | Inyección del puerto `Clock` en `Orchestrator` y pipeline de debate, con método `sleep(seconds)` para desacoplar esperas operacionales y mantener pruebas deterministas sin retardo. |
+| **F-27** | Bajo | **Resuelto** | Tipado estricto en `interviewer.py:conduct_interview` eliminando `# type: ignore[return-value]`. |
+

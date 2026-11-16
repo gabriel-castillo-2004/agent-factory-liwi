@@ -1,5 +1,7 @@
 """In-memory append-only EventStore adapter (INV-11, Section 7.5)."""
 
+import copy
+
 from agent_factory.domain.events import Event
 from agent_factory.ports.store import DuplicateEventError
 
@@ -16,11 +18,15 @@ class MemoryEventStore:
         if event.id in self._seen_ids:
             raise DuplicateEventError(f"Duplicate event ID: {event.id}")
         self._seen_ids.add(event.id)
-        self._events.append(event)
+        self._events.append(event.model_copy(update={"payload": copy.deepcopy(event.payload)}, deep=True))
 
     def get_events(self, project_id: str) -> list[Event]:
         """Return all events for project_id in append order."""
-        return [e for e in self._events if e.project_id == project_id]
+        return [
+            e.model_copy(update={"payload": copy.deepcopy(e.payload)}, deep=True)
+            for e in self._events
+            if e.project_id == project_id
+        ]
 
     def list_project_ids(self) -> list[str]:
         """Return distinct project IDs in insertion order."""

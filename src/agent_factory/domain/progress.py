@@ -4,7 +4,7 @@ from collections.abc import Sequence
 
 from agent_factory.domain.events import Event, EventType
 from agent_factory.domain.models import ProjectStatus, TestCounts
-from agent_factory.domain.states import ProjectState
+from agent_factory.domain.states import ProjectState, validate_transition
 
 STATE_BASE_PROGRESS: dict[ProjectState, int] = {
     ProjectState.IDLE: 0,
@@ -60,7 +60,9 @@ def project_status_from_events(project_id: str, events: Sequence[Event]) -> Proj
             name = payload.get("name", name)
             objective = payload.get("objective", objective)
             raw_state = payload.get("state", ProjectState.INTERVIEW)
-            current_state = ProjectState(raw_state)
+            next_state = ProjectState(raw_state)
+            validate_transition(current_state, next_state)
+            current_state = next_state
             last_progress = calculate_progress(
                 current_state,
                 passed_tests=tests.passed,
@@ -69,7 +71,13 @@ def project_status_from_events(project_id: str, events: Sequence[Event]) -> Proj
             )
 
         elif event.type == EventType.STATE_TRANSITIONED:
-            current_state = ProjectState(payload["to"])
+            next_state = ProjectState(payload["to"])
+            if next_state == ProjectState.BUILDING:
+                raise ValueError(
+                    "Cannot transition to BUILDING via STATE_TRANSITIONED without valid APPROVAL_RECORDED"
+                )
+            validate_transition(current_state, next_state)
+            current_state = next_state
             last_progress = calculate_progress(
                 current_state,
                 passed_tests=tests.passed,
@@ -82,7 +90,9 @@ def project_status_from_events(project_id: str, events: Sequence[Event]) -> Proj
             if "total_tests" in payload:
                 tests.total = payload["total_tests"]
             if "to" in payload:
-                current_state = ProjectState(payload["to"])
+                next_state = ProjectState(payload["to"])
+                validate_transition(current_state, next_state)
+                current_state = next_state
             last_progress = calculate_progress(
                 current_state,
                 passed_tests=tests.passed,
@@ -91,9 +101,19 @@ def project_status_from_events(project_id: str, events: Sequence[Event]) -> Proj
             )
 
         elif event.type == EventType.APPROVAL_RECORDED:
-            plan_hash = payload.get("plan_hash", plan_hash)
-            if "to" in payload:
-                current_state = ProjectState(payload["to"])
+            approved_hash = payload.get("plan_hash")
+            decision = payload.get("decision")
+            next_state = ProjectState(payload.get("to", ProjectState.BUILDING))
+            if next_state == ProjectState.BUILDING:
+                if decision != "approved":
+                    raise ValueError(f"Cannot transition to BUILDING: approval decision is '{decision}'")
+                if not plan_hash or approved_hash != plan_hash:
+                    raise ValueError(
+                        f"Cannot transition to BUILDING: plan_hash mismatch ('{approved_hash}' != '{plan_hash}')"
+                    )
+            validate_transition(current_state, next_state)
+            current_state = next_state
+            plan_hash = approved_hash
             last_progress = calculate_progress(
                 current_state,
                 passed_tests=tests.passed,
@@ -119,11 +139,13 @@ def project_status_from_events(project_id: str, events: Sequence[Event]) -> Proj
             ci_rounds = payload.get("ci_rounds", ci_rounds + 1)
 
         elif event.type == EventType.PROJECT_FAILED:
+            validate_transition(current_state, ProjectState.FAILED)
             current_state = ProjectState.FAILED
             failure_reason = payload.get("reason", "Unknown failure")
             # FAILED preserves the last progress value
 
         elif event.type == EventType.PROJECT_DELIVERED:
+            validate_transition(current_state, ProjectState.DELIVERED)
             current_state = ProjectState.DELIVERED
             last_progress = 100
 

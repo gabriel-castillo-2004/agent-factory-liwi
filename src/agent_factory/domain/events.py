@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class EventType(StrEnum):
@@ -28,6 +28,8 @@ class EventType(StrEnum):
 
 class Event(BaseModel):
     """Immutable append-only event record (INV-11, Section 5)."""
+
+    model_config = ConfigDict(frozen=True)
 
     id: str
     project_id: str
