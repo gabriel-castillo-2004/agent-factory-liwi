@@ -1,8 +1,9 @@
-"""Tests for Pragmatist, Structuralist, and Mediator pipeline (AC-1.3, AC-1.4)."""
+"""Tests for Pragmatist, Structuralist, and Mediator pipeline (AC-1.3, AC-1.4, F-12)."""
 
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
 from agent_factory.adapters.fake_llm import FakeLLM
 from agent_factory.agents.mediator import (
@@ -15,6 +16,21 @@ from agent_factory.agents.pragmatist import PragmatistProposal
 from agent_factory.agents.structuralist import StructuralistCritique
 from agent_factory.domain.models import Plan, Spec
 from agent_factory.domain.states import ProjectState
+
+
+class _MinimalStatelessLLM:
+    """LLM implementation without a .calls attribute to verify F-12 (INV-02)."""
+
+    def __init__(self, responses: list[dict[str, Any]]) -> None:
+        self._queue = list(responses)
+
+    def complete(
+        self,
+        messages: list[dict[str, str]],
+        schema: type[BaseModel] | dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        _ = (messages, schema)
+        return self._queue.pop(0)
 
 
 def _sample_complete_spec() -> Spec:
@@ -103,6 +119,23 @@ def test_debate_happy_path_makes_exactly_three_llm_calls() -> None:
     assert result.failure_cause is None
 
 
+def test_debate_pipeline_counts_llm_calls_without_fake_llm_calls_attribute() -> None:
+    """AC-1.3 / F-12 (INV-02): Pipeline counts LLM calls without relying on FakeLLM.calls."""
+    spec = _sample_complete_spec()
+    custom_llm = _MinimalStatelessLLM(
+        responses=[
+            _valid_pragmatist_dict(),
+            _valid_structuralist_dict(),
+            _valid_plan_dict(),
+        ]
+    )
+
+    result = run_debate_pipeline(spec=spec, llm=custom_llm)
+
+    assert result.state == ProjectState.WAITING_APPROVAL
+    assert result.llm_calls == 3
+
+
 def test_debate_invalid_json_retries_and_recovers_within_limit() -> None:
     """AC-1.3: Invalid JSON triggers up to 2 retries and succeeds if valid JSON is returned."""
     spec = _sample_complete_spec()
@@ -185,7 +218,7 @@ def test_mediator_rejects_plan_with_file_missing_contract() -> None:
 
 
 def test_mediator_rejects_plan_with_nonexistent_template_id() -> None:
-    """AC-1.4: Mediator rejects a Plan when template_id does not exist in catalog."""
+    """AC-1.4 / M8: Mediator rejects a Plan when template_id does not exist in catalog."""
     spec = _sample_complete_spec()
     proposal = PragmatistProposal.model_validate(_valid_pragmatist_dict())
     critique = StructuralistCritique.model_validate(_valid_structuralist_dict())

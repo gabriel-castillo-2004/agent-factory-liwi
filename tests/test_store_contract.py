@@ -1,10 +1,11 @@
-"""Unified contract test suite for MemoryEventStore and SqliteEventStore (AC-1.10, INV-11)."""
+"""Unified contract test suite for MemoryEventStore and SqliteEventStore (AC-1.10, INV-11, F-16)."""
 
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from agent_factory.adapters.memory_store import MemoryEventStore
 from agent_factory.adapters.sqlite_store import SqliteEventStore
@@ -21,6 +22,7 @@ def event_store(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Even
         db_file = tmp_path / "contract_events.db"
         store = SqliteEventStore(db_path=db_file)
         yield store
+        store.close()
 
 
 def test_store_append_and_get_events_preserves_order(event_store: EventStore) -> None:
@@ -140,3 +142,30 @@ def test_store_lists_distinct_project_ids(event_store: EventStore) -> None:
 def test_store_returns_empty_list_for_unknown_project(event_store: EventStore) -> None:
     """AC-1.10: Requesting events for a nonexistent project returns an empty list."""
     assert event_store.get_events("nonexistent-project-id") == []
+
+
+def test_store_events_are_immutable_and_defend_against_payload_tampering(
+    event_store: EventStore,
+) -> None:
+    """AC-1.10 / F-16 (INV-11): Event instances are frozen and stored payloads cannot be mutated in-place."""
+    now = datetime(2026, 11, 16, 13, 0, tzinfo=UTC)
+    original_payload = {"name": "ImmutableApp", "nested": ["v1"]}
+    event = Event(
+        id="evt-imm-1",
+        project_id="proj-immutable",
+        type=EventType.PROJECT_CREATED,
+        payload=original_payload,
+        at=now,
+    )
+
+    with pytest.raises((ValidationError, TypeError)):
+        event.type = "TAMPERED_TYPE"  # type: ignore[misc]
+
+    event_store.append(event)
+
+    # Attempt in-place mutation of retrieved event payload
+    fetched_first = event_store.get_events("proj-immutable")
+    fetched_first[0].payload["name"] = "HACKED_NAME"
+
+    fetched_second = event_store.get_events("proj-immutable")
+    assert fetched_second[0].payload["name"] == "ImmutableApp"

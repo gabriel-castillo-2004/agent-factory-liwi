@@ -1,4 +1,4 @@
-"""Tests for deterministic progress calculation and status projection (AC-1.6, AC-1.7)."""
+"""Tests for deterministic progress calculation and status projection (AC-1.6, AC-1.7, F-04, F-10)."""
 
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,21 +9,18 @@ from agent_factory.adapters.file_publisher import FileStatusPublisher
 from agent_factory.adapters.memory_store import MemoryEventStore
 from agent_factory.domain.events import Event, EventType
 from agent_factory.domain.progress import calculate_progress, project_status_from_events
-from agent_factory.domain.states import ProjectState
+from agent_factory.domain.states import IllegalTransition, ProjectState
 
 
-def test_status_reconstructed_identically_after_deleting_projection(tmp_path: Path) -> None:
-    """AC-1.6: Deleting the published projection and regenerating from events yields identical status."""
-    store = MemoryEventStore()
-    publisher = FileStatusPublisher(base_dir=tmp_path)
-    project_id = "proj-rebuild-01"
-    t0 = datetime(2026, 11, 16, 12, 0, tzinfo=UTC)
-    t1 = datetime(2026, 11, 16, 12, 5, tzinfo=UTC)
-    t2 = datetime(2026, 11, 16, 12, 10, tzinfo=UTC)
-    t3 = datetime(2026, 11, 16, 12, 15, tzinfo=UTC)
-    t4 = datetime(2026, 11, 16, 12, 20, tzinfo=UTC)
-
-    events = [
+def _events_up_to_state(
+    project_id: str,
+    target_state: ProjectState,
+    passed_tests: int = 0,
+    total_tests: int = 0,
+) -> list[Event]:
+    """Build a valid canonical sequence of events reaching target_state."""
+    base_time = datetime(2026, 11, 16, 12, 0, tzinfo=UTC)
+    events: list[Event] = [
         Event(
             id="evt-1",
             project_id=project_id,
@@ -33,41 +30,132 @@ def test_status_reconstructed_identically_after_deleting_projection(tmp_path: Pa
                 "objective": "Spaced repetition flashcards",
                 "state": ProjectState.INTERVIEW,
             },
-            at=t0,
-        ),
+            at=base_time,
+        )
+    ]
+    if target_state == ProjectState.INTERVIEW:
+        return events
+
+    events.append(
         Event(
             id="evt-2",
             project_id=project_id,
             type=EventType.STATE_TRANSITIONED,
             payload={"from": ProjectState.INTERVIEW, "to": ProjectState.DEBATE},
-            at=t1,
-        ),
+            at=datetime(2026, 11, 16, 12, 5, tzinfo=UTC),
+        )
+    )
+    if target_state == ProjectState.DEBATE:
+        return events
+
+    events.append(
         Event(
             id="evt-3",
             project_id=project_id,
             type=EventType.STATE_TRANSITIONED,
             payload={"from": ProjectState.DEBATE, "to": ProjectState.MEDIATION},
-            at=t2,
-        ),
+            at=datetime(2026, 11, 16, 12, 10, tzinfo=UTC),
+        )
+    )
+    if target_state == ProjectState.MEDIATION:
+        return events
+
+    events.append(
         Event(
             id="evt-4",
             project_id=project_id,
             type=EventType.PLAN_CREATED,
             payload={
                 "plan_hash": "abc123hash",
-                "total_tests": 4,
+                "total_tests": total_tests or 4,
                 "to": ProjectState.WAITING_APPROVAL,
             },
-            at=t3,
-        ),
+            at=datetime(2026, 11, 16, 12, 15, tzinfo=UTC),
+        )
+    )
+    if target_state == ProjectState.WAITING_APPROVAL:
+        return events
+
+    events.append(
         Event(
             id="evt-5",
             project_id=project_id,
             type=EventType.APPROVAL_RECORDED,
-            payload={"plan_hash": "abc123hash", "to": ProjectState.BUILDING},
-            at=t4,
-        ),
-    ]
+            payload={
+                "plan_hash": "abc123hash",
+                "decision": "approved",
+                "to": ProjectState.BUILDING,
+            },
+            at=datetime(2026, 11, 16, 12, 20, tzinfo=UTC),
+        )
+    )
+    if total_tests > 0:
+        events.append(
+            Event(
+                id="evt-6",
+                project_id=project_id,
+                type=EventType.TESTS_UPDATED,
+                payload={
+                    "passed": passed_tests,
+                    "failed": total_tests - passed_tests,
+                    "total": total_tests,
+                },
+                at=datetime(2026, 11, 16, 12, 25, tzinfo=UTC),
+            )
+        )
+    if target_state == ProjectState.BUILDING:
+        return events
+
+    events.append(
+        Event(
+            id="evt-7",
+            project_id=project_id,
+            type=EventType.STATE_TRANSITIONED,
+            payload={"from": ProjectState.BUILDING, "to": ProjectState.VERIFYING},
+            at=datetime(2026, 11, 16, 12, 30, tzinfo=UTC),
+        )
+    )
+    return events
+
+
+def test_status_reconstructed_identically_after_deleting_projection(tmp_path: Path) -> None:
+    """AC-1.6 / F-10 / M5: Regenerated status matches both original and hand-written expected values."""
+    store = MemoryEventStore()
+    publisher = FileStatusPublisher(base_dir=tmp_path)
+    project_id = "proj-rebuild-01"
+    t_final = datetime(2026, 11, 16, 12, 40, tzinfo=UTC)
+
+    events = _events_up_to_state(
+        project_id=project_id,
+        target_state=ProjectState.BUILDING,
+        passed_tests=2,
+        total_tests=4,
+    )
+    events.extend(
+        [
+            Event(
+                id="evt-inv-1",
+                project_id=project_id,
+                type=EventType.AGENT_INVOKED,
+                payload={"state": "INTERVIEW"},
+                at=datetime(2026, 11, 16, 12, 31, tzinfo=UTC),
+            ),
+            Event(
+                id="evt-inv-2",
+                project_id=project_id,
+                type=EventType.AGENT_INVOKED,
+                payload={"state": "BUILDING"},
+                at=datetime(2026, 11, 16, 12, 35, tzinfo=UTC),
+            ),
+            Event(
+                id="evt-ci-1",
+                project_id=project_id,
+                type=EventType.CI_ROUND_COMPLETED,
+                payload={"ci_rounds": 1},
+                at=t_final,
+            ),
+        ]
+    )
 
     for event in events:
         store.append(event)
@@ -86,6 +174,96 @@ def test_status_reconstructed_identically_after_deleting_projection(tmp_path: Pa
 
     assert regenerated_status == initial_status
     assert loaded_after_rebuild == initial_status
+
+    # Hand-written expected values (INV-23, F-10, M5)
+    assert regenerated_status.project_id == "proj-rebuild-01"
+    assert regenerated_status.name == "Flashcard App"
+    assert regenerated_status.objective == "Spaced repetition flashcards"
+    assert regenerated_status.state == ProjectState.BUILDING
+    assert regenerated_status.phase == "BUILDING"
+    assert regenerated_status.progress_pct == 62
+    assert regenerated_status.plan_hash == "abc123hash"
+    assert regenerated_status.tests.total == 4
+    assert regenerated_status.tests.passed == 2
+    assert regenerated_status.tests.failed == 2
+    assert regenerated_status.agent_invocations == 2
+    assert regenerated_status.ci_rounds == 1
+    assert regenerated_status.last_event == "evt-ci-1"
+    assert regenerated_status.updated_at == t_final
+
+
+def test_projection_rejects_illegal_state_transition_in_event_log() -> None:
+    """AC-1.6 / F-04 (INV-04, INV-11): Replaying an illegal state transition raises IllegalTransition."""
+    project_id = "proj-illegal-replay"
+    events = [
+        Event(
+            id="evt-1",
+            project_id=project_id,
+            type=EventType.PROJECT_CREATED,
+            payload={"name": "App", "objective": "Obj", "state": ProjectState.INTERVIEW},
+            at=datetime(2026, 11, 16, 12, 0, tzinfo=UTC),
+        ),
+        Event(
+            id="evt-2-illegal",
+            project_id=project_id,
+            type=EventType.STATE_TRANSITIONED,
+            payload={"from": ProjectState.INTERVIEW, "to": ProjectState.DELIVERED},
+            at=datetime(2026, 11, 16, 12, 5, tzinfo=UTC),
+        ),
+    ]
+
+    with pytest.raises(IllegalTransition):
+        project_status_from_events(project_id, events)
+
+
+@pytest.mark.parametrize(
+    "bad_approval_event",
+    [
+        Event(
+            id="evt-bad-1",
+            project_id="proj-bad-approval",
+            type=EventType.STATE_TRANSITIONED,
+            payload={"from": ProjectState.WAITING_APPROVAL, "to": ProjectState.BUILDING},
+            at=datetime(2026, 11, 16, 12, 25, tzinfo=UTC),
+        ),
+        Event(
+            id="evt-bad-2",
+            project_id="proj-bad-approval",
+            type=EventType.APPROVAL_RECORDED,
+            payload={
+                "plan_hash": "abc123hash",
+                "decision": "rejected",
+                "to": ProjectState.BUILDING,
+            },
+            at=datetime(2026, 11, 16, 12, 25, tzinfo=UTC),
+        ),
+        Event(
+            id="evt-bad-3",
+            project_id="proj-bad-approval",
+            type=EventType.APPROVAL_RECORDED,
+            payload={
+                "plan_hash": "tampered-wrong-hash",
+                "decision": "approved",
+                "to": ProjectState.BUILDING,
+            },
+            at=datetime(2026, 11, 16, 12, 25, tzinfo=UTC),
+        ),
+    ],
+)
+def test_projection_rejects_building_without_matching_approved_decision(
+    bad_approval_event: Event,
+) -> None:
+    """AC-1.6 / F-04 (INV-05, INV-11): Projection rejects entering BUILDING without valid approval."""
+    project_id = "proj-bad-approval"
+    events = _events_up_to_state(
+        project_id=project_id,
+        target_state=ProjectState.WAITING_APPROVAL,
+        total_tests=4,
+    )
+    events.append(bad_approval_event)
+
+    with pytest.raises((IllegalTransition, ValueError)):
+        project_status_from_events(project_id, events)
 
 
 @pytest.mark.parametrize(
@@ -109,7 +287,7 @@ def test_progress_calculation_matches_section_5_table_per_state(
     total_tests: int,
     expected_pct: int,
 ) -> None:
-    """AC-1.7: Progress percentage matches Section 5 table for every state."""
+    """AC-1.7 / M10: Progress percentage matches Section 5 table for every state."""
     pct = calculate_progress(
         state,
         passed_tests=passed_tests,
@@ -151,32 +329,21 @@ def test_failed_state_preserves_last_progress_value(
     )
     assert failed_pct == expected_preserved_pct
 
-    t0 = datetime(2026, 11, 16, 15, 0, tzinfo=UTC)
-    t1 = datetime(2026, 11, 16, 15, 5, tzinfo=UTC)
-    t2 = datetime(2026, 11, 16, 15, 10, tzinfo=UTC)
-    events = [
+    events = _events_up_to_state(
+        project_id="proj-fail",
+        target_state=prior_state,
+        passed_tests=passed_tests,
+        total_tests=total_tests,
+    )
+    events.append(
         Event(
-            id="e-1",
-            project_id="proj-fail",
-            type=EventType.PROJECT_CREATED,
-            payload={"name": "Test", "objective": "Obj", "state": prior_state},
-            at=t0,
-        ),
-        Event(
-            id="e-2",
-            project_id="proj-fail",
-            type=EventType.TESTS_UPDATED,
-            payload={"passed": passed_tests, "failed": total_tests - passed_tests, "total": total_tests},
-            at=t1,
-        ),
-        Event(
-            id="e-3",
+            id="evt-fail-final",
             project_id="proj-fail",
             type=EventType.PROJECT_FAILED,
             payload={"reason": "Budget exceeded"},
-            at=t2,
-        ),
-    ]
+            at=datetime(2026, 11, 16, 15, 10, tzinfo=UTC),
+        )
+    )
     status = project_status_from_events("proj-fail", events)
     assert status.state == ProjectState.FAILED
     assert status.progress_pct == expected_preserved_pct
