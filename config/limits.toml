@@ -1,0 +1,5 @@
+INTERVIEW = 6
+DEBATE = 3
+MEDIATION = 2
+BUILDING = 15
+ci_rounds = 3

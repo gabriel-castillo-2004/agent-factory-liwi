@@ -1,4 +1,4 @@
-# MASTER_PROMPT — Agent Factory (v1.2)
+# MASTER_PROMPT — Agent Factory (v1.2.1)
 
 > Documento rector del repo. Los agentes de código **NO lo modifican**.
 > Cualquier cambio entra solo como enmienda `INV-xx` aprobada por Gabriel.
@@ -37,24 +37,26 @@ El humano actúa como Product Owner: responde preguntas de negocio y aprueba el 
 | INV-01 | **TDD**: primero la prueba que falla, luego el código. Ningún módulo sin tests. | Única forma de que el bucle autónomo sea verificable. |
 | INV-02 | Todo acceso externo (LLM, GitHub, Telegram, disco compartido, shell, reloj) vive detrás de un **puerto**. El dominio no importa SDKs. | Tests deterministas y cambio de proveedor sin reescribir. |
 | INV-03 | Los tests de la suite del orquestador corren **sin red y sin secretos** (red bloqueada). | Reproducibilidad y seguridad. |
-| INV-04 | La **máquina de estados es explícita**; transiciones ilegales lanzan error. | Un chat libre pierde el rumbo. |
-| INV-05 | `BUILDING` es **inalcanzable** sin un `ApprovalEvent` cuyo `plan_hash` coincida con el plan vigente. | Garantiza el único punto de control humano. |
+| INV-04 | La **máquina de estados es explícita** y tiene un **único punto de paso**: todo cambio de estado, incluido el que se aplica al reproducir eventos, pasa por `validate_transition`. Transiciones ilegales lanzan error. Además, cada operación del orquestador valida su **estado de origen** (p. ej. el debate solo corre desde `INTERVIEW` o `DEBATE`). | Un chat libre pierde el rumbo, y una tabla que nadie consulta no protege nada. |
+| INV-05 | `BUILDING` es **inalcanzable** sin un `ApprovalEvent` con `decision = approved`, `plan_hash` igual al del plan vigente y emitido mientras el proyecto está en `WAITING_APPROVAL`. Un rechazo o ajuste nunca abre `BUILDING`. | Garantiza el único punto de control humano. |
 | INV-06 | Todo bucle tiene **tope** (intentos, rondas, llamadas, tiempo). Al agotarse: `FAILED` con reporte. | Cuotas finitas, costo cero, sin bucles infinitos. |
 | INV-07 | Sin secretos en el repo. `.env` ignorado; solo `.env.example`. Tokens con permisos mínimos. | El agente escribe código solo; el radio de daño debe ser pequeño. |
 | INV-08 | Dependencias **mínimas y fijadas** (versión exacta). Agregar una requiere ADR en `docs/decisions/`. | Menos superficie de ataque y de fallos. |
-| INV-09 | Fallos del LLM (JSON inválido, timeout, cuota agotada, proceso colgado) se manejan con **reintento acotado y backoff**; agotar cuota **pausa** el trabajo, no lo marca como fallo del proyecto. | Los modelos gratuitos o de plan son inestables por naturaleza. |
+| INV-09 | Fallos del LLM (JSON inválido, timeout, cuota agotada, proceso colgado) se manejan con **reintento acotado y backoff**; agotar cuota **pausa** el trabajo, no lo marca como fallo del proyecto. Toda excepción o timeout del LLM deja un **evento de fallo** y un estado reintentable o `FAILED`; nunca un proyecto atascado. | Los modelos gratuitos o de plan son inestables por naturaleza. |
 | INV-10 | Cada fase termina con `docs/PHASE_REPORT_N.md` y **se detiene**. No se empieza otra sin instrucción explícita. | Control de alcance y revisión humana por fase. |
-| INV-11 | **Registro de eventos append-only** como fuente de verdad. `status` es una **proyección** regenerable desde el registro; nunca muestra un estado que no ocurrió. | Evita estados huérfanos si algo falla a mitad de una transición. |
+| INV-11 | **Registro de eventos append-only** como fuente de verdad. `status` es una **proyección** regenerable desde el registro; nunca muestra un estado que no ocurrió. Al reproducir, la proyección **valida cada transición y rechaza eventos inválidos**; no confía en el estado destino que declara el evento. | Evita estados huérfanos si algo falla a mitad de una transición. |
 | INV-12 | El **porcentaje de avance lo calcula código determinista** (tabla de la sección 5); el LLM tiene prohibido escribirlo. | Un modelo que se autoevalúa sobreestima el progreso. |
 | INV-13 | **Inmutabilidad de pruebas.** Los tests se generan al inicio de `BUILDING` a partir de `acceptance_tests`, sin acceso al código de producción. Se registra el SHA-256 de `tests/` **y** de la configuración del runner (config de pruebas y scripts que las ejecutan). Antes de **cada** corrida un script determinista verifica el hash; si cambió: revierte y cuenta el intento como fallido. Mínimo un test por `acceptance_test`. Incluye un e2e en navegador headless que falla ante cualquier `console.error` o `pageerror`. | Impide "arreglar" tests en vez de corregir el bug, y detecta pantallas en blanco que las pruebas unitarias no ven. |
 | INV-14 | Los cambios a un proyecto **ya entregado** van en ramas `cr/<id>`, pasan CI y entran por PR con **aprobación humana del merge**. Los commits del agente llevan la marca `[agent-factory-skip]` y **no re-disparan** al agente. | Evita bucles y que el agente pise cambios manuales. |
 | INV-15 | **Iteración local, empuje mínimo.** El bucle escribir → probar → corregir ocurre en el disco local. Se hace push solo cuando las pruebas locales pasan (o se agota el tope). Máximo **3 rondas de CI** por proyecto. | Ahorra minutos de CI y mantiene limpio el historial. |
-| INV-16 | **Idempotencia de entrada.** Todo evento entrante (ej. `update_id` de Telegram) se registra como procesado **antes** de invocar cualquier LLM; si ya existe, se ignora. | Evita debates o builds duplicados por reintentos. |
-| INV-17 | **Presupuesto duro de llamadas por proyecto** (circuit breaker) por estado, configurable en `config/limits.toml`. Valores iniciales: `INTERVIEW` 6, `DEBATE` 3, `MEDIATION` 2, `BUILDING` 15 invocaciones del agente de código. Superarlo → `FAILED` inmediato. | Protege la cuota del plan. |
+| INV-16 | **Idempotencia de entrada.** Todo evento entrante (ej. `update_id` de Telegram) se registra como procesado de forma **persistente** (sobrevive a reinicios) **antes** de invocar cualquier LLM; si ya existe, se ignora. | Evita debates o builds duplicados por reintentos. |
+| INV-17 | **Presupuesto duro de llamadas por proyecto** (circuit breaker) por estado, configurable en `config/limits.toml`. Valores iniciales: `INTERVIEW` 6, `DEBATE` 3, `MEDIATION` 2, `BUILDING` 15 invocaciones del agente de código. Los contadores son **acumulativos por proyecto y nunca se reinician** al volver a entrar a un estado (p. ej. tras un ajuste). Superarlo → `FAILED` inmediato. El breaker se aplica en un **único punto central** que envuelve toda llamada al puerto LLM, de modo que ningún agente pueda saltárselo. | Protege la cuota del plan. |
 | INV-18 | **Sandbox y mínimo privilegio** para el agente de código local: trabaja solo dentro de `workspaces/<project_id>/` (idealmente en contenedor o WSL), sin acceso al resto del disco; token de GitHub limitado a los repos generados (idealmente una cuenta u organización dedicada); sin modos "autónomos sin confirmación" fuera del sandbox. | Un agente con shell en la PC del usuario es el mayor riesgo nuevo. |
 | INV-19 | **Términos del proveedor.** El adaptador `agy` solo se ejecuta en la máquina del usuario, con el binario oficial sin modificar, iniciado por el sistema tras una aprobación humana; **nunca en CI** ni con tokens personales guardados como secretos en la nube. Si algún día corre en la nube, usará el adaptador de API. | El plan personal está pensado para uso individual guiado por una persona. |
 | INV-20 | **Plantilla base obligatoria** para apps estáticas: el agente parte de un esqueleto pre-probado y solo escribe lógica, vistas y tests; no inventa la configuración de build desde cero. | La mayoría de fallos del bucle viene de configuración, no de lógica. |
 | INV-21 | **El estado de los proyectos vive fuera de sus repos.** Un archivo por proyecto en la rama `registry` de `agent-factory`; nada de `status.json` en la rama principal de los repos generados. | Evita conflictos de merge con commits manuales. |
+| INV-22 | **Toda entrada externa se valida** antes de usarse. `project_id` debe cumplir `^[a-z0-9][a-z0-9-]{0,62}$` y toda ruta derivada se resuelve y debe quedar dentro de su directorio base (sin `..`, rutas absolutas ni enlaces que escapen). | Evita path traversal y escrituras fuera del sandbox. |
+| INV-23 | **Pruebas con oráculo independiente.** El resultado esperado de un test nunca se calcula con el código ni con la tabla que se prueba: va escrito a mano en el test. Cada criterio incluye casos negativos. | Un test que reutiliza la lógica que verifica no detecta nada. |
 
 ## 4. Máquina de estados
 
@@ -141,17 +143,19 @@ Cada fase = **una tarea = un PR**. Al terminar: reporte y alto (INV-10).
 8. Circuit breaker de llamadas por estado (INV-17), leyendo `config/limits.toml`.
 9. `orchestrator.py`: conduce los estados, compuerta de aprobación (INV-05).
 10. **Criterios de aceptación**
-    - AC-1.1 Toda transición válida pasa; toda ilegal lanza `IllegalTransition` (test parametrizado sobre la tabla completa).
+    - AC-1.1 La matriz de transiciones esperada (estado × estado) está **escrita a mano en el test**, sin importar la tabla del código. Toda transición válida pasa y toda ilegal lanza `IllegalTransition`. Además, cada método del orquestador rechaza ser invocado desde un estado de origen inválido.
     - AC-1.2 Interviewer respeta el tope de 3 preguntas por ronda y termina por checklist o por tope.
     - AC-1.3 El debate hace **exactamente 3 llamadas** al LLM en el camino feliz; JSON inválido ejercita reintentos y termina en `FAILED` con causa.
     - AC-1.4 El Mediator rechaza planes sin `acceptance_tests`, con archivos sin `contract` o con `template_id` inexistente.
-    - AC-1.5 Entrar a `BUILDING` sin `ApprovalEvent`, o con `plan_hash` distinto, falla.
-    - AC-1.6 `status` se reconstruye idéntico a partir del registro de eventos (borrar la proyección y regenerarla).
+    - AC-1.5 Entrar a `BUILDING` falla si no hay aprobación, si el `plan_hash` difiere, si la decisión no es `approved` o si el proyecto no estaba en `WAITING_APPROVAL`.
+    - AC-1.6 `status` se reconstruye idéntico a partir del registro de eventos (borrar la proyección y regenerarla) y su contenido (estado, avance, hash) coincide con valores esperados escritos a mano. Un evento con transición inválida se rechaza al reproducir.
     - AC-1.7 El avance sigue la tabla de la sección 5 para cada estado y `FAILED` conserva el último valor.
-    - AC-1.8 Superar el presupuesto de llamadas de un estado lleva a `FAILED`.
-    - AC-1.9 El mismo id de evento procesado dos veces genera **cero** llamadas LLM la segunda vez.
+    - AC-1.8 Superar el presupuesto de llamadas de un estado lleva a `FAILED`, incluido el debate: ninguna secuencia de reintentos puede exceder el tope.
+    - AC-1.9 El mismo id de evento procesado dos veces genera **cero** llamadas LLM la segunda vez, incluso tras reabrir el store (simula un reinicio).
     - AC-1.10 Ambos stores pasan la misma suite de contrato.
     - AC-1.11 La suite corre sin red; cobertura ≥ 85 % en `domain/` y `agents/`; `ruff` limpio; CI verde.
+    - AC-1.12 Un `project_id` inválido (`../x`, ruta absoluta, vacío, demasiado largo) se rechaza en toda API pública y en `file_publisher`; ninguna escritura sale del directorio base.
+    - AC-1.13 Una excepción o timeout del LLM en cualquier estado produce un evento de fallo y un estado reintentable o `FAILED`; el proyecto nunca queda atascado.
 
 ### Fase 2 — Constructor local (el corazón del proyecto)
 - **Plantilla base** en `templates/static-app/` con build, linter, pruebas unitarias, e2e en navegador headless, workflow de CI y de despliegue. Stack decidido en `ADR-001` (preferencia: Vite + TypeScript sin framework + Vitest + Playwright).
