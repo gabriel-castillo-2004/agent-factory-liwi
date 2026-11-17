@@ -39,6 +39,7 @@ class SubprocessRunner(Runner):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                env=dict(env) if env is not None else None,
             )
             try:
                 stdout, stderr = proc.communicate(timeout=timeout)
@@ -70,6 +71,7 @@ class SubprocessRunner(Runner):
                 stderr=subprocess.PIPE,
                 text=True,
                 start_new_session=True,
+                env=dict(env) if env is not None else None,
             )
             try:
                 stdout, stderr = proc.communicate(timeout=timeout)

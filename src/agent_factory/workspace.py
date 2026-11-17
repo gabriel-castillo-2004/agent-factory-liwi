@@ -13,7 +13,10 @@ RUNNER_CONFIG_FILENAMES: tuple[str, ...] = (
     "pytest.ini",
     "package.json",
     "vitest.config.ts",
+    "vitest.config.js",
     "playwright.config.ts",
+    "playwright.config.js",
+    "playwright.config.mjs",
     "conftest.py",
     "setup.cfg",
 )
