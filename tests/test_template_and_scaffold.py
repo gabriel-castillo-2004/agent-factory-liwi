@@ -87,6 +87,36 @@ def test_inspect_template_rejects_missing_files_external_network_backend_or_popu
     with pytest.raises((FileNotFoundError, ValueError)):
         scaffold.inspect_template("incomplete-web")
 
+    pw_valid = (DEFAULT_TEMPLATES_ROOT / "static-web" / "playwright.config.mjs").read_text(
+        encoding="utf-8"
+    )
+
+    # 1b. Missing required index.html when playwright.config.mjs is present (kills M5/M5b)
+    missing_index_dir = templates_root / "missing-index-web"
+    missing_index_dir.mkdir(parents=True, exist_ok=True)
+    (missing_index_dir / "package.json").write_text(
+        '{"name": "tpl", "scripts": {"test": "node --test"}, "dependencies": {}}',
+        encoding="utf-8",
+    )
+    (missing_index_dir / "playwright.config.mjs").write_text(pw_valid, encoding="utf-8")
+    (missing_index_dir / "styles.css").write_text("body {}", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError):
+        scaffold.inspect_template("missing-index-web")
+
+    # 1c. Missing required styles.css when playwright.config.mjs is present (kills M5/M5b)
+    missing_styles_dir = templates_root / "missing-styles-web"
+    missing_styles_dir.mkdir(parents=True, exist_ok=True)
+    (missing_styles_dir / "package.json").write_text(
+        '{"name": "tpl", "scripts": {"test": "node --test"}, "dependencies": {}}',
+        encoding="utf-8",
+    )
+    (missing_styles_dir / "playwright.config.mjs").write_text(pw_valid, encoding="utf-8")
+    (missing_styles_dir / "index.html").write_text("<html></html>", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError):
+        scaffold.inspect_template("missing-styles-web")
+
     # 2. External network URL or backend dependency in template
     net_dir = templates_root / "networked-web"
     net_dir.mkdir(parents=True, exist_ok=True)
@@ -357,6 +387,15 @@ def test_template_scaffold_rejects_destination_symlink_src_or_prepopulated_tests
 
     with pytest.raises(SandboxViolationError):
         scaffold.scaffold(project_id="proj-dest-dirty-tests", template_id="static-web")
+
+    # 3. Destination ws_dir/tests is a directory link pointing outside workspace (even when target is empty)
+    empty_outside_tests = tmp_path / "empty_outside_tests"
+    empty_outside_tests.mkdir(parents=True, exist_ok=True)
+    ws_tests_link = ws_mgr.create_workspace("proj-dest-tests-link")
+    _create_dir_link(ws_tests_link / "tests", empty_outside_tests)
+
+    with pytest.raises(SandboxViolationError):
+        scaffold.scaffold(project_id="proj-dest-tests-link", template_id="static-web")
 
 
 def test_template_scaffold_defensive_errors_on_invalid_or_missing_template_and_malformed_package_json(

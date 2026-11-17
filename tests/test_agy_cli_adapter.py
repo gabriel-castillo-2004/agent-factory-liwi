@@ -687,7 +687,7 @@ def test_build_worker_captures_agy_cli_adapter_timeouts_in_test_gen_and_impl_wit
 def test_agy_cli_adapter_does_not_misclassify_429_substring_on_success_or_non_quota_failure(
     tmp_path: Path,
 ) -> None:
-    """F2B-02 (INV-09, A2b-5, INV-23): Success output containing '429'/'rate limit' returns CodeAgentResult, while non-quota errors mentioning 'line 429' raise non-quota CodeAgentError."""
+    """F2B-02 (INV-09, A2b-5, INV-23): Success output containing '429'/'rate limit' returns CodeAgentResult, while non-quota errors containing '429' raise non-quota CodeAgentError."""
     ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
     ws_dir = ws_mgr.create_workspace("proj-429-precision")
     plan = _sample_static_web_plan()
@@ -704,8 +704,14 @@ def test_agy_cli_adapter_does_not_misclassify_429_substring_on_success_or_non_qu
         "elif attempt == 2:\n"
         "    sys.stderr.write('SyntaxError at src/app.js line 429: unexpected token\\n')\n"
         "    sys.exit(1)\n"
-        "else:\n"
+        "elif attempt == 3:\n"
         "    sys.stderr.write('HTTP 429 Too Many Requests: slow down\\n')\n"
+        "    sys.exit(1)\n"
+        "elif attempt == 4:\n"
+        "    sys.stderr.write('TypeError at src/app.js:429:12 - undefined is not a function\\n')\n"
+        "    sys.exit(1)\n"
+        "else:\n"
+        "    sys.stderr.write('AssertionError: expected 429 to equal 200\\n')\n"
         "    sys.exit(1)\n",
         encoding="utf-8",
     )
@@ -734,11 +740,23 @@ def test_agy_cli_adapter_does_not_misclassify_429_substring_on_success_or_non_qu
         adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=3)
     assert quota_exc.value.retry_after_seconds == 4.0
 
+    # 4. Exit code 1 with ':429:12' stacktrace location raises non-quota CodeAgentError
+    with pytest.raises(CodeAgentError) as type_exc:
+        adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=4)
+    assert not isinstance(type_exc.value, QuotaExhaustedError)
+    assert "TypeError at src/app.js:429:12" in str(type_exc.value)
+
+    # 5. Exit code 1 with 'expected 429' assertion error raises non-quota CodeAgentError
+    with pytest.raises(CodeAgentError) as assert_exc:
+        adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=5)
+    assert not isinstance(assert_exc.value, QuotaExhaustedError)
+    assert "AssertionError: expected 429 to equal 200" in str(assert_exc.value)
+
 
 def test_agy_cli_adapter_rejects_nested_workspace_subdir_and_handles_multiline_or_plain_stdout(
     tmp_path: Path,
 ) -> None:
-    """F2B-07 (A2b-3, INV-18, INV-22): Rejects nested subdir workspaces/<id>/sub and parses multiline JSON or plain-text CLI stdout."""
+    """F2B-07 (A2b-3, INV-18, INV-22): Rejects nested subdir workspaces/<id>/sub and handles multiline JSON, trailing-line JSON, and plain-text stdout on exit 0 and exit 1."""
     ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
     ws_dir = ws_mgr.create_workspace("proj-sub-and-stdout")
     nested_dir = ws_dir / "subdir"
@@ -755,10 +773,39 @@ def test_agy_cli_adapter_rejects_nested_workspace_subdir_and_handles_multiline_o
                     indent=2,
                 ),
             ),
-            # 2. Plain text stdout (non-JSON fallback)
+            # 2. Plain text stdout (non-JSON fallback, exit_code == 0)
             CommandResult(
                 exit_code=0,
                 stdout="Plain text completion message\nLine 2",
+            ),
+            # 3. Log preamble followed by trailing JSON line (covers agy_cli_adapter.py:242-246)
+            CommandResult(
+                exit_code=0,
+                stdout=(
+                    "Analyzing workspace...\n"
+                    '{"files_written": ["src/tail.js"], "summary": "Tail JSON ok"}'
+                ),
+            ),
+            # 4. Malformed brace line inside plain text stdout (covers agy_cli_adapter.py:249-250)
+            CommandResult(
+                exit_code=0,
+                stdout="{not valid json}\nPlain text fallback",
+            ),
+            # 5. Empty stdout (exit_code == 0)
+            CommandResult(
+                exit_code=0,
+                stdout="",
+            ),
+            # 6. Non-dict valid JSON stdout (exit_code == 0)
+            CommandResult(
+                exit_code=0,
+                stdout='["not-a-dict"]',
+            ),
+            # 7. Plain text non-JSON failure (exit_code == 1)
+            CommandResult(
+                exit_code=1,
+                stdout="Plain build step output",
+                stderr="Plain compiler failure without json",
             ),
         ]
     )
@@ -778,4 +825,25 @@ def test_agy_cli_adapter_rejects_nested_workspace_subdir_and_handles_multiline_o
     res_plain = adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=2)
     assert res_plain.files_written == []
     assert "Plain text completion message" in res_plain.summary
+
+    res_tail = adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=3)
+    assert res_tail.files_written == ["src/tail.js"]
+    assert res_tail.summary == "Tail JSON ok"
+
+    res_bad_brace = adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=4)
+    assert res_bad_brace.files_written == []
+    assert res_bad_brace.summary == "{not valid json}\nPlain text fallback"
+
+    res_empty = adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=5)
+    assert res_empty.files_written == []
+    assert res_empty.summary == ""
+
+    res_non_dict = adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=6)
+    assert res_non_dict.files_written == []
+    assert res_non_dict.summary == '["not-a-dict"]'
+
+    with pytest.raises(CodeAgentError) as plain_fail_exc:
+        adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=7)
+    assert not isinstance(plain_fail_exc.value, QuotaExhaustedError)
+    assert "Plain compiler failure without json" in str(plain_fail_exc.value)
 
