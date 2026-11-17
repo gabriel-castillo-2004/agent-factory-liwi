@@ -17,7 +17,7 @@ from agent_factory.domain.progress import project_status_from_events
 from agent_factory.domain.states import IllegalTransition, ProjectState
 from agent_factory.orchestrator import Orchestrator
 from agent_factory.ports.code_agent import CodeAgentError, QuotaExhaustedError
-from agent_factory.ports.runner import CommandResult
+from agent_factory.ports.runner import CommandResult, CommandTimeoutError
 from agent_factory.ports.vcs import CIRunResult
 from agent_factory.workspace import WorkspaceManager
 
@@ -591,3 +591,419 @@ def test_events_and_project_status_track_invocations_ci_rounds_and_proportional_
     failed_status = orchestrator_fail.get_status(project_fail)
     assert failed_status.state == ProjectState.FAILED
     assert failed_status.progress_pct == 62
+
+
+def test_quota_resume_succeeds_after_prior_attempt_wrote_production_files_in_src(
+    tmp_path: Path,
+) -> None:
+    """F2A-01 (AC-2.4, INV-09): Resuming from PAUSED_QUOTA after a prior attempt already wrote to src/ succeeds without SandboxViolationError."""
+    project_id = "proj-quota-resume-src"
+    orchestrator, _ = _create_approved_project(project_id, num_tests=2, approve=True)
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+    fake_clock = _FakeClock()
+    queue = LocalJobQueue()
+
+    fake_agent = FakeCodeAgent(
+        test_gen_steps=[
+            {"tests/test_deck.py": "def test_at_01(): pass\ndef test_at_02(): pass\n"},
+        ],
+        impl_steps=[
+            # Attempt 1 writes production code in src/ and fails AT-02 locally
+            {"src/deck.ts": "export function flipCard(index: number): boolean { return false; }\n"},
+            # Attempt 2 hits QuotaExhaustedError while src/deck.ts already exists on disk
+            QuotaExhaustedError("Hourly plan quota reached on attempt 2", retry_after_seconds=3.0),
+            # Attempt 3 (after resume) fixes src/deck.ts and passes all tests
+            {"src/deck.ts": "export function flipCard(index: number): boolean { return index >= 0; }\n"},
+        ],
+    )
+    fake_runner = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=1,
+                stdout="1 passed, 1 failed",
+                stderr="AssertionError in AT-02",
+                test_results={"AT-01": True, "AT-02": False},
+            ),
+            CommandResult(
+                exit_code=0,
+                stdout="2 passed",
+                test_results={"AT-01": True, "AT-02": True},
+            ),
+        ]
+    )
+    fake_vcs = FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI green")])
+
+    worker = BuildWorker(
+        orchestrator=orchestrator,
+        workspace_manager=ws_mgr,
+        code_agent=fake_agent,
+        runner=fake_runner,
+        vcs=fake_vcs,
+        queue=queue,
+        clock=fake_clock,
+    )
+
+    worker.enqueue_approved_project(
+        project_id=project_id,
+        template_files={"pyproject.toml": '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'},
+    )
+
+    # First run: completes test_gen (1) + attempt 1 (2, writes src/deck.ts), then pauses on attempt 2
+    paused_report = worker.run_next()
+    assert paused_report is not None
+    assert paused_report.invocations == 2
+    assert paused_report.failure_cause is None
+
+    job_paused = queue.get_job(project_id)
+    assert job_paused is not None
+    assert job_paused.state == JobState.PAUSED_QUOTA
+    assert job_paused.pause_count == 1
+    assert fake_clock.sleeps == [3.0]
+    assert orchestrator.get_status(project_id).state == ProjectState.BUILDING
+
+    # Second run: resumes from PAUSED_QUOTA with src/deck.ts on disk, fixes code, and delivers
+    resumed_report = worker.run_next()
+    assert resumed_report is not None
+    assert len(fake_agent.test_gen_calls) == 1
+    assert resumed_report.invocations == 3
+    assert resumed_report.ci_rounds == 1
+    assert resumed_report.failure_cause is None
+    assert resumed_report.test_results == {"AT-01": True, "AT-02": True}
+    assert orchestrator.get_status(project_id).state == ProjectState.DELIVERED
+
+
+def test_runner_timeout_and_vcs_errors_transition_project_to_failed_with_report(
+    tmp_path: Path,
+) -> None:
+    """F2A-02 (A2a-2, INV-06, INV-09): CommandTimeoutError in runner or OSError/RuntimeError in VCS transitions project to FAILED with BuildReport."""
+    # 1. Runner raises CommandTimeoutError
+    project_timeout = "proj-runner-timeout"
+    orchestrator_1, _ = _create_approved_project(project_timeout, num_tests=2, approve=True)
+    worker_1 = BuildWorker(
+        orchestrator=orchestrator_1,
+        workspace_manager=WorkspaceManager(base_dir=tmp_path / "ws_timeout"),
+        code_agent=FakeCodeAgent(
+            test_gen_steps=[{"tests/test_deck.py": "def test_at_01(): pass\n"}],
+            impl_steps=[{"src/deck.ts": "while (true) {}\n"}],
+        ),
+        runner=FakeRunner(
+            results=[CommandTimeoutError("Command ['pytest', '-q'] timed out after 30.0 seconds")]
+        ),
+        vcs=FakeVCS(),
+    )
+
+    report_1 = worker_1.run_job(
+        project_id=project_timeout,
+        template_files={"pyproject.toml": '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'},
+    )
+    status_1 = orchestrator_1.get_status(project_timeout)
+    assert status_1.state == ProjectState.FAILED
+    assert status_1.failure_reason is not None
+    assert "timed out" in status_1.failure_reason
+    assert report_1.failure_cause is not None
+    assert "timed out" in report_1.failure_cause
+    assert report_1.invocations == 2
+
+    # 2. VCS raises OSError during CI verification
+    project_vcs_err = "proj-vcs-error"
+    orchestrator_2, _ = _create_approved_project(project_vcs_err, num_tests=2, approve=True)
+    worker_2 = BuildWorker(
+        orchestrator=orchestrator_2,
+        workspace_manager=WorkspaceManager(base_dir=tmp_path / "ws_vcs_err"),
+        code_agent=FakeCodeAgent(
+            test_gen_steps=[{"tests/test_deck.py": "def test_at_01(): pass\n"}],
+            impl_steps=[{"src/deck.ts": "export const ok = true;\n"}],
+        ),
+        runner=FakeRunner(
+            results=[
+                CommandResult(
+                    exit_code=0,
+                    stdout="2 passed",
+                    test_results={"AT-01": True, "AT-02": True},
+                )
+            ]
+        ),
+        vcs=FakeVCS(ci_results=[OSError("GitHub remote connection reset by peer")]),
+    )
+
+    report_2 = worker_2.run_job(
+        project_id=project_vcs_err,
+        template_files={"pyproject.toml": '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'},
+    )
+    status_2 = orchestrator_2.get_status(project_vcs_err)
+    assert status_2.state == ProjectState.FAILED
+    assert status_2.failure_reason is not None
+    assert "connection reset" in status_2.failure_reason
+    assert report_2.failure_cause is not None
+    assert "connection reset" in report_2.failure_cause
+
+
+def test_test_generation_quota_pause_and_code_agent_error_handling(
+    tmp_path: Path,
+) -> None:
+    """F2A-03 (AC-2.4, INV-09, INV-17, ADR-002): QuotaExhaustedError in generate_tests pauses without consuming breaker budget or emitting AGENT_INVOKED; CodeAgentError transitions to FAILED."""
+    # 1. QuotaExhaustedError during Step A (generate_tests)
+    project_quota = "proj-testgen-quota"
+    orchestrator_1, _ = _create_approved_project(project_quota, num_tests=2, approve=True)
+    fake_clock = _FakeClock()
+    queue = LocalJobQueue()
+
+    fake_agent_1 = FakeCodeAgent(
+        test_gen_steps=[
+            QuotaExhaustedError("Quota hit during test generation", retry_after_seconds=1.5),
+            {"tests/test_deck.py": "def test_at_01(): pass\ndef test_at_02(): pass\n"},
+        ],
+        impl_steps=[
+            {"src/deck.ts": "export function flipCard(index: number): boolean { return true; }\n"},
+        ],
+    )
+    worker_1 = BuildWorker(
+        orchestrator=orchestrator_1,
+        workspace_manager=WorkspaceManager(base_dir=tmp_path / "ws_tg_quota"),
+        code_agent=fake_agent_1,
+        runner=FakeRunner(
+            results=[
+                CommandResult(
+                    exit_code=0,
+                    stdout="2 passed",
+                    test_results={"AT-01": True, "AT-02": True},
+                )
+            ]
+        ),
+        vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI green")]),
+        queue=queue,
+        clock=fake_clock,
+    )
+
+    worker_1.enqueue_approved_project(
+        project_id=project_quota,
+        template_files={"pyproject.toml": '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'},
+    )
+
+    paused = worker_1.run_next()
+    assert paused is not None
+    assert paused.invocations == 0
+    assert paused.failure_cause is None
+
+    job = queue.get_job(project_quota)
+    assert job is not None
+    assert job.state == JobState.PAUSED_QUOTA
+    assert job.pause_count == 1
+    assert fake_clock.sleeps == [1.5]
+    # Zero BUILDING calls consumed in circuit breaker and zero AGENT_INVOKED emitted for BUILDING
+    assert orchestrator_1.circuit_breaker.get_calls(project_quota, ProjectState.BUILDING) == 0
+    assert orchestrator_1.get_status(project_quota).agent_invocations == 1
+
+    # Resume and complete within exact budget of 2 BUILDING calls (1 test_gen + 1 impl)
+    resumed = worker_1.run_next()
+    assert resumed is not None
+    assert resumed.invocations == 2
+    assert orchestrator_1.circuit_breaker.get_calls(project_quota, ProjectState.BUILDING) == 2
+    assert orchestrator_1.get_status(project_quota).agent_invocations == 3
+    assert orchestrator_1.get_status(project_quota).state == ProjectState.DELIVERED
+
+    # 2. CodeAgentError during Step A (generate_tests) transitions to FAILED and records the call
+    project_err = "proj-testgen-fatal"
+    orchestrator_2, _ = _create_approved_project(project_err, num_tests=2, approve=True)
+    worker_2 = BuildWorker(
+        orchestrator=orchestrator_2,
+        workspace_manager=WorkspaceManager(base_dir=tmp_path / "ws_tg_err"),
+        code_agent=FakeCodeAgent(
+            test_gen_steps=[CodeAgentError("Agent CLI crashed during test generation")]
+        ),
+        runner=FakeRunner(),
+        vcs=FakeVCS(),
+    )
+
+    report_err = worker_2.run_job(
+        project_id=project_err,
+        template_files={"pyproject.toml": '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'},
+    )
+    status_err = orchestrator_2.get_status(project_err)
+    assert status_err.state == ProjectState.FAILED
+    assert report_err.failure_cause is not None
+    assert "crashed during test generation" in report_err.failure_cause
+    assert report_err.invocations == 1
+    assert orchestrator_2.circuit_breaker.get_calls(project_err, ProjectState.BUILDING) == 1
+    assert status_err.agent_invocations == 2
+
+
+def test_building_budget_is_cumulative_with_breaker_and_records_failed_agent_calls(
+    tmp_path: Path,
+) -> None:
+    """F2A-04 (INV-17): BUILDING=15 limit is enforced cumulatively via CircuitBreaker before invoking agent, and CodeAgentError in implement_or_fix records the call before failing."""
+    # 1. Cumulative BUILDING budget: 14 prior calls + 1 test_gen = 15; 2nd worker call trips breaker BEFORE running implement_or_fix
+    project_cum = "proj-cumulative-breaker"
+    orchestrator_1, _ = _create_approved_project(project_cum, num_tests=2, approve=True)
+    for _ in range(14):
+        orchestrator_1.record_state_call(project_cum, ProjectState.BUILDING)
+    assert orchestrator_1.circuit_breaker.get_calls(project_cum, ProjectState.BUILDING) == 14
+
+    fake_agent_1 = FakeCodeAgent(
+        test_gen_steps=[{"tests/test_deck.py": "def test_at_01(): pass\n"}],
+        impl_steps=[{"src/deck.ts": "export const shouldNotRun = true;\n"}],
+    )
+    worker_1 = BuildWorker(
+        orchestrator=orchestrator_1,
+        workspace_manager=WorkspaceManager(base_dir=tmp_path / "ws_cum"),
+        code_agent=fake_agent_1,
+        runner=FakeRunner(),
+        vcs=FakeVCS(),
+    )
+
+    report_1 = worker_1.run_job(
+        project_id=project_cum,
+        template_files={"pyproject.toml": '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'},
+    )
+    status_1 = orchestrator_1.get_status(project_cum)
+    assert status_1.state == ProjectState.FAILED
+    assert len(fake_agent_1.test_gen_calls) == 1
+    assert len(fake_agent_1.impl_calls) == 0
+    assert orchestrator_1.circuit_breaker.get_calls(project_cum, ProjectState.BUILDING) == 15
+    assert report_1.failure_cause is not None
+    assert "BUILDING" in report_1.failure_cause
+
+    # 2. CodeAgentError in implement_or_fix records the invocation in CircuitBreaker and AGENT_INVOKED before failing
+    project_err = "proj-impl-err-breaker"
+    orchestrator_2, _ = _create_approved_project(project_err, num_tests=2, approve=True)
+    worker_2 = BuildWorker(
+        orchestrator=orchestrator_2,
+        workspace_manager=WorkspaceManager(base_dir=tmp_path / "ws_impl_err"),
+        code_agent=FakeCodeAgent(
+            test_gen_steps=[{"tests/test_deck.py": "def test_at_01(): pass\n"}],
+            impl_steps=[CodeAgentError("Agent crashed on impl attempt 1")],
+        ),
+        runner=FakeRunner(),
+        vcs=FakeVCS(),
+    )
+
+    report_2 = worker_2.run_job(
+        project_id=project_err,
+        template_files={"pyproject.toml": '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'},
+    )
+    status_2 = orchestrator_2.get_status(project_err)
+    assert status_2.state == ProjectState.FAILED
+    assert orchestrator_2.circuit_breaker.get_calls(project_err, ProjectState.BUILDING) == 2
+    assert status_2.agent_invocations == 3
+    assert report_2.invocations == 2
+
+
+def test_local_tests_passed_requires_zero_exit_code_and_all_plan_acceptance_tests(
+    tmp_path: Path,
+) -> None:
+    """F2A-05 (AC-2.1, INV-13): Local pass requires exit_code == 0 AND every acceptance_test.id in the Plan present and True in test_results."""
+    project_id = "proj-strict-local-pass"
+    orchestrator, _ = _create_approved_project(project_id, num_tests=2, approve=True)
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+
+    fake_agent = FakeCodeAgent(
+        test_gen_steps=[
+            {"tests/test_deck.py": "def test_at_01(): pass\ndef test_at_02(): pass\n"},
+        ],
+        impl_steps=[
+            {"src/deck.ts": "export const v = 1;\n"},
+            {"src/deck.ts": "export const v = 2;\n"},
+            {"src/deck.ts": "export const v = 3;\n"},
+            {"src/deck.ts": "export const v = 4;\n"},
+            {"src/deck.ts": "export const v = 5;\n"},
+        ],
+    )
+    fake_runner = FakeRunner(
+        results=[
+            # Attempt 1: non-zero exit code with empty test_results -> fail
+            CommandResult(exit_code=1, stdout="collection error", stderr="SyntaxError", test_results={}),
+            # Attempt 2: non-zero exit code even though test_results are all True -> fail (kills M14)
+            CommandResult(
+                exit_code=1,
+                stdout="linter error",
+                stderr="exit 1",
+                test_results={"AT-01": True, "AT-02": True},
+            ),
+            # Attempt 3: zero exit code but empty test_results -> fail
+            CommandResult(exit_code=0, stdout="0 selected", stderr="", test_results={}),
+            # Attempt 4: zero exit code but missing AT-02 from Plan -> fail
+            CommandResult(exit_code=0, stdout="1 passed", stderr="", test_results={"AT-01": True}),
+            # Attempt 5: zero exit code AND all Plan acceptance tests (AT-01, AT-02) True -> pass!
+            CommandResult(
+                exit_code=0,
+                stdout="2 passed",
+                stderr="",
+                test_results={"AT-01": True, "AT-02": True},
+            ),
+        ]
+    )
+    fake_vcs = FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI green")])
+
+    worker = BuildWorker(
+        orchestrator=orchestrator,
+        workspace_manager=ws_mgr,
+        code_agent=fake_agent,
+        runner=fake_runner,
+        vcs=fake_vcs,
+    )
+
+    report = worker.run_job(
+        project_id=project_id,
+        template_files={"pyproject.toml": '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'},
+    )
+
+    assert len(fake_runner.calls) == 5
+    assert len(fake_vcs.pushes) == 1
+    assert report.invocations == 6
+    assert report.ci_rounds == 1
+    assert orchestrator.get_status(project_id).state == ProjectState.DELIVERED
+
+
+def test_project_delivered_projects_repo_and_deploy_links_in_status(
+    tmp_path: Path,
+) -> None:
+    """F2A-07 (INV-11, INV-12): After PROJECT_DELIVERED, project_status_from_events projects status.links.repo and status.links.deploy matching the delivered URLs."""
+    project_id = "proj-links-delivered"
+    orchestrator, store = _create_approved_project(project_id, num_tests=2, approve=True)
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+
+    fake_agent = FakeCodeAgent(
+        test_gen_steps=[
+            {"tests/test_deck.py": "def test_at_01(): pass\ndef test_at_02(): pass\n"},
+        ],
+        impl_steps=[
+            {"src/deck.ts": "export function flipCard(index: number): boolean { return true; }\n"},
+        ],
+    )
+    fake_runner = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=0,
+                stdout="2 passed",
+                test_results={"AT-01": True, "AT-02": True},
+            )
+        ]
+    )
+    fake_vcs = FakeVCS(
+        ci_results=[CIRunResult(passed=True, summary="CI green")],
+        repo_base_url="https://github.com/af-org",
+        deploy_base_url="https://af-org.github.io",
+    )
+
+    worker = BuildWorker(
+        orchestrator=orchestrator,
+        workspace_manager=ws_mgr,
+        code_agent=fake_agent,
+        runner=fake_runner,
+        vcs=fake_vcs,
+    )
+
+    worker.run_job(
+        project_id=project_id,
+        template_files={"pyproject.toml": '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'},
+    )
+
+    status = orchestrator.get_status(project_id)
+    assert status.state == ProjectState.DELIVERED
+    assert status.links.repo == "https://github.com/af-org/proj-links-delivered"
+    assert status.links.deploy == "https://af-org.github.io/proj-links-delivered"
+
+    reprojected = project_status_from_events(project_id, store.get_events(project_id))
+    assert reprojected.links.repo == "https://github.com/af-org/proj-links-delivered"
+    assert reprojected.links.deploy == "https://af-org.github.io/proj-links-delivered"
+

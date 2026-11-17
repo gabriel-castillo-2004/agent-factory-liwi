@@ -316,6 +316,28 @@ def test_test_generation_rejects_preexisting_production_code_or_missing_tests(
         )
     assert len(fake_agent_1.test_gen_calls) == 0
 
+    # Case 1b: Pre-existing production file on disk in ws_dir/src/ without template_files
+    project_disk_src = "proj-contaminated-disk-src"
+    orchestrator_1b = _approved_project_orchestrator(project_disk_src)
+    ws_mgr_1b = WorkspaceManager(base_dir=tmp_path / "ws1b")
+    ws_dir_1b = ws_mgr_1b.create_workspace(project_disk_src)
+    (ws_dir_1b / "src").mkdir(parents=True, exist_ok=True)
+    (ws_dir_1b / "src" / "converter.ts").write_text("export const onDisk = true;\n", encoding="utf-8")
+    fake_agent_1b = FakeCodeAgent(
+        test_gen_steps=[{"tests/test_acceptance.py": "def test_1(): pass\n"}],
+        impl_steps=[{"src/converter.ts": "export const x = 1;\n"}],
+    )
+    worker_1b = BuildWorker(
+        orchestrator=orchestrator_1b,
+        workspace_manager=ws_mgr_1b,
+        code_agent=fake_agent_1b,
+        runner=FakeRunner(),
+        vcs=FakeVCS(),
+    )
+    with pytest.raises((SandboxViolationError, ValueError)):
+        worker_1b.run_job(project_id=project_disk_src)
+    assert len(fake_agent_1b.test_gen_calls) == 0
+
     # Case 2: Test generator produces zero test files in tests/
     project_no_tests = "proj-empty-testgen"
     orchestrator_2 = _approved_project_orchestrator(project_no_tests)
@@ -336,3 +358,58 @@ def test_test_generation_rejects_preexisting_production_code_or_missing_tests(
     assert orchestrator_2.get_status(project_no_tests).state == ProjectState.FAILED
     assert report_2.failure_cause is not None
     assert len(fake_agent_2.impl_calls) == 0
+
+
+def test_test_lock_protects_root_conftest_and_setup_cfg_from_modification_deletion_or_injection(
+    tmp_path: Path,
+) -> None:
+    """F2A-06 (INV-13): compute_test_lock and verify_and_restore_test_lock detect and revert changes to root conftest.py and setup.cfg."""
+    ws_dir = tmp_path / "ws-root-cfg"
+    (ws_dir / "tests").mkdir(parents=True, exist_ok=True)
+    original_test = "def test_at_01():\n    assert 2 + 2 == 4\n"
+    original_setup_cfg = "[tool:pytest]\ntestpaths = tests\n"
+    original_conftest = "# root conftest\n"
+
+    test_file = ws_dir / "tests" / "test_at_01.py"
+    setup_cfg_file = ws_dir / "setup.cfg"
+    conftest_file = ws_dir / "conftest.py"
+
+    test_file.write_text(original_test, encoding="utf-8")
+    setup_cfg_file.write_text(original_setup_cfg, encoding="utf-8")
+
+    snapshot = compute_test_lock(ws_dir)
+
+    # 1. Injecting a rogue conftest.py in the workspace root is detected and removed
+    conftest_file.write_text(
+        "def pytest_sessionfinish(session, exitstatus):\n    session.exitstatus = 0\n",
+        encoding="utf-8",
+    )
+    assert verify_and_restore_test_lock(ws_dir, snapshot) is False
+    assert not conftest_file.exists()
+    assert verify_and_restore_test_lock(ws_dir, snapshot) is True
+
+    # 2. Modifying root setup.cfg is detected and reverted
+    setup_cfg_file.write_text("[tool:pytest]\naddopts = -k nothing\n", encoding="utf-8")
+    assert verify_and_restore_test_lock(ws_dir, snapshot) is False
+    assert setup_cfg_file.read_text(encoding="utf-8") == original_setup_cfg
+    assert verify_and_restore_test_lock(ws_dir, snapshot) is True
+
+    # 3. Deleting root setup.cfg is detected and restored
+    setup_cfg_file.unlink()
+    assert verify_and_restore_test_lock(ws_dir, snapshot) is False
+    assert setup_cfg_file.is_file()
+    assert setup_cfg_file.read_text(encoding="utf-8") == original_setup_cfg
+
+    # 4. When root conftest.py is part of the initial lock, modifying or deleting it is detected and restored
+    conftest_file.write_text(original_conftest, encoding="utf-8")
+    snapshot_with_conftest = compute_test_lock(ws_dir)
+
+    conftest_file.write_text("# tampered root conftest\n", encoding="utf-8")
+    assert verify_and_restore_test_lock(ws_dir, snapshot_with_conftest) is False
+    assert conftest_file.read_text(encoding="utf-8") == original_conftest
+
+    conftest_file.unlink()
+    assert verify_and_restore_test_lock(ws_dir, snapshot_with_conftest) is False
+    assert conftest_file.is_file()
+    assert conftest_file.read_text(encoding="utf-8") == original_conftest
+
