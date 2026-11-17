@@ -18,7 +18,7 @@ class FakeRunner:
 
     def enqueue(self, step: RunnerStep) -> None:
         """Append a scripted CommandResult or Exception to the queue."""
-        raise NotImplementedError
+        self._results.append(step)
 
     def run(
         self,
@@ -27,4 +27,22 @@ class FakeRunner:
         timeout_seconds: float = 30.0,
     ) -> CommandResult:
         """Record call and return next scripted CommandResult or raise scripted Exception."""
-        raise NotImplementedError
+        self.calls.append(
+            {
+                "command": list(command),
+                "cwd": Path(cwd),
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        if not self._results:
+            return CommandResult(exit_code=0, stdout="", stderr="", timed_out=False)
+        step = self._results.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        if isinstance(step, type) and issubclass(step, Exception):
+            raise step()
+        if callable(step):
+            return step(command, cwd)
+        if isinstance(step, CommandResult):
+            return step
+        return CommandResult(exit_code=0, stdout=str(step))

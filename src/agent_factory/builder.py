@@ -5,13 +5,21 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
-from agent_factory.domain.models import BuildReport, Plan
+from agent_factory.domain.events import EventType, create_event
+from agent_factory.domain.models import BuildReport, Plan, validate_project_id
+from agent_factory.domain.states import IllegalTransition, ProjectState
 from agent_factory.orchestrator import Orchestrator
 from agent_factory.ports.clock import Clock
-from agent_factory.ports.code_agent import CodeAgent
+from agent_factory.ports.code_agent import CodeAgent, CodeAgentError, QuotaExhaustedError
 from agent_factory.ports.runner import Runner
 from agent_factory.ports.vcs import VCS
-from agent_factory.workspace import TestLockSnapshot, WorkspaceManager
+from agent_factory.workspace import (
+    SandboxViolationError,
+    TestLockSnapshot,
+    WorkspaceManager,
+    compute_test_lock,
+    verify_and_restore_test_lock,
+)
 
 
 class JobState(StrEnum):
@@ -48,15 +56,24 @@ class LocalJobQueue:
 
     def enqueue(self, project_id: str, plan: Plan) -> BuildJob:
         """Add or retrieve a BuildJob for project_id."""
-        raise NotImplementedError
+        if project_id in self._jobs:
+            return self._jobs[project_id]
+        job = BuildJob(project_id=project_id, plan=plan, state=JobState.QUEUED)
+        self._jobs[project_id] = job
+        self._order.append(project_id)
+        return job
 
     def get_job(self, project_id: str) -> BuildJob | None:
         """Return the BuildJob for project_id, or None if not queued."""
-        raise NotImplementedError
+        return self._jobs.get(project_id)
 
     def next_runnable_job(self) -> BuildJob | None:
         """Return the next job in QUEUED or PAUSED_QUOTA state."""
-        raise NotImplementedError
+        for pid in self._order:
+            job = self._jobs[pid]
+            if job.state in (JobState.QUEUED, JobState.PAUSED_QUOTA):
+                return job
+        return None
 
 
 class BuildWorker:
@@ -80,7 +97,10 @@ class BuildWorker:
         self.vcs = vcs
         self.queue = queue if queue is not None else LocalJobQueue()
         self.clock = clock if clock is not None else orchestrator.clock
-        self.max_ci_rounds = max_ci_rounds
+        if max_ci_rounds is not None:
+            self.max_ci_rounds = max_ci_rounds
+        else:
+            self.max_ci_rounds = self.orchestrator.circuit_breaker._limits.get("ci_rounds", 3)
 
     def enqueue_approved_project(
         self,
@@ -88,7 +108,15 @@ class BuildWorker:
         template_files: Mapping[str, str] | None = None,
     ) -> BuildJob:
         """Verify project is in BUILDING state, initialize workspace, and enqueue BuildJob."""
-        raise NotImplementedError
+        validate_project_id(project_id)
+        status = self.orchestrator.get_status(project_id)
+        if status.state != ProjectState.BUILDING:
+            raise IllegalTransition(status.state, ProjectState.BUILDING)
+        plan = self.orchestrator.get_plan(project_id)
+        if plan is None:
+            raise ValueError(f"No plan found for approved project '{project_id}'")
+        self.workspace_manager.create_workspace(project_id, template_files=template_files)
+        return self.queue.enqueue(project_id, plan)
 
     def run_job(
         self,
@@ -96,11 +124,358 @@ class BuildWorker:
         template_files: Mapping[str, str] | None = None,
     ) -> BuildReport:
         """Run or resume the build loop for project_id until DELIVERED, FAILED, or PAUSED_QUOTA."""
-        raise NotImplementedError
+        validate_project_id(project_id)
+        status = self.orchestrator.get_status(project_id)
+        if status.state != ProjectState.BUILDING:
+            raise IllegalTransition(status.state, ProjectState.BUILDING)
+
+        job = self.queue.get_job(project_id)
+        if job is None:
+            plan = self.orchestrator.get_plan(project_id)
+            if plan is None:
+                raise ValueError(f"No plan found for approved project '{project_id}'")
+            job = self.queue.enqueue(project_id, plan)
+
+        # Pre-check template files for contamination
+        if template_files:
+            for k in template_files:
+                norm = k.replace("\\", "/")
+                if norm.startswith("src/") or norm == "src":
+                    raise SandboxViolationError(
+                        f"Production file '{k}' found in template files prior to test generation (INV-13)"
+                    )
+
+        ws_dir = self.workspace_manager.create_workspace(project_id, template_files=template_files)
+
+        # Check existing workspace src directory for contamination
+        src_dir = ws_dir / "src"
+        if src_dir.is_dir() and any(p.is_file() for p in src_dir.rglob("*")):
+            raise SandboxViolationError(
+                "Production code in src/ exists before test generation; potential test contamination (INV-13)"
+            )
+
+        job.state = JobState.RUNNING
+
+        # -------------------------------------------------------------
+        # Step A: Test generation (blind to Plan and production code)
+        # -------------------------------------------------------------
+        if job.lock_snapshot is None:
+            # Check circuit breaker before invoking
+            status = self.orchestrator.record_state_call(project_id, ProjectState.BUILDING)
+            if status.state == ProjectState.FAILED:
+                job.state = JobState.FAILED
+                report = BuildReport(
+                    invocations=job.invocations_used,
+                    test_results=job.test_results,
+                    ci_rounds=job.ci_rounds_used,
+                    failure_cause=status.failure_reason,
+                )
+                job.report = report
+                return report
+
+            try:
+                self.code_agent.generate_tests(ws_dir, job.plan.acceptance_tests)
+                job.invocations_used += 1
+            except QuotaExhaustedError as err:
+                job.state = JobState.PAUSED_QUOTA
+                job.pause_count += 1
+                self.clock.sleep(err.retry_after_seconds)
+                report = BuildReport(
+                    invocations=job.invocations_used,
+                    test_results=job.test_results,
+                    ci_rounds=job.ci_rounds_used,
+                    failure_cause=None,
+                )
+                job.report = report
+                return report
+            except CodeAgentError as err:
+                self.orchestrator.store.append(
+                    create_event(
+                        project_id=project_id,
+                        event_type=EventType.PROJECT_FAILED,
+                        payload={"reason": str(err)},
+                        at=self.orchestrator._now(),
+                    )
+                )
+                job.state = JobState.FAILED
+                report = BuildReport(
+                    invocations=job.invocations_used,
+                    test_results=job.test_results,
+                    ci_rounds=job.ci_rounds_used,
+                    failure_cause=str(err),
+                )
+                job.report = report
+                return report
+
+            tests_dir = ws_dir / "tests"
+            has_tests = tests_dir.is_dir() and any(p.is_file() for p in tests_dir.rglob("*"))
+            if not has_tests:
+                self.orchestrator.store.append(
+                    create_event(
+                        project_id=project_id,
+                        event_type=EventType.PROJECT_FAILED,
+                        payload={"reason": "Test generation produced zero test files in tests/ (INV-13)"},
+                        at=self.orchestrator._now(),
+                    )
+                )
+                job.state = JobState.FAILED
+                report = BuildReport(
+                    invocations=job.invocations_used,
+                    test_results=job.test_results,
+                    ci_rounds=job.ci_rounds_used,
+                    failure_cause="Test generation produced zero test files in tests/ (INV-13)",
+                )
+                job.report = report
+                return report
+
+            job.lock_snapshot = compute_test_lock(ws_dir)
+
+        # -------------------------------------------------------------
+        # Step B: Local loop (write -> test -> fix -> verify CI)
+        # -------------------------------------------------------------
+        building_limit = self.orchestrator.circuit_breaker.get_limit(ProjectState.BUILDING) or 15
+
+        while True:
+            # Check invocation limit
+            if job.invocations_used >= building_limit:
+                status = self.orchestrator.record_state_call(project_id, ProjectState.BUILDING)
+                job.state = JobState.FAILED
+                report = BuildReport(
+                    invocations=job.invocations_used,
+                    test_results=job.test_results,
+                    ci_rounds=job.ci_rounds_used,
+                    failure_cause=status.failure_reason
+                    or f"BUILDING invocation limit ({building_limit}) exceeded",
+                )
+                job.report = report
+                return report
+
+            # Code agent writes / fixes code
+            attempt_num = job.invocations_used + 1
+            try:
+                self.code_agent.implement_or_fix(
+                    ws_dir,
+                    job.plan,
+                    failure_output=job.last_failure_output,
+                    attempt=attempt_num,
+                )
+            except QuotaExhaustedError as err:
+                job.state = JobState.PAUSED_QUOTA
+                job.pause_count += 1
+                self.clock.sleep(err.retry_after_seconds)
+                report = BuildReport(
+                    invocations=job.invocations_used,
+                    test_results=job.test_results,
+                    ci_rounds=job.ci_rounds_used,
+                    failure_cause=None,
+                )
+                job.report = report
+                return report
+            except CodeAgentError as err:
+                self.orchestrator.store.append(
+                    create_event(
+                        project_id=project_id,
+                        event_type=EventType.PROJECT_FAILED,
+                        payload={"reason": str(err)},
+                        at=self.orchestrator._now(),
+                    )
+                )
+                job.state = JobState.FAILED
+                report = BuildReport(
+                    invocations=job.invocations_used,
+                    test_results=job.test_results,
+                    ci_rounds=job.ci_rounds_used,
+                    failure_cause=str(err),
+                )
+                job.report = report
+                return report
+
+            # Record successful agent invocation
+            status = self.orchestrator.record_state_call(project_id, ProjectState.BUILDING)
+            job.invocations_used += 1
+
+            if status.state == ProjectState.FAILED:
+                job.state = JobState.FAILED
+                report = BuildReport(
+                    invocations=job.invocations_used,
+                    test_results=job.test_results,
+                    ci_rounds=job.ci_rounds_used,
+                    failure_cause=status.failure_reason,
+                )
+                job.report = report
+                return report
+
+            # Verify test lock
+            if not verify_and_restore_test_lock(ws_dir, job.lock_snapshot):
+                # Tampering detected and reverted: do not run tests, do not push
+                job.last_failure_output = (
+                    "Test or runner config tampered; changes reverted (INV-13)"
+                )
+                continue
+
+            # Run local tests
+            runner_result = self.runner.run(
+                command=["pytest", "-q"],
+                cwd=ws_dir,
+                timeout_seconds=30.0,
+            )
+
+            # Update test results
+            if runner_result.test_results:
+                job.test_results = dict(runner_result.test_results)
+                passed = sum(1 for v in runner_result.test_results.values() if v)
+                failed = sum(1 for v in runner_result.test_results.values() if not v)
+                total = len(runner_result.test_results)
+                self.orchestrator.store.append(
+                    create_event(
+                        project_id=project_id,
+                        event_type=EventType.TESTS_UPDATED,
+                        payload={"passed": passed, "failed": failed, "total": total},
+                        at=self.orchestrator._now(),
+                    )
+                )
+
+            local_tests_passed = (
+                runner_result.exit_code == 0
+                and (
+                    not runner_result.test_results
+                    or all(runner_result.test_results.values())
+                )
+            )
+
+            if not local_tests_passed:
+                output = runner_result.stdout
+                if runner_result.stderr:
+                    output = f"{output}\n{runner_result.stderr}".strip()
+                job.last_failure_output = output
+                continue
+
+            # Local tests passed! Perform CI verification round
+            if job.ci_rounds_used >= self.max_ci_rounds:
+                self.orchestrator.store.append(
+                    create_event(
+                        project_id=project_id,
+                        event_type=EventType.PROJECT_FAILED,
+                        payload={"reason": f"Maximum CI rounds ({self.max_ci_rounds}) exceeded"},
+                        at=self.orchestrator._now(),
+                    )
+                )
+                job.state = JobState.FAILED
+                report = BuildReport(
+                    invocations=job.invocations_used,
+                    test_results=job.test_results,
+                    ci_rounds=job.ci_rounds_used,
+                    failure_cause=f"Maximum CI rounds ({self.max_ci_rounds}) exceeded",
+                )
+                job.report = report
+                return report
+
+            # Transition to VERIFYING
+            self.orchestrator.store.append(
+                create_event(
+                    project_id=project_id,
+                    event_type=EventType.STATE_TRANSITIONED,
+                    payload={
+                        "from": ProjectState.BUILDING.value,
+                        "to": ProjectState.VERIFYING.value,
+                    },
+                    at=self.orchestrator._now(),
+                )
+            )
+
+            # Push branch
+            self.vcs.push_branch(project_id, ws_dir, branch="work")
+
+            # Get CI result
+            ci_result = self.vcs.get_ci_result(project_id, branch="work")
+            job.ci_rounds_used += 1
+            self.orchestrator.store.append(
+                create_event(
+                    project_id=project_id,
+                    event_type=EventType.CI_ROUND_COMPLETED,
+                    payload={"ci_rounds": job.ci_rounds_used, "summary": ci_result.summary},
+                    at=self.orchestrator._now(),
+                )
+            )
+
+            if ci_result.passed:
+                repo_url, deploy_url = self.vcs.merge_and_deploy(project_id, branch="work")
+                self.orchestrator.store.append(
+                    create_event(
+                        project_id=project_id,
+                        event_type=EventType.PROJECT_DELIVERED,
+                        payload={"repo_url": repo_url, "deploy_url": deploy_url},
+                        at=self.orchestrator._now(),
+                    )
+                )
+                # Write PROJECT_PROMPT.md
+                prompt_file = ws_dir / "PROJECT_PROMPT.md"
+                prompt_content = (
+                    f"# {job.plan.summary}\n\n"
+                    f"## Objective\n{job.plan.summary}\n\n"
+                    f"## Rationale\n{job.plan.rationale}\n\n"
+                    f"## Deployment Target\n{job.plan.deployment_target}\n"
+                )
+                prompt_file.write_text(prompt_content, encoding="utf-8")
+
+                job.state = JobState.COMPLETED
+                report = BuildReport(
+                    invocations=job.invocations_used,
+                    test_results=job.test_results,
+                    ci_rounds=job.ci_rounds_used,
+                    failure_cause=None,
+                )
+                job.report = report
+                return report
+
+            # CI failed: check if CI round limit reached
+            if job.ci_rounds_used >= self.max_ci_rounds:
+                self.orchestrator.store.append(
+                    create_event(
+                        project_id=project_id,
+                        event_type=EventType.PROJECT_FAILED,
+                        payload={
+                            "reason": (
+                                f"Maximum CI rounds ({self.max_ci_rounds}) exceeded: "
+                                f"{ci_result.summary}"
+                            )
+                        },
+                        at=self.orchestrator._now(),
+                    )
+                )
+                job.state = JobState.FAILED
+                report = BuildReport(
+                    invocations=job.invocations_used,
+                    test_results=job.test_results,
+                    ci_rounds=job.ci_rounds_used,
+                    failure_cause=(
+                        f"CI round limit reached ({self.max_ci_rounds}): "
+                        f"{ci_result.summary}"
+                    ),
+                )
+                job.report = report
+                return report
+
+            # Transition back to BUILDING for another fix attempt
+            self.orchestrator.store.append(
+                create_event(
+                    project_id=project_id,
+                    event_type=EventType.STATE_TRANSITIONED,
+                    payload={
+                        "from": ProjectState.VERIFYING.value,
+                        "to": ProjectState.BUILDING.value,
+                    },
+                    at=self.orchestrator._now(),
+                )
+            )
+            job.last_failure_output = ci_result.summary
 
     def run_next(
         self,
         template_files: Mapping[str, str] | None = None,
     ) -> BuildReport | None:
         """Run the next runnable job in the local queue, or return None if queue is empty."""
-        raise NotImplementedError
+        job = self.queue.next_runnable_job()
+        if job is None:
+            return None
+        return self.run_job(job.project_id, template_files=template_files)

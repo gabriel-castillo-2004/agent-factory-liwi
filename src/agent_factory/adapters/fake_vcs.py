@@ -25,7 +25,7 @@ class FakeVCS:
 
     def enqueue_ci_result(self, result: CIRunResult | Exception) -> None:
         """Append a scripted CIRunResult or Exception to the queue."""
-        raise NotImplementedError
+        self._ci_results.append(result)
 
     def push_branch(
         self,
@@ -34,7 +34,16 @@ class FakeVCS:
         branch: str = "work",
     ) -> str:
         """Record a branch push and return a deterministic fake commit ref."""
-        raise NotImplementedError
+        push_ref = f"ref-push-{len(self.pushes) + 1}"
+        self.pushes.append(
+            {
+                "project_id": project_id,
+                "workspace_dir": Path(workspace_dir),
+                "branch": branch,
+                "ref": push_ref,
+            }
+        )
+        return push_ref
 
     def get_ci_result(
         self,
@@ -42,7 +51,15 @@ class FakeVCS:
         branch: str = "work",
     ) -> CIRunResult:
         """Consume and return the next scripted CIRunResult."""
-        raise NotImplementedError
+        self.ci_checks.append({"project_id": project_id, "branch": branch})
+        if not self._ci_results:
+            return CIRunResult(passed=True, summary="CI green")
+        res = self._ci_results.pop(0)
+        if isinstance(res, Exception):
+            raise res
+        if isinstance(res, type) and issubclass(res, Exception):
+            raise res()
+        return res
 
     def merge_and_deploy(
         self,
@@ -50,4 +67,14 @@ class FakeVCS:
         branch: str = "work",
     ) -> tuple[str, str]:
         """Record merge/deploy and return (repo_url, deploy_url)."""
-        raise NotImplementedError
+        repo_url = f"{self.repo_base_url}/{project_id}"
+        deploy_url = f"{self.deploy_base_url}/{project_id}"
+        self.merges.append(
+            {
+                "project_id": project_id,
+                "branch": branch,
+                "repo_url": repo_url,
+                "deploy_url": deploy_url,
+            }
+        )
+        return repo_url, deploy_url
