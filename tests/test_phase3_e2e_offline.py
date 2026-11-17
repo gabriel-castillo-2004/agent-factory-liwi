@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_factory.adapters.agy_cli_adapter import AgyCliAdapter
+from agent_factory.adapters.fake_code_agent import FakeCodeAgent
 from agent_factory.adapters.fake_llm import FakeLLM
 from agent_factory.adapters.fake_runner import FakeRunner
 from agent_factory.adapters.fake_telegram import FakeTelegramClient
@@ -16,6 +17,7 @@ from agent_factory.adapters.git_registry_publisher import GitRegistryPublisher
 from agent_factory.adapters.memory_store import MemoryEventStore
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.builder import BuildWorker, LocalJobQueue
+from agent_factory.domain.events import EventType
 from agent_factory.domain.models import (
     AcceptanceTest,
     AcceptanceTestType,
@@ -432,3 +434,125 @@ def test_end_to_end_offline_telegram_build_handles_vcs_failure_without_leaking_s
         text=True,
     ).stdout
     assert "refs/heads/registry" not in refs_out
+
+
+def test_end_to_end_offline_registry_publish_failure_keeps_local_delivery_intact(
+    tmp_path: Path,
+) -> None:
+    """A3-01 / AC-3.6 (INV-04, INV-11, INV-19, ADR-003): E2E approve succeeds locally even if GitRegistryPublisher fails, leaving /status usable and secrets redacted."""
+    secret_tok = "TEST_E2E_REG_SECRET_9911"
+    store = MemoryEventStore()
+    clock = _FakeClock()
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "spec": {
+                    "objective": "Cronómetro resiliente",
+                    "users": ["Gabriel"],
+                    "features": ["Cronómetro"],
+                    "business_rules": ["Precisión 1s"],
+                    "edge_cases": ["Cero"],
+                    "constraints": ["Estático"],
+                    "success_criteria": ["Sin errores"],
+                    "assumptions": [],
+                },
+                "questions": [],
+            },
+            {"approach": "a", "components": ["src/app.js"], "tradeoffs": []},
+            {"critique": ["c"], "robust_proposal": "r", "architectural_safeguards": []},
+            _sample_countdown_plan(),
+        ]
+    )
+    orch = Orchestrator(store=store, llm=llm, clock=clock)
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+    scaffold = TemplateScaffold(workspace_manager=ws_mgr, templates_root=DEFAULT_TEMPLATES_ROOT)
+
+    reg_publisher = GitRegistryPublisher(
+        repo_path=tmp_path / "origin.git",
+        branch="registry",
+        push_to_remote=True,
+        runner=FakeRunner(
+            results=[
+                CommandResult(
+                    exit_code=128,
+                    stderr=f"fatal: remote registry unavailable GITHUB_TOKEN={secret_tok}",
+                )
+            ]
+        ),
+        work_dir=tmp_path / "reg_work",
+        secrets=(secret_tok,),
+    )
+    worker = BuildWorker(
+        orchestrator=orch,
+        workspace_manager=ws_mgr,
+        code_agent=FakeCodeAgent(
+            test_gen_steps=[{"tests/test_app.py": "def test_ok(): assert True\n"}],
+            impl_steps=[{"src/app.js": "export function formatSeconds(s) { return String(s); }\n"}],
+        ),
+        runner=FakeRunner(
+            results=[
+                CommandResult(
+                    exit_code=0,
+                    stdout="2 passed",
+                    test_results={"AT-01": True, "AT-02": True},
+                )
+            ]
+        ),
+        vcs=FakeVCS(
+            ci_results=[CIRunResult(passed=True, summary="CI ok")],
+            repo_base_url="https://github.com/gabriel-test",
+            deploy_base_url="https://gabriel-test.github.io",
+        ),
+        queue=LocalJobQueue(),
+        clock=clock,
+        registry_publisher=reg_publisher,
+        secrets_to_redact=(secret_tok,),
+    )
+    client = FakeTelegramClient()
+    bot = TelegramBotService(
+        client=client,
+        orchestrator=orch,
+        build_worker=worker,
+        template_scaffold=scaffold,
+        registry_publisher=reg_publisher,
+        config=TelegramBotConfig(
+            allowed_chat_ids=frozenset({1001}),
+            allowed_user_ids=frozenset({2001}),
+            secrets_to_redact=(secret_tok,),
+        ),
+    )
+
+    new_out = bot.handle_update(
+        TelegramUpdate(update_id=1, chat_id=1001, user_id=2001, text="/new Cronometro resiliente")
+    )
+    pid = new_out.project_id
+    assert pid == "cronometro-resiliente"
+    plan_hash = orch.get_status(pid).plan_hash
+    assert plan_hash is not None
+
+    approve_out = bot.handle_update(
+        TelegramUpdate(
+            update_id=2,
+            chat_id=1001,
+            user_id=2001,
+            callback_query_id="cb-reg-warn",
+            callback_data=f"approve:{pid}:{plan_hash}",
+        )
+    )
+    assert approve_out.accepted is True
+    assert "https://github.com/gabriel-test/cronometro-resiliente" in approve_out.reply_text
+    assert "https://gabriel-test.github.io/cronometro-resiliente" in approve_out.reply_text
+    assert secret_tok not in approve_out.reply_text
+
+    # Subsequent /status must succeed without raising IllegalTransition (DELIVERED preserved)
+    st_out = bot.handle_update(
+        TelegramUpdate(update_id=3, chat_id=1001, user_id=2001, text=f"/status {pid}")
+    )
+    assert st_out.action == "status_reported"
+    assert "DELIVERED" in st_out.reply_text
+    assert "100%" in st_out.reply_text
+    assert secret_tok not in st_out.reply_text
+    assert orch.get_status(pid).state == ProjectState.DELIVERED
+    assert not any(e.type == EventType.PROJECT_FAILED for e in store.get_events(pid))
+    assert secret_tok not in "\n".join(e.model_dump_json() for e in store.get_events(pid))

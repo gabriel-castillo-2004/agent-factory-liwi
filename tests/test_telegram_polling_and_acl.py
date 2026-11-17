@@ -14,6 +14,7 @@ from agent_factory.adapters.fake_runner import FakeRunner
 from agent_factory.adapters.fake_telegram import FakeTelegramClient
 from agent_factory.adapters.fake_vcs import FakeVCS
 from agent_factory.adapters.memory_store import MemoryEventStore
+from agent_factory.adapters.sqlite_store import SqliteEventStore
 from agent_factory.adapters.telegram_client import TelegramHttpClient
 from agent_factory.builder import BuildWorker, JobState, LocalJobQueue
 from agent_factory.domain.models import (
@@ -22,9 +23,10 @@ from agent_factory.domain.models import (
     FileSpec,
     Plan,
 )
-from agent_factory.domain.states import ProjectState
+from agent_factory.domain.states import IllegalTransition, ProjectState
 from agent_factory.orchestrator import CircuitBreaker, Orchestrator
 from agent_factory.ports.code_agent import QuotaExhaustedError
+from agent_factory.ports.llm import LLMError
 from agent_factory.ports.notifier import (
     HttpResponse,
     InlineButton,
@@ -549,3 +551,314 @@ def test_telegram_bot_status_resume_and_update_id_deduplication(tmp_path: Path) 
     assert "100%" in st_done.reply_text
     assert "https://github.com/agent-factory-test/reloj-pomodoro" in st_done.reply_text
     assert "https://agent-factory-test.github.io/reloj-pomodoro" in st_done.reply_text
+
+
+def test_telegram_bot_persists_dedup_and_active_project_across_restart(tmp_path: Path) -> None:
+    """A3-03 (INV-16, INV-23): Restarting TelegramBotService over SqliteEventStore skips already processed update_ids and routes plain replies to active project."""
+    db_path = tmp_path / "telegram_bot_persist.db"
+    cfg = TelegramBotConfig(
+        allowed_chat_ids=frozenset({1001}),
+        allowed_user_ids=frozenset({2001}),
+    )
+    llm = FakeLLM(
+        responses=[
+            {
+                "spec": _partial_spec_payload("App Persistente"),
+                "questions": ["¿Qué formato prefieres?"],
+            },
+            {
+                "spec": _complete_spec_payload("App Persistente"),
+                "questions": [],
+            },
+            {"approach": "Static ES", "components": ["src/app.js"], "tradeoffs": []},
+            {"critique": ["Empty state"], "robust_proposal": "Fallback", "architectural_safeguards": []},
+            _complete_plan_payload("App Persistente"),
+        ]
+    )
+
+    # First run before restart
+    store_1 = SqliteEventStore(db_path=db_path)
+    orch_1 = Orchestrator(store=store_1, llm=llm, clock=_FakeClock())
+    bot_1 = TelegramBotService(
+        client=FakeTelegramClient(),
+        orchestrator=orch_1,
+        config=cfg,
+    )
+    out_new = bot_1.handle_update(
+        TelegramUpdate(update_id=501, chat_id=1001, user_id=2001, text="/new App Persistente")
+    )
+    assert out_new.action == "interview_question_asked"
+    out_st = bot_1.handle_update(
+        TelegramUpdate(update_id=502, chat_id=1001, user_id=2001, text="/status app-persistente")
+    )
+    assert out_st.action == "status_reported"
+    assert len(llm.calls) == 1
+    store_1.close()
+
+    # Simulated process restart: fresh SqliteEventStore, Orchestrator, and TelegramBotService (no shared Inbox)
+    store_2 = SqliteEventStore(db_path=db_path)
+    try:
+        orch_2 = Orchestrator(store=store_2, llm=llm, clock=_FakeClock())
+        client_2 = FakeTelegramClient(
+            updates=[
+                TelegramUpdate(update_id=501, chat_id=1001, user_id=2001, text="/new App Persistente"),
+                TelegramUpdate(update_id=502, chat_id=1001, user_id=2001, text="/status app-persistente"),
+                TelegramUpdate(
+                    update_id=503,
+                    chat_id=1001,
+                    user_id=2001,
+                    text="Gabriel, 100% estático en Markdown",
+                ),
+            ]
+        )
+        bot_2 = TelegramBotService(
+            client=client_2,
+            orchestrator=orch_2,
+            config=cfg,
+        )
+
+        outcomes = bot_2.poll_once()
+        assert len(outcomes) == 3
+        assert outcomes[0].duplicate is True
+        assert outcomes[0].action == "ignored_duplicate"
+        assert outcomes[1].duplicate is True
+        assert outcomes[1].action == "ignored_duplicate"
+        assert outcomes[2].accepted is True
+        assert outcomes[2].project_id == "app-persistente"
+        assert outcomes[2].action == "plan_ready_for_approval"
+        assert orch_2.get_status("app-persistente").state == ProjectState.WAITING_APPROVAL
+        # 1 call before restart + 1 interview round 2 + 3 debate calls = 5 total (0 from duplicate 501)
+        assert len(llm.calls) == 5
+    finally:
+        store_2.close()
+
+
+def test_telegram_bot_rejects_mismatched_adjust_hash_and_survives_malformed_or_failed_poll_batch(
+    tmp_path: Path,
+) -> None:
+    """A3-03 / A3-05 (INV-04, INV-05, INV-22, INV-23): Rejects adjust with wrong hash, enforces request_adjustment precondition, checks offset across polls, answered_callbacks, COMPLETED /resume guard, and poll_once exception resilience (kills M19, M20, M26, M28)."""
+    clock = _FakeClock()
+    store = MemoryEventStore()
+    llm = FakeLLM(
+        responses=[
+            # Round 1: ask 1 question to verify request_adjustment fails in INTERVIEW (M28)
+            {
+                "spec": _partial_spec_payload("App Resiliente"),
+                "questions": ["¿Objetivo exacto?"],
+            },
+            # Round 2: complete spec + 3 debate calls
+            {"spec": _complete_spec_payload("App Resiliente"), "questions": []},
+            {"approach": "Static ES", "components": ["src/app.js"], "tradeoffs": []},
+            {"critique": ["OK"], "robust_proposal": "Guard", "architectural_safeguards": []},
+            _complete_plan_payload("App Resiliente"),
+            # For failed interviewer LLM during /new inside batch 2
+            LLMError("Upstream interviewer error"),
+        ]
+    )
+    orch = Orchestrator(store=store, llm=llm, clock=clock)
+    worker = BuildWorker(
+        orchestrator=orch,
+        workspace_manager=WorkspaceManager(base_dir=tmp_path / "ws"),
+        code_agent=FakeCodeAgent(
+            test_gen_steps=[{"tests/test_app.py": "def test_ok(): assert True\n"}],
+            impl_steps=[{"src/app.js": "export const ok = 1;\n"}],
+        ),
+        runner=FakeRunner(
+            results=[CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True})]
+        ),
+        vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
+        queue=LocalJobQueue(),
+        clock=clock,
+    )
+    client = FakeTelegramClient()
+    bot = TelegramBotService(
+        client=client,
+        orchestrator=orch,
+        build_worker=worker,
+        config=TelegramBotConfig(
+            allowed_chat_ids=frozenset({1001}),
+            allowed_user_ids=frozenset({2001}),
+        ),
+    )
+
+    # 1. Start interview -> verify request_adjustment from INTERVIEW raises IllegalTransition (kills M28)
+    bot.handle_update(
+        TelegramUpdate(update_id=699, chat_id=1001, user_id=2001, text="/new App Resiliente")
+    )
+    pid = "app-resiliente"
+    assert orch.get_status(pid).state == ProjectState.INTERVIEW
+    with pytest.raises(IllegalTransition):
+        orch.request_adjustment(pid, "Not in WAITING_APPROVAL")
+
+    # Complete interview -> WAITING_APPROVAL
+    bot.handle_update(
+        TelegramUpdate(update_id=700, chat_id=1001, user_id=2001, text="Gabriel, estática")
+    )
+    status_wait = orch.get_status(pid)
+    assert status_wait.state == ProjectState.WAITING_APPROVAL
+    real_hash = status_wait.plan_hash
+    assert real_hash is not None
+
+    # 2. Wrong hash in adjust:<pid>:<wrong_hash> MUST NOT revert WAITING_APPROVAL -> INTERVIEW (INV-05)
+    bad_adj = bot.handle_update(
+        TelegramUpdate(
+            update_id=701,
+            chat_id=1001,
+            user_id=2001,
+            callback_query_id="cb-adj-wrong",
+            callback_data=f"adjust:{pid}:wronghash0000",
+        )
+    )
+    assert bad_adj.accepted is True
+    assert bad_adj.action != "adjustment_requested"
+    assert orch.get_status(pid).state == ProjectState.WAITING_APPROVAL
+    assert "cb-adj-wrong" in [c["callback_query_id"] for c in client.answered_callbacks]
+
+    # Reset offset cursor cleanly and check consecutive poll_once() cursor propagation
+    client.enqueue_update(
+        TelegramUpdate(
+            update_id=702,
+            chat_id=1001,
+            user_id=2001,
+            callback_query_id="cb-ok-1",
+            callback_data=f"approve:{pid}:{real_hash}",
+        )
+    )
+    bot.next_offset = None
+    batch_1 = bot.poll_once()
+    assert len(batch_1) == 1
+    assert orch.get_status(pid).state == ProjectState.DELIVERED
+    assert worker.queue.get_job(pid) is not None
+    assert worker.queue.get_job(pid).state == JobState.COMPLETED
+    # Kills M20: callback must have been acknowledged
+    assert "cb-ok-1" in [c["callback_query_id"] for c in client.answered_callbacks]
+
+    # request_adjustment from DELIVERED also raises IllegalTransition (kills M28)
+    with pytest.raises(IllegalTransition):
+        orch.request_adjustment(pid, "Already delivered")
+
+    # 3. Batch 2: consecutive poll_once() must send offset=703 (kills M26) and survive every error case
+    for upd in (
+        TelegramUpdate(
+            update_id=703,
+            chat_id=1001,
+            user_id=2001,
+            callback_query_id="cb-dup-approve",
+            callback_data=f"approve:{pid}:{real_hash}",
+        ),
+        TelegramUpdate(
+            update_id=704,
+            chat_id=1001,
+            user_id=2001,
+            callback_query_id="cb-bad-pid",
+            callback_data="approve:../escape:deadbeef",
+        ),
+        TelegramUpdate(
+            update_id=705,
+            chat_id=1001,
+            user_id=2001,
+            text="/new App Resiliente",
+        ),
+        TelegramUpdate(
+            update_id=706,
+            chat_id=1001,
+            user_id=2001,
+            text=f"/resume {pid}",
+        ),
+        TelegramUpdate(
+            update_id=707,
+            chat_id=1001,
+            user_id=2001,
+            text="/new Falla Entrevista",
+        ),
+        TelegramUpdate(
+            update_id=708,
+            chat_id=1001,
+            user_id=2001,
+            text=f"/status {pid}",
+        ),
+    ):
+        client.enqueue_update(upd)
+
+    batch_2 = bot.poll_once()
+    assert client.get_updates_calls[1]["offset"] == 703
+    assert len(batch_2) == 6
+    assert batch_2[0].action != "approval_processed"
+    assert batch_2[1].action == "error"
+    assert batch_2[2].action == "error"
+    # Kills M19: COMPLETED job in queue must NOT resume
+    assert batch_2[3].action != "resumed"
+    assert orch.get_status(pid).state == ProjectState.DELIVERED
+    # Failed Interviewer leaves falla-entrevista in FAILED without advancing to DEBATE
+    assert batch_2[4].action != "plan_ready_for_approval"
+    assert orch.get_status("falla-entrevista").state == ProjectState.FAILED
+    # Subsequent update in the same batch still executes cleanly
+    assert batch_2[5].action == "status_reported"
+    assert "DELIVERED" in batch_2[5].reply_text
+
+    bot.poll_once()
+    assert client.get_updates_calls[2]["offset"] == 709
+
+
+def test_telegram_http_client_handles_null_text_ok_false_invalid_json_and_answer_callback() -> None:
+    """A3-05 / A3-07 (INV-04, INV-19, INV-23): Handles text=None messages, answerCallbackQuery, HTTP 200 ok=false (kills M25), and invalid JSON."""
+    token = "TEST_HTTP_EDGE_TOK_9988"
+    transport = _RecordingHttpTransport(
+        responses=[
+            HttpResponse(
+                status_code=200,
+                body=json.dumps(
+                    {
+                        "ok": True,
+                        "result": [
+                            {
+                                "update_id": 801,
+                                "message": {
+                                    "message_id": 15,
+                                    "chat": {"id": 1001},
+                                    "text": None,
+                                },
+                            },
+                            {
+                                "update_id": 802,
+                                "message": {
+                                    "message_id": 16,
+                                    "from": {"id": 2001},
+                                    "chat": {"id": 1001},
+                                    "text": None,
+                                },
+                            },
+                        ],
+                    }
+                ),
+            ),
+            HttpResponse(status_code=200, body=json.dumps({"ok": True, "result": True})),
+            HttpResponse(
+                status_code=200,
+                body=json.dumps({"ok": False, "description": f"Conflict for bot{token}"}),
+            ),
+            HttpResponse(status_code=200, body="<<<not-valid-json>>>"),
+        ]
+    )
+    client = TelegramHttpClient(bot_token=token, transport=transport)
+
+    updates = client.get_updates(offset=801, timeout=15)
+    assert len(updates) == 2
+    assert updates[0].text == ""
+    assert updates[0].user_id == 0
+    assert updates[1].text == ""
+    assert updates[1].user_id == 2001
+
+    client.answer_callback_query("cbq-123", text="Procesando")
+    assert transport.calls[1]["url"].endswith("/answerCallbackQuery")
+    assert transport.calls[1]["payload"]["callback_query_id"] == "cbq-123"
+    assert transport.calls[1]["payload"]["text"] == "Procesando"
+
+    # HTTP 200 with ok=False must raise TelegramTransportError without token leak (kills M25)
+    with pytest.raises(TelegramTransportError) as err_ok_false:
+        client.get_updates(offset=803, timeout=15)
+    assert token not in str(err_ok_false.value)
+
+    # HTTP 200 with invalid JSON must raise TelegramTransportError
+    with pytest.raises(TelegramTransportError):
+        client.get_updates(offset=804, timeout=15)
