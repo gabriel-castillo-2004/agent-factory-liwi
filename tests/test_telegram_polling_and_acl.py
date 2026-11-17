@@ -664,7 +664,7 @@ def test_telegram_bot_rejects_mismatched_adjust_hash_and_survives_malformed_or_f
             impl_steps=[{"src/app.js": "export const ok = 1;\n"}],
         ),
         runner=FakeRunner(
-            results=[CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True})]
+            results=[CommandResult(exit_code=0, stdout="2 passed", test_results={"AT-01": True, "AT-02": True})]
         ),
         vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
         queue=LocalJobQueue(),

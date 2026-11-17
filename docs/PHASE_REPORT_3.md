@@ -1,15 +1,15 @@
-# Phase Report 3 — Telegram Long Polling, Sanitización de Secretos y Publicación en `registry` (Endurecimiento PASO B')
+# Phase Report 3 — Telegram Long Polling, Sanitización de Secretos y Publicación en `registry` (Cierre PASO A'')
 
-**Rama:** `phase-3` (endurecimiento sobre tag `phase-3.1-tests`)  
-**Estado:** Implementación endurecida en `src/` completada (`A3-01`–`A3-09`); `304 passed, 1 failed` en `pytest` debido al defecto de fixture en un test nuevo documentado bajo `INV-13` en [`docs/PHASE3_TEST_ISSUES.md`](PHASE3_TEST_ISSUES.md).
+**Rama:** `phase-3` (tag `phase-3.2-tests`)  
+**Estado:** Implementación y suite de pruebas completadas y verificadas (`305 passed`, 0 failed). Defecto de fixture documentado en [`docs/PHASE3_TEST_ISSUES.md`](PHASE3_TEST_ISSUES.md) resuelto quirúrgicamente en PASO A''.
 
 ---
 
-## 1. Cambios implementados en PASO B' (`A3-01` a `A3-09`)
+## 1. Resumen de cambios (`A3-01` a `A3-09`) y Ajuste de Fixture (PASO A'')
 
 - **`A3-01` (`src/agent_factory/domain/events.py`, `src/agent_factory/builder.py`, `docs/decisions/ADR-003-telegram-and-registry-ports.md`):**
   - Se agregó `EventType.REGISTRY_PUBLISH_FAILED` al dominio de eventos.
-  - En `BuildWorker`, tras `PROJECT_DELIVERED`, el fallo de `registry_publisher.publish_project` deja de emitir `PROJECT_FAILED` (evitando la transición ilegal `DELIVERED -> FAILED` bajo `INV-04`/`INV-11`) y registra `EventType.REGISTRY_PUBLISH_FAILED` en modo *best-effort*, conservando `JobState.COMPLETED` y `ProjectState.DELIVERED`.
+  - En `BuildWorker`, tras `PROJECT_DELIVERED`, el fallo de `registry_publisher.publish_project` no emite `PROJECT_FAILED` (evitando la transición ilegal `DELIVERED -> FAILED` bajo `INV-04`/`INV-11`) y registra `EventType.REGISTRY_PUBLISH_FAILED` en modo *best-effort*, conservando `JobState.COMPLETED` y `ProjectState.DELIVERED`.
 - **`A3-02` (`src/agent_factory/builder.py`, `src/agent_factory/orchestrator.py`):**
   - Se extrajeron los helpers `_redact` y `_fail_job` en `BuildWorker` y se aplicó `redact_secrets` de forma uniforme en todas las rutas de fallo (`generate_tests`, `implement_or_fix`, `runner.run`, `vcs.push_branch`, `vcs.get_ci_result`, `vcs.merge_and_deploy`, `max_ci_rounds`, resúmenes de CI).
   - Se aplicó `redact_secrets` en los payloads de fallo de `Orchestrator` (`handle_interview_message`, `run_debate`, `record_state_call`).
@@ -28,30 +28,32 @@
   - `_post` captura `http.client.HTTPException` además de errores de `urllib`/`OSError` y relanza `TelegramTransportError` sanitizado fuera de bloques `except` (`__cause__=None`, `__context__=None`).
   - `get_updates` tolera `"text": None` y subobjetos nulos sin lanzar `AttributeError`/`TypeError`.
 - **`A3-08` y `A3-09` (Transparencia de métricas y alcance):**
-  - Se reportan las métricas exactas observadas en la corrida final y el estado real de alcance pendiente respecto a `MASTER_PROMPT.md` §7.
+  - Métricas exactas observadas en la corrida final de la suite y delimitación del alcance pendiente respecto a `MASTER_PROMPT.md` §7.
+- **Ajuste Quirúrgico PASO A'' (`tests/test_telegram_polling_and_acl.py:667`):**
+  - Se completó el fixture de `FakeRunner` inyectando `test_results={"AT-01": True, "AT-02": True}` para coincidir con las 2 pruebas de aceptación definidas por `_complete_plan_payload`, resolviendo `ISSUE-3.1` sin debilitar aserciones ni el oráculo de prueba.
 
 ---
 
 ## 2. Verificación ejecutada
 
-### Linter e integridad de tests (`INV-13`)
+### Linter e integridad de código (`src/`, `templates/`, `pyproject.toml`)
 
+- `git diff --stat -- src/ templates/ pyproject.toml`: **salida vacía** (cero cambios en código de producción, plantillas ni dependencias en este paso).
 - `.\.venv\Scripts\ruff.exe check .`: **`All checks passed!`** (código de salida `0`).
-- `git diff phase-3.1-tests --stat -- tests/ pyproject.toml templates/`: salida vacía (cero cambios en `tests/`, `pyproject.toml` o `templates/`).
 
 ### Suite de pruebas y cobertura (`pytest -q --cov=src/agent_factory --cov-report=term-missing`)
 
-- **Resultado global observado:** `1 failed, 304 passed, 2 warnings in 52.60s` (código de salida `1`).
-- **Tests de registro (`tests/test_registry_publisher.py`):** `4 passed in 23.59s`.
-- **Único test fallido:** `tests/test_telegram_polling_and_acl.py::test_telegram_bot_rejects_mismatched_adjust_hash_and_survives_malformed_or_failed_poll_batch` (`:730`).
-  - Causa documentada en [`docs/PHASE3_TEST_ISSUES.md`](PHASE3_TEST_ISSUES.md): el fixture `_complete_plan_payload` define 2 pruebas (`AT-01` y `AT-02`), mientras `:667` configura `FakeRunner` únicamente con `test_results={"AT-01": True}` (sin `"AT-02": True`), activando el circuit breaker de `BUILDING` (`16 calls exceeded limit of 15`) -> `ProjectState.FAILED`. En acatamiento de `INV-13`, no se modificó el test ni se debilitó `has_all_plan_tests` en `src/agent_factory/builder.py`.
+- **Resultado global observado:** **`305 passed, 2 warnings in 53.61s`** (código de salida `0`).
+- **Tests de registro (`tests/test_registry_publisher.py`):** `4 passed`.
+- **Tests de Telegram y ACL (`tests/test_telegram_polling_and_acl.py`):** `7 passed`.
 
 #### Cobertura medida (`src/agent_factory`)
 
 | Módulo / Total | Stmts | Miss | Branch | BrPart | Cobertura |
 |---|---:|---:|---:|---:|---:|
-| `TOTAL` (`src/agent_factory`) | 2271 | 163 | 608 | 96 | **91%** |
+| `TOTAL` (`src/agent_factory`) | 2271 | 156 | 608 | 93 | **91%** |
 | `adapters/agy_cli_adapter.py` | 104 | 0 | 28 | 1 | **99%** |
+| `adapters/fake_telegram.py` | 35 | 2 | 10 | 2 | **91%** |
 | `adapters/git_registry_publisher.py` | 166 | 19 | 48 | 11 | **85%** |
 | `adapters/memory_store.py` | 32 | 0 | 6 | 0 | **100%** |
 | `adapters/sqlite_store.py` | 56 | 0 | 6 | 2 | **97%** |
@@ -63,9 +65,7 @@
 | `domain/states.py` | 25 | 0 | 2 | 0 | **100%** |
 | `orchestrator.py` | 215 | 17 | 56 | 6 | **90%** |
 | `secrets.py` | 28 | 1 | 14 | 2 | **93%** |
-| `telegram_bot.py` | 263 | 29 | 96 | 19 | **86%** |
-
-*(Nota: la cobertura de `telegram_bot.py` queda acotada al 86% porque el fallo en `tests/test_telegram_polling_and_acl.py:730` interrumpe las aserciones posteriores de las líneas `:731-800` de ese mismo test.)*
+| `telegram_bot.py` | 263 | 22 | 96 | 16 | **89%** |
 
 ---
 
