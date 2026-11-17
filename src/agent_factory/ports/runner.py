@@ -1,6 +1,6 @@
 """Port definition for command execution with timeout and process-tree cleanup (INV-02, INV-06)."""
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -30,6 +30,7 @@ class Runner(Protocol):
         command: Sequence[str],
         cwd: Path,
         timeout_seconds: float = 30.0,
+        env: Mapping[str, str] | None = None,
     ) -> CommandResult:
         """Execute command in cwd and return CommandResult, or raise CommandTimeoutError."""
         raise NotImplementedError

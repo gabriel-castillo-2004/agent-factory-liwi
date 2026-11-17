@@ -1,6 +1,6 @@
 """Scripted fake command runner adapter for offline deterministic testing (INV-02, INV-03)."""
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +25,7 @@ class FakeRunner:
         command: Sequence[str],
         cwd: Path,
         timeout_seconds: float = 30.0,
+        env: Mapping[str, str] | None = None,
     ) -> CommandResult:
         """Record call and return next scripted CommandResult or raise scripted Exception."""
         self.calls.append(
@@ -32,6 +33,7 @@ class FakeRunner:
                 "command": list(command),
                 "cwd": Path(cwd),
                 "timeout_seconds": timeout_seconds,
+                "env": dict(env) if env is not None else None,
             }
         )
         if not self._results:

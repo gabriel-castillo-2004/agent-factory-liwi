@@ -3,7 +3,7 @@
 import os
 import signal
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from agent_factory.ports.runner import CommandResult, CommandTimeoutError, Runner
@@ -20,6 +20,7 @@ class SubprocessRunner(Runner):
         command: Sequence[str],
         cwd: Path,
         timeout_seconds: float | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> CommandResult:
         """Execute command in cwd with timeout, killing parent and all child processes on timeout."""
         if isinstance(command, (str, bytes)) or not command:

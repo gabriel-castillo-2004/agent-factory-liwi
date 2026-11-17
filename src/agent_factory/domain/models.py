@@ -22,7 +22,7 @@ def validate_project_id(project_id: str) -> str:
         )
     return project_id
 
-VALID_TEMPLATES: frozenset[str] = frozenset({"static-app"})
+VALID_TEMPLATES: frozenset[str] = frozenset({"static-app", "static-web"})
 
 SPEC_CHECKLIST_FIELDS: tuple[str, ...] = (
     "objective",
