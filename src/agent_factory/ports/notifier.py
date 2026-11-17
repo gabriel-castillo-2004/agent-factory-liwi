@@ -55,6 +55,7 @@ class HttpTransport(Protocol):
         payload: Mapping[str, Any],
         timeout_seconds: float = 35.0,
         headers: Mapping[str, str] | None = None,
+        extra_secrets: Sequence[str] = (),
     ) -> HttpResponse:
         """Send an outbound HTTP POST with JSON payload and return HttpResponse."""
         raise NotImplementedError

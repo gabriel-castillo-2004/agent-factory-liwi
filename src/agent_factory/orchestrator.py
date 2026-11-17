@@ -23,7 +23,7 @@ from agent_factory.domain.states import IllegalTransition, ProjectState, validat
 from agent_factory.inbox import Inbox
 from agent_factory.ports.clock import Clock
 from agent_factory.ports.llm import LLM, LLMError
-from agent_factory.ports.publisher import StatusPublisher
+from agent_factory.ports.publisher import RegistryPublishError, StatusPublisher
 from agent_factory.ports.store import EventStore
 from agent_factory.secrets import redact_secrets
 
@@ -408,7 +408,6 @@ class Orchestrator:
         if current_status.state != ProjectState.WAITING_APPROVAL:
             raise IllegalTransition(current_status.state, ProjectState.INTERVIEW)
         validate_transition(current_status.state, ProjectState.INTERVIEW)
-        self.circuit_breaker.reset(project_id)
         self.store.append(
             create_event(
                 project_id=project_id,
@@ -475,7 +474,10 @@ class Orchestrator:
             )
             if self._last_published_status.get(project_id) != last_key:
                 self._last_published_status[project_id] = last_key
-                self.publisher.publish(status)
+                try:
+                    self.publisher.publish(status)
+                except (RegistryPublishError, OSError, RuntimeError, ValueError):
+                    pass
         return status
 
     def get_plan(self, project_id: str) -> Plan | None:

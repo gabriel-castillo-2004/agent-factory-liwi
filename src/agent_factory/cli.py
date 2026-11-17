@@ -79,81 +79,81 @@ class ProductionLLMAdapter:
         endpoint = "https://api.openai.com/v1/chat/completions"
         chosen_model = ""
 
-        if self.models_config_path is not None:
-            if not self.models_config_path.is_file():
-                raise LLMError(f"Models config file not found: {self.models_config_path}")
-            try:
-                with self.models_config_path.open("rb") as f:
-                    cfg_data = tomllib.load(f)
-            except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError, ValueError) as exc:
-                clean_err = redact_secrets(
-                    f"Failed to load models config from {self.models_config_path}: {exc}",
-                    extra_secrets=self.secrets,
-                )
-                err = LLMError(clean_err)
-                err.__cause__ = None
-                err.__context__ = None
-                raise err
+        if self.models_config_path is None:
+            raise LLMError("No models configuration path provided for ProductionLLMAdapter")
 
-            if not isinstance(cfg_data, dict) or not cfg_data:
-                raise LLMError(f"Models config at {self.models_config_path} is empty or invalid")
+        if not self.models_config_path.is_file():
+            raise LLMError(f"Models config file not found: {self.models_config_path}")
+        try:
+            with self.models_config_path.open("rb") as f:
+                cfg_data = tomllib.load(f)
+        except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError, ValueError) as exc:
+            clean_err = redact_secrets(
+                f"Failed to load models config from {self.models_config_path}: {exc}",
+                extra_secrets=self.secrets,
+            )
+            err = LLMError(clean_err)
+            err.__cause__ = None
+            err.__context__ = None
+            raise err
 
-            if "endpoint" in cfg_data:
-                endpoint = str(cfg_data["endpoint"])
+        if not isinstance(cfg_data, dict) or not cfg_data:
+            raise LLMError(f"Models config at {self.models_config_path} is empty or invalid")
 
-            models_section = cfg_data.get("models")
-            if isinstance(models_section, dict):
-                models_cfg = models_section
-            else:
-                models_cfg = cfg_data
+        if "endpoint" in cfg_data:
+            endpoint = str(cfg_data["endpoint"])
 
-            if not models_cfg:
-                raise LLMError(f"No models configured in {self.models_config_path}")
-
-            # State routing: MEDIATION (strong) vs INTERVIEW/DEBATE (fast)
-            is_mediation = False
-            if schema is not None:
-                schema_name = getattr(schema, "__name__", str(schema))
-                if "Plan" in schema_name:
-                    is_mediation = True
-
-            for msg in messages:
-                content = msg.get("content", "")
-                if "Mediator" in content or "mediation" in content.lower():
-                    is_mediation = True
-                    break
-
-            if is_mediation:
-                chosen_model = str(
-                    models_cfg.get("strong")
-                    or models_cfg.get("MEDIATION")
-                    or models_cfg.get("mediation")
-                    or models_cfg.get("STRONG")
-                    or ""
-                )
-            else:
-                chosen_model = str(
-                    models_cfg.get("fast")
-                    or models_cfg.get("INTERVIEW")
-                    or models_cfg.get("DEBATE")
-                    or models_cfg.get("FAST")
-                    or models_cfg.get("idle")
-                    or ""
-                )
-
-            if not chosen_model:
-                fallback_keys = ("fast", "strong") if not is_mediation else ("strong", "fast")
-                for k in fallback_keys:
-                    if k in models_cfg:
-                        chosen_model = str(models_cfg[k])
-                        break
-                if not chosen_model and models_cfg:
-                    chosen_model = str(next(iter(models_cfg.values())))
-
-            if not chosen_model:
-                raise LLMError("Could not resolve model from models configuration")
+        models_section = cfg_data.get("models")
+        if isinstance(models_section, dict):
+            models_cfg = models_section
         else:
-            chosen_model = "model-fast-01"
+            models_cfg = cfg_data
+
+        if not models_cfg:
+            raise LLMError(f"No models configured in {self.models_config_path}")
+
+        # State routing: MEDIATION (strong) vs INTERVIEW/DEBATE (fast)
+        is_mediation = False
+        if schema is not None:
+            schema_name = getattr(schema, "__name__", str(schema))
+            if "Plan" in schema_name:
+                is_mediation = True
+
+        for msg in messages:
+            content = msg.get("content", "")
+            if "Mediator" in content or "mediation" in content.lower():
+                is_mediation = True
+                break
+
+        if is_mediation:
+            chosen_model = str(
+                models_cfg.get("strong")
+                or models_cfg.get("MEDIATION")
+                or models_cfg.get("mediation")
+                or models_cfg.get("STRONG")
+                or ""
+            )
+        else:
+            chosen_model = str(
+                models_cfg.get("fast")
+                or models_cfg.get("INTERVIEW")
+                or models_cfg.get("DEBATE")
+                or models_cfg.get("FAST")
+                or models_cfg.get("idle")
+                or ""
+            )
+
+        if not chosen_model:
+            fallback_keys = ("fast", "strong") if not is_mediation else ("strong", "fast")
+            for k in fallback_keys:
+                if k in models_cfg:
+                    chosen_model = str(models_cfg[k])
+                    break
+            if not chosen_model and models_cfg:
+                chosen_model = str(next(iter(models_cfg.values())))
+
+        if not chosen_model:
+            raise LLMError("Could not resolve model from models configuration")
 
         payload: dict[str, Any] = {
             "model": chosen_model,
@@ -470,8 +470,45 @@ def build_runtime(
             err.__context__ = None
             raise err
 
+        if not isinstance(models_data, dict) or not models_data:
+            raise CliConfigError(
+                f"Models configuration file is empty or invalid: {config.models_config_path}"
+            )
+
+        models_section = models_data.get("models")
+        if isinstance(models_section, dict):
+            if not models_section:
+                raise CliConfigError("models.toml missing required non-empty [models] section")
+            models_cfg = models_section
+        else:
+            known_keys = {
+                "fast",
+                "strong",
+                "interview",
+                "debate",
+                "mediation",
+                "building",
+                "waiting_approval",
+                "verifying",
+                "delivered",
+                "failed",
+                "idle",
+                "change_request",
+            }
+            if not any(k.lower() in known_keys for k in models_data):
+                raise CliConfigError(
+                    "models.toml missing required non-empty [models] section or model keys"
+                )
+            models_cfg = models_data
+
+        for state_key, model_val in models_cfg.items():
+            if str(model_val).strip().upper() == "CONFIGURE_ME":
+                raise CliConfigError(
+                    f"Models configuration contains unconfigured placeholder 'CONFIGURE_ME' for {state_key}"
+                )
+
         for state_key, model_val in models_data.items():
-            if str(model_val).strip() == "CONFIGURE_ME":
+            if str(model_val).strip().upper() == "CONFIGURE_ME":
                 raise CliConfigError(
                     f"Models configuration contains unconfigured placeholder 'CONFIGURE_ME' for {state_key}"
                 )
@@ -535,7 +572,7 @@ def build_runtime(
         if config.deploy_target or config.vercel_token:
             deploy_base_url = (
                 f"https://{config.github_owner}.github.io"
-                if config.deploy_target in {"gh-pages", "github-pages"} or config.github_owner
+                if (config.deploy_target in {"gh-pages", "github-pages"} and bool(config.github_owner))
                 else ""
             )
             deploy_publisher = StaticDeployPublisher(

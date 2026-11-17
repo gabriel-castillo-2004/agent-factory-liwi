@@ -27,6 +27,7 @@ class UrllibHttpTransport:
         payload: Mapping[str, Any],
         timeout_seconds: float = 35.0,
         headers: Mapping[str, str] | None = None,
+        extra_secrets: Sequence[str] = (),
     ) -> HttpResponse:
         """Execute outbound HTTPS POST using urllib.request."""
         data = json.dumps(payload).encode("utf-8")
@@ -42,7 +43,7 @@ class UrllibHttpTransport:
             headers=req_headers,
             method="POST",
         )
-        extra: list[str] = []
+        extra: list[str] = list(extra_secrets)
         if headers:
             for v in headers.values():
                 if v:

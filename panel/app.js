@@ -34,8 +34,7 @@
       .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,}|sk-[A-Za-z0-9_-]{12,})\b/g, "[REDACTED]")
       .replace(/(Bearer\s+)[A-Za-z0-9_.-]+/gi, "$1[REDACTED]")
       .replace(/(https?:\/\/[^/\s:@]+:)[^/\s@]+(@)/g, "$1[REDACTED]$2")
-      .replace(/([?&](?:token|access_token|api_key|apikey|secret|password|auth)=)[^&\s#]+/gi, "$1[REDACTED]")
-      .replace(/\bNaN\b/g, "");
+      .replace(/([?&](?:token|access_token|api_key|apikey|secret|password|auth)=)[^&\s#]+/gi, "$1[REDACTED]");
   }
 
   function sanitizeLinkUrl(rawUrl) {

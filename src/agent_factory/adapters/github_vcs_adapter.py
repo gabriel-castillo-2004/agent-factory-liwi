@@ -133,11 +133,56 @@ class GitHubVCSAdapter(VCS):
         clean_env = self.build_clean_env()
         if (workspace_dir / ".git").is_dir():
             self.runner.run(["git", "add", "-A"], cwd=workspace_dir, env=clean_env)
-            self.runner.run(
-                ["git", "commit", "-m", f"chore({project_id}): update {valid_branch}"],
+            diff_res = self.runner.run(
+                ["git", "diff", "--cached", "--quiet"],
                 cwd=workspace_dir,
                 env=clean_env,
             )
+            if diff_res.exit_code != 0:
+                has_local_identity = False
+                git_cfg = workspace_dir / ".git" / "config"
+                if git_cfg.is_file():
+                    try:
+                        cfg_txt = git_cfg.read_text(encoding="utf-8")
+                        if "user.name" in cfg_txt or ("[user]" in cfg_txt and "name =" in cfg_txt):
+                            has_local_identity = True
+                    except OSError:
+                        pass
+
+                if has_local_identity:
+                    commit_cmd = [
+                        "git",
+                        "commit",
+                        "-m",
+                        f"chore({project_id}): update {valid_branch}",
+                    ]
+                else:
+                    commit_cmd = [
+                        "git",
+                        "-c",
+                        "user.name=AgentFactory",
+                        "-c",
+                        "user.email=agent@factory.local",
+                        "commit",
+                        "-m",
+                        f"chore({project_id}): update {valid_branch}",
+                    ]
+                try:
+                    commit_res = self.runner.run(commit_cmd, cwd=workspace_dir, env=clean_env)
+                except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
+                    clean_err = redact_secrets(str(exc), extra_secrets=self.secrets)
+                    err_obj = VcsError(f"Git commit failed: {clean_err}")
+                    err_obj.__cause__ = None
+                    err_obj.__context__ = None
+                    raise err_obj
+
+                if commit_res.exit_code != 0:
+                    err = commit_res.stderr or commit_res.stdout or f"exit code {commit_res.exit_code}"
+                    clean_err = redact_secrets(err, extra_secrets=self.secrets)
+                    err_obj = VcsError(f"Git commit failed: {clean_err}")
+                    err_obj.__cause__ = None
+                    err_obj.__context__ = None
+                    raise err_obj
         cmd = ["git", "push", "-u", "origin", valid_branch]
         clean_err: str | None = None
         res = None
