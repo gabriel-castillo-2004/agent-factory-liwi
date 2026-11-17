@@ -3,7 +3,7 @@
 from collections.abc import Sequence
 
 from agent_factory.domain.events import Event, EventType
-from agent_factory.domain.models import ProjectStatus, TestCounts
+from agent_factory.domain.models import ProjectLinks, ProjectStatus, TestCounts
 from agent_factory.domain.states import ProjectState, validate_transition
 
 STATE_BASE_PROGRESS: dict[ProjectState, int] = {
@@ -50,6 +50,7 @@ def project_status_from_events(project_id: str, events: Sequence[Event]) -> Proj
     last_event: str | None = None
     updated_at = None
     last_progress = 0
+    links = ProjectLinks()
 
     for event in events:
         last_event = event.id
@@ -162,6 +163,11 @@ def project_status_from_events(project_id: str, events: Sequence[Event]) -> Proj
             validate_transition(current_state, ProjectState.DELIVERED)
             current_state = ProjectState.DELIVERED
             last_progress = 100
+            if "repo_url" in payload or "deploy_url" in payload:
+                links = ProjectLinks(
+                    repo=payload.get("repo_url", links.repo),
+                    deploy=payload.get("deploy_url", links.deploy),
+                )
 
     return ProjectStatus(
         project_id=project_id,
@@ -174,6 +180,7 @@ def project_status_from_events(project_id: str, events: Sequence[Event]) -> Proj
         tests=tests,
         agent_invocations=agent_invocations,
         ci_rounds=ci_rounds,
+        links=links,
         last_event=last_event,
         updated_at=updated_at,
         failure_reason=failure_reason,
