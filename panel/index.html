@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#0f172a">
+  <meta name="description" content="Panel PWA de solo lectura de Agent Factory sobre la rama registry.">
+  <title>Agent Factory — Panel Registry</title>
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" type="image/svg+xml" href="./icons/icon.svg">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <img src="./icons/icon.svg" alt="Agent Factory" class="brand-icon" width="32" height="32">
+        <div>
+          <h1>Agent Factory</h1>
+          <p class="subtitle">Panel PWA de solo lectura &middot; rama <code>registry</code></p>
+        </div>
+      </div>
+      <div class="status-pills">
+        <span id="connection-badge" class="pill pill-online" aria-live="polite">En línea</span>
+        <span id="updated-at-badge" class="pill pill-muted">Sin actualizar</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="source-bar card" aria-label="Fuente del registro">
+      <form id="source-form" class="source-form">
+        <label for="registry-base-input">Origen <code>registry</code> (solo lectura):</label>
+        <div class="source-controls">
+          <input
+            id="registry-base-input"
+            type="url"
+            placeholder="https://raw.githubusercontent.com/<org>/<repo>/registry"
+            autocomplete="off"
+            spellcheck="false"
+          >
+          <button type="submit" class="btn btn-primary">Cargar</button>
+          <button type="button" id="refresh-btn" class="btn btn-secondary">Actualizar</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="error-banner" class="alert alert-error hidden" role="alert" aria-live="assertive"></section>
+
+    <section class="kpis" aria-label="Resumen de proyectos">
+      <article class="kpi-card">
+        <span class="kpi-label">Proyectos</span>
+        <strong id="kpi-total" class="kpi-value">0</strong>
+      </article>
+      <article class="kpi-card">
+        <span class="kpi-label">Entregados</span>
+        <strong id="kpi-delivered" class="kpi-value">0</strong>
+      </article>
+      <article class="kpi-card">
+        <span class="kpi-label">En progreso</span>
+        <strong id="kpi-active" class="kpi-value">0</strong>
+      </article>
+      <article class="kpi-card">
+        <span class="kpi-label">Con fallo</span>
+        <strong id="kpi-failed" class="kpi-value">0</strong>
+      </article>
+    </section>
+
+    <section class="toolbar card" aria-label="Filtros del catálogo">
+      <div class="toolbar-row">
+        <input
+          id="search-input"
+          type="search"
+          placeholder="Buscar por ID, nombre u objetivo..."
+          aria-label="Buscar proyectos"
+        >
+        <select id="state-filter" aria-label="Filtrar por estado">
+          <option value="ALL">Todos los estados</option>
+          <option value="DELIVERED">DELIVERED</option>
+          <option value="BUILDING">BUILDING</option>
+          <option value="VERIFYING">VERIFYING</option>
+          <option value="WAITING_APPROVAL">WAITING_APPROVAL</option>
+          <option value="INTERVIEW">INTERVIEW</option>
+          <option value="DEBATE">DEBATE</option>
+          <option value="MEDIATION">MEDIATION</option>
+          <option value="FAILED">FAILED</option>
+        </select>
+      </div>
+    </section>
+
+    <section class="workspace-grid">
+      <div class="catalog-pane">
+        <h2 class="section-title">Catálogo</h2>
+        <div id="projects-empty" class="empty-state hidden">
+          No hay proyectos que coincidan con el filtro actual.
+        </div>
+        <div id="projects-list" class="projects-grid" role="list"></div>
+      </div>
+
+      <aside id="detail-pane" class="detail-pane card" aria-label="Detalle del proyecto">
+        <h2 class="section-title">Detalle</h2>
+        <div id="detail-placeholder" class="empty-state">
+          Selecciona un proyecto del catálogo para consultar su fase, cuotas e historial de eventos sanitizados.
+        </div>
+        <div id="detail-content" class="hidden"></div>
+      </aside>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p>Agent Factory &middot; Modo estático sin backend ni tokens de escritura en navegador.</p>
+  </footer>
+
+  <script defer src="./app.js"></script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+{
+  "name": "Agent Factory Registry Panel",
+  "short_name": "AgentFactory",
+  "description": "Panel PWA de solo lectura para consultar proyectos, avance e historial de eventos desde la rama registry.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "lang": "es-MX",
+  "icons": [
+    {
+      "src": "./icons/icon.svg",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "./icons/icon.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
