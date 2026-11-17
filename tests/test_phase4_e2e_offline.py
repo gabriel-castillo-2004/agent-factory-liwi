@@ -409,7 +409,7 @@ def test_phase4_e2e_bot_and_build_worker_stream_state_and_sanitized_events_to_re
     )
     limits_toml = tmp_path / "limits_e2e.toml"
     limits_toml.write_text(
-        "INTERVIEW = 6\nDEBATE = 3\nMEDIATION = 2\nBUILDING = 15\nci_rounds = 3\n",
+        "INTERVIEW = 6\nDEBATE = 4\nMEDIATION = 2\nBUILDING = 15\nci_rounds = 3\n",
         encoding="utf-8",
     )
 
@@ -558,6 +558,9 @@ def test_phase4_e2e_bot_and_build_worker_stream_state_and_sanitized_events_to_re
         assert proj_waiting["progress_pct"] == 35
         first_hash = proj_waiting["plan_hash"]
         assert first_hash is not None
+        assert rt.orchestrator.circuit_breaker.get_calls(pid, ProjectState.INTERVIEW) == 1
+        assert rt.orchestrator.circuit_breaker.get_calls(pid, ProjectState.DEBATE) == 2
+        assert rt.orchestrator.circuit_breaker.get_calls(pid, ProjectState.MEDIATION) == 1
 
         # Poll 2: adjust callback -> returns to INTERVIEW and updates registry immediately
         transport._batches.append(
@@ -584,6 +587,10 @@ def test_phase4_e2e_bot_and_build_worker_stream_state_and_sanitized_events_to_re
         )
         assert proj_adj["state"] == "INTERVIEW"
         assert proj_adj["progress_pct"] == 10
+        # INV-17 / H43-01: request_adjustment MUST NEVER reset accumulated CircuitBreaker counters
+        assert rt.orchestrator.circuit_breaker.get_calls(pid, ProjectState.INTERVIEW) == 1
+        assert rt.orchestrator.circuit_breaker.get_calls(pid, ProjectState.DEBATE) == 2
+        assert rt.orchestrator.circuit_breaker.get_calls(pid, ProjectState.MEDIATION) == 1
 
         # Poll 3: answer -> WAITING_APPROVAL v2, Poll 4: approve -> DELIVERED with full events array
         transport._batches.append(
@@ -602,6 +609,9 @@ def test_phase4_e2e_bot_and_build_worker_stream_state_and_sanitized_events_to_re
         run_polling_loop(rt.bot_service, clock=clock, stop_event=stop_ev, max_iterations=1)
         new_hash = rt.orchestrator.get_status(pid).plan_hash
         assert new_hash is not None
+        assert rt.orchestrator.circuit_breaker.get_calls(pid, ProjectState.INTERVIEW) == 2
+        assert rt.orchestrator.circuit_breaker.get_calls(pid, ProjectState.DEBATE) == 4
+        assert rt.orchestrator.circuit_breaker.get_calls(pid, ProjectState.MEDIATION) == 2
 
         transport._batches.append(
             [

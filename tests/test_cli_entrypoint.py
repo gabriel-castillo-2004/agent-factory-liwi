@@ -861,3 +861,124 @@ def test_urllib_http_transport_post_json_sends_headers_json_and_wraps_http_url_e
         assert auth_tok not in str(tp_err.value)
         assert tp_err.value.__cause__ is None
         assert tp_err.value.__context__ is None
+
+    # 3. M43-14: UrllibHttpTransport.post_json accepts extra_secrets=(...) and scrubs both extra_secrets and custom headers in TelegramTransportError
+    custom_sec = "CUSTOM_SECRET_XYZ"
+    hdr_sec = "CUSTOM_HDR_TOKEN_445566"
+
+    def _fake_urlopen_custom(req: urllib.request.Request, timeout: float = 35.0) -> _FakeRespCtx:
+        raise urllib.error.URLError(
+            f"upstream rejected auth ({custom_sec}) and header ({hdr_sec})"
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_custom)
+    with pytest.raises(TelegramTransportError) as custom_err:
+        transport.post_json(
+            "https://custom-llm.test/v1/chat/completions",
+            {"model": "acme-fast", "messages": []},
+            headers={"X-Custom-Auth": hdr_sec},
+            extra_secrets=(custom_sec,),
+        )
+    assert custom_sec not in str(custom_err.value)
+    assert hdr_sec not in str(custom_err.value)
+    assert "[REDACTED]" in str(custom_err.value)
+    assert custom_err.value.__cause__ is None
+    assert custom_err.value.__context__ is None
+
+
+def test_cli_h42_01_rejects_none_models_path_invalid_models_toml_and_vercel_github_io_url(
+    tmp_path: Path,
+) -> None:
+    """H42-01 (INV-07, INV-19, INV-21, INV-23, MASTER_PROMPT §2 / AGENTS.md #12): Rejects models_config_path=None (no model-fast-01 fallback), rejects models.toml missing [models]/model keys or using nested CONFIGURE_ME, and avoids github.io deploy_base_url when deploy_target=vercel."""
+    tg_tok = "TEST_H4201B_TG_TOK_111"
+    llm_key = "TEST_H4201B_LLM_KEY_222"
+    vc_tok = "TEST_H4201B_VC_TOK_333"
+
+    class _FailIfCalledTransport:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def post_json(
+            self,
+            url: str,
+            payload: Mapping[str, Any],
+            timeout_seconds: float = 35.0,
+            headers: Mapping[str, str] | None = None,
+        ) -> HttpResponse:
+            self.calls.append({"url": url, "payload": dict(payload)})
+            return HttpResponse(status_code=200, body='{"choices":[{"message":{"content":"{}"}}]}')
+
+    no_call_transport = _FailIfCalledTransport()
+
+    # 1. ProductionLLMAdapter MUST reject models_config_path=None instead of hardcoding "model-fast-01"
+    with pytest.raises((LLMError, ValueError)):
+        adapter_none = ProductionLLMAdapter(
+            api_key=llm_key,
+            models_config_path=None,
+            transport=no_call_transport,
+            secrets=(llm_key,),
+        )
+        adapter_none.complete([{"role": "user", "content": "Hola"}])
+    assert len(no_call_transport.calls) == 0
+
+    limits_toml = tmp_path / "limits_h42b.toml"
+    limits_toml.write_text(
+        "INTERVIEW = 6\nDEBATE = 3\nMEDIATION = 2\nBUILDING = 15\nci_rounds = 3\n",
+        encoding="utf-8",
+    )
+
+    # 2. build_runtime MUST reject empty models.toml, missing [models]/model keys, empty [models], and nested [models] CONFIGURE_ME
+    bad_toml_variants = {
+        "empty": "",
+        "no_models_section": 'endpoint = "https://custom-llm.test/v1/chat/completions"\n[other]\nfoo = "bar"\n',
+        "empty_models_section": "[models]\n",
+        "nested_configure_me": '[models]\nfast = "CONFIGURE_ME"\nstrong = "acme-strong"\n',
+    }
+    for label, toml_content in bad_toml_variants.items():
+        bad_path = tmp_path / f"{label}_models.toml"
+        bad_path.write_text(toml_content, encoding="utf-8")
+        cfg_bad = load_cli_config(
+            {
+                "TELEGRAM_BOT_TOKEN": tg_tok,
+                "ALLOWED_CHAT_IDS": "1001",
+                "ALLOWED_USER_IDS": "2001",
+                "LLM_API_KEY": llm_key,
+                "AGENT_FACTORY_DB_PATH": str(tmp_path / f"{label}.db"),
+                "AGENT_FACTORY_WORKSPACES_DIR": str(tmp_path / f"ws_{label}"),
+                "AGENT_FACTORY_MODELS_CONFIG": str(bad_path),
+                "AGENT_FACTORY_LIMITS_CONFIG": str(limits_toml),
+            }
+        )
+        with pytest.raises(CliConfigError):
+            build_runtime(cfg_bad, transport=no_call_transport)
+
+    # 3. deploy_target == "vercel" MUST NOT set deploy_base_url to https://<github_owner>.github.io
+    valid_models = tmp_path / "valid_models_vercel.toml"
+    valid_models.write_text(
+        '[models]\nfast = "acme-fast"\nstrong = "acme-strong"\n',
+        encoding="utf-8",
+    )
+    cfg_vercel = load_cli_config(
+        {
+            "TELEGRAM_BOT_TOKEN": tg_tok,
+            "ALLOWED_CHAT_IDS": "1001",
+            "ALLOWED_USER_IDS": "2001",
+            "LLM_API_KEY": llm_key,
+            "GITHUB_OWNER": "gabriel-vercel-owner",
+            "AGENT_FACTORY_DEPLOY_TARGET": "vercel",
+            "VERCEL_TOKEN": vc_tok,
+            "AGENT_FACTORY_DB_PATH": str(tmp_path / "vercel_runtime.db"),
+            "AGENT_FACTORY_WORKSPACES_DIR": str(tmp_path / "ws_vercel"),
+            "AGENT_FACTORY_REGISTRY_REPO": str(tmp_path / "origin.git"),
+            "AGENT_FACTORY_MODELS_CONFIG": str(valid_models),
+            "AGENT_FACTORY_LIMITS_CONFIG": str(limits_toml),
+        }
+    )
+    rt_vc = build_runtime(cfg_vercel, transport=no_call_transport)
+    try:
+        assert isinstance(rt_vc.vcs, GitHubVCSAdapter)
+        assert isinstance(rt_vc.vcs.deploy_publisher, StaticDeployPublisher)
+        assert rt_vc.vcs.deploy_publisher.target == "vercel"
+        assert "github.io" not in rt_vc.vcs.deploy_publisher.deploy_base_url
+    finally:
+        rt_vc.store.close()

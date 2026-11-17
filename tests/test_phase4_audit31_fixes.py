@@ -777,3 +777,49 @@ def test_git_registry_publisher_recovers_from_active_conflicted_rebase_and_wires
         assert len(proj_json["events"]) == len(expected_events)
     finally:
         store.close()
+
+
+def test_orchestrator_create_project_survives_registry_publish_error_best_effort(
+    tmp_path: Path,
+) -> None:
+    """H43-02 (INV-11, INV-21, AC-3.6, INV-23): Orchestrator.create_project() and get_status() with publisher=GitRegistryPublisher treat registry failures as best-effort without aborting local state persistence."""
+    reg_tok = "TEST_H4302_REG_SECRET_7711"
+    failing_runner = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=128,
+                stderr=f"fatal: unable to access origin.git GITHUB_TOKEN={reg_tok}",
+            ),
+            CommandResult(
+                exit_code=128,
+                stderr=f"fatal: still unreachable GITHUB_TOKEN={reg_tok}",
+            ),
+        ]
+    )
+    reg_pub = GitRegistryPublisher(
+        repo_path=tmp_path / "missing_origin.git",
+        branch="registry",
+        push_to_remote=True,
+        runner=failing_runner,
+        work_dir=tmp_path / "wt_best_effort",
+        secrets=(reg_tok,),
+    )
+
+    store = SqliteEventStore(db_path=tmp_path / "h4302.db")
+    try:
+        orch = Orchestrator(store=store, llm=FakeLLM(), publisher=reg_pub)
+        created = orch.create_project("proj-best-effort", "Best Effort App", "Survive remote fail")
+        assert created.project_id == "proj-best-effort"
+        assert created.state == ProjectState.INTERVIEW
+        assert created.progress_pct == 10
+        assert len(failing_runner.calls) >= 1
+
+        # Subsequent get_status() also remains usable without raising RegistryPublishError
+        queried = orch.get_status("proj-best-effort")
+        assert queried.state == ProjectState.INTERVIEW
+        assert queried.progress_pct == 10
+        events = store.get_events("proj-best-effort")
+        assert len(events) == 1
+        assert events[0].type == EventType.PROJECT_CREATED
+    finally:
+        store.close()

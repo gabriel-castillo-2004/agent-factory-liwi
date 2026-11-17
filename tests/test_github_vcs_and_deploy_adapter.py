@@ -524,3 +524,119 @@ def test_github_vcs_prepares_dirty_git_repo_ensures_pr_deploys_site_branch_and_k
     assert vc_tok not in " ".join(vc_call["command"])
     assert vc_call["env"] is not None
     assert vc_call["env"].get("VERCEL_TOKEN") == vc_tok
+
+
+def test_github_vcs_push_branch_passes_git_identity_and_raises_vcs_error_on_commit_failure(
+    tmp_path: Path,
+) -> None:
+    """H43-03 (INV-07, INV-15, INV-19, INV-23): push_branch passes -c user.name=... and -c user.email=... to git commit (working without global gitconfig) and raises sanitized VcsError if git commit fails."""
+    gh_tok = "TEST_GH_H4303_SECRET_5566"
+    bare_remote = tmp_path / "ident-remote.git"
+    subprocess.run(["git", "init", "--bare", str(bare_remote)], check=True, capture_output=True)
+
+    ws_dir = tmp_path / "ws" / "app-git-ident"
+    ws_dir.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(ws_dir), "init", "-b", "main"], check=True, capture_output=True)
+    (ws_dir / "README.md").write_text("# Init\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(ws_dir), "add", "README.md"], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(ws_dir),
+            "-c",
+            "user.name=Init",
+            "-c",
+            "user.email=init@local",
+            "commit",
+            "-m",
+            "init",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "-C", str(ws_dir), "remote", "add", "origin", str(bare_remote)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(ws_dir), "checkout", "-b", "work"], check=True, capture_output=True)
+
+    # Dirty file in workspace without any user.name/email configured in repo or isolated HOME
+    (ws_dir / "src").mkdir(parents=True)
+    (ws_dir / "src" / "main.js").write_text("export const ready = true;\n", encoding="utf-8")
+    empty_home = tmp_path / "empty_home"
+    empty_home.mkdir()
+
+    real_runner = SubprocessRunner(default_timeout_seconds=15.0)
+    recorded_cmds: list[list[str]] = []
+
+    class _IsolatedGitRunner:
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            recorded_cmds.append(list(command))
+            isolated_env = dict(env or {})
+            isolated_env["HOME"] = str(empty_home)
+            isolated_env["USERPROFILE"] = str(empty_home)
+            isolated_env["GIT_CONFIG_NOSYSTEM"] = "1"
+            isolated_env["GIT_CONFIG_GLOBAL"] = str(empty_home / "nonexistent_gitconfig")
+            return real_runner.run(command, cwd, timeout_seconds=timeout_seconds, env=isolated_env)
+
+    vcs_iso = GitHubVCSAdapter(
+        runner=_IsolatedGitRunner(),
+        owner="acme-org",
+        github_token=gh_tok,
+        secrets=(gh_tok,),
+    )
+    vcs_iso.push_branch("app-git-ident", ws_dir, branch="work")
+
+    commit_cmds = [cmd for cmd in recorded_cmds if cmd[:1] == ["git"] and "commit" in cmd]
+    assert commit_cmds, f"Expected git commit call, saw: {recorded_cmds}"
+    commit_cmd = commit_cmds[0]
+    assert "-c" in commit_cmd
+    assert any(arg.startswith("user.name=") for arg in commit_cmd)
+    assert any(arg.startswith("user.email=") for arg in commit_cmd)
+
+    pushed_files = subprocess.run(
+        ["git", "-C", str(bare_remote), "ls-tree", "-r", "refs/heads/work", "--name-only"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "src/main.js" in pushed_files
+
+    # Part B: Non-zero exit code from git commit MUST raise VcsError (never push silently) and scrub secret
+    ws_fail = tmp_path / "ws" / "app-commit-fail"
+    (ws_fail / ".git").mkdir(parents=True)
+    (ws_fail / "index.html").write_text("<h1>Fail</h1>\n", encoding="utf-8")
+
+    class _CommitFailingRunner:
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            if "diff" in command:
+                return CommandResult(exit_code=1, stdout="")
+            if "commit" in command:
+                return CommandResult(
+                    exit_code=1,
+                    stderr=f"fatal: hook rejected commit GITHUB_TOKEN={gh_tok}",
+                )
+            return CommandResult(exit_code=0, stdout="ok")
+
+    vcs_fail = GitHubVCSAdapter(
+        runner=_CommitFailingRunner(),
+        owner="acme-org",
+        github_token=gh_tok,
+        secrets=(gh_tok,),
+    )
+    with pytest.raises(VcsError) as vcs_err:
+        vcs_fail.push_branch("app-commit-fail", ws_fail, branch="work")
+    assert gh_tok not in str(vcs_err.value)
+    assert "[REDACTED]" in str(vcs_err.value)
+    assert vcs_err.value.__cause__ is None
+    assert vcs_err.value.__context__ is None

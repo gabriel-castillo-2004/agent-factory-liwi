@@ -445,7 +445,7 @@ globalThis.fetch = async (url) => {{
         projects: {{
           "nan-app": {{
             project_id: "nan-app",
-            name: "NaN Check",
+            name: "Numeric Bounds Check",
             objective: "Resilience",
             state: "BUILDING",
             progress_pct: "not-a-number"
@@ -459,7 +459,7 @@ globalThis.fetch = async (url) => {{
     status: 200,
     text: async () => JSON.stringify({{
       project_id: "nan-app",
-      name: "NaN Check",
+      name: "Numeric Bounds Check",
       objective: "Resilience",
       state: "BUILDING",
       phase: "BUILDING",
@@ -502,7 +502,9 @@ globalThis.fetch = async (url) => {{
     catPcts: Object.fromEntries(cat.projects.map((p) => [p.project_id, p.progress_pct])),
     detail: detail,
     cardsHtml: els["projects-list"].children.map((c) => c.innerHTML).join(""),
-    detailHtml: els["detail-content"].innerHTML
+    detailHtml: els["detail-content"].innerHTML,
+    redactedNanCheck: api.redactDisplayText("NaN Check"),
+    redactedNormalText: api.redactDisplayText("Pan NaN y app")
   }}));
 }})().catch((err) => {{
   console.error(err);
@@ -529,3 +531,6 @@ globalThis.fetch = async (url) => {{
     assert "NaN%" not in out["cardsHtml"]
     assert "NaN" not in out["detailHtml"]
     assert "Infinity" not in out["detailHtml"]
+    # H43-04: redactDisplayText MUST preserve legitimate "NaN" word in user text
+    assert out["redactedNanCheck"] == "NaN Check"
+    assert out["redactedNormalText"] == "Pan NaN y app"
