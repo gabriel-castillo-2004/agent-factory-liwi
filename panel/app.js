@@ -3,9 +3,8 @@
   var api = factory();
   if (typeof module === "object" && module.exports) {
     module.exports = api;
-  } else {
-    root.AgentFactoryPanel = api;
   }
+  root.AgentFactoryPanel = api;
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 

@@ -196,10 +196,29 @@ def test_panel_pwa_bundle_export_sanitized_history_and_negative_cases(tmp_path: 
         pass
 
 
-def test_panel_pwa_js_behavior_xss_id_links_detail_rendering_and_html_input() -> None:
-    """H4-04 / H4-08 / M4-19 / M4-20 (INV-16, INV-22, INV-23): Executes panel/app.js against real XSS/ID/URL/detail payloads and checks relative input support in index.html."""
+def _find_js_runtime() -> str:
     js_exe = shutil.which("node") or shutil.which("deno")
     assert js_exe is not None, "A JavaScript runtime (node or deno) is required to execute panel/app.js tests"
+    return js_exe
+
+
+def _run_js_script(js_exe: str, js_script: str, timeout: int = 15) -> str:
+    cmd = (
+        [js_exe, "-e", js_script]
+        if Path(js_exe).stem.lower() == "node"
+        else [js_exe, "eval", "--no-remote", js_script]
+    )
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"JS execution failed ({proc.returncode}):\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
+        )
+    return proc.stdout.strip()
+
+
+def test_panel_pwa_js_behavior_xss_id_links_detail_rendering_and_html_input() -> None:
+    """H4-04 / H4-08 / M4-19 / M4-20 (INV-16, INV-22, INV-23): Executes panel/app.js against real XSS/ID/URL/detail payloads and checks relative input support in index.html."""
+    js_exe = _find_js_runtime()
 
     app_js_posix = (PANEL_DIR / "app.js").resolve().as_posix()
     js_script = f"""
@@ -276,7 +295,7 @@ globalThis.fetch = async (url) => {{
 }};
 (async () => {{
   new Function(readFile(appPath))();
-  const api = globalThis.AgentFactoryPanel;
+  const api = globalThis.AgentFactoryPanel || (typeof module !== "undefined" && module.exports ? module.exports : null);
   for (const fn of (docListeners["DOMContentLoaded"] || [])) fn();
   await new Promise((r) => setTimeout(r, 20));
   if (els["projects-list"].children.length > 0 && els["projects-list"].children[0].listeners.click) {{
@@ -319,13 +338,7 @@ globalThis.fetch = async (url) => {{
   if (typeof Deno !== "undefined") Deno.exit(1); else process.exit(1);
 }});
 """
-    cmd = (
-        [js_exe, "-e", js_script]
-        if Path(js_exe).stem.lower() == "node"
-        else [js_exe, "eval", "--no-remote", js_script]
-    )
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=True)
-    out = json.loads(proc.stdout.strip())
+    out = json.loads(_run_js_script(js_exe, js_script))
 
     # Hand-crafted oracles killing M4-19 and M4-20
     assert out["escapedScript"] == "&lt;script&gt;alert(1)&lt;/script&gt;"
@@ -396,8 +409,7 @@ def test_panel_styles_has_warning_prompt_rules_app_handles_nonfinite_and_ci_enfo
     ci_yml = (repo_root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert re.search(r"--cov-fail-under=(?:8[5-9]|9\d|100)\b", ci_yml) is not None
 
-    js_exe = shutil.which("node") or shutil.which("deno")
-    assert js_exe is not None, "A JavaScript runtime (node or deno) is required to execute panel/app.js tests"
+    js_exe = _find_js_runtime()
 
     app_js_posix = (PANEL_DIR / "app.js").resolve().as_posix()
     js_script = f"""
@@ -474,7 +486,7 @@ globalThis.fetch = async (url) => {{
 }};
 (async () => {{
   new Function(readFile(appPath))();
-  const api = globalThis.AgentFactoryPanel;
+  const api = globalThis.AgentFactoryPanel || (typeof module !== "undefined" && module.exports ? module.exports : null);
   for (const fn of (docListeners["DOMContentLoaded"] || [])) fn();
   await new Promise((r) => setTimeout(r, 20));
   if (els["projects-list"].children.length > 0 && els["projects-list"].children[0].listeners.click) {{
@@ -511,13 +523,7 @@ globalThis.fetch = async (url) => {{
   if (typeof Deno !== "undefined") Deno.exit(1); else process.exit(1);
 }});
 """
-    cmd = (
-        [js_exe, "-e", js_script]
-        if Path(js_exe).stem.lower() == "node"
-        else [js_exe, "eval", "--no-remote", js_script]
-    )
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=True)
-    out = json.loads(proc.stdout.strip())
+    out = json.loads(_run_js_script(js_exe, js_script))
 
     assert out["catPcts"] == {"cat-nan": 0, "cat-inf": 0, "cat-neg": 0, "cat-over": 100}
     detail = out["detail"]
