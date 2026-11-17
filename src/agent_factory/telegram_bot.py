@@ -13,7 +13,12 @@ from agent_factory.domain.models import ApprovalEvent, ProjectStatus, validate_p
 from agent_factory.domain.states import IllegalTransition, ProjectState
 from agent_factory.inbox import Inbox
 from agent_factory.orchestrator import ApprovalError, Orchestrator
-from agent_factory.ports.notifier import InlineButton, TelegramClient, TelegramUpdate
+from agent_factory.ports.notifier import (
+    InlineButton,
+    TelegramClient,
+    TelegramTransportError,
+    TelegramUpdate,
+)
 from agent_factory.ports.publisher import RegistryPublisher
 from agent_factory.scaffold import TemplateScaffold
 from agent_factory.secrets import redact_secrets
@@ -494,6 +499,14 @@ class TelegramBotService:
 
         if self.build_worker is not None and self.build_worker.queue is not None:
             job = self.build_worker.queue.get_job(pid)
+            if job is not None and job.state == JobState.COMPLETED:
+                return self._error_outcome(
+                    update,
+                    f"El proyecto {pid} ya se encuentra completado.",
+                    command="/resume",
+                    project_id=pid,
+                    action="resume_rejected",
+                )
             if job is not None and job.state == JobState.PAUSED_QUOTA:
                 self.build_worker.run_job(pid)
                 st = self.orchestrator.get_status(pid)
@@ -598,7 +611,19 @@ class TelegramBotService:
                 RuntimeError,
             ) as exc:
                 if self.is_authorized(update.chat_id, update.user_id):
-                    outcome = self._error_outcome(update, f"Error procesando actualización: {exc}")
+                    try:
+                        outcome = self._error_outcome(update, f"Error procesando actualización: {exc}")
+                    except (TelegramTransportError, OSError, RuntimeError):
+                        clean_msg = redact_secrets(
+                            f"Error procesando actualización: {exc}",
+                            extra_secrets=self.config.secrets_to_redact,
+                        )
+                        outcome = UpdateOutcome(
+                            update_id=update.update_id,
+                            accepted=False,
+                            action="error",
+                            reply_text=clean_msg,
+                        )
                 else:
                     outcome = UpdateOutcome(
                         update_id=update.update_id,

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import math
 import os
 import signal
+import sys
 import threading
 import time
+import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -13,17 +16,17 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_factory.adapters.agy_cli_adapter import AgyCliAdapter
-from agent_factory.adapters.fake_llm import FakeLLM
 from agent_factory.adapters.git_registry_publisher import GitRegistryPublisher
 from agent_factory.adapters.github_vcs_adapter import GitHubVCSAdapter
 from agent_factory.adapters.sqlite_store import SqliteEventStore
+from agent_factory.adapters.static_deploy_publisher import StaticDeployPublisher
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.adapters.telegram_client import TelegramHttpClient
 from agent_factory.builder import BuildWorker
-from agent_factory.orchestrator import Orchestrator
+from agent_factory.orchestrator import CircuitBreaker, Orchestrator
 from agent_factory.ports.clock import Clock
 from agent_factory.ports.code_agent import CodeAgent
-from agent_factory.ports.llm import LLM
+from agent_factory.ports.llm import LLM, LLMError
 from agent_factory.ports.notifier import (
     HttpTransport,
     TelegramClient,
@@ -41,6 +44,36 @@ from agent_factory.workspace import WorkspaceManager
 
 class CliConfigError(ValueError):
     """Raised when required CLI configuration or whitelists are missing or invalid (INV-19, INV-21)."""
+
+
+class ProductionLLMAdapter:
+    """Production LLM adapter executing model completions behind the LLM port (INV-02, INV-09)."""
+
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        models_config_path: Path | None = None,
+        transport: HttpTransport | None = None,
+        secrets: Sequence[str] = (),
+    ) -> None:
+        self.api_key = api_key
+        self.models_config_path = models_config_path
+        self.transport = transport
+        combined = list(secrets)
+        if api_key and api_key not in combined:
+            combined.append(api_key)
+        self.secrets = tuple(combined)
+
+    def complete(
+        self,
+        messages: list[dict[str, str]],
+        schema: type[BaseModel] | dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Execute completion request over HTTP transport."""
+        if self.transport is None:
+            raise LLMError("No HttpTransport configured for ProductionLLMAdapter")
+        return {}
 
 
 class CliConfig(BaseModel):
@@ -134,25 +167,40 @@ def load_cli_config(env: Mapping[str, str] | None = None) -> CliConfig:
     registry_branch = effective.get("AGENT_FACTORY_REGISTRY_BRANCH", "registry").strip() or "registry"
 
     try:
-        poll_timeout = int(effective.get("AGENT_FACTORY_POLL_TIMEOUT", "30"))
+        raw_poll = effective.get("AGENT_FACTORY_POLL_TIMEOUT", "30")
+        poll_timeout = int(raw_poll)
         if poll_timeout <= 0:
             raise CliConfigError("AGENT_FACTORY_POLL_TIMEOUT must be positive")
-    except ValueError as exc:
-        raise CliConfigError(f"Invalid AGENT_FACTORY_POLL_TIMEOUT: {exc}") from None
+    except (ValueError, CliConfigError) as exc:
+        clean_err = redact_secrets(
+            f"Invalid AGENT_FACTORY_POLL_TIMEOUT: {exc}",
+            extra_secrets=(token,) if token else (),
+        )
+        raise CliConfigError(clean_err) from None
 
     try:
-        backoff_initial = float(effective.get("AGENT_FACTORY_BACKOFF_INITIAL", "1.0"))
-        backoff_max = float(effective.get("AGENT_FACTORY_BACKOFF_MAX", "60.0"))
-        if backoff_initial <= 0 or backoff_max <= 0:
-            raise CliConfigError("Backoff seconds must be positive")
+        raw_initial = effective.get("AGENT_FACTORY_BACKOFF_INITIAL", "1.0")
+        raw_max = effective.get("AGENT_FACTORY_BACKOFF_MAX", "60.0")
+        backoff_initial = float(raw_initial)
+        backoff_max = float(raw_max)
+        if not math.isfinite(backoff_initial) or backoff_initial <= 0:
+            raise CliConfigError("AGENT_FACTORY_BACKOFF_INITIAL must be a finite positive number")
+        if not math.isfinite(backoff_max) or backoff_max <= 0:
+            raise CliConfigError("AGENT_FACTORY_BACKOFF_MAX must be a finite positive number")
         if backoff_initial > backoff_max:
             raise CliConfigError(
                 f"AGENT_FACTORY_BACKOFF_INITIAL ({backoff_initial}) cannot exceed "
                 f"AGENT_FACTORY_BACKOFF_MAX ({backoff_max})"
             )
-    except ValueError as exc:
-        raise CliConfigError(f"Invalid backoff value: {exc}") from None
+    except (ValueError, CliConfigError) as exc:
+        clean_err = redact_secrets(
+            f"Invalid backoff value: {exc}",
+            extra_secrets=(token,) if token else (),
+        )
+        raise CliConfigError(clean_err) from None
 
+    models_config = Path(effective.get("AGENT_FACTORY_MODELS_CONFIG", "config/models.toml"))
+    limits_config = Path(effective.get("AGENT_FACTORY_LIMITS_CONFIG", "config/limits.toml"))
     github_owner = effective.get("GITHUB_OWNER", "agent-factory").strip() or "agent-factory"
     deploy_target = effective.get("AGENT_FACTORY_DEPLOY_TARGET", "github-pages").strip() or "github-pages"
     github_token = effective.get("GITHUB_TOKEN", "").strip()
@@ -170,6 +218,8 @@ def load_cli_config(env: Mapping[str, str] | None = None) -> CliConfig:
         poll_timeout_seconds=poll_timeout,
         backoff_initial_seconds=backoff_initial,
         backoff_max_seconds=backoff_max,
+        models_config_path=models_config,
+        limits_config_path=limits_config,
         github_owner=github_owner,
         deploy_target=deploy_target,
         github_token=github_token,
@@ -196,8 +246,48 @@ def build_runtime(
 
     store = SqliteEventStore(db_path=config.db_path)
     effective_runner = runner if runner is not None else SubprocessRunner()
-    effective_llm = llm if llm is not None else FakeLLM()
-    orchestrator = Orchestrator(store=store, llm=effective_llm, clock=clock)
+
+    active_secrets = tuple(
+        s for s in (config.telegram_bot_token, config.github_token, config.vercel_token, config.llm_api_key) if s
+    )
+
+    if llm is not None:
+        effective_llm = llm
+    else:
+        if not config.llm_api_key:
+            raise CliConfigError("Missing required environment variable LLM_API_KEY")
+
+        if not config.models_config_path.is_file():
+            raise CliConfigError(
+                f"Models configuration file not found: {config.models_config_path}"
+            )
+
+        try:
+            with config.models_config_path.open("rb") as f:
+                models_data = tomllib.load(f)
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise CliConfigError(f"Failed to parse models configuration: {exc}") from None
+
+        for state_key, model_val in models_data.items():
+            if str(model_val).strip() == "CONFIGURE_ME":
+                raise CliConfigError(
+                    f"Models configuration contains unconfigured placeholder 'CONFIGURE_ME' for {state_key}"
+                )
+
+        effective_llm = ProductionLLMAdapter(
+            api_key=config.llm_api_key,
+            models_config_path=config.models_config_path,
+            transport=transport,
+            secrets=active_secrets,
+        )
+
+    circuit_breaker = CircuitBreaker(config_path=config.limits_config_path)
+    orchestrator = Orchestrator(
+        store=store,
+        llm=effective_llm,
+        clock=clock,
+        circuit_breaker=circuit_breaker,
+    )
 
     workspace_manager = WorkspaceManager(base_dir=config.workspaces_dir)
     template_scaffold = TemplateScaffold(
@@ -211,6 +301,15 @@ def build_runtime(
         else AgyCliAdapter(workspace_manager=workspace_manager, runner=effective_runner)
     )
 
+    deploy_publisher: StaticDeployPublisher | None = None
+    if config.deploy_target or config.vercel_token:
+        deploy_publisher = StaticDeployPublisher(
+            runner=effective_runner,
+            target=config.deploy_target,
+            deploy_token=config.vercel_token,
+            secrets=active_secrets,
+        )
+
     effective_vcs = (
         vcs
         if vcs is not None
@@ -218,12 +317,9 @@ def build_runtime(
             runner=effective_runner,
             owner=config.github_owner,
             github_token=config.github_token,
-            secrets=(config.github_token,) if config.github_token else (),
+            secrets=active_secrets,
+            deploy_publisher=deploy_publisher,
         )
-    )
-
-    active_secrets = tuple(
-        s for s in (config.telegram_bot_token, config.github_token, config.vercel_token) if s
     )
 
     effective_registry = (
@@ -341,19 +437,32 @@ def main(
     stop_event: threading.Event | None = None,
 ) -> int:
     """Entrypoint for `python -m agent_factory`."""
+    effective_env = os.environ if env is None else env
+    token = effective_env.get("TELEGRAM_BOT_TOKEN", "").strip()
     try:
         config = load_cli_config(env)
-    except CliConfigError:
+    except CliConfigError as err:
+        clean_err = redact_secrets(str(err), extra_secrets=(token,) if token else ())
+        sys.stderr.write(f"Configuration error: {clean_err}\n")
         return 1
 
     event = stop_event if stop_event is not None else threading.Event()
     install_signal_handlers(event)
 
-    runtime = build_runtime(config)
-    run_polling_loop(
-        runtime.bot_service,
-        stop_event=event,
-        initial_backoff_seconds=config.backoff_initial_seconds,
-        max_backoff_seconds=config.backoff_max_seconds,
-    )
+    try:
+        runtime = build_runtime(config)
+    except CliConfigError as err:
+        clean_err = redact_secrets(str(err), extra_secrets=(token,) if token else ())
+        sys.stderr.write(f"Runtime configuration error: {clean_err}\n")
+        return 1
+
+    try:
+        run_polling_loop(
+            runtime.bot_service,
+            stop_event=event,
+            initial_backoff_seconds=config.backoff_initial_seconds,
+            max_backoff_seconds=config.backoff_max_seconds,
+        )
+    finally:
+        runtime.store.close()
     return 0

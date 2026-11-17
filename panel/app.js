@@ -45,8 +45,14 @@
     if (!trimmed) {
       return null;
     }
+    if (!/^https?:\/\//i.test(trimmed)) {
+      return null;
+    }
     try {
-      var parsed = new URL(trimmed, "https://agent-factory.invalid");
+      var parsed = new URL(trimmed);
+      if (parsed.username || parsed.password) {
+        return null;
+      }
       if (parsed.protocol === "https:" || parsed.protocol === "http:") {
         return redactDisplayText(trimmed);
       }
@@ -372,6 +378,12 @@
       var failureHtml = detail.failure_reason
         ? '<div class="alert alert-error"><strong>Causa:</strong> ' + escapeHtml(detail.failure_reason) + "</div>"
         : "";
+      var reportCauseHtml = (detail.build_report && detail.build_report.failure_cause)
+        ? '<div class="alert alert-warning"><strong>Causa informe build:</strong> ' + escapeHtml(detail.build_report.failure_cause) + "</div>"
+        : "";
+      var promptHtml = detail.project_prompt
+        ? '<h4 class="section-title">Prompt Maestro (PROJECT_PROMPT.md)</h4><pre class="prompt-box"><code>' + escapeHtml(detail.project_prompt) + "</code></pre>"
+        : "";
       var eventsHtml = detail.events.length
         ? detail.events.map(function (ev) {
             return (
@@ -398,6 +410,8 @@
         "</div>" +
         '<div class="links-row">' + repoLink + deployLink + "</div>" +
         failureHtml +
+        reportCauseHtml +
+        promptHtml +
         '<h4 class="section-title">Historial de eventos sanitizados</h4>' +
         '<ul class="events-list">' + eventsHtml + "</ul>";
     }

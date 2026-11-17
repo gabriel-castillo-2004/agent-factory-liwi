@@ -61,18 +61,26 @@ class GitRegistryPublisher:
     def _run_git(self, args: Sequence[str], cwd: Path) -> CommandResult:
         """Run a git command via self.runner and redact secrets if execution fails."""
         cmd = ["git"] + list(args)
+        clean_err: str | None = None
+        fail_prefix: str = ""
+        res = None
         try:
             res = self.runner.run(cmd, cwd=cwd, env=self.env)
         except (OSError, RuntimeError, ValueError) as exc:
             clean_err = redact_secrets(str(exc), extra_secrets=self.secrets, env=self.env)
-            raise RegistryPublishError(f"Git execution failed: {clean_err}") from None
+            fail_prefix = "Git execution failed: "
+        else:
+            if res.exit_code != 0:
+                err_text = res.stderr or res.stdout or f"exit code {res.exit_code}"
+                clean_err = redact_secrets(err_text, extra_secrets=self.secrets, env=self.env)
+                fail_prefix = f"Git command failed ({' '.join(args[:2])}): "
 
-        if res.exit_code != 0:
-            err_text = res.stderr or res.stdout or f"exit code {res.exit_code}"
-            clean_err = redact_secrets(err_text, extra_secrets=self.secrets, env=self.env)
-            raise RegistryPublishError(
-                f"Git command failed ({' '.join(args[:2])}): {clean_err}"
-            )
+        if clean_err is not None:
+            err_obj = RegistryPublishError(f"{fail_prefix}{clean_err}")
+            err_obj.__cause__ = None
+            err_obj.__context__ = None
+            raise err_obj
+
         return res
 
     def _resolve_work_dir(self) -> Path:
@@ -165,6 +173,9 @@ class GitRegistryPublisher:
                                         except (json.JSONDecodeError, OSError):
                                             pass
                                     projs = idx_data.setdefault("projects", {})
+                                    if not isinstance(projs, dict):
+                                        projs = {}
+                                        idx_data["projects"] = projs
                                     for fname, content in cached_projects.items():
                                         pid = fname.removesuffix(".json")
                                         target_file = local_projects_dir / fname

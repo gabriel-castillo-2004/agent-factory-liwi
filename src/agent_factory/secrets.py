@@ -25,7 +25,7 @@ def redact_secrets(
     # 1. Redact via URL, header, and token prefix patterns
     # Telegram bot API URL pattern: https://api.telegram.org/bot<token>/...
     result = re.sub(
-        r"(https?://api\.telegram\.org/bot)[^/\s]+",
+        r"(https?://api\.telegram\.org/bot)[^/\s\"']+",
         r"\1[REDACTED]",
         result,
     )
@@ -39,7 +39,7 @@ def redact_secrets(
 
     # HTTP basic auth / userinfo credentials in URL authority only (never cross '/' into path)
     result = re.sub(
-        r"(https?://[^/\s:@]+:)[^/\s@]+(@)",
+        r"(https?://[^/\s:@\"']+:)[^/\s@\"']+(@)",
         r"\1[REDACTED]\2",
         result,
     )

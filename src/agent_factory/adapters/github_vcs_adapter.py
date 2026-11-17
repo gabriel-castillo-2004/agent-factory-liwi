@@ -82,7 +82,10 @@ class GitHubVCSAdapter(VCS):
         )
         self.default_branch = default_branch
         self.github_token = github_token
-        self.secrets: tuple[str, ...] = tuple(secrets)
+        combined_secrets = list(secrets)
+        if github_token and github_token not in combined_secrets:
+            combined_secrets.append(github_token)
+        self.secrets: tuple[str, ...] = tuple(combined_secrets)
         self.deploy_publisher = deploy_publisher
         self.timeout_seconds = timeout_seconds
 
@@ -127,18 +130,24 @@ class GitHubVCSAdapter(VCS):
 
         clean_env = self.build_clean_env()
         cmd = ["git", "push", "-u", "origin", valid_branch]
+        clean_err: str | None = None
+        res = None
         try:
             res = self.runner.run(cmd, cwd=workspace_dir, env=clean_env)
         except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
             clean_err = redact_secrets(str(exc), extra_secrets=self.secrets)
-            raise VcsError(f"Git push failed: {clean_err}") from None
+        else:
+            if res.exit_code != 0:
+                err = res.stderr or res.stdout or f"exit code {res.exit_code}"
+                clean_err = redact_secrets(err, extra_secrets=self.secrets)
 
-        if res.exit_code != 0:
-            err = res.stderr or res.stdout or f"exit code {res.exit_code}"
-            clean_err = redact_secrets(err, extra_secrets=self.secrets)
-            raise VcsError(f"Git push failed: {clean_err}")
+        if clean_err is not None:
+            err_obj = VcsError(f"Git push failed: {clean_err}")
+            err_obj.__cause__ = None
+            err_obj.__context__ = None
+            raise err_obj
 
-        return res.stdout.strip() or valid_branch
+        return res.stdout.strip() if res and res.stdout.strip() else valid_branch
 
     def get_ci_result(
         self,
@@ -148,23 +157,50 @@ class GitHubVCSAdapter(VCS):
         """Query remote CI workflow result for project_id and branch via Runner."""
         validate_project_id(project_id)
         valid_branch = self._validate_branch(branch)
+        repo_target = f"{self.owner}/{project_id}" if self.owner else project_id
 
         clean_env = self.build_clean_env()
-        cmd = ["gh", "run", "view", "--branch", valid_branch, "--json", "status,conclusion"]
+        cmd = [
+            "gh",
+            "run",
+            "list",
+            "--repo",
+            repo_target,
+            "--branch",
+            valid_branch,
+            "--limit",
+            "1",
+            "--json",
+            "status,conclusion",
+        ]
+        clean_err: str | None = None
+        res = None
         try:
             res = self.runner.run(cmd, cwd=Path.cwd(), env=clean_env)
         except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
             clean_err = redact_secrets(str(exc), extra_secrets=self.secrets)
-            raise VcsError(f"CI query failed: {clean_err}") from None
+        else:
+            if res.exit_code != 0:
+                err = res.stderr or res.stdout or f"exit code {res.exit_code}"
+                clean_err = redact_secrets(err, extra_secrets=self.secrets)
 
-        if res.exit_code != 0:
-            err = res.stderr or res.stdout or f"exit code {res.exit_code}"
-            clean_err = redact_secrets(err, extra_secrets=self.secrets)
-            raise VcsError(f"CI query failed: {clean_err}")
+        if clean_err is not None:
+            err_obj = VcsError(f"CI query failed: {clean_err}")
+            err_obj.__cause__ = None
+            err_obj.__context__ = None
+            raise err_obj
 
-        raw_output = res.stdout.strip()
+        raw_output = res.stdout.strip() if res else ""
         try:
             parsed = json.loads(raw_output)
+            if isinstance(parsed, list):
+                if not parsed:
+                    return CIRunResult(
+                        passed=False,
+                        summary="No CI runs found",
+                        failed_checks=["ci"],
+                    )
+                parsed = parsed[0]
             if isinstance(parsed, dict):
                 if "passed" in parsed:
                     return CIRunResult(
@@ -181,11 +217,10 @@ class GitHubVCSAdapter(VCS):
         except json.JSONDecodeError:
             pass
 
-        passed = "pass" in raw_output.lower() and "fail" not in raw_output.lower()
         return CIRunResult(
-            passed=passed,
+            passed=False,
             summary=raw_output[:200],
-            failed_checks=[] if passed else ["ci"],
+            failed_checks=["ci"],
         )
 
     def merge_and_deploy(
@@ -196,19 +231,26 @@ class GitHubVCSAdapter(VCS):
         """Merge verified branch and deploy static artifact, returning (repo_url, deploy_url)."""
         validate_project_id(project_id)
         valid_branch = self._validate_branch(branch)
+        repo_target = f"{self.owner}/{project_id}" if self.owner else project_id
 
         clean_env = self.build_clean_env()
-        cmd = ["gh", "pr", "merge", valid_branch, "--merge", "--auto"]
+        cmd = ["gh", "pr", "merge", valid_branch, "--repo", repo_target, "--merge", "--auto"]
+        clean_err: str | None = None
+        res = None
         try:
             res = self.runner.run(cmd, cwd=Path.cwd(), env=clean_env)
         except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
             clean_err = redact_secrets(str(exc), extra_secrets=self.secrets)
-            raise VcsError(f"Merge failed: {clean_err}") from None
+        else:
+            if res.exit_code != 0:
+                err = res.stderr or res.stdout or f"exit code {res.exit_code}"
+                clean_err = redact_secrets(err, extra_secrets=self.secrets)
 
-        if res.exit_code != 0:
-            err = res.stderr or res.stdout or f"exit code {res.exit_code}"
-            clean_err = redact_secrets(err, extra_secrets=self.secrets)
-            raise VcsError(f"Merge failed: {clean_err}")
+        if clean_err is not None:
+            err_obj = VcsError(f"Merge failed: {clean_err}")
+            err_obj.__cause__ = None
+            err_obj.__context__ = None
+            raise err_obj
 
         repo_url = (
             f"{self.repo_base_url}/{self.owner}/{project_id}"

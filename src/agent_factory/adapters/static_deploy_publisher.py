@@ -47,6 +47,17 @@ FORBIDDEN_ENV_SUBSTRINGS: tuple[str, ...] = (
 )
 
 
+def _sanitize_data(data: Any, secrets: Sequence[str]) -> Any:
+    """Recursively scrub secrets from nested dicts, lists, and strings without corrupting JSON."""
+    if isinstance(data, str):
+        return redact_secrets(data, extra_secrets=secrets)
+    if isinstance(data, dict):
+        return {k: _sanitize_data(v, secrets) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_sanitize_data(item, secrets) for item in data]
+    return data
+
+
 class StaticDeployError(RuntimeError):
     """Raised when static deployment fails, with sensitive tokens redacted (INV-07)."""
 
@@ -74,7 +85,10 @@ class StaticDeployPublisher:
         self.deploy_base_url = deploy_base_url.rstrip("/")
         self.branch = branch
         self.deploy_token = deploy_token
-        self.secrets: tuple[str, ...] = tuple(secrets)
+        combined_secrets = list(secrets)
+        if deploy_token and deploy_token not in combined_secrets:
+            combined_secrets.append(deploy_token)
+        self.secrets: tuple[str, ...] = tuple(combined_secrets)
         self.timeout_seconds = timeout_seconds
 
     def build_clean_env(self, host_env: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -128,9 +142,7 @@ class StaticDeployPublisher:
             "build_report": build_report.model_dump() if build_report else None,
             "project_prompt": project_prompt,
         }
-        serialized = json.dumps(detail)
-        redacted = redact_secrets(serialized, extra_secrets=self.secrets)
-        return json.loads(redacted)
+        return _sanitize_data(detail, self.secrets)
 
     def export_panel_bundle(
         self,
@@ -156,7 +168,7 @@ class StaticDeployPublisher:
             state_str = s.state.value if hasattr(s.state, "value") else str(s.state)
             repo_url = s.links.repo if s.links else None
             deploy_url = s.links.deploy if s.links else None
-            reg_projects[s.project_id] = {
+            raw_entry = {
                 "project_id": s.project_id,
                 "name": s.name,
                 "objective": s.objective,
@@ -167,6 +179,7 @@ class StaticDeployPublisher:
                 "deploy_url": deploy_url,
                 "updated_at": s.updated_at.isoformat() if s.updated_at else None,
             }
+            reg_projects[s.project_id] = _sanitize_data(raw_entry, self.secrets)
             evs = (events_by_project or {}).get(s.project_id, ())
             rep = (reports_by_project or {}).get(s.project_id)
             detail = self.build_sanitized_project_detail(s, events=evs, build_report=rep)
@@ -179,8 +192,9 @@ class StaticDeployPublisher:
             "updated_at": datetime.now(UTC).isoformat(),
             "projects": reg_projects,
         }
+        sanitized_reg_data = _sanitize_data(reg_data, self.secrets)
         (output_dir / "registry.json").write_text(
-            json.dumps(reg_data, indent=2, sort_keys=True), encoding="utf-8"
+            json.dumps(sanitized_reg_data, indent=2, sort_keys=True), encoding="utf-8"
         )
         return output_dir
 
@@ -193,21 +207,37 @@ class StaticDeployPublisher:
     ) -> str:
         """Validate project_id/source_dir and deploy static artifact via Runner, returning deploy URL."""
         validate_project_id(project_id)
-        if not source_dir.is_dir():
+        resolved_source = Path(source_dir).resolve()
+        if not resolved_source.is_dir():
             raise ValueError(f"Source directory {source_dir} does not exist")
 
-        effective_branch = branch or self.branch
+        chosen_branch = self.branch if branch is None else branch
+        effective_branch = chosen_branch.strip()
+        if (
+            not effective_branch
+            or effective_branch.startswith("-")
+            or any(ch.isspace() for ch in effective_branch)
+            or ".." in effective_branch
+            or effective_branch in {"main", "master", "refs/heads/main", "refs/heads/master"}
+        ):
+            raise ValueError(f"Invalid or protected branch: '{effective_branch}'")
+
         clean_env = self.build_clean_env()
-        cmd = ["gh", "pages", "deploy", str(source_dir), "--branch", effective_branch]
+        cmd = ["gh", "pages", "deploy", str(resolved_source), "--branch", effective_branch]
+        clean_err: str | None = None
         try:
-            res = self.runner.run(cmd, cwd=source_dir, env=clean_env)
+            res = self.runner.run(cmd, cwd=resolved_source, env=clean_env)
         except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
             clean_err = redact_secrets(str(exc), extra_secrets=self.secrets)
-            raise StaticDeployError(f"Static deploy failed: {clean_err}") from None
+        else:
+            if res.exit_code != 0:
+                err = res.stderr or res.stdout or f"exit code {res.exit_code}"
+                clean_err = redact_secrets(err, extra_secrets=self.secrets)
 
-        if res.exit_code != 0:
-            err = res.stderr or res.stdout or f"exit code {res.exit_code}"
-            clean_err = redact_secrets(err, extra_secrets=self.secrets)
-            raise StaticDeployError(f"Static deploy failed: {clean_err}")
+        if clean_err is not None:
+            err_obj = StaticDeployError(f"Static deploy failed: {clean_err}")
+            err_obj.__cause__ = None
+            err_obj.__context__ = None
+            raise err_obj
 
         return f"{self.deploy_base_url}/{project_id}"
