@@ -2,7 +2,7 @@
 
 import hashlib
 from collections.abc import Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from pydantic import BaseModel, Field
 
@@ -70,8 +70,16 @@ class WorkspaceManager:
         if not path_str:
             raise SandboxViolationError("Empty relative path is invalid")
 
+        if "\\" in str(relative_path):
+            raise SandboxViolationError(
+                f"Backslash in path rejected: {relative_path}"
+            )
+
+        win_path = PureWindowsPath(path_str)
         if (
-            path_str.startswith(("/", "\\"))
+            any(part == ".." for part in win_path.parts)
+            or win_path.is_absolute()
+            or path_str.startswith(("/", "\\"))
             or Path(relative_path).is_absolute()
             or (len(path_str) > 1 and path_str[1] == ":")
         ):
@@ -85,6 +93,8 @@ class WorkspaceManager:
                 f"Path '{relative_path}' resolves outside workspace '{ws_dir}': {candidate}"
             )
         return candidate
+
+    resolve_path = resolve_safe_path
 
     def write_file(self, project_id: str, relative_path: str | Path, content: str) -> Path:
         """Safely write content to relative_path inside workspaces/<project_id>/."""
