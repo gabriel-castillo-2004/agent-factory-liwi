@@ -14,6 +14,8 @@ RUNNER_CONFIG_FILENAMES: tuple[str, ...] = (
     "package.json",
     "vitest.config.ts",
     "playwright.config.ts",
+    "conftest.py",
+    "setup.cfg",
 )
 
 

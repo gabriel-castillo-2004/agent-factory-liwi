@@ -11,7 +11,7 @@ from agent_factory.domain.states import IllegalTransition, ProjectState
 from agent_factory.orchestrator import Orchestrator
 from agent_factory.ports.clock import Clock
 from agent_factory.ports.code_agent import CodeAgent, CodeAgentError, QuotaExhaustedError
-from agent_factory.ports.runner import Runner
+from agent_factory.ports.runner import CommandTimeoutError, Runner
 from agent_factory.ports.vcs import VCS
 from agent_factory.workspace import (
     SandboxViolationError,
@@ -136,46 +136,56 @@ class BuildWorker:
                 raise ValueError(f"No plan found for approved project '{project_id}'")
             job = self.queue.enqueue(project_id, plan)
 
-        # Pre-check template files for contamination
-        if template_files:
-            for k in template_files:
-                norm = k.replace("\\", "/")
-                if norm.startswith("src/") or norm == "src":
-                    raise SandboxViolationError(
-                        f"Production file '{k}' found in template files prior to test generation (INV-13)"
-                    )
-
-        ws_dir = self.workspace_manager.create_workspace(project_id, template_files=template_files)
-
-        # Check existing workspace src directory for contamination
-        src_dir = ws_dir / "src"
-        if src_dir.is_dir() and any(p.is_file() for p in src_dir.rglob("*")):
-            raise SandboxViolationError(
-                "Production code in src/ exists before test generation; potential test contamination (INV-13)"
-            )
-
         job.state = JobState.RUNNING
 
         # -------------------------------------------------------------
         # Step A: Test generation (blind to Plan and production code)
         # -------------------------------------------------------------
         if job.lock_snapshot is None:
-            # Check circuit breaker before invoking
-            status = self.orchestrator.record_state_call(project_id, ProjectState.BUILDING)
-            if status.state == ProjectState.FAILED:
+            # Check template files for contamination before creating workspace
+            if template_files:
+                for k in template_files:
+                    norm = k.replace("\\", "/")
+                    if norm.startswith("src/") or norm == "src":
+                        raise SandboxViolationError(
+                            f"Production file '{k}' found in template files prior to test generation (INV-13)"
+                        )
+
+            ws_dir = self.workspace_manager.create_workspace(
+                project_id, template_files=template_files
+            )
+
+            # Check existing workspace src directory for contamination on disk
+            src_dir = ws_dir / "src"
+            if src_dir.is_dir() and any(p.is_file() for p in src_dir.rglob("*")):
+                raise SandboxViolationError(
+                    "Production code in src/ exists before test generation; potential test contamination (INV-13)"
+                )
+
+            # Check circuit breaker limit before invoking
+            building_limit = (
+                self.orchestrator.circuit_breaker.get_limit(ProjectState.BUILDING) or 15
+            )
+            calls = self.orchestrator.circuit_breaker.get_calls(
+                project_id, ProjectState.BUILDING
+            )
+            if calls >= building_limit:
+                status = self.orchestrator.record_state_call(
+                    project_id, ProjectState.BUILDING
+                )
                 job.state = JobState.FAILED
                 report = BuildReport(
                     invocations=job.invocations_used,
                     test_results=job.test_results,
                     ci_rounds=job.ci_rounds_used,
-                    failure_cause=status.failure_reason,
+                    failure_cause=status.failure_reason
+                    or f"BUILDING invocation limit ({building_limit}) exceeded",
                 )
                 job.report = report
                 return report
 
             try:
                 self.code_agent.generate_tests(ws_dir, job.plan.acceptance_tests)
-                job.invocations_used += 1
             except QuotaExhaustedError as err:
                 job.state = JobState.PAUSED_QUOTA
                 job.pause_count += 1
@@ -189,6 +199,9 @@ class BuildWorker:
                 job.report = report
                 return report
             except CodeAgentError as err:
+                # Fatal code agent error: record the invocation in CircuitBreaker and AGENT_INVOKED before failing
+                self.orchestrator.record_state_call(project_id, ProjectState.BUILDING)
+                job.invocations_used += 1
                 self.orchestrator.store.append(
                     create_event(
                         project_id=project_id,
@@ -207,14 +220,35 @@ class BuildWorker:
                 job.report = report
                 return report
 
+            # Successful test generation: record call in CircuitBreaker and AGENT_INVOKED
+            status = self.orchestrator.record_state_call(
+                project_id, ProjectState.BUILDING
+            )
+            job.invocations_used += 1
+
+            if status.state == ProjectState.FAILED:
+                job.state = JobState.FAILED
+                report = BuildReport(
+                    invocations=job.invocations_used,
+                    test_results=job.test_results,
+                    ci_rounds=job.ci_rounds_used,
+                    failure_cause=status.failure_reason,
+                )
+                job.report = report
+                return report
+
             tests_dir = ws_dir / "tests"
-            has_tests = tests_dir.is_dir() and any(p.is_file() for p in tests_dir.rglob("*"))
+            has_tests = tests_dir.is_dir() and any(
+                p.is_file() for p in tests_dir.rglob("*")
+            )
             if not has_tests:
                 self.orchestrator.store.append(
                     create_event(
                         project_id=project_id,
                         event_type=EventType.PROJECT_FAILED,
-                        payload={"reason": "Test generation produced zero test files in tests/ (INV-13)"},
+                        payload={
+                            "reason": "Test generation produced zero test files in tests/ (INV-13)"
+                        },
                         at=self.orchestrator._now(),
                     )
                 )
@@ -229,16 +263,27 @@ class BuildWorker:
                 return report
 
             job.lock_snapshot = compute_test_lock(ws_dir)
+        else:
+            ws_dir = self.workspace_manager.create_workspace(
+                project_id, template_files=None
+            )
 
         # -------------------------------------------------------------
         # Step B: Local loop (write -> test -> fix -> verify CI)
         # -------------------------------------------------------------
-        building_limit = self.orchestrator.circuit_breaker.get_limit(ProjectState.BUILDING) or 15
+        building_limit = (
+            self.orchestrator.circuit_breaker.get_limit(ProjectState.BUILDING) or 15
+        )
 
         while True:
-            # Check invocation limit
-            if job.invocations_used >= building_limit:
-                status = self.orchestrator.record_state_call(project_id, ProjectState.BUILDING)
+            # Check invocation limit against CircuitBreaker
+            calls = self.orchestrator.circuit_breaker.get_calls(
+                project_id, ProjectState.BUILDING
+            )
+            if calls >= building_limit:
+                status = self.orchestrator.record_state_call(
+                    project_id, ProjectState.BUILDING
+                )
                 job.state = JobState.FAILED
                 report = BuildReport(
                     invocations=job.invocations_used,
@@ -272,6 +317,9 @@ class BuildWorker:
                 job.report = report
                 return report
             except CodeAgentError as err:
+                # Fatal code agent error: record the invocation in CircuitBreaker and AGENT_INVOKED before failing
+                self.orchestrator.record_state_call(project_id, ProjectState.BUILDING)
+                job.invocations_used += 1
                 self.orchestrator.store.append(
                     create_event(
                         project_id=project_id,
@@ -291,7 +339,9 @@ class BuildWorker:
                 return report
 
             # Record successful agent invocation
-            status = self.orchestrator.record_state_call(project_id, ProjectState.BUILDING)
+            status = self.orchestrator.record_state_call(
+                project_id, ProjectState.BUILDING
+            )
             job.invocations_used += 1
 
             if status.state == ProjectState.FAILED:
@@ -314,11 +364,30 @@ class BuildWorker:
                 continue
 
             # Run local tests
-            runner_result = self.runner.run(
-                command=["pytest", "-q"],
-                cwd=ws_dir,
-                timeout_seconds=30.0,
-            )
+            try:
+                runner_result = self.runner.run(
+                    command=["pytest", "-q"],
+                    cwd=ws_dir,
+                    timeout_seconds=30.0,
+                )
+            except (CommandTimeoutError, OSError, RuntimeError, ValueError) as err:
+                self.orchestrator.store.append(
+                    create_event(
+                        project_id=project_id,
+                        event_type=EventType.PROJECT_FAILED,
+                        payload={"reason": str(err)},
+                        at=self.orchestrator._now(),
+                    )
+                )
+                job.state = JobState.FAILED
+                report = BuildReport(
+                    invocations=job.invocations_used,
+                    test_results=job.test_results,
+                    ci_rounds=job.ci_rounds_used,
+                    failure_cause=str(err),
+                )
+                job.report = report
+                return report
 
             # Update test results
             if runner_result.test_results:
@@ -335,12 +404,17 @@ class BuildWorker:
                     )
                 )
 
+            required_test_ids = [at.id for at in job.plan.acceptance_tests]
+            has_all_plan_tests = bool(runner_result.test_results) and all(
+                runner_result.test_results.get(tid) is True for tid in required_test_ids
+            )
+            all_reported_tests_passed = bool(runner_result.test_results) and all(
+                runner_result.test_results.values()
+            )
             local_tests_passed = (
                 runner_result.exit_code == 0
-                and (
-                    not runner_result.test_results
-                    or all(runner_result.test_results.values())
-                )
+                and has_all_plan_tests
+                and all_reported_tests_passed
             )
 
             if not local_tests_passed:
@@ -350,27 +424,7 @@ class BuildWorker:
                 job.last_failure_output = output
                 continue
 
-            # Local tests passed! Perform CI verification round
-            if job.ci_rounds_used >= self.max_ci_rounds:
-                self.orchestrator.store.append(
-                    create_event(
-                        project_id=project_id,
-                        event_type=EventType.PROJECT_FAILED,
-                        payload={"reason": f"Maximum CI rounds ({self.max_ci_rounds}) exceeded"},
-                        at=self.orchestrator._now(),
-                    )
-                )
-                job.state = JobState.FAILED
-                report = BuildReport(
-                    invocations=job.invocations_used,
-                    test_results=job.test_results,
-                    ci_rounds=job.ci_rounds_used,
-                    failure_cause=f"Maximum CI rounds ({self.max_ci_rounds}) exceeded",
-                )
-                job.report = report
-                return report
-
-            # Transition to VERIFYING
+            # Local tests passed! Transition to VERIFYING for CI verification
             self.orchestrator.store.append(
                 create_event(
                     project_id=project_id,
@@ -383,23 +437,68 @@ class BuildWorker:
                 )
             )
 
-            # Push branch
-            self.vcs.push_branch(project_id, ws_dir, branch="work")
+            try:
+                # Push branch
+                self.vcs.push_branch(project_id, ws_dir, branch="work")
 
-            # Get CI result
-            ci_result = self.vcs.get_ci_result(project_id, branch="work")
+                # Get CI result
+                ci_result = self.vcs.get_ci_result(project_id, branch="work")
+            except (OSError, RuntimeError, ValueError) as err:
+                self.orchestrator.store.append(
+                    create_event(
+                        project_id=project_id,
+                        event_type=EventType.PROJECT_FAILED,
+                        payload={"reason": str(err)},
+                        at=self.orchestrator._now(),
+                    )
+                )
+                job.state = JobState.FAILED
+                report = BuildReport(
+                    invocations=job.invocations_used,
+                    test_results=job.test_results,
+                    ci_rounds=job.ci_rounds_used,
+                    failure_cause=str(err),
+                )
+                job.report = report
+                return report
+
             job.ci_rounds_used += 1
             self.orchestrator.store.append(
                 create_event(
                     project_id=project_id,
                     event_type=EventType.CI_ROUND_COMPLETED,
-                    payload={"ci_rounds": job.ci_rounds_used, "summary": ci_result.summary},
+                    payload={
+                        "ci_rounds": job.ci_rounds_used,
+                        "summary": ci_result.summary,
+                    },
                     at=self.orchestrator._now(),
                 )
             )
 
             if ci_result.passed:
-                repo_url, deploy_url = self.vcs.merge_and_deploy(project_id, branch="work")
+                try:
+                    repo_url, deploy_url = self.vcs.merge_and_deploy(
+                        project_id, branch="work"
+                    )
+                except (OSError, RuntimeError, ValueError) as err:
+                    self.orchestrator.store.append(
+                        create_event(
+                            project_id=project_id,
+                            event_type=EventType.PROJECT_FAILED,
+                            payload={"reason": str(err)},
+                            at=self.orchestrator._now(),
+                        )
+                    )
+                    job.state = JobState.FAILED
+                    report = BuildReport(
+                        invocations=job.invocations_used,
+                        test_results=job.test_results,
+                        ci_rounds=job.ci_rounds_used,
+                        failure_cause=str(err),
+                    )
+                    job.report = report
+                    return report
+
                 self.orchestrator.store.append(
                     create_event(
                         project_id=project_id,

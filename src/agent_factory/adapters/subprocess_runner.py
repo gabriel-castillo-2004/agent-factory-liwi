@@ -22,6 +22,9 @@ class SubprocessRunner(Runner):
         timeout_seconds: float | None = None,
     ) -> CommandResult:
         """Execute command in cwd with timeout, killing parent and all child processes on timeout."""
+        if isinstance(command, (str, bytes)) or not command:
+            raise ValueError("command must be a non-empty sequence of strings")
+
         timeout = (
             timeout_seconds if timeout_seconds is not None else self.default_timeout_seconds
         )
