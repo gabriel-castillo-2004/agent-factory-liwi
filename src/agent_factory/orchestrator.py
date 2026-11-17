@@ -395,6 +395,14 @@ class Orchestrator:
         )
         return self.get_status(project_id)
 
+    def request_adjustment(
+        self,
+        project_id: str,
+        reason: str = "",
+    ) -> ProjectStatus:
+        """Transition a project in WAITING_APPROVAL back to INTERVIEW for plan adjustment (INV-04, INV-05)."""
+        raise NotImplementedError
+
     def record_state_call(
         self,
         project_id: str,

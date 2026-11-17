@@ -1,6 +1,6 @@
 """Local build worker, job queue, and write-test-fix loop (Section 7 Phase 2, INV-09, INV-13, INV-15, INV-17)."""
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 
 from pydantic import BaseModel, Field
@@ -11,6 +11,7 @@ from agent_factory.domain.states import IllegalTransition, ProjectState
 from agent_factory.orchestrator import Orchestrator
 from agent_factory.ports.clock import Clock
 from agent_factory.ports.code_agent import CodeAgent, CodeAgentError, QuotaExhaustedError
+from agent_factory.ports.publisher import RegistryPublisher
 from agent_factory.ports.runner import CommandTimeoutError, Runner
 from agent_factory.ports.vcs import VCS
 from agent_factory.workspace import (
@@ -89,6 +90,8 @@ class BuildWorker:
         queue: LocalJobQueue | None = None,
         clock: Clock | None = None,
         max_ci_rounds: int | None = None,
+        registry_publisher: RegistryPublisher | None = None,
+        secrets_to_redact: Sequence[str] = (),
     ) -> None:
         self.orchestrator = orchestrator
         self.workspace_manager = workspace_manager
@@ -101,6 +104,8 @@ class BuildWorker:
             self.max_ci_rounds = max_ci_rounds
         else:
             self.max_ci_rounds = self.orchestrator.circuit_breaker._limits.get("ci_rounds", 3)
+        self.registry_publisher = registry_publisher
+        self.secrets_to_redact: tuple[str, ...] = tuple(secrets_to_redact)
 
     def enqueue_approved_project(
         self,
