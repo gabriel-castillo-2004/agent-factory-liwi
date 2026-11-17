@@ -88,6 +88,7 @@ class GitHubVCSAdapter(VCS):
         self.secrets: tuple[str, ...] = tuple(combined_secrets)
         self.deploy_publisher = deploy_publisher
         self.timeout_seconds = timeout_seconds
+        self._last_workspace_dir: dict[str, Path] = {}
 
     def build_clean_env(self, host_env: Mapping[str, str] | None = None) -> dict[str, str]:
         """Build sanitized subprocess env keeping system vars and stripping unrelated secrets (INV-19)."""
@@ -128,6 +129,7 @@ class GitHubVCSAdapter(VCS):
         if not workspace_dir.is_dir():
             raise ValueError(f"Workspace directory {workspace_dir} does not exist")
 
+        self._last_workspace_dir[project_id] = workspace_dir
         clean_env = self.build_clean_env()
         cmd = ["git", "push", "-u", "origin", valid_branch]
         clean_err: str | None = None
@@ -257,5 +259,13 @@ class GitHubVCSAdapter(VCS):
             if self.owner
             else f"{self.repo_base_url}/{project_id}"
         )
-        deploy_url = f"{self.deploy_base_url}/{project_id}"
+        if self.deploy_publisher is not None:
+            ws_dir = self._last_workspace_dir.get(
+                project_id, Path("workspaces") / project_id
+            )
+            deploy_url = self.deploy_publisher.deploy_site(
+                project_id, ws_dir, branch=valid_branch
+            )
+        else:
+            deploy_url = f"{self.deploy_base_url}/{project_id}"
         return (repo_url, deploy_url)

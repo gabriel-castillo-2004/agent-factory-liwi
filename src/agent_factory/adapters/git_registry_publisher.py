@@ -6,8 +6,10 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
+from agent_factory.domain.events import Event
 from agent_factory.domain.models import ProjectStatus, validate_project_id
 from agent_factory.ports.publisher import RegistryEntry, RegistryPublishError
 from agent_factory.ports.runner import CommandResult, Runner
@@ -82,6 +84,16 @@ class GitRegistryPublisher:
             raise err_obj
 
         return res
+
+    def _scrub_value(self, value: Any) -> Any:
+        """Recursively scrub secrets from strings, dictionaries, and sequences."""
+        if isinstance(value, str):
+            return redact_secrets(value, extra_secrets=self.secrets, env=self.env)
+        if isinstance(value, dict):
+            return {k: self._scrub_value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._scrub_value(x) for x in value]
+        return value
 
     def _resolve_work_dir(self) -> Path:
         """Return the effective working directory for the registry repository."""
@@ -233,7 +245,11 @@ class GitRegistryPublisher:
             if not remote_sha or local_sha != remote_sha:
                 self._run_git(["push", "-u", self.remote, branch], cwd=work_dir)
 
-    def publish_project(self, status: ProjectStatus) -> RegistryEntry:
+    def publish_project(
+        self,
+        status: ProjectStatus,
+        events: Sequence[Event] = (),
+    ) -> RegistryEntry:
         """Publish projects/<project_id>.json and update registry.json on self.branch without touching main."""
         branch = self._validate_branch()
         validate_project_id(status.project_id)
@@ -242,14 +258,19 @@ class GitRegistryPublisher:
 
         repo_url = status.links.repo if status.links else None
         deploy_url = status.links.deploy if status.links else None
+        clean_name = self._scrub_value(status.name)
+        clean_objective = self._scrub_value(status.objective)
+        clean_repo_url = self._scrub_value(repo_url) if repo_url else None
+        clean_deploy_url = self._scrub_value(deploy_url) if deploy_url else None
+
         entry = RegistryEntry(
             project_id=status.project_id,
-            name=status.name,
-            objective=status.objective,
+            name=clean_name,
+            objective=clean_objective,
             state=status.state,
             progress_pct=status.progress_pct,
-            repo_url=repo_url,
-            deploy_url=deploy_url,
+            repo_url=clean_repo_url,
+            deploy_url=clean_deploy_url,
             plan_hash=status.plan_hash,
             updated_at=status.updated_at,
         )
@@ -269,15 +290,32 @@ class GitRegistryPublisher:
 
         projects_dict = index_data["projects"]
         if isinstance(projects_dict, dict):
-            projects_dict[status.project_id] = entry.model_dump(mode="json")
+            projects_dict[status.project_id] = self._scrub_value(entry.model_dump(mode="json"))
         now_ts = status.updated_at or datetime.now(UTC)
         index_data["updated_at"] = now_ts.isoformat()
-        reg_file.write_text(json.dumps(index_data, indent=2, default=str), encoding="utf-8")
+        clean_index_json = redact_secrets(
+            json.dumps(index_data, indent=2, default=str),
+            extra_secrets=self.secrets,
+            env=self.env,
+        )
+        reg_file.write_text(clean_index_json, encoding="utf-8")
 
         proj_dir = work_dir / "projects"
         proj_dir.mkdir(parents=True, exist_ok=True)
         proj_file = proj_dir / f"{status.project_id}.json"
-        proj_file.write_text(status.model_dump_json(indent=2), encoding="utf-8")
+
+        status_dict = status.model_dump(mode="json")
+        status_dict = self._scrub_value(status_dict)
+        if events:
+            events_data = [self._scrub_value(e.model_dump(mode="json")) for e in events]
+            status_dict["events"] = events_data
+
+        clean_proj_json = redact_secrets(
+            json.dumps(status_dict, indent=2, default=str),
+            extra_secrets=self.secrets,
+            env=self.env,
+        )
+        proj_file.write_text(clean_proj_json, encoding="utf-8")
 
         self._commit_and_push_if_needed(
             work_dir, branch, f"chore(registry): update {status.project_id}"

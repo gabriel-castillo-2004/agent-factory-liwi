@@ -1,10 +1,12 @@
 """Port definition for publishing ProjectStatus projections and registry index (INV-02, INV-11, INV-21)."""
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field, field_validator
 
+from agent_factory.domain.events import Event
 from agent_factory.domain.models import ProjectStatus, validate_project_id
 from agent_factory.domain.states import ProjectState
 
@@ -53,7 +55,11 @@ class StatusPublisher(Protocol):
 class RegistryPublisher(Protocol):
     """Protocol for publishing project metadata onto the isolated registry branch without modifying main (INV-21)."""
 
-    def publish_project(self, status: ProjectStatus) -> RegistryEntry:
+    def publish_project(
+        self,
+        status: ProjectStatus,
+        events: Sequence[Event] = (),
+    ) -> RegistryEntry:
         """Update per-project JSON and registry.json index on the registry branch."""
         raise NotImplementedError
 

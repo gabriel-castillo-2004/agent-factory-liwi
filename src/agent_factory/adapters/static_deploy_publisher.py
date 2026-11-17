@@ -213,17 +213,27 @@ class StaticDeployPublisher:
 
         chosen_branch = self.branch if branch is None else branch
         effective_branch = chosen_branch.strip()
+        branch_lower = effective_branch.lower()
         if (
             not effective_branch
             or effective_branch.startswith("-")
             or any(ch.isspace() for ch in effective_branch)
             or ".." in effective_branch
-            or effective_branch in {"main", "master", "refs/heads/main", "refs/heads/master"}
+            or ":" in effective_branch
+            or "\\" in effective_branch
+            or branch_lower in {"main", "master", "origin/main", "origin/master", "refs/heads/main", "refs/heads/master"}
+            or branch_lower.endswith(("/main", "/master"))
         ):
             raise ValueError(f"Invalid or protected branch: '{effective_branch}'")
 
         clean_env = self.build_clean_env()
-        cmd = ["gh", "pages", "deploy", str(resolved_source), "--branch", effective_branch]
+        target_lower = self.target.lower()
+        if target_lower == "vercel":
+            cmd = ["vercel", "deploy", str(resolved_source), "--yes"]
+            if self.deploy_token:
+                cmd.extend(["--token", self.deploy_token])
+        else:
+            cmd = ["gh", "pages", "deploy", str(resolved_source), "--branch", effective_branch]
         clean_err: str | None = None
         try:
             res = self.runner.run(cmd, cwd=resolved_source, env=clean_env)
@@ -240,4 +250,8 @@ class StaticDeployPublisher:
             err_obj.__context__ = None
             raise err_obj
 
-        return f"{self.deploy_base_url}/{project_id}"
+        if self.deploy_base_url:
+            return f"{self.deploy_base_url}/{project_id}"
+        if res and res.stdout.strip().startswith("http"):
+            return res.stdout.strip()
+        return f"https://{project_id}.pages.dev"

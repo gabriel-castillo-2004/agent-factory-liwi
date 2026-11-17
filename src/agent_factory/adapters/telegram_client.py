@@ -26,16 +26,20 @@ class UrllibHttpTransport:
         url: str,
         payload: Mapping[str, Any],
         timeout_seconds: float = 35.0,
+        headers: Mapping[str, str] | None = None,
     ) -> HttpResponse:
         """Execute outbound HTTPS POST using urllib.request."""
         data = json.dumps(payload).encode("utf-8")
+        req_headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        if headers:
+            req_headers.update(headers)
         req = urllib.request.Request(
             url,
             data=data,
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
+            headers=req_headers,
             method="POST",
         )
         try:
