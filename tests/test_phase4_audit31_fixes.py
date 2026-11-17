@@ -575,3 +575,205 @@ def test_git_registry_publisher_scrubs_secrets_in_registry_index_project_json_an
     assert len(proj1_data["events"]) == 2
     assert proj1_data["events"][0]["type"] == "PROJECT_CREATED"
     assert proj1_data["events"][1]["type"] == "PROJECT_FAILED"
+
+
+def test_git_registry_publisher_recovers_from_active_conflicted_rebase_and_wires_events_and_bot_registry(
+    tmp_path: Path,
+) -> None:
+    """H42-04 / M42-12 (INV-07, INV-11, INV-19, INV-21, INV-23): Recovers from active unresolved rebase conflict (REBASE_HEAD), passes BuildWorker store events to publish_project, and uses TelegramBotService.registry_publisher."""
+    bare_repo = _init_bare_repo(tmp_path)
+    runner = SubprocessRunner(default_timeout_seconds=15.0)
+    ts = datetime(2026, 11, 17, 12, 0, tzinfo=UTC)
+
+    wt_conflict = tmp_path / "wt_conflict"
+    wt_peer = tmp_path / "wt_peer"
+
+    pub_conflict = GitRegistryPublisher(
+        repo_path=bare_repo,
+        branch="registry",
+        push_to_remote=True,
+        runner=runner,
+        work_dir=wt_conflict,
+    )
+    pub_peer = GitRegistryPublisher(
+        repo_path=bare_repo,
+        branch="registry",
+        push_to_remote=True,
+        runner=runner,
+        work_dir=wt_peer,
+    )
+
+    pub_conflict.publish_project(
+        ProjectStatus(project_id="proj-base", name="Base", state=ProjectState.DELIVERED, progress_pct=100, updated_at=ts)
+    )
+    pub_peer.publish_project(
+        ProjectStatus(project_id="proj-peer-init", name="PeerInit", state=ProjectState.DELIVERED, progress_pct=100, updated_at=ts)
+    )
+
+    # Create diverged local commit + peer push on registry.json, then leave wt_conflict in active conflicted rebase
+    pub_conflict_offline = GitRegistryPublisher(
+        repo_path=bare_repo,
+        branch="registry",
+        push_to_remote=False,
+        runner=runner,
+        work_dir=wt_conflict,
+    )
+    pub_conflict_offline.publish_project(
+        ProjectStatus(project_id="proj-offline-cached", name="OfflineCached", state=ProjectState.DELIVERED, progress_pct=100, updated_at=ts)
+    )
+    pub_peer.publish_project(
+        ProjectStatus(project_id="proj-peer-next", name="PeerNext", state=ProjectState.DELIVERED, progress_pct=100, updated_at=ts)
+    )
+
+    subprocess.run(["git", "-C", str(wt_conflict), "fetch", "origin", "registry"], check=True, capture_output=True)
+    reb = subprocess.run(
+        ["git", "-C", str(wt_conflict), "rebase", "origin/registry"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert reb.returncode != 0
+    assert (wt_conflict / ".git" / "rebase-merge").exists() or (wt_conflict / ".git" / "rebase-apply").exists()
+    assert (wt_conflict / ".git" / "REBASE_HEAD").exists()
+
+    # publish_project MUST abort the stuck conflicted rebase first and recover cleanly
+    pub_conflict.publish_project(
+        ProjectStatus(project_id="proj-after-conflict", name="Recovered", state=ProjectState.DELIVERED, progress_pct=100, updated_at=ts)
+    )
+    assert not (wt_conflict / ".git" / "rebase-merge").exists()
+    assert not (wt_conflict / ".git" / "REBASE_HEAD").exists()
+
+    reg_after = json.loads(
+        subprocess.run(
+            ["git", "-C", str(bare_repo), "show", "refs/heads/registry:registry.json"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
+    assert "proj-after-conflict" in reg_after["projects"]
+    assert "proj-offline-cached" in reg_after["projects"]
+    assert "proj-peer-next" in reg_after["projects"]
+
+    # Part B: BuildWorker passes store events to publish_project AND TelegramBotService uses registry_publisher (kills M42-12)
+    class _RecordingRegistryWrapper:
+        def __init__(self, inner: GitRegistryPublisher) -> None:
+            self.inner = inner
+            self.publish_calls: list[tuple[ProjectStatus, list[Event]]] = []
+
+        def publish_project(self, status: ProjectStatus, events: Sequence[Event] = ()):
+            self.publish_calls.append((status, list(events)))
+            return self.inner.publish_project(status, events=events)
+
+        def load_index(self):
+            return self.inner.load_index()
+
+    event_secret = "TEST_H4204_EVT_SECRET_8899"
+    plan = Plan(
+        summary="Nota Secreta",
+        rationale="Static ES",
+        template_id="static-web",
+        files=[FileSpec(path="src/app.js", purpose="App", contract="export {};", depends_on=[])],
+        acceptance_tests=[AcceptanceTest(id="AT-01", description="OK", type=AcceptanceTestType.UNIT)],
+        risks=[],
+        deployment_target="github-pages",
+    )
+    llm = FakeLLM(
+        responses=[
+            {
+                "spec": {
+                    "objective": "App Nota",
+                    "users": ["Gabriel"],
+                    "features": ["f1"],
+                    "business_rules": ["r1"],
+                    "edge_cases": ["e1"],
+                    "constraints": ["c1"],
+                    "success_criteria": ["s1"],
+                    "assumptions": [],
+                },
+                "questions": [],
+            },
+            {"approach": "Static", "components": ["src/app.js"], "tradeoffs": []},
+            {"critique": ["c"], "robust_proposal": "r", "architectural_safeguards": []},
+            plan.model_dump(mode="json"),
+        ]
+    )
+
+    store = SqliteEventStore(db_path=tmp_path / "h4204.db")
+    try:
+        orch = Orchestrator(store=store, llm=llm)
+        rec_reg = _RecordingRegistryWrapper(
+            GitRegistryPublisher(
+                repo_path=bare_repo,
+                branch="registry",
+                push_to_remote=True,
+                runner=runner,
+                work_dir=tmp_path / "wt_worker",
+                secrets=(event_secret,),
+            )
+        )
+        worker = BuildWorker(
+            orchestrator=orch,
+            workspace_manager=WorkspaceManager(base_dir=tmp_path / "ws_worker"),
+            code_agent=FakeCodeAgent(
+                test_gen_steps=[{"tests/test_app.py": "def test_ok(): assert True\n"}],
+                impl_steps=[{"src/app.js": "export const ok = 1;\n"}],
+            ),
+            runner=FakeRunner(results=[CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True})]),
+            vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary=f"CI ok GITHUB_TOKEN={event_secret}")]),
+            queue=LocalJobQueue(),
+            registry_publisher=rec_reg,
+            secrets_to_redact=(event_secret,),
+        )
+        tg_client = FakeTelegramClient()
+        bot = TelegramBotService(
+            client=tg_client,
+            orchestrator=orch,
+            config=TelegramBotConfig(allowed_chat_ids=frozenset({1001}), allowed_user_ids=frozenset({2001})),
+            build_worker=worker,
+            registry_publisher=rec_reg,
+        )
+
+        # /new -> WAITING_APPROVAL: TelegramBotService MUST publish to registry_publisher BEFORE BuildWorker runs (kills M42-12)
+        new_out = bot.handle_update(
+            TelegramUpdate(update_id=101, chat_id=1001, user_id=2001, text="/new Nota App")
+        )
+        pid = new_out.project_id
+        assert pid == "nota-app"
+        assert len(rec_reg.publish_calls) >= 1
+        assert any(st.project_id == pid and st.state == ProjectState.WAITING_APPROVAL for st, _ in rec_reg.publish_calls)
+
+        waiting_hash = orch.get_status(pid).plan_hash
+        assert waiting_hash is not None
+        calls_before_approve = len(rec_reg.publish_calls)
+
+        # approve -> BuildWorker MUST pass store events to registry_publisher.publish_project(...)
+        bot.handle_update(
+            TelegramUpdate(
+                update_id=102,
+                chat_id=1001,
+                user_id=2001,
+                callback_query_id="cb-nota",
+                callback_data=f"approve:{pid}:{waiting_hash}",
+            )
+        )
+        assert len(rec_reg.publish_calls) > calls_before_approve
+        worker_status, worker_events = rec_reg.publish_calls[-1]
+        assert worker_status.state == ProjectState.DELIVERED
+        expected_events = store.get_events(pid)
+        assert len(worker_events) == len(expected_events)
+        assert len(worker_events) >= 4
+
+        proj_json_raw = subprocess.run(
+            ["git", "-C", str(bare_repo), "show", f"refs/heads/registry:projects/{pid}.json"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert event_secret not in proj_json_raw
+        proj_json = json.loads(proj_json_raw)
+        assert proj_json["state"] == "DELIVERED"
+        assert isinstance(proj_json.get("events"), list)
+        assert len(proj_json["events"]) == len(expected_events)
+    finally:
+        store.close()

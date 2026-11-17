@@ -1,6 +1,7 @@
 """Tests for fail-closed CLI configuration, dependency assembly, exponential backoff loop, and shutdown signals (AC-4.2, AC-4.3, INV-03, INV-19, INV-21, INV-23)."""
 
 import http.client
+import io
 import json
 import os
 import runpy
@@ -10,10 +11,12 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import pytest
 
@@ -23,18 +26,22 @@ from agent_factory.adapters.github_vcs_adapter import GitHubVCSAdapter
 from agent_factory.adapters.memory_store import MemoryEventStore
 from agent_factory.adapters.static_deploy_publisher import StaticDeployPublisher
 from agent_factory.adapters.telegram_client import UrllibHttpTransport
+from agent_factory.agents.pragmatist import PragmatistProposal
 from agent_factory.cli import (
     CliConfig,
     CliConfigError,
+    ProductionLLMAdapter,
     build_runtime,
     install_signal_handlers,
     load_cli_config,
     main,
     run_polling_loop,
 )
+from agent_factory.domain.models import Plan
 from agent_factory.domain.states import ProjectState
 from agent_factory.ports.llm import LLMError
 from agent_factory.ports.notifier import HttpResponse, TelegramTransportError, TelegramUpdate
+from agent_factory.ports.publisher import StatusPublisher
 
 
 class _FakeClock:
@@ -558,3 +565,299 @@ def test_cli_config_scrubs_exception_context_and_polling_loop_wakes_immediately_
     elapsed = time.monotonic() - start
     assert iterations == 1
     assert elapsed < 1.5
+
+
+def test_cli_production_llm_uses_models_section_state_routing_schema_and_runtime_wiring(
+    tmp_path: Path,
+) -> None:
+    """H42-01 / M42-10 (INV-01, INV-09, INV-11, INV-21, INV-23, MASTER_PROMPT §2): Reads [models] fast/strong by state (never hardcoded model-fast-01), forwards JSON schema guidance, rejects empty/corrupt TOML and non-JSON on schema, and wires Orchestrator.publisher + github_owner deploy_base_url."""
+    tg_tok = "TEST_H4201_TG_TOK_123"
+    llm_key = "TEST_H4201_LLM_KEY_456"
+
+    models_section_toml = tmp_path / "models_section.toml"
+    models_section_toml.write_text(
+        'endpoint = "https://custom-llm.test/v1/chat/completions"\n\n'
+        "[models]\n"
+        'fast = "acme-haiku-fast-2026"\n'
+        'strong = "acme-opus-mediation-2026"\n',
+        encoding="utf-8",
+    )
+    limits_toml = tmp_path / "limits_h42.toml"
+    limits_toml.write_text(
+        "INTERVIEW = 6\nDEBATE = 3\nMEDIATION = 2\nBUILDING = 15\nci_rounds = 3\n",
+        encoding="utf-8",
+    )
+
+    class _RecordingTransport:
+        def __init__(self, script: list[HttpResponse]) -> None:
+            self._script = list(script)
+            self.calls: list[dict[str, Any]] = []
+
+        def post_json(
+            self,
+            url: str,
+            payload: Mapping[str, Any],
+            timeout_seconds: float = 35.0,
+            headers: Mapping[str, str] | None = None,
+        ) -> HttpResponse:
+            self.calls.append(
+                {
+                    "url": url,
+                    "payload": dict(payload),
+                    "timeout": timeout_seconds,
+                    "headers": dict(headers or {}),
+                }
+            )
+            return self._script.pop(0)
+
+    transport = _RecordingTransport(
+        script=[
+            # 1. INTERVIEW / fast model call
+            HttpResponse(
+                status_code=200,
+                body=json.dumps(
+                    {"choices": [{"message": {"content": '{"questions": [], "is_complete": true}'}}]}
+                ),
+            ),
+            # 2. DEBATE (PragmatistProposal schema) / fast model call with schema instructions
+            HttpResponse(
+                status_code=200,
+                body=json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": '{"approach": "static", "components": ["app.js"], "tradeoffs": []}'
+                                }
+                            }
+                        ]
+                    }
+                ),
+            ),
+            # 3. MEDIATION / strong model call with Plan schema
+            HttpResponse(
+                status_code=200,
+                body=json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json.dumps(
+                                        {
+                                            "summary": "Plan OK",
+                                            "rationale": "Simple",
+                                            "template_id": "static-web",
+                                            "files": [
+                                                {
+                                                    "path": "src/app.js",
+                                                    "purpose": "Main",
+                                                    "contract": "export {};",
+                                                    "depends_on": [],
+                                                }
+                                            ],
+                                            "acceptance_tests": [
+                                                {"id": "AT-01", "description": "Pass", "type": "unit"}
+                                            ],
+                                            "risks": [],
+                                            "deployment_target": "github-pages",
+                                        }
+                                    )
+                                }
+                            }
+                        ]
+                    }
+                ),
+            ),
+            # 4. Non-JSON reply when schema is required -> MUST raise LLMError
+            HttpResponse(
+                status_code=200,
+                body=json.dumps(
+                    {"choices": [{"message": {"content": "Sure, here is a plain prose answer."}}]}
+                ),
+            ),
+        ]
+    )
+
+    adapter = ProductionLLMAdapter(
+        api_key=llm_key,
+        models_config_path=models_section_toml,
+        transport=transport,
+        secrets=(llm_key,),
+    )
+
+    # Call 1: INTERVIEW -> selects [models].fast (NEVER "model-fast-01")
+    out_interview = adapter.complete(
+        messages=[
+            {"role": "system", "content": "You are an expert product interviewer."},
+            {"role": "user", "content": "Build timer"},
+        ],
+        schema=None,
+    )
+    assert out_interview == {"questions": [], "is_complete": True}
+    assert transport.calls[0]["url"] == "https://custom-llm.test/v1/chat/completions"
+    assert transport.calls[0]["payload"]["model"] == "acme-haiku-fast-2026"
+    assert transport.calls[0]["payload"]["model"] != "model-fast-01"
+
+    # Call 2: DEBATE (Pragmatist + schema) -> selects fast model AND includes JSON schema guidance
+    out_debate = adapter.complete(
+        messages=[
+            {"role": "system", "content": "You are Pragmatist, an architectural agent."},
+            {"role": "user", "content": "Spec details"},
+        ],
+        schema=PragmatistProposal,
+    )
+    assert out_debate["approach"] == "static"
+    debate_payload = transport.calls[1]["payload"]
+    debate_serialized = json.dumps(debate_payload)
+    assert debate_payload["model"] == "acme-haiku-fast-2026"
+    assert "approach" in debate_serialized
+    assert "response_format" in debate_payload or "json" in debate_serialized.lower()
+
+    # Call 3: MEDIATION (Mediator + Plan) -> MUST select [models].strong (kills M42-10)
+    out_med = adapter.complete(
+        messages=[
+            {"role": "system", "content": "You are Mediator, the final debate synthesis agent."},
+            {"role": "user", "content": "Spec and proposals"},
+        ],
+        schema=Plan,
+    )
+    assert out_med["template_id"] == "static-web"
+    med_payload = transport.calls[2]["payload"]
+    assert med_payload["model"] == "acme-opus-mediation-2026"
+    assert "acceptance_tests" in json.dumps(med_payload)
+
+    # Call 4: Non-JSON text when schema != None MUST fail closed with LLMError
+    with pytest.raises(LLMError):
+        adapter.complete(
+            messages=[{"role": "user", "content": "Propose"}],
+            schema=PragmatistProposal,
+        )
+
+    # Empty or corrupt models.toml MUST fail closed with LLMError (not silent model-fast-01 fallback)
+    empty_toml = tmp_path / "empty_models.toml"
+    empty_toml.write_text("", encoding="utf-8")
+    corrupt_toml = tmp_path / "corrupt_models.toml"
+    corrupt_toml.write_text("broken = [unclosed\n", encoding="utf-8")
+
+    for bad_path in (empty_toml, corrupt_toml):
+        bad_adapter = ProductionLLMAdapter(
+            api_key=llm_key,
+            models_config_path=bad_path,
+            transport=_RecordingTransport(
+                script=[
+                    HttpResponse(
+                        status_code=200,
+                        body=json.dumps({"choices": [{"message": {"content": "{}"}}]}),
+                    )
+                ]
+            ),
+            secrets=(llm_key,),
+        )
+        with pytest.raises(LLMError):
+            bad_adapter.complete([{"role": "user", "content": "Hi"}])
+
+    # build_runtime must wire non-None StatusPublisher in Orchestrator and propagate github_owner to deploy_base_url
+    cfg_rt = load_cli_config(
+        {
+            "TELEGRAM_BOT_TOKEN": tg_tok,
+            "ALLOWED_CHAT_IDS": "1001",
+            "ALLOWED_USER_IDS": "2001",
+            "LLM_API_KEY": llm_key,
+            "GITHUB_OWNER": "gabriel-acme-test",
+            "AGENT_FACTORY_DEPLOY_TARGET": "github-pages",
+            "AGENT_FACTORY_DB_PATH": str(tmp_path / "wired.db"),
+            "AGENT_FACTORY_WORKSPACES_DIR": str(tmp_path / "ws_wired"),
+            "AGENT_FACTORY_REGISTRY_REPO": str(tmp_path / "origin.git"),
+            "AGENT_FACTORY_MODELS_CONFIG": str(models_section_toml),
+            "AGENT_FACTORY_LIMITS_CONFIG": str(limits_toml),
+        }
+    )
+    rt = build_runtime(cfg_rt, transport=transport)
+    try:
+        assert rt.orchestrator.publisher is not None
+        assert isinstance(rt.orchestrator.publisher, StatusPublisher)
+        assert isinstance(rt.vcs, GitHubVCSAdapter)
+        assert rt.vcs.deploy_publisher is not None
+        assert rt.vcs.deploy_publisher.deploy_base_url == "https://gabriel-acme-test.github.io"
+    finally:
+        rt.store.close()
+
+
+def test_urllib_http_transport_post_json_sends_headers_json_and_wraps_http_url_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """H42-02 / M42-11 (INV-01, INV-02, INV-19, INV-23): Exercises real UrllibHttpTransport.post_json offline via urllib.request.urlopen interception, validating POST, JSON UTF-8, custom Authorization Bearer headers, and HTTPError/URLError -> TelegramTransportError."""
+    auth_tok = "TEST_URLLIB_BEARER_778899"
+    tg_url_err_tok = "123456:URLLIB_ERR_SECRET_4455"
+    seen_requests: list[tuple[urllib.request.Request, float]] = []
+
+    class _FakeRespCtx:
+        def __init__(self, status: int, data: bytes) -> None:
+            self.status = status
+            self._data = data
+
+        def read(self) -> bytes:
+            return self._data
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    mode = {"next": "ok"}
+
+    def _fake_urlopen(req: urllib.request.Request, timeout: float = 35.0) -> _FakeRespCtx:
+        seen_requests.append((req, timeout))
+        if mode["next"] == "http_err":
+            raise urllib.error.HTTPError(
+                url=f"https://api.telegram.org/bot{tg_url_err_tok}/sendMessage",
+                code=401,
+                msg="Unauthorized",
+                hdrs={},  # type: ignore[arg-type]
+                fp=io.BytesIO(f"bad token {auth_tok}".encode()),
+            )
+        if mode["next"] == "url_err":
+            raise urllib.error.URLError(
+                f"dial tcp failed for https://api.telegram.org/bot{tg_url_err_tok}/getUpdates"
+            )
+        return _FakeRespCtx(200, b'{"choices":[{"message":{"content":"{}"}}]}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    transport = UrllibHttpTransport()
+
+    # 1. Success path: POST, UTF-8 JSON body, Content-Type, and custom Authorization header (kills M42-11)
+    resp = transport.post_json(
+        "https://custom-llm.test/v1/chat/completions",
+        {"model": "acme-fast", "messages": [{"role": "user", "content": "Hola ñ"}]},
+        timeout_seconds=12.5,
+        headers={"Authorization": f"Bearer {auth_tok}", "X-Trace-Id": "trace-42"},
+    )
+    assert resp.status_code == 200
+    assert json.loads(resp.body) == {"choices": [{"message": {"content": "{}"}}]}
+
+    req, used_timeout = seen_requests[0]
+    assert used_timeout == 12.5
+    assert req.get_method() == "POST"
+    assert req.full_url == "https://custom-llm.test/v1/chat/completions"
+    assert json.loads(req.data.decode("utf-8")) == {
+        "model": "acme-fast",
+        "messages": [{"role": "user", "content": "Hola ñ"}],
+    }
+    norm_headers = {k.lower(): v for k, v in req.header_items()}
+    assert norm_headers["content-type"] == "application/json"
+    assert norm_headers["authorization"] == f"Bearer {auth_tok}"
+    assert norm_headers["x-trace-id"] == "trace-42"
+
+    # 2. HTTPError and URLError MUST wrap cleanly into TelegramTransportError without leaking tokens or __context__
+    for err_mode in ("http_err", "url_err"):
+        mode["next"] = err_mode
+        with pytest.raises(TelegramTransportError) as tp_err:
+            transport.post_json(
+                f"https://api.telegram.org/bot{tg_url_err_tok}/sendMessage",
+                {"chat_id": 1},
+            )
+        assert tg_url_err_tok not in str(tp_err.value)
+        assert auth_tok not in str(tp_err.value)
+        assert tp_err.value.__cause__ is None
+        assert tp_err.value.__context__ is None

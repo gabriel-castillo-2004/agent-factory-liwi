@@ -384,3 +384,148 @@ def test_panel_styles_css_targets_text_input_not_removed_url_input() -> None:
     styles_css = (PANEL_DIR / "styles.css").read_text(encoding="utf-8")
     assert re.search(r'input\[type=["\']url["\']\]', styles_css) is None
     assert re.search(r'input\[type=["\']text["\']\]|#registry-base-input', styles_css) is not None
+
+
+def test_panel_styles_has_warning_prompt_rules_app_handles_nonfinite_and_ci_enforces_cov_floor() -> None:
+    """H42-05 (INV-01, INV-16, INV-23): styles.css defines .alert-warning/.prompt-box, app.js guards non-finite counters/percentages with Number.isFinite (no NaN%), and ci.yml enforces --cov-fail-under=85."""
+    repo_root = PANEL_DIR.parent
+    styles_css = (PANEL_DIR / "styles.css").read_text(encoding="utf-8")
+    assert re.search(r"\.alert-warning\b[^}]*\{", styles_css) is not None
+    assert re.search(r"\.prompt-box\b[^}]*\{", styles_css) is not None
+
+    ci_yml = (repo_root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert re.search(r"--cov-fail-under=(?:8[5-9]|9\d|100)\b", ci_yml) is not None
+
+    js_exe = shutil.which("node") or shutil.which("deno")
+    assert js_exe is not None, "A JavaScript runtime (node or deno) is required to execute panel/app.js tests"
+
+    app_js_posix = (PANEL_DIR / "app.js").resolve().as_posix()
+    js_script = f"""
+const appPath = {json.dumps(app_js_posix)};
+const readFile = (p) => typeof Deno !== "undefined" ? Deno.readTextFileSync(p) : require("fs").readFileSync(p, "utf8");
+function makeEl(id) {{
+  let _html = "";
+  const children = [];
+  return {{
+    id, className: "", tabIndex: 0, textContent: "", value: "", children, listeners: {{}},
+    classList: {{ _s: new Set(), add(c){{ this._s.add(c); }}, remove(c){{ this._s.delete(c); }} }},
+    setAttribute(){{}},
+    addEventListener(t, fn){{ (this.listeners[t] = this.listeners[t] || []).push(fn); }},
+    appendChild(ch){{ children.push(ch); }},
+    get innerHTML(){{ return _html; }},
+    set innerHTML(v){{ _html = String(v); if (_html === "") children.length = 0; }}
+  }};
+}}
+const els = {{}};
+for (const id of [
+  "error-banner", "registry-base-input", "source-form", "refresh-btn", "search-input",
+  "state-filter", "projects-list", "projects-empty", "detail-placeholder", "detail-content",
+  "connection-badge", "updated-at-badge", "kpi-total", "kpi-delivered", "kpi-active", "kpi-failed"
+]) {{
+  els[id] = makeEl(id);
+}}
+const docListeners = {{}};
+globalThis.document = {{
+  getElementById: (id) => els[id] || null,
+  createElement: (tag) => makeEl(tag),
+  addEventListener: (t, fn) => {{ (docListeners[t] = docListeners[t] || []).push(fn); }}
+}};
+globalThis.window = {{
+  location: {{ search: "" }},
+  localStorage: {{ getItem: () => null, setItem: () => {{}} }},
+  addEventListener: () => {{}}
+}};
+globalThis.fetch = async (url) => {{
+  if (url.endsWith("/registry.json")) {{
+    return {{
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({{
+        version: "1.0",
+        projects: {{
+          "nan-app": {{
+            project_id: "nan-app",
+            name: "NaN Check",
+            objective: "Resilience",
+            state: "BUILDING",
+            progress_pct: "not-a-number"
+          }}
+        }}
+      }})
+    }};
+  }}
+  return {{
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({{
+      project_id: "nan-app",
+      name: "NaN Check",
+      objective: "Resilience",
+      state: "BUILDING",
+      phase: "BUILDING",
+      progress_pct: "not-a-number",
+      agent_invocations: "oops",
+      ci_rounds: "Infinity",
+      tests: {{ total: "NaN", passed: "bad", failed: -5 }},
+      build_report: {{ invocations: "NaN", ci_rounds: "oops", failure_cause: null }},
+      events: []
+    }})
+  }};
+}};
+(async () => {{
+  new Function(readFile(appPath))();
+  const api = globalThis.AgentFactoryPanel;
+  for (const fn of (docListeners["DOMContentLoaded"] || [])) fn();
+  await new Promise((r) => setTimeout(r, 20));
+  if (els["projects-list"].children.length > 0 && els["projects-list"].children[0].listeners.click) {{
+    els["projects-list"].children[0].listeners.click[0]();
+    await new Promise((r) => setTimeout(r, 20));
+  }}
+  const cat = api.parseRegistryCatalog({{
+    version: "1.0",
+    projects: {{
+      "cat-nan": {{ state: "BUILDING", progress_pct: Number.NaN }},
+      "cat-inf": {{ state: "BUILDING", progress_pct: Number.POSITIVE_INFINITY }},
+      "cat-neg": {{ state: "BUILDING", progress_pct: -25 }},
+      "cat-over": {{ state: "DELIVERED", progress_pct: 999 }}
+    }}
+  }});
+  const detail = api.normalizeProjectDetail({{
+    project_id: "nan-app",
+    progress_pct: Number.NaN,
+    agent_invocations: "bad",
+    ci_rounds: Number.POSITIVE_INFINITY,
+    tests: {{ total: "NaN", passed: Number.NEGATIVE_INFINITY, failed: "abc" }},
+    build_report: {{ invocations: "oops", ci_rounds: Number.POSITIVE_INFINITY }}
+  }});
+  console.log(JSON.stringify({{
+    catPcts: Object.fromEntries(cat.projects.map((p) => [p.project_id, p.progress_pct])),
+    detail: detail,
+    cardsHtml: els["projects-list"].children.map((c) => c.innerHTML).join(""),
+    detailHtml: els["detail-content"].innerHTML
+  }}));
+}})().catch((err) => {{
+  console.error(err);
+  if (typeof Deno !== "undefined") Deno.exit(1); else process.exit(1);
+}});
+"""
+    cmd = (
+        [js_exe, "-e", js_script]
+        if Path(js_exe).stem.lower() == "node"
+        else [js_exe, "eval", "--no-remote", js_script]
+    )
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=True)
+    out = json.loads(proc.stdout.strip())
+
+    assert out["catPcts"] == {"cat-nan": 0, "cat-inf": 0, "cat-neg": 0, "cat-over": 100}
+    detail = out["detail"]
+    assert detail["progress_pct"] == 0
+    assert detail["agent_invocations"] == 0
+    assert detail["ci_rounds"] == 0
+    assert detail["tests"] == {"total": 0, "passed": 0, "failed": 0}
+    assert detail["build_report"]["invocations"] == 0
+    assert detail["build_report"]["ci_rounds"] == 0
+    assert "NaN" not in out["cardsHtml"]
+    assert "NaN%" not in out["cardsHtml"]
+    assert "NaN" not in out["detailHtml"]
+    assert "Infinity" not in out["detailHtml"]

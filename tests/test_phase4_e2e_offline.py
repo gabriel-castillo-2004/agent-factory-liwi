@@ -389,3 +389,251 @@ def test_phase4_e2e_negative_invalid_config_and_transient_backoff(tmp_path: Path
     assert clock.sleeps == [1.5]
     assert len(errors) == 1
     assert tok not in errors[0]
+
+
+def test_phase4_e2e_bot_and_build_worker_stream_state_and_sanitized_events_to_registry(
+    tmp_path: Path,
+) -> None:
+    """H42-04 / M42-12 (INV-11, INV-19, INV-21, INV-23): build_runtime runtime updates registry from TelegramBotService on intermediate transitions (/new, adjust) and persists BuildWorker sanitized events into projects/<id>.json."""
+    bare_repo, _ = _init_bare_repo(tmp_path)
+    tg_token = "TEST_E2E_H4204_TG_TOK_111"
+    gh_token = "TEST_E2E_H4204_GH_TOK_222"
+    llm_key = "TEST_E2E_H4204_LLM_KEY_333"
+
+    models_toml = tmp_path / "models_e2e.toml"
+    models_toml.write_text(
+        "[models]\n"
+        'fast = "e2e-fast-model"\n'
+        'strong = "e2e-strong-model"\n',
+        encoding="utf-8",
+    )
+    limits_toml = tmp_path / "limits_e2e.toml"
+    limits_toml.write_text(
+        "INTERVIEW = 6\nDEBATE = 3\nMEDIATION = 2\nBUILDING = 15\nci_rounds = 3\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_cli_config(
+        {
+            "TELEGRAM_BOT_TOKEN": tg_token,
+            "ALLOWED_CHAT_IDS": "1001",
+            "ALLOWED_USER_IDS": "2001",
+            "LLM_API_KEY": llm_key,
+            "AGENT_FACTORY_DB_PATH": str(tmp_path / "e2e_stream.db"),
+            "AGENT_FACTORY_WORKSPACES_DIR": str(tmp_path / "workspaces"),
+            "AGENT_FACTORY_REGISTRY_REPO": str(bare_repo),
+            "AGENT_FACTORY_REGISTRY_BRANCH": "registry",
+            "AGENT_FACTORY_MODELS_CONFIG": str(models_toml),
+            "AGENT_FACTORY_LIMITS_CONFIG": str(limits_toml),
+            "GITHUB_OWNER": "gabriel-test",
+            "GITHUB_TOKEN": gh_token,
+        }
+    )
+
+    plan = Plan(
+        summary="Clima Viva",
+        rationale="ES static",
+        template_id="static-web",
+        files=[FileSpec(path="src/app.js", purpose="App", contract="export {};", depends_on=[])],
+        acceptance_tests=[AcceptanceTest(id="AT-01", description="Unit", type=AcceptanceTestType.UNIT)],
+        risks=[],
+        deployment_target="github-pages",
+    )
+    llm = FakeLLM(
+        responses=[
+            # Round 1: /new Clima Viva -> complete spec -> plan 1
+            {
+                "spec": {
+                    "objective": "Clima",
+                    "users": ["Gabriel"],
+                    "features": ["Tiempo"],
+                    "business_rules": ["Static"],
+                    "edge_cases": ["Offline"],
+                    "constraints": ["Zero cost"],
+                    "success_criteria": ["0 errors"],
+                    "assumptions": [],
+                },
+                "questions": [],
+            },
+            {"approach": "Static", "components": ["src/app.js"], "tradeoffs": []},
+            {"critique": ["Timeout"], "robust_proposal": "Fallback", "architectural_safeguards": []},
+            plan.model_dump(mode="json"),
+            # Round 2 (after adjust): interview -> debate -> plan 2
+            {
+                "spec": {
+                    "objective": "Clima con alerta",
+                    "users": ["Gabriel"],
+                    "features": ["Tiempo", "Alerta"],
+                    "business_rules": ["Static"],
+                    "edge_cases": ["Offline"],
+                    "constraints": ["Zero cost"],
+                    "success_criteria": ["0 errors"],
+                    "assumptions": [],
+                },
+                "questions": [],
+            },
+            {"approach": "Static v2", "components": ["src/app.js"], "tradeoffs": []},
+            {"critique": ["Timeout"], "robust_proposal": "Fallback v2", "architectural_safeguards": []},
+            plan.model_dump(mode="json"),
+        ]
+    )
+
+    real_runner = SubprocessRunner(default_timeout_seconds=15.0)
+    cli_script = tmp_path / "sim_agy_stream.py"
+    cli_script.write_text(
+        "import json, pathlib, sys\n"
+        "args = sys.argv[1:]\n"
+        "mode = args[args.index('--mode') + 1]\n"
+        "ws = pathlib.Path.cwd()\n"
+        "if mode == 'generate-tests':\n"
+        "    (ws / 'tests').mkdir(parents=True, exist_ok=True)\n"
+        "    (ws / 'tests' / 'test_ok.py').write_text('def test_ok(): assert True\\n', encoding='utf-8')\n"
+        "    print(json.dumps({'files_written': ['tests/test_ok.py'], 'summary': 'Tests ok'}))\n"
+        "else:\n"
+        "    (ws / 'src').mkdir(parents=True, exist_ok=True)\n"
+        "    (ws / 'src' / 'app.js').write_text('export const ok = 1;\\n', encoding='utf-8')\n"
+        "    print(json.dumps({'files_written': ['src/app.js'], 'summary': 'App ok'}))\n",
+        encoding="utf-8",
+    )
+
+    class _StreamRunner:
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            cmd0 = Path(command[0]).name.lower()
+            if cmd0.startswith("python"):
+                return real_runner.run(command, cwd, timeout_seconds=timeout_seconds, env=env)
+            if command[0] == "pytest":
+                return CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True})
+            if command[0] == "git" and (
+                "af_registry" in str(cwd)
+                or any(str(bare_repo) in c for c in command)
+                or "registry" in " ".join(command)
+            ):
+                return real_runner.run(command, cwd, timeout_seconds=timeout_seconds, env=env)
+            if command[0] == "gh" and ("run" in command or "workflow" in command):
+                return CommandResult(exit_code=0, stdout=json.dumps([{"status": "completed", "conclusion": "success"}]))
+            return CommandResult(exit_code=0, stdout="ok")
+
+    hybrid_runner = _StreamRunner()
+    transport = _ScriptedTelegramTransport(
+        update_batches=[
+            [
+                {
+                    "update_id": 1,
+                    "message": {
+                        "message_id": 1,
+                        "from": {"id": 2001, "username": "gabriel"},
+                        "chat": {"id": 1001},
+                        "text": "/new Clima Viva",
+                    },
+                }
+            ]
+        ]
+    )
+    from agent_factory.adapters.agy_cli_adapter import AgyCliAdapter
+    from agent_factory.workspace import WorkspaceManager
+
+    ws_mgr = WorkspaceManager(base_dir=cfg.workspaces_dir)
+    agy = AgyCliAdapter(workspace_manager=ws_mgr, runner=hybrid_runner, cli_command=[sys.executable, str(cli_script)])
+    clock = _FakeClock()
+    rt = build_runtime(cfg, llm=llm, runner=hybrid_runner, transport=transport, code_agent=agy, clock=clock)
+    try:
+        stop_ev = threading.Event()
+        # Poll 1: /new -> WAITING_APPROVAL (MUST already be published to registry by TelegramBotService, kills M42-12)
+        run_polling_loop(rt.bot_service, clock=clock, stop_event=stop_ev, max_iterations=1)
+        pid = "clima-viva"
+        proj_waiting_raw = subprocess.run(
+            ["git", "-C", str(bare_repo), "show", f"refs/heads/registry:projects/{pid}.json"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        proj_waiting = json.loads(proj_waiting_raw)
+        assert proj_waiting["state"] == "WAITING_APPROVAL"
+        assert proj_waiting["progress_pct"] == 35
+        first_hash = proj_waiting["plan_hash"]
+        assert first_hash is not None
+
+        # Poll 2: adjust callback -> returns to INTERVIEW and updates registry immediately
+        transport._batches.append(
+            [
+                {
+                    "update_id": 2,
+                    "callback_query": {
+                        "id": "cb-adj",
+                        "from": {"id": 2001, "username": "gabriel"},
+                        "message": {"message_id": 2, "chat": {"id": 1001}},
+                        "data": f"adjust:{pid}:{first_hash}",
+                    },
+                }
+            ]
+        )
+        run_polling_loop(rt.bot_service, clock=clock, stop_event=stop_ev, max_iterations=1)
+        proj_adj = json.loads(
+            subprocess.run(
+                ["git", "-C", str(bare_repo), "show", f"refs/heads/registry:projects/{pid}.json"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        )
+        assert proj_adj["state"] == "INTERVIEW"
+        assert proj_adj["progress_pct"] == 10
+
+        # Poll 3: answer -> WAITING_APPROVAL v2, Poll 4: approve -> DELIVERED with full events array
+        transport._batches.append(
+            [
+                {
+                    "update_id": 3,
+                    "message": {
+                        "message_id": 3,
+                        "from": {"id": 2001, "username": "gabriel"},
+                        "chat": {"id": 1001},
+                        "text": "Agrega alerta offline",
+                    },
+                }
+            ]
+        )
+        run_polling_loop(rt.bot_service, clock=clock, stop_event=stop_ev, max_iterations=1)
+        new_hash = rt.orchestrator.get_status(pid).plan_hash
+        assert new_hash is not None
+
+        transport._batches.append(
+            [
+                {
+                    "update_id": 4,
+                    "callback_query": {
+                        "id": "cb-ok",
+                        "from": {"id": 2001, "username": "gabriel"},
+                        "message": {"message_id": 4, "chat": {"id": 1001}},
+                        "data": f"approve:{pid}:{new_hash}",
+                    },
+                }
+            ]
+        )
+        run_polling_loop(rt.bot_service, clock=clock, stop_event=stop_ev, max_iterations=1)
+
+        proj_delivered_raw = subprocess.run(
+            ["git", "-C", str(bare_repo), "show", f"refs/heads/registry:projects/{pid}.json"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        proj_delivered = json.loads(proj_delivered_raw)
+        assert proj_delivered["state"] == "DELIVERED"
+        assert proj_delivered["progress_pct"] == 100
+        assert isinstance(proj_delivered.get("events"), list)
+        event_types = [ev["type"] for ev in proj_delivered["events"]]
+        assert "PROJECT_CREATED" in event_types
+        assert "APPROVAL_RECORDED" in event_types
+        assert "PROJECT_DELIVERED" in event_types
+        assert tg_token not in proj_delivered_raw
+        assert gh_token not in proj_delivered_raw
+        assert llm_key not in proj_delivered_raw
+    finally:
+        rt.store.close()

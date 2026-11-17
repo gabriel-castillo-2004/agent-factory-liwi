@@ -1,7 +1,10 @@
 """Tests for real GitHubVCSAdapter and StaticDeployPublisher via Runner with clean env and secret redaction (AC-4.4, INV-07, INV-19, INV-22, INV-23)."""
 
 import json
+import subprocess
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -11,6 +14,7 @@ from agent_factory.adapters.static_deploy_publisher import (
     StaticDeployError,
     StaticDeployPublisher,
 )
+from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.domain.models import ProjectLinks, ProjectStatus
 from agent_factory.domain.states import ProjectState
 from agent_factory.ports.runner import CommandResult, CommandTimeoutError
@@ -397,3 +401,126 @@ def test_github_vcs_merge_deploys_via_deploy_publisher_and_static_deploy_routes_
     assert len(shared_runner.calls) == 3
     assert shared_runner.calls[1]["command"][:3] == ["gh", "pr", "merge"]
     assert shared_runner.calls[2]["command"][0].lower() == "vercel"
+
+
+def test_github_vcs_prepares_dirty_git_repo_ensures_pr_deploys_site_branch_and_keeps_vercel_token_out_of_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """H42-03 (INV-07, INV-19, INV-22, INV-23): push_branch stages/commits dirty git changes and creates PR before merge; merge_and_deploy uses deployer branch (gh-pages, not work); vercel passes token only via env."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "HOST_TG_SECRET_H4203")
+    monkeypatch.setenv("LLM_API_KEY", "HOST_LLM_SECRET_H4203")
+
+    gh_tok = "TEST_GH_H4203_SECRET_111"
+    vc_tok = "TEST_VC_H4203_SECRET_222"
+
+    # Initialize real local bare remote + dirty workspace branch `work`
+    bare_remote = tmp_path / "app-remote.git"
+    subprocess.run(["git", "init", "--bare", str(bare_remote)], check=True, capture_output=True)
+    ws_dir = tmp_path / "ws" / "app-git-flow"
+    ws_dir.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(ws_dir), "init", "-b", "main"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(ws_dir), "config", "user.name", "AgentFactory"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(ws_dir), "config", "user.email", "af@local"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(ws_dir), "remote", "add", "origin", str(bare_remote)], check=True, capture_output=True)
+    (ws_dir / "README.md").write_text("# Init\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(ws_dir), "add", "README.md"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(ws_dir), "commit", "-m", "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(ws_dir), "push", "-u", "origin", "main"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(ws_dir), "checkout", "-b", "work"], check=True, capture_output=True)
+
+    # Dirty uncommitted changes in working tree
+    (ws_dir / "src").mkdir(parents=True)
+    (ws_dir / "src" / "app.js").write_text("export const x = 42;\n", encoding="utf-8")
+
+    real_runner = SubprocessRunner(default_timeout_seconds=15.0)
+    calls: list[dict[str, Any]] = []
+
+    class _GitAndMockGhRunner:
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            calls.append(
+                {
+                    "command": list(command),
+                    "cwd": Path(cwd),
+                    "env": dict(env) if env is not None else None,
+                }
+            )
+            if command[0] == "git":
+                return real_runner.run(command, cwd, timeout_seconds=timeout_seconds, env=env)
+            if command[:3] == ["gh", "pr", "list"]:
+                return CommandResult(exit_code=0, stdout="[]")
+            if command[:3] == ["gh", "pr", "create"]:
+                return CommandResult(exit_code=0, stdout="https://github.com/acme-org/app-git-flow/pull/1\n")
+            return CommandResult(exit_code=0, stdout="ok\n")
+
+    hybrid_runner = _GitAndMockGhRunner()
+    deployer = StaticDeployPublisher(
+        runner=hybrid_runner,
+        target="github-pages",
+        deploy_base_url="https://acme-org.github.io",
+        branch="gh-pages",
+        deploy_token=gh_tok,
+        secrets=(gh_tok,),
+    )
+    vcs = GitHubVCSAdapter(
+        runner=hybrid_runner,
+        owner="acme-org",
+        github_token=gh_tok,
+        secrets=(gh_tok,),
+        deploy_publisher=deployer,
+    )
+
+    vcs.push_branch("app-git-flow", ws_dir, branch="work")
+    # Uncommitted file MUST have been committed and pushed onto bare remote refs/heads/work
+    remote_app = subprocess.run(
+        ["git", "-C", str(bare_remote), "show", "refs/heads/work:src/app.js"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert remote_app == "export const x = 42;\n"
+
+    repo_url, deploy_url = vcs.merge_and_deploy("app-git-flow", branch="work")
+    assert repo_url == "https://github.com/acme-org/app-git-flow"
+    assert deploy_url == "https://acme-org.github.io/app-git-flow"
+
+    cmd_strings = [" ".join(c["command"]) for c in calls]
+    add_idxs = [i for i, s in enumerate(cmd_strings) if s.startswith("git add")]
+    commit_idxs = [i for i, s in enumerate(cmd_strings) if s.startswith("git commit")]
+    push_idxs = [i for i, s in enumerate(cmd_strings) if s.startswith("git push")]
+    pr_create_idxs = [i for i, c in enumerate(calls) if c["command"][:3] == ["gh", "pr", "create"]]
+    pr_merge_idxs = [i for i, c in enumerate(calls) if c["command"][:3] == ["gh", "pr", "merge"]]
+    deploy_idxs = [i for i, c in enumerate(calls) if c["command"][:3] == ["gh", "pages", "deploy"]]
+
+    assert add_idxs and commit_idxs and push_idxs
+    assert add_idxs[0] < commit_idxs[0] < push_idxs[0]
+    assert pr_create_idxs and pr_merge_idxs
+    assert pr_create_idxs[0] < pr_merge_idxs[0]
+    assert deploy_idxs
+    deploy_cmd = calls[deploy_idxs[0]]["command"]
+    assert "--branch" in deploy_cmd
+    branch_arg = deploy_cmd[deploy_cmd.index("--branch") + 1]
+    assert branch_arg == "gh-pages"
+    assert "work" not in deploy_cmd
+
+    # StaticDeployPublisher vercel MUST NOT expose deploy_token in CLI argv (--token)
+    vc_runner = FakeRunner(results=[CommandResult(exit_code=0, stdout="https://acme-vc.vercel.app/app-vc-sec\n")])
+    vc_pub = StaticDeployPublisher(
+        runner=vc_runner,
+        target="vercel",
+        deploy_base_url="https://acme-vc.vercel.app",
+        deploy_token=vc_tok,
+    )
+    vc_pub.deploy_site("app-vc-sec", ws_dir)
+    vc_call = vc_runner.calls[0]
+    assert vc_call["command"][0].lower() == "vercel"
+    assert "--token" not in vc_call["command"]
+    assert vc_tok not in " ".join(vc_call["command"])
+    assert vc_call["env"] is not None
+    assert vc_call["env"].get("VERCEL_TOKEN") == vc_tok

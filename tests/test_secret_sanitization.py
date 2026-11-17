@@ -501,3 +501,28 @@ def test_redact_secrets_telegram_url_without_slash_preserves_quotes_and_kills_m4
         env={},
     )
     assert single_quoted == "url='https://api.telegram.org/bot[REDACTED]'"
+
+
+def test_redact_secrets_masks_x_access_token_vercel_vcp_llm_api_key_and_query_key_without_env() -> None:
+    """H42-05 (INV-07, INV-19, INV-23): Redacts x-access-token:<tok>, vercel_<tok>, vcp_<tok>, LLM_API_KEY=, and ?key= even when env={} and extra_secrets=()."""
+    gh_x = "GHX_RAW_TOKEN_11223344"
+    gh_x_bare = "GHX_BARE_TOKEN_55667788"
+    vc_tok = "vercel_RAW_TOKEN_99001122"
+    vcp_tok = "vcp_CLOUD_TOKEN_33445566"
+    llm_tok = "LLM_RAW_SECRET_77889900"
+    q_tok = "QKEY_RAW_SECRET_112233"
+
+    raw = (
+        f"clone https://x-access-token:{gh_x}@github.com/org/repo.git; "
+        f"hdr x-access-token:{gh_x_bare}; "
+        f"deploy {vc_tok} or {vcp_tok}; "
+        f"LLM_API_KEY={llm_tok} https://svc.test/run?key={q_tok}"
+    )
+    cleaned = redact_secrets(raw, extra_secrets=(), env={})
+
+    for secret in (gh_x, gh_x_bare, vc_tok, vcp_tok, llm_tok, q_tok):
+        assert secret not in cleaned
+    assert cleaned.count("[REDACTED]") >= 5
+
+    safe_text = "https://example.com/vercel/docs?page=2&sort=asc"
+    assert redact_secrets(safe_text, extra_secrets=(), env={}) == safe_text
