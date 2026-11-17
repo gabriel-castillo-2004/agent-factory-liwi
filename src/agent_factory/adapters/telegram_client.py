@@ -1,5 +1,8 @@
 """Outbound-only Telegram Bot API long polling client (INV-02, INV-04, INV-19, ADR-003)."""
 
+import json
+import urllib.error
+import urllib.request
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -8,8 +11,10 @@ from agent_factory.ports.notifier import (
     HttpTransport,
     InlineButton,
     SentMessage,
+    TelegramTransportError,
     TelegramUpdate,
 )
+from agent_factory.secrets import redact_secrets
 
 
 class UrllibHttpTransport:
@@ -22,7 +27,23 @@ class UrllibHttpTransport:
         timeout_seconds: float = 35.0,
     ) -> HttpResponse:
         """Execute outbound HTTPS POST using urllib.request."""
-        raise NotImplementedError
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                body = resp.read().decode("utf-8")
+                return HttpResponse(status_code=resp.status, body=body)
+        except urllib.error.HTTPError as err:
+            body = err.read().decode("utf-8", errors="replace")
+            return HttpResponse(status_code=err.code, body=body)
 
 
 class TelegramHttpClient:
@@ -40,13 +61,98 @@ class TelegramHttpClient:
         )
         self.api_base_url = api_base_url.rstrip("/")
 
+    def _post(self, method: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Send an outbound POST to Telegram API and validate response, redacting secrets on failure."""
+        url = f"{self.api_base_url}/bot{self.bot_token}/{method}"
+        try:
+            resp = self.transport.post_json(url, payload)
+        except (OSError, RuntimeError, ValueError) as exc:
+            clean_err = redact_secrets(str(exc), extra_secrets=(self.bot_token,))
+            raise TelegramTransportError(
+                f"Telegram transport failure for {method}: {clean_err}"
+            ) from None
+
+        if resp.status_code != 200:
+            clean_body = redact_secrets(resp.body, extra_secrets=(self.bot_token,))
+            raise TelegramTransportError(
+                f"Telegram API HTTP {resp.status_code} for {method}: {clean_body}"
+            )
+
+        try:
+            data = json.loads(resp.body)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise TelegramTransportError(
+                f"Invalid JSON response from Telegram for {method}: {exc}"
+            ) from None
+
+        if not isinstance(data, dict) or not data.get("ok"):
+            desc = data.get("description", "Unknown error") if isinstance(data, dict) else "Non-dict response"
+            clean_desc = redact_secrets(str(desc), extra_secrets=(self.bot_token,))
+            raise TelegramTransportError(f"Telegram API error for {method}: {clean_desc}")
+
+        return data
+
     def get_updates(
         self,
         offset: int | None = None,
         timeout: int = 30,
     ) -> list[TelegramUpdate]:
         """Call Telegram getUpdates API via outbound HttpTransport."""
-        raise NotImplementedError
+        payload: dict[str, Any] = {"timeout": timeout}
+        if offset is not None:
+            payload["offset"] = offset
+
+        data = self._post("getUpdates", payload)
+        raw_updates = data.get("result", [])
+        if not isinstance(raw_updates, list):
+            return []
+
+        updates: list[TelegramUpdate] = []
+        for item in raw_updates:
+            if not isinstance(item, dict):
+                continue
+            update_id = item.get("update_id", 0)
+            chat_id = 0
+            user_id = 0
+            text = ""
+            callback_data: str | None = None
+            callback_query_id: str | None = None
+            username = ""
+
+            if "callback_query" in item and isinstance(item["callback_query"], dict):
+                cb = item["callback_query"]
+                callback_query_id = cb.get("id")
+                callback_data = cb.get("data")
+                sender = cb.get("from", {})
+                if isinstance(sender, dict):
+                    user_id = sender.get("id", 0)
+                    username = sender.get("username", "")
+                msg = cb.get("message", {})
+                if isinstance(msg, dict):
+                    chat_id = msg.get("chat", {}).get("id", 0)
+            elif "message" in item and isinstance(item["message"], dict):
+                msg = item["message"]
+                sender = msg.get("from", {})
+                if isinstance(sender, dict):
+                    user_id = sender.get("id", 0)
+                    username = sender.get("username", "")
+                chat = msg.get("chat", {})
+                if isinstance(chat, dict):
+                    chat_id = chat.get("id", 0)
+                text = msg.get("text", "")
+
+            updates.append(
+                TelegramUpdate(
+                    update_id=update_id,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    text=text,
+                    callback_data=callback_data,
+                    callback_query_id=callback_query_id,
+                    username=username,
+                )
+            )
+        return updates
 
     def send_message(
         self,
@@ -55,7 +161,30 @@ class TelegramHttpClient:
         buttons: Sequence[Sequence[InlineButton]] | None = None,
     ) -> SentMessage:
         """Call Telegram sendMessage API with optional inline keyboard."""
-        raise NotImplementedError
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+        }
+        if buttons:
+            inline_keyboard = [
+                [{"text": btn.text, "callback_data": btn.callback_data} for btn in row]
+                for row in buttons
+            ]
+            payload["reply_markup"] = {"inline_keyboard": inline_keyboard}
+
+        data = self._post("sendMessage", payload)
+        res = data.get("result", {})
+        msg_id = res.get("message_id", 0) if isinstance(res, dict) else 0
+        resp_chat_id = chat_id
+        if isinstance(res, dict):
+            resp_chat_id = res.get("chat", {}).get("id", chat_id)
+
+        return SentMessage(
+            message_id=msg_id,
+            chat_id=resp_chat_id,
+            text=text,
+            buttons=[list(r) for r in (buttons or [])],
+        )
 
     def answer_callback_query(
         self,
@@ -63,4 +192,7 @@ class TelegramHttpClient:
         text: str = "",
     ) -> None:
         """Call Telegram answerCallbackQuery API."""
-        raise NotImplementedError
+        payload: dict[str, Any] = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text
+        self._post("answerCallbackQuery", payload)

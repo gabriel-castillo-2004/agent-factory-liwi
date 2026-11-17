@@ -18,7 +18,7 @@ class FakeTelegramClient:
 
     def enqueue_update(self, update: TelegramUpdate | Exception) -> None:
         """Append an update or exception to the inbound long-polling queue."""
-        raise NotImplementedError
+        self._queued_updates.append(update)
 
     def get_updates(
         self,
@@ -26,7 +26,31 @@ class FakeTelegramClient:
         timeout: int = 30,
     ) -> list[TelegramUpdate]:
         """Return queued updates matching offset >= update_id and record the poll call."""
-        raise NotImplementedError
+        self.get_updates_calls.append({"offset": offset, "timeout": timeout})
+        if not self._queued_updates:
+            return []
+
+        if isinstance(self._queued_updates[0], Exception):
+            raise self._queued_updates.pop(0)
+
+        # Discard acknowledged updates: update_id < offset
+        if offset is not None:
+            self._queued_updates = [
+                item
+                for item in self._queued_updates
+                if isinstance(item, Exception) or item.update_id >= offset
+            ]
+
+        matching: list[TelegramUpdate] = []
+        remaining: list[TelegramUpdate | Exception] = []
+        for item in self._queued_updates:
+            if isinstance(item, TelegramUpdate):
+                matching.append(item)
+            else:
+                remaining.append(item)
+
+        self._queued_updates = remaining
+        return matching
 
     def send_message(
         self,
@@ -35,7 +59,15 @@ class FakeTelegramClient:
         buttons: Sequence[Sequence[InlineButton]] | None = None,
     ) -> SentMessage:
         """Record an outgoing Telegram message and return SentMessage."""
-        raise NotImplementedError
+        msg = SentMessage(
+            message_id=self._next_message_id,
+            chat_id=chat_id,
+            text=text,
+            buttons=[list(row) for row in (buttons or [])],
+        )
+        self._next_message_id += 1
+        self.sent_messages.append(msg)
+        return msg
 
     def answer_callback_query(
         self,
@@ -43,4 +75,6 @@ class FakeTelegramClient:
         text: str = "",
     ) -> None:
         """Record callback acknowledgment."""
-        raise NotImplementedError
+        self.answered_callbacks.append(
+            {"callback_query_id": callback_query_id, "text": text}
+        )

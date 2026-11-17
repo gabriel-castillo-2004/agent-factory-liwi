@@ -401,7 +401,24 @@ class Orchestrator:
         reason: str = "",
     ) -> ProjectStatus:
         """Transition a project in WAITING_APPROVAL back to INTERVIEW for plan adjustment (INV-04, INV-05)."""
-        raise NotImplementedError
+        validate_project_id(project_id)
+        current_status = self.get_status(project_id)
+        if current_status.state != ProjectState.WAITING_APPROVAL:
+            raise IllegalTransition(current_status.state, ProjectState.INTERVIEW)
+        validate_transition(current_status.state, ProjectState.INTERVIEW)
+        self.store.append(
+            create_event(
+                project_id=project_id,
+                event_type=EventType.STATE_TRANSITIONED,
+                payload={
+                    "from": current_status.state.value,
+                    "to": ProjectState.INTERVIEW.value,
+                    "reason": reason or "Adjustment requested by user",
+                },
+                at=self._now(),
+            )
+        )
+        return self.get_status(project_id)
 
     def record_state_call(
         self,

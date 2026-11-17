@@ -11,9 +11,10 @@ from agent_factory.domain.states import IllegalTransition, ProjectState
 from agent_factory.orchestrator import Orchestrator
 from agent_factory.ports.clock import Clock
 from agent_factory.ports.code_agent import CodeAgent, CodeAgentError, QuotaExhaustedError
-from agent_factory.ports.publisher import RegistryPublisher
+from agent_factory.ports.publisher import RegistryPublisher, RegistryPublishError
 from agent_factory.ports.runner import CommandTimeoutError, Runner
 from agent_factory.ports.vcs import VCS
+from agent_factory.secrets import redact_secrets
 from agent_factory.workspace import (
     SandboxViolationError,
     TestLockSnapshot,
@@ -486,11 +487,12 @@ class BuildWorker:
                         project_id, branch="work"
                     )
                 except (OSError, RuntimeError, ValueError) as err:
+                    clean_err = redact_secrets(str(err), extra_secrets=self.secrets_to_redact)
                     self.orchestrator.store.append(
                         create_event(
                             project_id=project_id,
                             event_type=EventType.PROJECT_FAILED,
-                            payload={"reason": str(err)},
+                            payload={"reason": clean_err},
                             at=self.orchestrator._now(),
                         )
                     )
@@ -499,7 +501,7 @@ class BuildWorker:
                         invocations=job.invocations_used,
                         test_results=job.test_results,
                         ci_rounds=job.ci_rounds_used,
-                        failure_cause=str(err),
+                        failure_cause=clean_err,
                     )
                     job.report = report
                     return report
@@ -521,6 +523,37 @@ class BuildWorker:
                     f"## Deployment Target\n{job.plan.deployment_target}\n"
                 )
                 prompt_file.write_text(prompt_content, encoding="utf-8")
+
+                if self.registry_publisher is not None:
+                    try:
+                        delivered_status = self.orchestrator.get_status(project_id)
+                        self.registry_publisher.publish_project(delivered_status)
+                    except (
+                        RegistryPublishError,
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                    ) as reg_exc:
+                        clean_reg_err = redact_secrets(
+                            str(reg_exc), extra_secrets=self.secrets_to_redact
+                        )
+                        self.orchestrator.store.append(
+                            create_event(
+                                project_id=project_id,
+                                event_type=EventType.PROJECT_FAILED,
+                                payload={"reason": f"Registry publish failed: {clean_reg_err}"},
+                                at=self.orchestrator._now(),
+                            )
+                        )
+                        job.state = JobState.FAILED
+                        report = BuildReport(
+                            invocations=job.invocations_used,
+                            test_results=job.test_results,
+                            ci_rounds=job.ci_rounds_used,
+                            failure_cause=f"Registry publish failed: {clean_reg_err}",
+                        )
+                        job.report = report
+                        return report
 
                 job.state = JobState.COMPLETED
                 report = BuildReport(
