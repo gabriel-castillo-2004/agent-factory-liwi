@@ -417,6 +417,9 @@ class TelegramBotService:
 
         try:
             self.orchestrator.create_project(pid, name=idea, objective=idea)
+            self.orchestrator.handle_interview_message(
+                pid, f"tg-msg-{update.update_id}", idea
+            )
         except (ValueError, IllegalTransition) as exc:
             return self._error_outcome(
                 update,
@@ -425,11 +428,10 @@ class TelegramBotService:
                 project_id=pid,
             )
 
-        self._set_active_project(update.chat_id, pid)
-        self.orchestrator.handle_interview_message(
-            pid, f"tg-msg-{update.update_id}", idea
-        )
-        return self._handle_interview_state(update, pid, command="/new")
+        outcome = self._handle_interview_state(update, pid, command="/new")
+        if outcome.action != "error":
+            self._set_active_project(update.chat_id, pid)
+        return outcome
 
     def _handle_status(self, update: TelegramUpdate, raw_text: str) -> UpdateOutcome:
         """Handle /status [project_id] or /estado [project_id]."""
@@ -547,11 +549,12 @@ class TelegramBotService:
             return self._handle_callback(update)
 
         raw_text = (update.text or "").strip()
-        if raw_text.startswith("/new"):
+        first_token = raw_text.split(None, 1)[0].lower() if raw_text else ""
+        if first_token == "/new":
             return self._handle_new(update, raw_text)
-        if raw_text.startswith(("/status", "/estado")):
+        if first_token in {"/status", "/estado"}:
             return self._handle_status(update, raw_text)
-        if raw_text.startswith("/resume"):
+        if first_token == "/resume":
             return self._handle_resume(update, raw_text)
 
         pid = self.active_project_by_chat.get(update.chat_id)

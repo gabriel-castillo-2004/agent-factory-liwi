@@ -2,14 +2,49 @@
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.domain.events import Event
-from agent_factory.domain.models import BuildReport, ProjectStatus
-from agent_factory.ports.runner import Runner
+from agent_factory.domain.models import BuildReport, ProjectStatus, validate_project_id
+from agent_factory.ports.runner import CommandTimeoutError, Runner
+from agent_factory.secrets import redact_secrets
+
+SAFE_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "PATH",
+        "SYSTEMROOT",
+        "COMSPEC",
+        "PATHEXT",
+        "WINDIR",
+        "TMP",
+        "TEMP",
+        "USER",
+        "USERNAME",
+        "HOME",
+        "USERPROFILE",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "GIT_EXEC_PATH",
+    }
+)
+FORBIDDEN_ENV_SUBSTRINGS: tuple[str, ...] = (
+    "TELEGRAM",
+    "LLM",
+    "OPENAI",
+    "ANTHROPIC",
+    "GEMINI",
+    "SECRET",
+    "PASSWORD",
+    "CREDENTIAL",
+)
 
 
 class StaticDeployError(RuntimeError):
@@ -44,7 +79,58 @@ class StaticDeployPublisher:
 
     def build_clean_env(self, host_env: Mapping[str, str] | None = None) -> dict[str, str]:
         """Construct sanitized subprocess env excluding unrelated host secrets (INV-19)."""
-        raise NotImplementedError("StaticDeployPublisher.build_clean_env is not implemented yet (PASO B)")
+        effective = os.environ if host_env is None else host_env
+        clean: dict[str, str] = {}
+        for k, v in effective.items():
+            k_up = k.upper()
+            if k_up in SAFE_ENV_KEYS and not any(sub in k_up for sub in FORBIDDEN_ENV_SUBSTRINGS):
+                clean[k] = v
+        if self.deploy_token:
+            clean["VERCEL_TOKEN"] = self.deploy_token
+            clean["GITHUB_TOKEN"] = self.deploy_token
+        return clean
+
+    def build_sanitized_project_detail(
+        self,
+        status: ProjectStatus,
+        events: Sequence[Event] = (),
+        *,
+        build_report: BuildReport | None = None,
+        project_prompt: str | None = None,
+    ) -> dict[str, Any]:
+        """Build sanitized JSON-serializable detail dict for projects/<project_id>.json."""
+        validate_project_id(status.project_id)
+        state_str = (
+            status.state.value if hasattr(status.state, "value") else str(status.state)
+        )
+        detail: dict[str, Any] = {
+            "project_id": status.project_id,
+            "name": status.name,
+            "objective": status.objective,
+            "state": state_str,
+            "phase": status.phase,
+            "progress_pct": status.progress_pct,
+            "plan_hash": status.plan_hash,
+            "tests": status.tests.model_dump() if status.tests else None,
+            "agent_invocations": status.agent_invocations,
+            "ci_rounds": status.ci_rounds,
+            "links": status.links.model_dump() if status.links else None,
+            "updated_at": status.updated_at.isoformat() if status.updated_at else None,
+            "events": [
+                {
+                    "id": ev.id,
+                    "type": ev.type.value if hasattr(ev.type, "value") else str(ev.type),
+                    "payload": ev.payload,
+                    "at": ev.at.isoformat() if ev.at else None,
+                }
+                for ev in events
+            ],
+            "build_report": build_report.model_dump() if build_report else None,
+            "project_prompt": project_prompt,
+        }
+        serialized = json.dumps(detail)
+        redacted = redact_secrets(serialized, extra_secrets=self.secrets)
+        return json.loads(redacted)
 
     def export_panel_bundle(
         self,
@@ -56,18 +142,47 @@ class StaticDeployPublisher:
         panel_source_dir: Path = Path("panel"),
     ) -> Path:
         """Assemble static PWA panel assets with sanitized registry.json and projects/<id>.json."""
-        raise NotImplementedError("StaticDeployPublisher.export_panel_bundle is not implemented yet (PASO B)")
+        for s in statuses:
+            validate_project_id(s.project_id)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if panel_source_dir.is_dir():
+            shutil.copytree(panel_source_dir, output_dir, dirs_exist_ok=True)
 
-    def build_sanitized_project_detail(
-        self,
-        status: ProjectStatus,
-        events: Sequence[Event] = (),
-        *,
-        build_report: BuildReport | None = None,
-        project_prompt: str | None = None,
-    ) -> dict[str, Any]:
-        """Build sanitized JSON-serializable detail dict for projects/<project_id>.json."""
-        raise NotImplementedError("StaticDeployPublisher.build_sanitized_project_detail is not implemented yet (PASO B)")
+        projects_dir = output_dir / "projects"
+        projects_dir.mkdir(parents=True, exist_ok=True)
+
+        reg_projects: dict[str, Any] = {}
+        for s in statuses:
+            state_str = s.state.value if hasattr(s.state, "value") else str(s.state)
+            repo_url = s.links.repo if s.links else None
+            deploy_url = s.links.deploy if s.links else None
+            reg_projects[s.project_id] = {
+                "project_id": s.project_id,
+                "name": s.name,
+                "objective": s.objective,
+                "state": state_str,
+                "progress_pct": s.progress_pct,
+                "plan_hash": s.plan_hash,
+                "repo_url": repo_url,
+                "deploy_url": deploy_url,
+                "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+            }
+            evs = (events_by_project or {}).get(s.project_id, ())
+            rep = (reports_by_project or {}).get(s.project_id)
+            detail = self.build_sanitized_project_detail(s, events=evs, build_report=rep)
+            (projects_dir / f"{s.project_id}.json").write_text(
+                json.dumps(detail, indent=2, sort_keys=True), encoding="utf-8"
+            )
+
+        reg_data = {
+            "version": "1.0",
+            "updated_at": datetime.now(UTC).isoformat(),
+            "projects": reg_projects,
+        }
+        (output_dir / "registry.json").write_text(
+            json.dumps(reg_data, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        return output_dir
 
     def deploy_site(
         self,
@@ -77,4 +192,22 @@ class StaticDeployPublisher:
         branch: str | None = None,
     ) -> str:
         """Validate project_id/source_dir and deploy static artifact via Runner, returning deploy URL."""
-        raise NotImplementedError("StaticDeployPublisher.deploy_site is not implemented yet (PASO B)")
+        validate_project_id(project_id)
+        if not source_dir.is_dir():
+            raise ValueError(f"Source directory {source_dir} does not exist")
+
+        effective_branch = branch or self.branch
+        clean_env = self.build_clean_env()
+        cmd = ["gh", "pages", "deploy", str(source_dir), "--branch", effective_branch]
+        try:
+            res = self.runner.run(cmd, cwd=source_dir, env=clean_env)
+        except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
+            clean_err = redact_secrets(str(exc), extra_secrets=self.secrets)
+            raise StaticDeployError(f"Static deploy failed: {clean_err}") from None
+
+        if res.exit_code != 0:
+            err = res.stderr or res.stdout or f"exit code {res.exit_code}"
+            clean_err = redact_secrets(err, extra_secrets=self.secrets)
+            raise StaticDeployError(f"Static deploy failed: {clean_err}")
+
+        return f"{self.deploy_base_url}/{project_id}"

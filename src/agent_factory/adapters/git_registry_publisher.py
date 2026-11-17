@@ -132,7 +132,53 @@ class GitRegistryPublisher:
                         if anc.exit_code == 0:
                             self._run_git(["reset", "--hard", "FETCH_HEAD"], cwd=work_dir)
                         else:
-                            self._run_git(["rebase", "FETCH_HEAD"], cwd=work_dir)
+                            try:
+                                self._run_git(["rebase", "FETCH_HEAD"], cwd=work_dir)
+                            except RegistryPublishError:
+                                self.runner.run(
+                                    ["git", "rebase", "--abort"], cwd=work_dir, env=self.env
+                                )
+                                local_projects_dir = work_dir / "projects"
+                                cached_projects: dict[str, str] = {}
+                                if local_projects_dir.is_dir():
+                                    for pfile in local_projects_dir.glob("*.json"):
+                                        try:
+                                            cached_projects[pfile.name] = pfile.read_text(
+                                                encoding="utf-8"
+                                            )
+                                        except OSError:
+                                            pass
+                                self._run_git(["reset", "--hard", "FETCH_HEAD"], cwd=work_dir)
+                                if cached_projects:
+                                    local_projects_dir.mkdir(parents=True, exist_ok=True)
+                                    reg_file = work_dir / "registry.json"
+                                    idx_data: dict[str, object] = {
+                                        "version": "1.0",
+                                        "updated_at": None,
+                                        "projects": {},
+                                    }
+                                    if reg_file.exists():
+                                        try:
+                                            parsed = json.loads(reg_file.read_text(encoding="utf-8"))
+                                            if isinstance(parsed, dict):
+                                                idx_data = parsed
+                                        except (json.JSONDecodeError, OSError):
+                                            pass
+                                    projs = idx_data.setdefault("projects", {})
+                                    for fname, content in cached_projects.items():
+                                        pid = fname.removesuffix(".json")
+                                        target_file = local_projects_dir / fname
+                                        if not target_file.exists():
+                                            target_file.write_text(content, encoding="utf-8")
+                                        if pid not in projs:
+                                            try:
+                                                projs[pid] = json.loads(content)
+                                            except (json.JSONDecodeError, ValueError):
+                                                pass
+                                    reg_file.write_text(
+                                        json.dumps(idx_data, indent=2, sort_keys=True),
+                                        encoding="utf-8",
+                                    )
 
     def _commit_and_push_if_needed(self, work_dir: Path, branch: str, message: str) -> None:
         """Stage changes, commit if index differs, and push if remote lags behind local HEAD."""

@@ -44,6 +44,14 @@ def redact_secrets(
         result,
     )
 
+    # URL query parameter credentials (e.g. ?token=..., &api_key=..., ?access_token=..., etc.)
+    result = re.sub(
+        r"([?&](?:token|api_key|apikey|access_token|secret|password|auth|client_secret)=)[^&\s#\"']+",
+        r"\1[REDACTED]",
+        result,
+        flags=re.IGNORECASE,
+    )
+
     # Bearer tokens in headers or messages
     result = re.sub(
         r"(Bearer\s+)[A-Za-z0-9_.-]+",
@@ -61,7 +69,7 @@ def redact_secrets(
 
     # Key=value token assignments for standard secret variables
     result = re.sub(
-        r"((?:GITHUB_TOKEN|VERCEL_TOKEN|TELEGRAM_BOT_TOKEN)\s*=\s*)[^\s;&,]+",
+        r"((?:GITHUB_TOKEN|VERCEL_TOKEN|TELEGRAM_BOT_TOKEN)\s*=\s*)[^\s;&,\"']+",
         r"\1[REDACTED]",
         result,
         flags=re.IGNORECASE,

@@ -2,16 +2,50 @@
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
-from agent_factory.ports.runner import Runner
+from agent_factory.domain.models import validate_project_id
+from agent_factory.ports.runner import CommandTimeoutError, Runner
 from agent_factory.ports.vcs import VCS, CIRunResult
+from agent_factory.secrets import redact_secrets
 
 if TYPE_CHECKING:
     from agent_factory.adapters.static_deploy_publisher import StaticDeployPublisher
+
+SAFE_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "PATH",
+        "SYSTEMROOT",
+        "COMSPEC",
+        "PATHEXT",
+        "WINDIR",
+        "TMP",
+        "TEMP",
+        "USER",
+        "USERNAME",
+        "HOME",
+        "USERPROFILE",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "GIT_EXEC_PATH",
+    }
+)
+FORBIDDEN_ENV_SUBSTRINGS: tuple[str, ...] = (
+    "TELEGRAM",
+    "LLM",
+    "OPENAI",
+    "ANTHROPIC",
+    "GEMINI",
+    "SECRET",
+    "PASSWORD",
+    "CREDENTIAL",
+)
 
 
 class VcsError(RuntimeError):
@@ -54,7 +88,30 @@ class GitHubVCSAdapter(VCS):
 
     def build_clean_env(self, host_env: Mapping[str, str] | None = None) -> dict[str, str]:
         """Build sanitized subprocess env keeping system vars and stripping unrelated secrets (INV-19)."""
-        raise NotImplementedError("GitHubVCSAdapter.build_clean_env is not implemented yet (PASO B)")
+        effective = os.environ if host_env is None else host_env
+        clean: dict[str, str] = {}
+        for k, v in effective.items():
+            k_up = k.upper()
+            if k_up in SAFE_ENV_KEYS and not any(sub in k_up for sub in FORBIDDEN_ENV_SUBSTRINGS):
+                clean[k] = v
+        if self.github_token:
+            clean["GITHUB_TOKEN"] = self.github_token
+            clean["GH_TOKEN"] = self.github_token
+        return clean
+
+    def _validate_branch(self, branch: str) -> str:
+        """Validate branch name preventing flag injection and path traversal."""
+        b = branch.strip()
+        if (
+            not b
+            or b.startswith("-")
+            or any(ch.isspace() for ch in b)
+            or ".." in b
+            or ":" in b
+            or "\\" in b
+        ):
+            raise ValueError(f"Invalid branch name '{branch}'")
+        return b
 
     def push_branch(
         self,
@@ -63,7 +120,25 @@ class GitHubVCSAdapter(VCS):
         branch: str = "work",
     ) -> str:
         """Validate project_id/branch and push workspace branch via Runner."""
-        raise NotImplementedError("GitHubVCSAdapter.push_branch is not implemented yet (PASO B)")
+        validate_project_id(project_id)
+        valid_branch = self._validate_branch(branch)
+        if not workspace_dir.is_dir():
+            raise ValueError(f"Workspace directory {workspace_dir} does not exist")
+
+        clean_env = self.build_clean_env()
+        cmd = ["git", "push", "-u", "origin", valid_branch]
+        try:
+            res = self.runner.run(cmd, cwd=workspace_dir, env=clean_env)
+        except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
+            clean_err = redact_secrets(str(exc), extra_secrets=self.secrets)
+            raise VcsError(f"Git push failed: {clean_err}") from None
+
+        if res.exit_code != 0:
+            err = res.stderr or res.stdout or f"exit code {res.exit_code}"
+            clean_err = redact_secrets(err, extra_secrets=self.secrets)
+            raise VcsError(f"Git push failed: {clean_err}")
+
+        return res.stdout.strip() or valid_branch
 
     def get_ci_result(
         self,
@@ -71,7 +146,47 @@ class GitHubVCSAdapter(VCS):
         branch: str = "work",
     ) -> CIRunResult:
         """Query remote CI workflow result for project_id and branch via Runner."""
-        raise NotImplementedError("GitHubVCSAdapter.get_ci_result is not implemented yet (PASO B)")
+        validate_project_id(project_id)
+        valid_branch = self._validate_branch(branch)
+
+        clean_env = self.build_clean_env()
+        cmd = ["gh", "run", "view", "--branch", valid_branch, "--json", "status,conclusion"]
+        try:
+            res = self.runner.run(cmd, cwd=Path.cwd(), env=clean_env)
+        except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
+            clean_err = redact_secrets(str(exc), extra_secrets=self.secrets)
+            raise VcsError(f"CI query failed: {clean_err}") from None
+
+        if res.exit_code != 0:
+            err = res.stderr or res.stdout or f"exit code {res.exit_code}"
+            clean_err = redact_secrets(err, extra_secrets=self.secrets)
+            raise VcsError(f"CI query failed: {clean_err}")
+
+        raw_output = res.stdout.strip()
+        try:
+            parsed = json.loads(raw_output)
+            if isinstance(parsed, dict):
+                if "passed" in parsed:
+                    return CIRunResult(
+                        passed=bool(parsed["passed"]),
+                        summary=str(parsed.get("summary", "")),
+                        failed_checks=list(parsed.get("failed_checks", [])),
+                    )
+                conclusion = str(parsed.get("conclusion", "")).lower()
+                status_str = str(parsed.get("status", "")).lower()
+                passed = conclusion == "success"
+                summary = f"CI status: {status_str}, conclusion: {conclusion}"
+                failed_checks = [] if passed else ["ci"]
+                return CIRunResult(passed=passed, summary=summary, failed_checks=failed_checks)
+        except json.JSONDecodeError:
+            pass
+
+        passed = "pass" in raw_output.lower() and "fail" not in raw_output.lower()
+        return CIRunResult(
+            passed=passed,
+            summary=raw_output[:200],
+            failed_checks=[] if passed else ["ci"],
+        )
 
     def merge_and_deploy(
         self,
@@ -79,4 +194,26 @@ class GitHubVCSAdapter(VCS):
         branch: str = "work",
     ) -> tuple[str, str]:
         """Merge verified branch and deploy static artifact, returning (repo_url, deploy_url)."""
-        raise NotImplementedError("GitHubVCSAdapter.merge_and_deploy is not implemented yet (PASO B)")
+        validate_project_id(project_id)
+        valid_branch = self._validate_branch(branch)
+
+        clean_env = self.build_clean_env()
+        cmd = ["gh", "pr", "merge", valid_branch, "--merge", "--auto"]
+        try:
+            res = self.runner.run(cmd, cwd=Path.cwd(), env=clean_env)
+        except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
+            clean_err = redact_secrets(str(exc), extra_secrets=self.secrets)
+            raise VcsError(f"Merge failed: {clean_err}") from None
+
+        if res.exit_code != 0:
+            err = res.stderr or res.stdout or f"exit code {res.exit_code}"
+            clean_err = redact_secrets(err, extra_secrets=self.secrets)
+            raise VcsError(f"Merge failed: {clean_err}")
+
+        repo_url = (
+            f"{self.repo_base_url}/{self.owner}/{project_id}"
+            if self.owner
+            else f"{self.repo_base_url}/{project_id}"
+        )
+        deploy_url = f"{self.deploy_base_url}/{project_id}"
+        return (repo_url, deploy_url)
