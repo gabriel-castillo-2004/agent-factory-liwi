@@ -413,3 +413,42 @@ def test_test_lock_protects_root_conftest_and_setup_cfg_from_modification_deleti
     assert conftest_file.is_file()
     assert conftest_file.read_text(encoding="utf-8") == original_conftest
 
+
+def test_test_lock_protects_playwright_config_mjs_and_package_json_from_tampering(
+    tmp_path: Path,
+) -> None:
+    """F2B-05 (AC-2.2, INV-13): compute_test_lock and verify_and_restore_test_lock detect and revert modifications or deletion of playwright.config.mjs and package.json (kills M15)."""
+    ws_dir = tmp_path / "ws-static-web-lock"
+    (ws_dir / "tests").mkdir(parents=True, exist_ok=True)
+    (ws_dir / "tests" / "test_app.mjs").write_text("import test from 'node:test';\n", encoding="utf-8")
+
+    templates_dir = Path(__file__).resolve().parents[1] / "templates" / "static-web"
+    original_pw = (templates_dir / "playwright.config.mjs").read_text(encoding="utf-8")
+    original_pkg = (templates_dir / "package.json").read_text(encoding="utf-8")
+
+    pw_file = ws_dir / "playwright.config.mjs"
+    pkg_file = ws_dir / "package.json"
+    pw_file.write_text(original_pw, encoding="utf-8")
+    pkg_file.write_text(original_pkg, encoding="utf-8")
+
+    snapshot = compute_test_lock(ws_dir)
+
+    # 1. Weakening playwright.config.mjs (e.g., removing error guards or changing testDir) is detected & reverted
+    pw_file.write_text('export default { testDir: "./empty" };\n', encoding="utf-8")
+    assert verify_and_restore_test_lock(ws_dir, snapshot) is False
+    assert pw_file.read_text(encoding="utf-8") == original_pw
+    assert verify_and_restore_test_lock(ws_dir, snapshot) is True
+
+    # 2. Deleting playwright.config.mjs is detected & restored
+    pw_file.unlink()
+    assert verify_and_restore_test_lock(ws_dir, snapshot) is False
+    assert pw_file.is_file()
+    assert pw_file.read_text(encoding="utf-8") == original_pw
+
+    # 3. Altering package.json test scripts is detected & reverted
+    pkg_file.write_text('{"name": "tampered", "scripts": {"test": "exit 0"}}\n', encoding="utf-8")
+    assert verify_and_restore_test_lock(ws_dir, snapshot) is False
+    assert pkg_file.read_text(encoding="utf-8") == original_pkg
+    assert verify_and_restore_test_lock(ws_dir, snapshot) is True
+
+

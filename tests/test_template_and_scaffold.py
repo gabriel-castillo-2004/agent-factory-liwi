@@ -182,3 +182,202 @@ def test_template_scaffold_rejects_invalid_project_id_contaminated_workspace_or_
     evil_scaffold = TemplateScaffold(workspace_manager=ws_mgr, templates_root=custom_templates)
     with pytest.raises(SandboxViolationError):
         evil_scaffold.scaffold(project_id="proj-evil-link", template_id="evil-web")
+
+
+def _write_valid_template_base(tpl_dir: Path) -> None:
+    """Populate tpl_dir with clean static-web files copied directly from DEFAULT_TEMPLATES_ROOT."""
+    tpl_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("package.json", "playwright.config.mjs", "index.html", "styles.css"):
+        (tpl_dir / name).write_text(
+            (DEFAULT_TEMPLATES_ROOT / "static-web" / name).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+
+def test_static_web_template_and_inspect_template_enforce_console_error_and_pageerror_guard(
+    tmp_path: Path,
+) -> None:
+    """F2B-03 (AC-2.5, INV-13, INV-23): templates/static-web/ enforces console.error and pageerror failure guards, and inspect_template rejects templates missing them."""
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+    default_scaffold = TemplateScaffold(
+        workspace_manager=ws_mgr, templates_root=DEFAULT_TEMPLATES_ROOT
+    )
+
+    # Positive check against templates/static-web/
+    inspection = default_scaffold.inspect_template("static-web")
+    assert inspection.template_id == "static-web"
+    pw_text = (DEFAULT_TEMPLATES_ROOT / "static-web" / "playwright.config.mjs").read_text(
+        encoding="utf-8"
+    )
+    assert 'page.on("console"' in pw_text
+    assert 'msg.type() === "error"' in pw_text
+    assert 'page.on("pageerror"' in pw_text
+    assert "throw new Error" in pw_text
+
+    # Negative checks against custom templates missing browser error guards
+    templates_root = tmp_path / "templates"
+    custom_scaffold = TemplateScaffold(workspace_manager=ws_mgr, templates_root=templates_root)
+
+    # Case 1: Missing both console error and pageerror listeners
+    no_guard_dir = templates_root / "no-error-guard-web"
+    _write_valid_template_base(no_guard_dir)
+    (no_guard_dir / "playwright.config.mjs").write_text(
+        'export default { testDir: "./tests", use: { headless: true, offline: true } };\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        custom_scaffold.inspect_template("no-error-guard-web")
+
+    # Case 2: Only console error listener without pageerror listener
+    no_pageerror_dir = templates_root / "no-pageerror-web"
+    _write_valid_template_base(no_pageerror_dir)
+    (no_pageerror_dir / "playwright.config.mjs").write_text(
+        'export function guard(page) { page.on("console", (m) => { if (m.type() === "error") throw new Error(m.text()); }); }\n'
+        'export default { testDir: "./tests", use: { headless: true, offline: true } };\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        custom_scaffold.inspect_template("no-pageerror-web")
+
+    # Case 3: Only pageerror listener without console.error listener
+    no_console_dir = templates_root / "no-console-guard-web"
+    _write_valid_template_base(no_console_dir)
+    (no_console_dir / "playwright.config.mjs").write_text(
+        'export function guard(page) { page.on("pageerror", (e) => { throw e; }); }\n'
+        'export default { testDir: "./tests", use: { headless: true, offline: true } };\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        custom_scaffold.inspect_template("no-console-guard-web")
+
+
+def test_inspect_template_separately_rejects_package_dependencies_and_external_urls(
+    tmp_path: Path,
+) -> None:
+    """F2B-04 (A2b-1, INV-16, INV-23): inspect_template rejects package dependencies/devDependencies/peerDependencies alone (kills M1) and external http(s) URLs alone (kills M2)."""
+    templates_root = tmp_path / "templates"
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+    scaffold = TemplateScaffold(workspace_manager=ws_mgr, templates_root=templates_root)
+
+    # 1. Runtime dependency alone (clean HTML/CSS/Playwright) -> kills M1
+    dep_dir = templates_root / "dep-only-web"
+    _write_valid_template_base(dep_dir)
+    (dep_dir / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "dep-only",
+                "scripts": {"test": "node --test"},
+                "dependencies": {"express": "4.19.2"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        scaffold.inspect_template("dep-only-web")
+
+    # 2. devDependencies alone -> fails today
+    dev_dep_dir = templates_root / "dev-dep-web"
+    _write_valid_template_base(dev_dep_dir)
+    (dev_dep_dir / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "dev-dep-only",
+                "scripts": {"test": "node --test"},
+                "dependencies": {},
+                "devDependencies": {"fastify": "4.28.0"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        scaffold.inspect_template("dev-dep-web")
+
+    # 3. peerDependencies alone -> fails today
+    peer_dep_dir = templates_root / "peer-dep-web"
+    _write_valid_template_base(peer_dep_dir)
+    (peer_dep_dir / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "peer-dep-only",
+                "scripts": {"test": "node --test"},
+                "dependencies": {},
+                "peerDependencies": {"pg": "8.11.0"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        scaffold.inspect_template("peer-dep-web")
+
+    # 4. External https:// URL alone in index.html (clean package.json) -> kills M2
+    html_url_dir = templates_root / "html-https-only-web"
+    _write_valid_template_base(html_url_dir)
+    (html_url_dir / "index.html").write_text(
+        '<!DOCTYPE html><html><body><script src="https://cdn.example.com/lib.js"></script></body></html>\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        scaffold.inspect_template("html-https-only-web")
+
+    # 5. External http:// URL alone in styles.css (clean package.json and index.html)
+    css_url_dir = templates_root / "css-http-only-web"
+    _write_valid_template_base(css_url_dir)
+    (css_url_dir / "styles.css").write_text(
+        '@import url("http://fonts.example.com/font.css");\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        scaffold.inspect_template("css-http-only-web")
+
+
+def test_template_scaffold_rejects_destination_symlink_src_or_prepopulated_tests(
+    tmp_path: Path,
+) -> None:
+    """F2B-06 (A2b-2, INV-13, INV-18, INV-22): TemplateScaffold.scaffold rejects escaping symlink/junction at ws/src and rejects pre-existing files in ws/tests."""
+    base_dir = tmp_path / "workspaces"
+    ws_mgr = WorkspaceManager(base_dir=base_dir)
+    scaffold = TemplateScaffold(workspace_manager=ws_mgr, templates_root=DEFAULT_TEMPLATES_ROOT)
+
+    # 1. Destination ws_dir/src is a directory link pointing outside workspace (even when target is empty)
+    empty_outside_dir = tmp_path / "empty_outside_src"
+    empty_outside_dir.mkdir(parents=True, exist_ok=True)
+    ws_src_link = ws_mgr.create_workspace("proj-dest-src-link")
+    _create_dir_link(ws_src_link / "src", empty_outside_dir)
+
+    with pytest.raises(SandboxViolationError):
+        scaffold.scaffold(project_id="proj-dest-src-link", template_id="static-web")
+
+    # 2. Destination ws_dir/tests already has pre-existing files
+    ws_dirty_tests = ws_mgr.create_workspace("proj-dest-dirty-tests")
+    (ws_dirty_tests / "tests").mkdir(parents=True, exist_ok=True)
+    (ws_dirty_tests / "tests" / "preexisting.test.mjs").write_text(
+        "// preexisting rogue test\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SandboxViolationError):
+        scaffold.scaffold(project_id="proj-dest-dirty-tests", template_id="static-web")
+
+
+def test_template_scaffold_defensive_errors_on_invalid_or_missing_template_and_malformed_package_json(
+    tmp_path: Path,
+) -> None:
+    """F2B-07 (A2b-1, INV-22): Covers empty/backslash/missing template_id and malformed package.json branches."""
+    templates_root = tmp_path / "templates"
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+    scaffold = TemplateScaffold(workspace_manager=ws_mgr, templates_root=templates_root)
+
+    with pytest.raises(SandboxViolationError):
+        scaffold.inspect_template("")
+
+    with pytest.raises(SandboxViolationError):
+        scaffold.inspect_template("static\\web")
+
+    with pytest.raises(FileNotFoundError):
+        scaffold.inspect_template("does-not-exist")
+
+    bad_json_dir = templates_root / "bad-json-web"
+    _write_valid_template_base(bad_json_dir)
+    (bad_json_dir / "package.json").write_text("{not valid json", encoding="utf-8")
+    with pytest.raises(ValueError):
+        scaffold.inspect_template("bad-json-web")

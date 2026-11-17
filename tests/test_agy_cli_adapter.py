@@ -15,6 +15,7 @@ from agent_factory.adapters.fake_vcs import FakeVCS
 from agent_factory.adapters.memory_store import MemoryEventStore
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.builder import BuildWorker, JobState, LocalJobQueue
+from agent_factory.domain.events import EventType
 from agent_factory.domain.models import (
     AcceptanceTest,
     AcceptanceTestType,
@@ -358,9 +359,9 @@ def test_agy_cli_adapter_translates_quota_errors_execution_failures_and_runner_t
 
     adapter = AgyCliAdapter(
         workspace_manager=ws_mgr,
-        runner=SubprocessRunner(default_timeout_seconds=0.4),
+        runner=SubprocessRunner(default_timeout_seconds=5.0),
         cli_command=[sys.executable, str(cli_script)],
-        timeout_seconds=0.4,
+        timeout_seconds=5.0,
         default_retry_after_seconds=3.5,
     )
 
@@ -376,8 +377,15 @@ def test_agy_cli_adapter_translates_quota_errors_execution_failures_and_runner_t
     assert "Fatal CLI internal crash" in str(fatal_exc.value)
 
     # 3. Subprocess hang -> timeout enforced by SubprocessRunner -> CommandTimeoutError or CodeAgentError
+    timeout_adapter = AgyCliAdapter(
+        workspace_manager=ws_mgr,
+        runner=SubprocessRunner(default_timeout_seconds=0.3),
+        cli_command=[sys.executable, str(cli_script)],
+        timeout_seconds=0.3,
+        default_retry_after_seconds=3.5,
+    )
     with pytest.raises((CommandTimeoutError, CodeAgentError)) as timeout_exc:
-        adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=3)
+        timeout_adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=3)
     assert "timed out" in str(timeout_exc.value).lower()
 
 
@@ -575,3 +583,199 @@ def test_end_to_end_offline_build_worker_pauses_on_agy_cli_quota_and_fails_on_cl
     assert status_2.state == ProjectState.FAILED
     assert crash_report.failure_cause is not None
     assert "Unrecoverable CLI binary failure" in crash_report.failure_cause
+
+
+def test_build_worker_captures_agy_cli_adapter_timeouts_in_test_gen_and_impl_without_getting_stuck(
+    tmp_path: Path,
+) -> None:
+    """F2B-01 (INV-06, INV-09, A2b-5, A2b-6): Timeouts in AgyCliAdapter during generate_tests or implement_or_fix record the call, emit PROJECT_FAILED, and transition to FAILED with BuildReport."""
+    # 1. Timeout during Step A (generate_tests)
+    project_step_a = "proj-cli-timeout-step-a"
+    orch_a, store_a = _approved_static_web_orchestrator(project_step_a)
+    ws_mgr_a = WorkspaceManager(base_dir=tmp_path / "ws_to_a")
+    TemplateScaffold(workspace_manager=ws_mgr_a, templates_root=DEFAULT_TEMPLATES_ROOT).scaffold(
+        project_id=project_step_a, template_id="static-web"
+    )
+
+    hang_step_a_script = tmp_path / "hang_step_a.py"
+    hang_step_a_script.write_text("import time\ntime.sleep(5.0)\n", encoding="utf-8")
+
+    queue_a = LocalJobQueue()
+    adapter_a = AgyCliAdapter(
+        workspace_manager=ws_mgr_a,
+        runner=SubprocessRunner(default_timeout_seconds=0.4),
+        cli_command=[sys.executable, str(hang_step_a_script)],
+        timeout_seconds=0.4,
+    )
+    worker_a = BuildWorker(
+        orchestrator=orch_a,
+        workspace_manager=ws_mgr_a,
+        code_agent=adapter_a,
+        runner=FakeRunner(),
+        vcs=FakeVCS(),
+        queue=queue_a,
+    )
+    worker_a.enqueue_approved_project(project_id=project_step_a)
+
+    report_a = worker_a.run_job(project_id=project_step_a)
+    status_a = orch_a.get_status(project_step_a)
+    job_a = queue_a.get_job(project_step_a)
+    assert status_a.state == ProjectState.FAILED
+    assert job_a is not None
+    assert job_a.state == JobState.FAILED
+    assert report_a.invocations == 1
+    assert report_a.failure_cause is not None
+    assert "timed out" in report_a.failure_cause.lower()
+    assert orch_a.circuit_breaker.get_calls(project_step_a, ProjectState.BUILDING) == 1
+    assert status_a.agent_invocations == 2
+    assert any(e.type == EventType.PROJECT_FAILED for e in store_a.get_events(project_step_a))
+
+    # 2. Timeout during Step B (implement_or_fix) after generate_tests succeeds
+    project_step_b = "proj-cli-timeout-step-b"
+    orch_b, store_b = _approved_static_web_orchestrator(project_step_b)
+    ws_mgr_b = WorkspaceManager(base_dir=tmp_path / "ws_to_b")
+    TemplateScaffold(workspace_manager=ws_mgr_b, templates_root=DEFAULT_TEMPLATES_ROOT).scaffold(
+        project_id=project_step_b, template_id="static-web"
+    )
+
+    hang_step_b_script = tmp_path / "hang_step_b.py"
+    hang_step_b_script.write_text(
+        "import json, pathlib, sys, time\n"
+        "args = sys.argv[1:]\n"
+        "mode = args[args.index('--mode') + 1]\n"
+        "ws = pathlib.Path.cwd()\n"
+        "if mode == 'generate-tests':\n"
+        "    (ws / 'tests').mkdir(parents=True, exist_ok=True)\n"
+        "    (ws / 'tests' / 'test_c.py').write_text('def test_1(): pass\\n', encoding='utf-8')\n"
+        "    print(json.dumps({'files_written': ['tests/test_c.py'], 'summary': 'ok'}))\n"
+        "else:\n"
+        "    time.sleep(5.0)\n",
+        encoding="utf-8",
+    )
+
+    queue_b = LocalJobQueue()
+    adapter_b = AgyCliAdapter(
+        workspace_manager=ws_mgr_b,
+        runner=SubprocessRunner(default_timeout_seconds=1.2),
+        cli_command=[sys.executable, str(hang_step_b_script)],
+        timeout_seconds=1.2,
+    )
+    worker_b = BuildWorker(
+        orchestrator=orch_b,
+        workspace_manager=ws_mgr_b,
+        code_agent=adapter_b,
+        runner=FakeRunner(),
+        vcs=FakeVCS(),
+        queue=queue_b,
+    )
+    worker_b.enqueue_approved_project(project_id=project_step_b)
+
+    report_b = worker_b.run_job(project_id=project_step_b)
+    status_b = orch_b.get_status(project_step_b)
+    job_b = queue_b.get_job(project_step_b)
+    assert status_b.state == ProjectState.FAILED
+    assert job_b is not None
+    assert job_b.state == JobState.FAILED
+    assert report_b.invocations == 2
+    assert report_b.failure_cause is not None
+    assert "timed out" in report_b.failure_cause.lower()
+    assert orch_b.circuit_breaker.get_calls(project_step_b, ProjectState.BUILDING) == 2
+    assert status_b.agent_invocations == 3
+    assert any(e.type == EventType.PROJECT_FAILED for e in store_b.get_events(project_step_b))
+
+
+def test_agy_cli_adapter_does_not_misclassify_429_substring_on_success_or_non_quota_failure(
+    tmp_path: Path,
+) -> None:
+    """F2B-02 (INV-09, A2b-5, INV-23): Success output containing '429'/'rate limit' returns CodeAgentResult, while non-quota errors mentioning 'line 429' raise non-quota CodeAgentError."""
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+    ws_dir = ws_mgr.create_workspace("proj-429-precision")
+    plan = _sample_static_web_plan()
+
+    cli_script = tmp_path / "line_429_cli.py"
+    cli_script.write_text(
+        "import json, sys\n"
+        "args = sys.argv[1:]\n"
+        "payload = json.loads(args[args.index('--payload') + 1])\n"
+        "attempt = payload.get('attempt', 1)\n"
+        "if attempt == 1:\n"
+        "    print(json.dumps({'files_written': ['src/app.js'], 'summary': 'Wrote 429 bytes near line 429 rate limit check'}))\n"
+        "    sys.exit(0)\n"
+        "elif attempt == 2:\n"
+        "    sys.stderr.write('SyntaxError at src/app.js line 429: unexpected token\\n')\n"
+        "    sys.exit(1)\n"
+        "else:\n"
+        "    sys.stderr.write('HTTP 429 Too Many Requests: slow down\\n')\n"
+        "    sys.exit(1)\n",
+        encoding="utf-8",
+    )
+
+    adapter = AgyCliAdapter(
+        workspace_manager=ws_mgr,
+        runner=SubprocessRunner(default_timeout_seconds=5.0),
+        cli_command=[sys.executable, str(cli_script)],
+        timeout_seconds=5.0,
+        default_retry_after_seconds=4.0,
+    )
+
+    # 1. Exit code 0 with '429' and 'rate limit' in summary succeeds without QuotaExhaustedError
+    ok_res = adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=1)
+    assert ok_res.files_written == ["src/app.js"]
+    assert "429 bytes" in ok_res.summary
+
+    # 2. Exit code 1 with 'line 429' in SyntaxError raises non-quota CodeAgentError
+    with pytest.raises(CodeAgentError) as syntax_exc:
+        adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=2)
+    assert not isinstance(syntax_exc.value, QuotaExhaustedError)
+    assert "line 429" in str(syntax_exc.value)
+
+    # 3. Real HTTP 429 status on exit code 1 still triggers QuotaExhaustedError
+    with pytest.raises(QuotaExhaustedError) as quota_exc:
+        adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=3)
+    assert quota_exc.value.retry_after_seconds == 4.0
+
+
+def test_agy_cli_adapter_rejects_nested_workspace_subdir_and_handles_multiline_or_plain_stdout(
+    tmp_path: Path,
+) -> None:
+    """F2B-07 (A2b-3, INV-18, INV-22): Rejects nested subdir workspaces/<id>/sub and parses multiline JSON or plain-text CLI stdout."""
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+    ws_dir = ws_mgr.create_workspace("proj-sub-and-stdout")
+    nested_dir = ws_dir / "subdir"
+    nested_dir.mkdir(parents=True, exist_ok=True)
+    plan = _sample_static_web_plan()
+
+    fake_runner = FakeRunner(
+        results=[
+            # 1. Multiline pretty-printed JSON stdout
+            CommandResult(
+                exit_code=0,
+                stdout=json.dumps(
+                    {"files_written": ["src/app.js"], "summary": "Pretty JSON output"},
+                    indent=2,
+                ),
+            ),
+            # 2. Plain text stdout (non-JSON fallback)
+            CommandResult(
+                exit_code=0,
+                stdout="Plain text completion message\nLine 2",
+            ),
+        ]
+    )
+    adapter = AgyCliAdapter(
+        workspace_manager=ws_mgr,
+        runner=fake_runner,
+        cli_command=["agy"],
+    )
+
+    with pytest.raises(SandboxViolationError):
+        adapter.validate_workspace_cwd(nested_dir)
+
+    res_multiline = adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=1)
+    assert res_multiline.files_written == ["src/app.js"]
+    assert res_multiline.summary == "Pretty JSON output"
+
+    res_plain = adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=2)
+    assert res_plain.files_written == []
+    assert "Plain text completion message" in res_plain.summary
+
