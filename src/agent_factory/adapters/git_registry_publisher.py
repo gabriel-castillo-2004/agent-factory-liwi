@@ -13,7 +13,9 @@ from agent_factory.ports.publisher import RegistryEntry, RegistryPublishError
 from agent_factory.ports.runner import CommandResult, Runner
 from agent_factory.secrets import redact_secrets
 
-PROTECTED_MAIN_BRANCHES: frozenset[str] = frozenset({"main", "master"})
+PROTECTED_MAIN_BRANCHES: frozenset[str] = frozenset(
+    {"main", "master", "refs/heads/main", "refs/heads/master"}
+)
 
 
 class GitRegistryPublisher:
@@ -39,6 +41,23 @@ class GitRegistryPublisher:
         self.secrets: tuple[str, ...] = tuple(secrets)
         self.env = dict(env) if env is not None else None
 
+    def _validate_branch(self) -> str:
+        """Reject protected main/master branches and unsafe git flag/ref names (INV-21, INV-22)."""
+        branch = self.branch.strip()
+        norm = branch.lower()
+        if (
+            not branch
+            or branch.startswith("-")
+            or any(ch.isspace() for ch in branch)
+            or ".." in branch
+            or ":" in branch
+            or "\\" in branch
+            or norm in PROTECTED_MAIN_BRANCHES
+            or norm.endswith(("/main", "/master"))
+        ):
+            raise ValueError(f"Cannot publish registry onto invalid or protected branch '{self.branch}'")
+        return branch
+
     def _run_git(self, args: Sequence[str], cwd: Path) -> CommandResult:
         """Run a git command via self.runner and redact secrets if execution fails."""
         cmd = ["git"] + list(args)
@@ -62,30 +81,27 @@ class GitRegistryPublisher:
             return self.work_dir
         return Path(tempfile.gettempdir()) / f"af_registry_{abs(hash(str(self.repo_path)))}"
 
-    def _ensure_repository_ready(self, work_dir: Path) -> None:
-        """Ensure work_dir is cloned and checked out on self.branch."""
+    def _ensure_repository_ready(self, work_dir: Path, branch: str) -> None:
+        """Ensure work_dir is cloned, checked out on branch, and synchronized with remote."""
         if not (work_dir / ".git").exists():
             work_dir.parent.mkdir(parents=True, exist_ok=True)
             self._run_git(["clone", str(self.repo_path), str(work_dir)], cwd=work_dir.parent)
 
-            # Check if self.branch exists on local or remote
             check_local = self.runner.run(
-                ["git", "show-ref", "--verify", f"refs/heads/{self.branch}"],
+                ["git", "show-ref", "--verify", f"refs/heads/{branch}"],
                 cwd=work_dir,
                 env=self.env,
             )
             check_remote = self.runner.run(
-                ["git", "show-ref", "--verify", f"refs/remotes/{self.remote}/{self.branch}"],
+                ["git", "show-ref", "--verify", f"refs/remotes/{self.remote}/{branch}"],
                 cwd=work_dir,
                 env=self.env,
             )
             if check_local.exit_code == 0 or check_remote.exit_code == 0:
-                self._run_git(["checkout", self.branch], cwd=work_dir)
+                self._run_git(["checkout", branch], cwd=work_dir)
             else:
-                self._run_git(["checkout", "--orphan", self.branch], cwd=work_dir)
-                st = self.runner.run(["git", "status", "--porcelain"], cwd=work_dir, env=self.env)
-                if st.stdout.strip():
-                    self._run_git(["rm", "-rf", "."], cwd=work_dir)
+                self._run_git(["checkout", "--orphan", branch], cwd=work_dir)
+                self._run_git(["rm", "-rf", "--ignore-unmatch", "."], cwd=work_dir)
                 for child in work_dir.iterdir():
                     if child.name != ".git":
                         if child.is_dir():
@@ -93,16 +109,79 @@ class GitRegistryPublisher:
                         else:
                             child.unlink(missing_ok=True)
         else:
-            self._run_git(["checkout", self.branch], cwd=work_dir)
+            self._run_git(["checkout", branch], cwd=work_dir)
+            if self.push_to_remote:
+                fetch_res = self.runner.run(
+                    ["git", "fetch", self.remote, branch],
+                    cwd=work_dir,
+                    env=self.env,
+                )
+                if fetch_res.exit_code == 0:
+                    local_sha = self.runner.run(
+                        ["git", "rev-parse", "HEAD"], cwd=work_dir, env=self.env
+                    ).stdout.strip()
+                    remote_sha = self.runner.run(
+                        ["git", "rev-parse", "FETCH_HEAD"], cwd=work_dir, env=self.env
+                    ).stdout.strip()
+                    if local_sha and remote_sha and local_sha != remote_sha:
+                        anc = self.runner.run(
+                            ["git", "merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"],
+                            cwd=work_dir,
+                            env=self.env,
+                        )
+                        if anc.exit_code == 0:
+                            self._run_git(["reset", "--hard", "FETCH_HEAD"], cwd=work_dir)
+                        else:
+                            self._run_git(["rebase", "FETCH_HEAD"], cwd=work_dir)
+
+    def _commit_and_push_if_needed(self, work_dir: Path, branch: str, message: str) -> None:
+        """Stage changes, commit if index differs, and push if remote lags behind local HEAD."""
+        self._run_git(["add", "-A", "--", "registry.json", "projects"], cwd=work_dir)
+        diff_check = self.runner.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=work_dir,
+            env=self.env,
+        )
+        if diff_check.exit_code != 0:
+            self._run_git(
+                [
+                    "-c",
+                    "user.name=AgentFactory",
+                    "-c",
+                    "user.email=agent@factory.local",
+                    "commit",
+                    "-m",
+                    message,
+                ],
+                cwd=work_dir,
+            )
+
+        if self.push_to_remote:
+            ls_res = self.runner.run(
+                ["git", "ls-remote", "--heads", self.remote, branch],
+                cwd=work_dir,
+                env=self.env,
+            )
+            local_res = self.runner.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=work_dir,
+                env=self.env,
+            )
+            local_sha = local_res.stdout.strip()
+            remote_sha = (
+                ls_res.stdout.split()[0]
+                if ls_res.exit_code == 0 and ls_res.stdout.strip()
+                else ""
+            )
+            if not remote_sha or local_sha != remote_sha:
+                self._run_git(["push", "-u", self.remote, branch], cwd=work_dir)
 
     def publish_project(self, status: ProjectStatus) -> RegistryEntry:
         """Publish projects/<project_id>.json and update registry.json on self.branch without touching main."""
-        if self.branch.strip().lower() in PROTECTED_MAIN_BRANCHES:
-            raise ValueError(f"Cannot publish registry onto protected branch '{self.branch}'")
-
+        branch = self._validate_branch()
         validate_project_id(status.project_id)
         work_dir = self._resolve_work_dir()
-        self._ensure_repository_ready(work_dir)
+        self._ensure_repository_ready(work_dir, branch)
 
         repo_url = status.links.repo if status.links else None
         deploy_url = status.links.deploy if status.links else None
@@ -143,33 +222,14 @@ class GitRegistryPublisher:
         proj_file = proj_dir / f"{status.project_id}.json"
         proj_file.write_text(status.model_dump_json(indent=2), encoding="utf-8")
 
-        self._run_git(["add", "registry.json", "projects"], cwd=work_dir)
-
-        diff_check = self.runner.run(
-            ["git", "diff", "--cached", "--quiet"],
-            cwd=work_dir,
-            env=self.env,
+        self._commit_and_push_if_needed(
+            work_dir, branch, f"chore(registry): update {status.project_id}"
         )
-        if diff_check.exit_code != 0:
-            self._run_git(
-                [
-                    "-c",
-                    "user.name=AgentFactory",
-                    "-c",
-                    "user.email=agent@factory.local",
-                    "commit",
-                    "-m",
-                    f"chore(registry): update {status.project_id}",
-                ],
-                cwd=work_dir,
-            )
-            if self.push_to_remote:
-                self._run_git(["push", "-u", self.remote, self.branch], cwd=work_dir)
-
         return entry
 
     def load_index(self) -> dict[str, RegistryEntry]:
         """Load registry.json from self.branch without modifying checked-out working tree."""
+        branch = self._validate_branch()
         work_dir = self._resolve_work_dir()
         reg_file = work_dir / "registry.json"
         if reg_file.exists():
@@ -182,7 +242,7 @@ class GitRegistryPublisher:
 
         try:
             res = self._run_git(
-                ["show", f"refs/heads/{self.branch}:registry.json"],
+                ["show", f"refs/heads/{branch}:registry.json"],
                 cwd=self.repo_path,
             )
             data = json.loads(res.stdout)
@@ -197,6 +257,7 @@ class GitRegistryPublisher:
 
     def load(self, project_id: str) -> ProjectStatus | None:
         """Load ProjectStatus for project_id from the registry branch, or None if absent."""
+        branch = self._validate_branch()
         validate_project_id(project_id)
         work_dir = self._resolve_work_dir()
         proj_file = work_dir / "projects" / f"{project_id}.json"
@@ -208,7 +269,7 @@ class GitRegistryPublisher:
 
         try:
             res = self._run_git(
-                ["show", f"refs/heads/{self.branch}:projects/{project_id}.json"],
+                ["show", f"refs/heads/{branch}:projects/{project_id}.json"],
                 cwd=self.repo_path,
             )
             return ProjectStatus.model_validate_json(res.stdout)
@@ -217,9 +278,10 @@ class GitRegistryPublisher:
 
     def delete(self, project_id: str) -> None:
         """Remove project entry from the registry branch."""
+        branch = self._validate_branch()
         validate_project_id(project_id)
         work_dir = self._resolve_work_dir()
-        self._ensure_repository_ready(work_dir)
+        self._ensure_repository_ready(work_dir, branch)
 
         reg_file = work_dir / "registry.json"
         if reg_file.exists():
@@ -240,24 +302,6 @@ class GitRegistryPublisher:
         if proj_file.exists():
             proj_file.unlink(missing_ok=True)
 
-        self._run_git(["add", "registry.json", "projects"], cwd=work_dir)
-        diff_check = self.runner.run(
-            ["git", "diff", "--cached", "--quiet"],
-            cwd=work_dir,
-            env=self.env,
+        self._commit_and_push_if_needed(
+            work_dir, branch, f"chore(registry): delete {project_id}"
         )
-        if diff_check.exit_code != 0:
-            self._run_git(
-                [
-                    "-c",
-                    "user.name=AgentFactory",
-                    "-c",
-                    "user.email=agent@factory.local",
-                    "commit",
-                    "-m",
-                    f"chore(registry): delete {project_id}",
-                ],
-                cwd=work_dir,
-            )
-            if self.push_to_remote:
-                self._run_git(["push", self.remote, self.branch], cwd=work_dir)

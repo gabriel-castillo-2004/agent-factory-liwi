@@ -108,6 +108,39 @@ class BuildWorker:
         self.registry_publisher = registry_publisher
         self.secrets_to_redact: tuple[str, ...] = tuple(secrets_to_redact)
 
+    def _redact(self, text: str) -> str:
+        """Scrub configured secrets and credential patterns from diagnostic strings."""
+        return redact_secrets(text, extra_secrets=self.secrets_to_redact)
+
+    def _fail_job(
+        self,
+        project_id: str,
+        job: BuildJob,
+        reason: str,
+        *,
+        emit_event: bool = True,
+    ) -> BuildReport:
+        """Sanitize reason, emit optional PROJECT_FAILED, mark job FAILED, and build report."""
+        clean_reason = self._redact(reason)
+        if emit_event:
+            self.orchestrator.store.append(
+                create_event(
+                    project_id=project_id,
+                    event_type=EventType.PROJECT_FAILED,
+                    payload={"reason": clean_reason},
+                    at=self.orchestrator._now(),
+                )
+            )
+        job.state = JobState.FAILED
+        report = BuildReport(
+            invocations=job.invocations_used,
+            test_results=job.test_results,
+            ci_rounds=job.ci_rounds_used,
+            failure_cause=clean_reason,
+        )
+        job.report = report
+        return report
+
     def enqueue_approved_project(
         self,
         project_id: str,
@@ -179,16 +212,13 @@ class BuildWorker:
                 status = self.orchestrator.record_state_call(
                     project_id, ProjectState.BUILDING
                 )
-                job.state = JobState.FAILED
-                report = BuildReport(
-                    invocations=job.invocations_used,
-                    test_results=job.test_results,
-                    ci_rounds=job.ci_rounds_used,
-                    failure_cause=status.failure_reason
+                return self._fail_job(
+                    project_id,
+                    job,
+                    status.failure_reason
                     or f"BUILDING invocation limit ({building_limit}) exceeded",
+                    emit_event=False,
                 )
-                job.report = report
-                return report
 
             try:
                 self.code_agent.generate_tests(ws_dir, job.plan.acceptance_tests)
@@ -208,23 +238,7 @@ class BuildWorker:
                 # Fatal code agent error: record the invocation in CircuitBreaker and AGENT_INVOKED before failing
                 self.orchestrator.record_state_call(project_id, ProjectState.BUILDING)
                 job.invocations_used += 1
-                self.orchestrator.store.append(
-                    create_event(
-                        project_id=project_id,
-                        event_type=EventType.PROJECT_FAILED,
-                        payload={"reason": str(err)},
-                        at=self.orchestrator._now(),
-                    )
-                )
-                job.state = JobState.FAILED
-                report = BuildReport(
-                    invocations=job.invocations_used,
-                    test_results=job.test_results,
-                    ci_rounds=job.ci_rounds_used,
-                    failure_cause=str(err),
-                )
-                job.report = report
-                return report
+                return self._fail_job(project_id, job, str(err))
 
             # Successful test generation: record call in CircuitBreaker and AGENT_INVOKED
             status = self.orchestrator.record_state_call(
@@ -233,40 +247,23 @@ class BuildWorker:
             job.invocations_used += 1
 
             if status.state == ProjectState.FAILED:
-                job.state = JobState.FAILED
-                report = BuildReport(
-                    invocations=job.invocations_used,
-                    test_results=job.test_results,
-                    ci_rounds=job.ci_rounds_used,
-                    failure_cause=status.failure_reason,
+                return self._fail_job(
+                    project_id,
+                    job,
+                    status.failure_reason or "Circuit breaker tripped",
+                    emit_event=False,
                 )
-                job.report = report
-                return report
 
             tests_dir = ws_dir / "tests"
             has_tests = tests_dir.is_dir() and any(
                 p.is_file() for p in tests_dir.rglob("*")
             )
             if not has_tests:
-                self.orchestrator.store.append(
-                    create_event(
-                        project_id=project_id,
-                        event_type=EventType.PROJECT_FAILED,
-                        payload={
-                            "reason": "Test generation produced zero test files in tests/ (INV-13)"
-                        },
-                        at=self.orchestrator._now(),
-                    )
+                return self._fail_job(
+                    project_id,
+                    job,
+                    "Test generation produced zero test files in tests/ (INV-13)",
                 )
-                job.state = JobState.FAILED
-                report = BuildReport(
-                    invocations=job.invocations_used,
-                    test_results=job.test_results,
-                    ci_rounds=job.ci_rounds_used,
-                    failure_cause="Test generation produced zero test files in tests/ (INV-13)",
-                )
-                job.report = report
-                return report
 
             job.lock_snapshot = compute_test_lock(ws_dir)
         else:
@@ -290,16 +287,13 @@ class BuildWorker:
                 status = self.orchestrator.record_state_call(
                     project_id, ProjectState.BUILDING
                 )
-                job.state = JobState.FAILED
-                report = BuildReport(
-                    invocations=job.invocations_used,
-                    test_results=job.test_results,
-                    ci_rounds=job.ci_rounds_used,
-                    failure_cause=status.failure_reason
+                return self._fail_job(
+                    project_id,
+                    job,
+                    status.failure_reason
                     or f"BUILDING invocation limit ({building_limit}) exceeded",
+                    emit_event=False,
                 )
-                job.report = report
-                return report
 
             # Code agent writes / fixes code
             attempt_num = job.invocations_used + 1
@@ -326,23 +320,7 @@ class BuildWorker:
                 # Fatal code agent error: record the invocation in CircuitBreaker and AGENT_INVOKED before failing
                 self.orchestrator.record_state_call(project_id, ProjectState.BUILDING)
                 job.invocations_used += 1
-                self.orchestrator.store.append(
-                    create_event(
-                        project_id=project_id,
-                        event_type=EventType.PROJECT_FAILED,
-                        payload={"reason": str(err)},
-                        at=self.orchestrator._now(),
-                    )
-                )
-                job.state = JobState.FAILED
-                report = BuildReport(
-                    invocations=job.invocations_used,
-                    test_results=job.test_results,
-                    ci_rounds=job.ci_rounds_used,
-                    failure_cause=str(err),
-                )
-                job.report = report
-                return report
+                return self._fail_job(project_id, job, str(err))
 
             # Record successful agent invocation
             status = self.orchestrator.record_state_call(
@@ -351,15 +329,12 @@ class BuildWorker:
             job.invocations_used += 1
 
             if status.state == ProjectState.FAILED:
-                job.state = JobState.FAILED
-                report = BuildReport(
-                    invocations=job.invocations_used,
-                    test_results=job.test_results,
-                    ci_rounds=job.ci_rounds_used,
-                    failure_cause=status.failure_reason,
+                return self._fail_job(
+                    project_id,
+                    job,
+                    status.failure_reason or "Circuit breaker tripped",
+                    emit_event=False,
                 )
-                job.report = report
-                return report
 
             # Verify test lock
             if not verify_and_restore_test_lock(ws_dir, job.lock_snapshot):
@@ -377,23 +352,7 @@ class BuildWorker:
                     timeout_seconds=30.0,
                 )
             except (CommandTimeoutError, OSError, RuntimeError, ValueError) as err:
-                self.orchestrator.store.append(
-                    create_event(
-                        project_id=project_id,
-                        event_type=EventType.PROJECT_FAILED,
-                        payload={"reason": str(err)},
-                        at=self.orchestrator._now(),
-                    )
-                )
-                job.state = JobState.FAILED
-                report = BuildReport(
-                    invocations=job.invocations_used,
-                    test_results=job.test_results,
-                    ci_rounds=job.ci_rounds_used,
-                    failure_cause=str(err),
-                )
-                job.report = report
-                return report
+                return self._fail_job(project_id, job, str(err))
 
             # Update test results
             if runner_result.test_results:
@@ -450,32 +409,17 @@ class BuildWorker:
                 # Get CI result
                 ci_result = self.vcs.get_ci_result(project_id, branch="work")
             except (OSError, RuntimeError, ValueError) as err:
-                self.orchestrator.store.append(
-                    create_event(
-                        project_id=project_id,
-                        event_type=EventType.PROJECT_FAILED,
-                        payload={"reason": str(err)},
-                        at=self.orchestrator._now(),
-                    )
-                )
-                job.state = JobState.FAILED
-                report = BuildReport(
-                    invocations=job.invocations_used,
-                    test_results=job.test_results,
-                    ci_rounds=job.ci_rounds_used,
-                    failure_cause=str(err),
-                )
-                job.report = report
-                return report
+                return self._fail_job(project_id, job, str(err))
 
             job.ci_rounds_used += 1
+            clean_ci_summary = self._redact(ci_result.summary)
             self.orchestrator.store.append(
                 create_event(
                     project_id=project_id,
                     event_type=EventType.CI_ROUND_COMPLETED,
                     payload={
                         "ci_rounds": job.ci_rounds_used,
-                        "summary": ci_result.summary,
+                        "summary": clean_ci_summary,
                     },
                     at=self.orchestrator._now(),
                 )
@@ -487,24 +431,7 @@ class BuildWorker:
                         project_id, branch="work"
                     )
                 except (OSError, RuntimeError, ValueError) as err:
-                    clean_err = redact_secrets(str(err), extra_secrets=self.secrets_to_redact)
-                    self.orchestrator.store.append(
-                        create_event(
-                            project_id=project_id,
-                            event_type=EventType.PROJECT_FAILED,
-                            payload={"reason": clean_err},
-                            at=self.orchestrator._now(),
-                        )
-                    )
-                    job.state = JobState.FAILED
-                    report = BuildReport(
-                        invocations=job.invocations_used,
-                        test_results=job.test_results,
-                        ci_rounds=job.ci_rounds_used,
-                        failure_cause=clean_err,
-                    )
-                    job.report = report
-                    return report
+                    return self._fail_job(project_id, job, str(err))
 
                 self.orchestrator.store.append(
                     create_event(
@@ -524,6 +451,7 @@ class BuildWorker:
                 )
                 prompt_file.write_text(prompt_content, encoding="utf-8")
 
+                registry_warning: str | None = None
                 if self.registry_publisher is not None:
                     try:
                         delivered_status = self.orchestrator.get_status(project_id)
@@ -534,64 +462,36 @@ class BuildWorker:
                         RuntimeError,
                         ValueError,
                     ) as reg_exc:
-                        clean_reg_err = redact_secrets(
-                            str(reg_exc), extra_secrets=self.secrets_to_redact
+                        clean_reg_err = self._redact(str(reg_exc))
+                        registry_warning = (
+                            f"Registry publish failed (best-effort): {clean_reg_err}"
                         )
                         self.orchestrator.store.append(
                             create_event(
                                 project_id=project_id,
-                                event_type=EventType.PROJECT_FAILED,
-                                payload={"reason": f"Registry publish failed: {clean_reg_err}"},
+                                event_type=EventType.REGISTRY_PUBLISH_FAILED,
+                                payload={"reason": registry_warning},
                                 at=self.orchestrator._now(),
                             )
                         )
-                        job.state = JobState.FAILED
-                        report = BuildReport(
-                            invocations=job.invocations_used,
-                            test_results=job.test_results,
-                            ci_rounds=job.ci_rounds_used,
-                            failure_cause=f"Registry publish failed: {clean_reg_err}",
-                        )
-                        job.report = report
-                        return report
 
                 job.state = JobState.COMPLETED
                 report = BuildReport(
                     invocations=job.invocations_used,
                     test_results=job.test_results,
                     ci_rounds=job.ci_rounds_used,
-                    failure_cause=None,
+                    failure_cause=registry_warning,
                 )
                 job.report = report
                 return report
 
             # CI failed: check if CI round limit reached
             if job.ci_rounds_used >= self.max_ci_rounds:
-                self.orchestrator.store.append(
-                    create_event(
-                        project_id=project_id,
-                        event_type=EventType.PROJECT_FAILED,
-                        payload={
-                            "reason": (
-                                f"Maximum CI rounds ({self.max_ci_rounds}) exceeded: "
-                                f"{ci_result.summary}"
-                            )
-                        },
-                        at=self.orchestrator._now(),
-                    )
+                return self._fail_job(
+                    project_id,
+                    job,
+                    f"CI round limit reached ({self.max_ci_rounds}): {clean_ci_summary}",
                 )
-                job.state = JobState.FAILED
-                report = BuildReport(
-                    invocations=job.invocations_used,
-                    test_results=job.test_results,
-                    ci_rounds=job.ci_rounds_used,
-                    failure_cause=(
-                        f"CI round limit reached ({self.max_ci_rounds}): "
-                        f"{ci_result.summary}"
-                    ),
-                )
-                job.report = report
-                return report
 
             # Transition back to BUILDING for another fix attempt
             self.orchestrator.store.append(
@@ -605,7 +505,7 @@ class BuildWorker:
                     at=self.orchestrator._now(),
                 )
             )
-            job.last_failure_output = ci_result.summary
+            job.last_failure_output = clean_ci_summary
 
     def run_next(
         self,

@@ -22,17 +22,24 @@ def redact_secrets(
 
     result = str(text)
 
-    # 1. Redact via URL and header credential patterns
-    # Telegram bot URL pattern: https://api.telegram.org/bot<token>/...
+    # 1. Redact via URL, header, and token prefix patterns
+    # Telegram bot API URL pattern: https://api.telegram.org/bot<token>/...
     result = re.sub(
         r"(https?://api\.telegram\.org/bot)[^/\s]+",
         r"\1[REDACTED]",
         result,
     )
 
-    # HTTP basic auth or token in URL: https://x-access-token:<token>@...
+    # Telegram bot token outside api.telegram.org URL: bot<digits>:<token>
     result = re.sub(
-        r"(https?://[^:\s]+:)[^@\s]+(@)",
+        r"\bbot\d+:[A-Za-z0-9_-]{8,}",
+        "bot[REDACTED]",
+        result,
+    )
+
+    # HTTP basic auth / userinfo credentials in URL authority only (never cross '/' into path)
+    result = re.sub(
+        r"(https?://[^/\s:@]+:)[^/\s@]+(@)",
         r"\1[REDACTED]\2",
         result,
     )
@@ -43,6 +50,13 @@ def redact_secrets(
         r"\1[REDACTED]",
         result,
         flags=re.IGNORECASE,
+    )
+
+    # Well-known provider token prefixes (GitHub classic/fine-grained PATs, sk- API keys)
+    result = re.sub(
+        r"\b(?:gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,}|sk-[A-Za-z0-9_-]{12,})\b",
+        "[REDACTED]",
+        result,
     )
 
     # Key=value token assignments for standard secret variables

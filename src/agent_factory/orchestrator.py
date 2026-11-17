@@ -25,6 +25,7 @@ from agent_factory.ports.clock import Clock
 from agent_factory.ports.llm import LLM, LLMError
 from agent_factory.ports.publisher import StatusPublisher
 from agent_factory.ports.store import EventStore
+from agent_factory.secrets import redact_secrets
 
 
 class ApprovalError(Exception):
@@ -199,7 +200,7 @@ class Orchestrator:
             fail_evt = create_event(
                 project_id=project_id,
                 event_type=EventType.PROJECT_FAILED,
-                payload={"reason": str(err)},
+                payload={"reason": redact_secrets(str(err))},
                 at=self._now(),
             )
             self.store.append(fail_evt)
@@ -230,7 +231,7 @@ class Orchestrator:
             fail_evt = create_event(
                 project_id=project_id,
                 event_type=EventType.PROJECT_FAILED,
-                payload={"reason": str(err)},
+                payload={"reason": redact_secrets(str(err))},
                 at=self._now(),
             )
             self.store.append(fail_evt)
@@ -319,7 +320,7 @@ class Orchestrator:
                 create_event(
                     project_id=project_id,
                     event_type=EventType.PROJECT_FAILED,
-                    payload={"reason": str(err)},
+                    payload={"reason": redact_secrets(str(err))},
                     at=self._now(),
                 )
             )
@@ -330,7 +331,7 @@ class Orchestrator:
                 create_event(
                     project_id=project_id,
                     event_type=EventType.PROJECT_FAILED,
-                    payload={"reason": result.failure_cause or "Debate pipeline failed"},
+                    payload={"reason": redact_secrets(result.failure_cause or "Debate pipeline failed")},
                     at=self._now(),
                 )
             )
@@ -449,7 +450,7 @@ class Orchestrator:
                 create_event(
                     project_id=project_id,
                     event_type=EventType.PROJECT_FAILED,
-                    payload={"reason": str(err)},
+                    payload={"reason": redact_secrets(str(err))},
                     at=self._now(),
                 )
             )

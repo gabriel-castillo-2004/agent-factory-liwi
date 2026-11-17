@@ -1,5 +1,6 @@
 """Outbound-only Telegram Bot API long polling client (INV-02, INV-04, INV-19, ADR-003)."""
 
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -61,33 +62,52 @@ class TelegramHttpClient:
         )
         self.api_base_url = api_base_url.rstrip("/")
 
+    def _scrub(self, text: str) -> str:
+        """Redact bot_token and other credentials from diagnostic text."""
+        return redact_secrets(text, extra_secrets=(self.bot_token,))
+
     def _post(self, method: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Send an outbound POST to Telegram API and validate response, redacting secrets on failure."""
         url = f"{self.api_base_url}/bot{self.bot_token}/{method}"
+        transport_error: TelegramTransportError | None = None
+        resp: HttpResponse | None = None
         try:
             resp = self.transport.post_json(url, payload)
-        except (OSError, RuntimeError, ValueError) as exc:
-            clean_err = redact_secrets(str(exc), extra_secrets=(self.bot_token,))
-            raise TelegramTransportError(
+        except (http.client.HTTPException, OSError, RuntimeError, ValueError) as exc:
+            clean_err = self._scrub(str(exc))
+            transport_error = TelegramTransportError(
                 f"Telegram transport failure for {method}: {clean_err}"
-            ) from None
+            )
+        # Raise outside except block so __context__ / __cause__ never retain raw exception/token
+        if transport_error is not None:
+            raise transport_error
+        assert resp is not None
 
         if resp.status_code != 200:
-            clean_body = redact_secrets(resp.body, extra_secrets=(self.bot_token,))
+            clean_body = self._scrub(resp.body)
             raise TelegramTransportError(
                 f"Telegram API HTTP {resp.status_code} for {method}: {clean_body}"
             )
 
+        parse_error: TelegramTransportError | None = None
+        data: Any = None
         try:
             data = json.loads(resp.body)
         except (json.JSONDecodeError, ValueError) as exc:
-            raise TelegramTransportError(
-                f"Invalid JSON response from Telegram for {method}: {exc}"
-            ) from None
+            clean_parse_err = self._scrub(str(exc))
+            parse_error = TelegramTransportError(
+                f"Invalid JSON response from Telegram for {method}: {clean_parse_err}"
+            )
+        if parse_error is not None:
+            raise parse_error
 
         if not isinstance(data, dict) or not data.get("ok"):
-            desc = data.get("description", "Unknown error") if isinstance(data, dict) else "Non-dict response"
-            clean_desc = redact_secrets(str(desc), extra_secrets=(self.bot_token,))
+            desc = (
+                data.get("description", "Unknown error")
+                if isinstance(data, dict)
+                else "Non-dict response"
+            )
+            clean_desc = self._scrub(str(desc))
             raise TelegramTransportError(f"Telegram API error for {method}: {clean_desc}")
 
         return data
@@ -111,7 +131,7 @@ class TelegramHttpClient:
         for item in raw_updates:
             if not isinstance(item, dict):
                 continue
-            update_id = item.get("update_id", 0)
+            update_id = int(item.get("update_id") or 0)
             chat_id = 0
             user_id = 0
             text = ""
@@ -119,27 +139,27 @@ class TelegramHttpClient:
             callback_query_id: str | None = None
             username = ""
 
-            if "callback_query" in item and isinstance(item["callback_query"], dict):
+            if isinstance(item.get("callback_query"), dict):
                 cb = item["callback_query"]
                 callback_query_id = cb.get("id")
                 callback_data = cb.get("data")
-                sender = cb.get("from", {})
+                sender = cb.get("from")
                 if isinstance(sender, dict):
-                    user_id = sender.get("id", 0)
-                    username = sender.get("username", "")
-                msg = cb.get("message", {})
-                if isinstance(msg, dict):
-                    chat_id = msg.get("chat", {}).get("id", 0)
-            elif "message" in item and isinstance(item["message"], dict):
+                    user_id = int(sender.get("id") or 0)
+                    username = str(sender.get("username") or "")
+                msg = cb.get("message")
+                if isinstance(msg, dict) and isinstance(msg.get("chat"), dict):
+                    chat_id = int(msg["chat"].get("id") or 0)
+            elif isinstance(item.get("message"), dict):
                 msg = item["message"]
-                sender = msg.get("from", {})
+                sender = msg.get("from")
                 if isinstance(sender, dict):
-                    user_id = sender.get("id", 0)
-                    username = sender.get("username", "")
-                chat = msg.get("chat", {})
+                    user_id = int(sender.get("id") or 0)
+                    username = str(sender.get("username") or "")
+                chat = msg.get("chat")
                 if isinstance(chat, dict):
-                    chat_id = chat.get("id", 0)
-                text = msg.get("text", "")
+                    chat_id = int(chat.get("id") or 0)
+                text = str(msg.get("text") or "")
 
             updates.append(
                 TelegramUpdate(
@@ -174,10 +194,10 @@ class TelegramHttpClient:
 
         data = self._post("sendMessage", payload)
         res = data.get("result", {})
-        msg_id = res.get("message_id", 0) if isinstance(res, dict) else 0
+        msg_id = int(res.get("message_id") or 0) if isinstance(res, dict) else 0
         resp_chat_id = chat_id
-        if isinstance(res, dict):
-            resp_chat_id = res.get("chat", {}).get("id", chat_id)
+        if isinstance(res, dict) and isinstance(res.get("chat"), dict):
+            resp_chat_id = int(res["chat"].get("id") or chat_id)
 
         return SentMessage(
             message_id=msg_id,
