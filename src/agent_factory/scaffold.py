@@ -102,6 +102,24 @@ class TemplateScaffold:
                     f"Template '{template_id}' is missing required file '{req}'"
                 )
 
+        # Enforce browser error guards in playwright.config.mjs (F2B-03, AC-2.5, INV-13)
+        pw_file = tpl_dir / "playwright.config.mjs"
+        pw_text = pw_file.read_text(encoding="utf-8")
+        has_console_guard = (
+            'page.on("console"' in pw_text or "page.on('console'" in pw_text
+        ) and (
+            'type() === "error"' in pw_text
+            or "type() === 'error'" in pw_text
+            or "console.error" in pw_text
+        )
+        has_pageerror_guard = (
+            'page.on("pageerror"' in pw_text or "page.on('pageerror'" in pw_text
+        )
+        if not has_console_guard or not has_pageerror_guard:
+            raise ValueError(
+                f"Template '{template_id}' is missing required console.error and pageerror browser guards in playwright.config.mjs"
+            )
+
         # Collect all non-src files
         files = sorted(
             p.relative_to(tpl_dir).as_posix()
@@ -109,7 +127,7 @@ class TemplateScaffold:
             if p.is_file() and not p.relative_to(tpl_dir).as_posix().startswith("src/")
         )
 
-        # Parse package.json
+        # Parse package.json and verify dependencies
         pkg_file = tpl_dir / "package.json"
         try:
             pkg_data = json.loads(pkg_file.read_text(encoding="utf-8"))
@@ -118,12 +136,13 @@ class TemplateScaffold:
 
         package_name = str(pkg_data.get("name", ""))
         scripts = {str(k): str(v) for k, v in pkg_data.get("scripts", {}).items()}
-        dependencies = pkg_data.get("dependencies", {})
 
         external_or_backend_refs: list[str] = []
-        if dependencies:
-            for dep in sorted(dependencies.keys()):
-                external_or_backend_refs.append(f"package.json dependency: {dep}")
+        for dep_type in ("dependencies", "devDependencies", "peerDependencies"):
+            deps = pkg_data.get(dep_type, {})
+            if isinstance(deps, dict) and deps:
+                for dep in sorted(deps.keys()):
+                    external_or_backend_refs.append(f"package.json {dep_type}: {dep}")
 
         # Scan text files for external network protocols
         for f_rel in files:
@@ -158,11 +177,30 @@ class TemplateScaffold:
         ws_dir = self.workspace_manager.get_workspace_dir(project_id)
         inspection = self.inspect_template(template_id)
 
-        # Check destination workspace for contamination in src/
+        # Check destination workspace src/ for symlink escape or existing files (F2B-06)
         src_dir = ws_dir / "src"
+        if src_dir.is_symlink() or (
+            src_dir.exists() and not src_dir.resolve().is_relative_to(ws_dir)
+        ):
+            raise SandboxViolationError(
+                f"Destination workspace '{project_id}' src/ is an escaping link: {src_dir}"
+            )
         if src_dir.is_dir() and any(p.is_file() for p in src_dir.rglob("*")):
             raise SandboxViolationError(
                 f"Destination workspace '{project_id}' already contains files in src/"
+            )
+
+        # Check destination workspace tests/ for symlink escape or existing files (F2B-06)
+        tests_dir = ws_dir / "tests"
+        if tests_dir.is_symlink() or (
+            tests_dir.exists() and not tests_dir.resolve().is_relative_to(ws_dir)
+        ):
+            raise SandboxViolationError(
+                f"Destination workspace '{project_id}' tests/ is an escaping link: {tests_dir}"
+            )
+        if tests_dir.is_dir() and any(p.is_file() for p in tests_dir.rglob("*")):
+            raise SandboxViolationError(
+                f"Destination workspace '{project_id}' already contains files in tests/"
             )
 
         ws_dir.mkdir(parents=True, exist_ok=True)

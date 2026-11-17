@@ -198,7 +198,7 @@ class BuildWorker:
                 )
                 job.report = report
                 return report
-            except CodeAgentError as err:
+            except (CodeAgentError, CommandTimeoutError) as err:
                 # Fatal code agent error: record the invocation in CircuitBreaker and AGENT_INVOKED before failing
                 self.orchestrator.record_state_call(project_id, ProjectState.BUILDING)
                 job.invocations_used += 1
@@ -316,7 +316,7 @@ class BuildWorker:
                 )
                 job.report = report
                 return report
-            except CodeAgentError as err:
+            except (CodeAgentError, CommandTimeoutError) as err:
                 # Fatal code agent error: record the invocation in CircuitBreaker and AGENT_INVOKED before failing
                 self.orchestrator.record_state_call(project_id, ProjectState.BUILDING)
                 job.invocations_used += 1

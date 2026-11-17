@@ -76,6 +76,10 @@ class AgyCliAdapter(CodeAgent):
             raise SandboxViolationError(
                 f"Workspace cwd '{workspace_dir}' is not inside workspace base '{base_dir}'"
             )
+        if ws_path.parent != base_dir:
+            raise SandboxViolationError(
+                f"Workspace cwd '{workspace_dir}' is a nested subdirectory under '{base_dir}'"
+            )
         project_id = ws_path.name
         try:
             expected_ws_dir = self.workspace_manager.get_workspace_dir(project_id)
@@ -174,27 +178,46 @@ class AgyCliAdapter(CodeAgent):
 
         combined_output = f"{res.stdout}\n{res.stderr}".strip()
 
-        # Check for quota exhaustion
-        is_quota = (
-            res.exit_code in (42, 429)
-            or "429" in combined_output
-            or "quota exhausted" in combined_output.lower()
-            or "rate limit" in combined_output.lower()
-            or "too many requests" in combined_output.lower()
-        )
-        if is_quota:
-            retry_match = re.search(r"retry_after[ =:]+([0-9.]+)", combined_output, re.IGNORECASE)
-            retry_after = (
-                float(retry_match.group(1))
-                if retry_match
-                else self.default_retry_after_seconds
+        # Handle non-zero exit codes (quota exhaustion or fatal agent failures)
+        if res.exit_code != 0:
+            lowered = combined_output.lower()
+            quota_phrases = (
+                "too many requests",
+                "quota exhausted",
+                "quota exceeded",
+                "rate limit exceeded",
+                "resource_exhausted",
             )
-            raise QuotaExhaustedError(
-                message=combined_output or "CLI quota exhausted",
-                retry_after_seconds=retry_after,
+            is_quota = (
+                res.exit_code in (42, 429)
+                or any(phrase in lowered for phrase in quota_phrases)
+                or bool(
+                    re.search(
+                        r"\b(?:http|status|error|code)\s*429\b",
+                        combined_output,
+                        re.IGNORECASE,
+                    )
+                )
+                or bool(
+                    re.search(r"\b429\b", combined_output)
+                    and not re.search(r"\bline\s+429\b", combined_output, re.IGNORECASE)
+                )
             )
 
-        if res.exit_code != 0:
+            if is_quota:
+                retry_match = re.search(
+                    r"retry_after[ =:]+([0-9.]+)", combined_output, re.IGNORECASE
+                )
+                retry_after = (
+                    float(retry_match.group(1))
+                    if retry_match
+                    else self.default_retry_after_seconds
+                )
+                raise QuotaExhaustedError(
+                    message=combined_output or "CLI quota exhausted",
+                    retry_after_seconds=retry_after,
+                )
+
             raise CodeAgentError(
                 f"CLI execution failed with exit code {res.exit_code}: {combined_output}"
             )
@@ -205,17 +228,24 @@ class AgyCliAdapter(CodeAgent):
         output_text = res.stdout.strip()
         if output_text:
             try:
-                for line in output_text.splitlines()[::-1]:
-                    line_s = line.strip()
-                    if line_s.startswith("{") and line_s.endswith("}"):
-                        data = json.loads(line_s)
+                try:
+                    data = json.loads(output_text)
+                    if isinstance(data, dict):
                         files_written = data.get("files_written", [])
                         summary = data.get("summary", "")
-                        break
-                else:
-                    data = json.loads(output_text)
-                    files_written = data.get("files_written", [])
-                    summary = data.get("summary", "")
+                    else:
+                        summary = output_text
+                except (json.JSONDecodeError, ValueError):
+                    for line in output_text.splitlines()[::-1]:
+                        line_s = line.strip()
+                        if line_s.startswith("{") and line_s.endswith("}"):
+                            data = json.loads(line_s)
+                            if isinstance(data, dict):
+                                files_written = data.get("files_written", [])
+                                summary = data.get("summary", "")
+                                break
+                    else:
+                        summary = output_text
             except (json.JSONDecodeError, ValueError, TypeError):
                 summary = output_text
 
