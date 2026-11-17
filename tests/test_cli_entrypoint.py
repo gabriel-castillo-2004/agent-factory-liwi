@@ -1,10 +1,16 @@
 """Tests for fail-closed CLI configuration, dependency assembly, exponential backoff loop, and shutdown signals (AC-4.2, AC-4.3, INV-03, INV-19, INV-21, INV-23)."""
 
+import http.client
+import json
 import os
+import runpy
+import shutil
 import signal
 import subprocess
 import sys
 import threading
+import time
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -16,6 +22,7 @@ from agent_factory.adapters.fake_telegram import FakeTelegramClient
 from agent_factory.adapters.github_vcs_adapter import GitHubVCSAdapter
 from agent_factory.adapters.memory_store import MemoryEventStore
 from agent_factory.adapters.static_deploy_publisher import StaticDeployPublisher
+from agent_factory.adapters.telegram_client import UrllibHttpTransport
 from agent_factory.cli import (
     CliConfig,
     CliConfigError,
@@ -26,7 +33,8 @@ from agent_factory.cli import (
     run_polling_loop,
 )
 from agent_factory.domain.states import ProjectState
-from agent_factory.ports.notifier import TelegramTransportError, TelegramUpdate
+from agent_factory.ports.llm import LLMError
+from agent_factory.ports.notifier import HttpResponse, TelegramTransportError, TelegramUpdate
 
 
 class _FakeClock:
@@ -333,3 +341,220 @@ def test_cli_config_rejects_nan_inf_and_never_leaks_token_in_any_error() -> None
                     "AGENT_FACTORY_POLL_TIMEOUT": bad_timeout,
                 }
             )
+
+
+def test_cli_production_llm_adapter_uses_urllib_transport_calls_http_and_releases_store_on_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """H4-01 / H41-01 / H41-02 / M4-N11 (INV-01, INV-02, INV-07, INV-09, INV-23): ProductionLLMAdapter wires UrllibHttpTransport, sends HTTP POST with Bearer auth & models.toml settings, releases SQLite on error, aligns .env.example, and runs __main__.main()."""
+    tg_tok = "TEST_H4101_TG_TOK_111"
+    llm_key = "TEST_H4101_LLM_KEY_222"
+
+    models_toml = tmp_path / "models_prod.toml"
+    models_toml.write_text(
+        'IDLE = "model-fast-01"\n'
+        'INTERVIEW = "model-interview-01"\n'
+        'DEBATE = "model-fast-01"\n'
+        'MEDIATION = "model-strong-01"\n'
+        'WAITING_APPROVAL = "model-fast-01"\n'
+        'BUILDING = "model-fast-01"\n'
+        'VERIFYING = "model-fast-01"\n'
+        'DELIVERED = "model-fast-01"\n'
+        'FAILED = "model-fast-01"\n'
+        'CHANGE_REQUEST = "model-fast-01"\n'
+        'endpoint = "https://llm.provider.test/v1/chat/completions"\n',
+        encoding="utf-8",
+    )
+    limits_toml = tmp_path / "limits_prod.toml"
+    limits_toml.write_text(
+        "INTERVIEW = 6\nDEBATE = 3\nMEDIATION = 2\nBUILDING = 15\nci_rounds = 3\n",
+        encoding="utf-8",
+    )
+
+    # 1. Failing build_runtime MUST NOT leave an open SqliteEventStore handle (H41-02)
+    leak_dir = tmp_path / "leak_db_dir"
+    cfg_no_key = load_cli_config(
+        {
+            "TELEGRAM_BOT_TOKEN": tg_tok,
+            "ALLOWED_CHAT_IDS": "1001",
+            "ALLOWED_USER_IDS": "2001",
+            "AGENT_FACTORY_DB_PATH": str(leak_dir / "runtime.db"),
+            "AGENT_FACTORY_WORKSPACES_DIR": str(tmp_path / "ws_leak"),
+            "AGENT_FACTORY_MODELS_CONFIG": str(models_toml),
+            "AGENT_FACTORY_LIMITS_CONFIG": str(limits_toml),
+        }
+    )
+    with pytest.raises(CliConfigError):
+        build_runtime(cfg_no_key)
+    if leak_dir.exists():
+        shutil.rmtree(leak_dir)
+    assert not leak_dir.exists()
+
+    # 2. build_runtime without explicit transport defaults to UrllibHttpTransport on ProductionLLMAdapter
+    valid_env = {
+        "TELEGRAM_BOT_TOKEN": tg_tok,
+        "ALLOWED_CHAT_IDS": "1001",
+        "ALLOWED_USER_IDS": "2001",
+        "LLM_API_KEY": llm_key,
+        "AGENT_FACTORY_DB_PATH": str(tmp_path / "prod_default.db"),
+        "AGENT_FACTORY_WORKSPACES_DIR": str(tmp_path / "ws_prod"),
+        "AGENT_FACTORY_MODELS_CONFIG": str(models_toml),
+        "AGENT_FACTORY_LIMITS_CONFIG": str(limits_toml),
+    }
+    cfg_valid = load_cli_config(valid_env)
+    rt_default = build_runtime(cfg_valid)
+    try:
+        assert isinstance(getattr(rt_default.llm, "transport", None), UrllibHttpTransport)
+    finally:
+        rt_default.store.close()
+
+    # 3. ProductionLLMAdapter.complete reads model/endpoint, POSTs JSON with Bearer auth, parses reply, and redacts errors (kills M4-N11)
+    class _RecordingLlmHttpTransport:
+        def __init__(self, script: list[HttpResponse | Exception]) -> None:
+            self._script = list(script)
+            self.calls: list[dict[str, Any]] = []
+
+        def post_json(
+            self,
+            url: str,
+            payload: Mapping[str, Any],
+            timeout_seconds: float = 35.0,
+            headers: Mapping[str, str] | None = None,
+        ) -> HttpResponse:
+            self.calls.append(
+                {
+                    "url": url,
+                    "payload": dict(payload),
+                    "timeout": timeout_seconds,
+                    "headers": dict(headers or {}),
+                }
+            )
+            step = self._script.pop(0)
+            if isinstance(step, Exception):
+                raise step
+            return step
+
+    transport = _RecordingLlmHttpTransport(
+        script=[
+            HttpResponse(
+                status_code=200,
+                body=json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json.dumps(
+                                        {
+                                            "questions": ["Qual usuario?"],
+                                            "is_complete": False,
+                                        }
+                                    )
+                                }
+                            }
+                        ]
+                    }
+                ),
+            ),
+            HttpResponse(status_code=401, body=f"Invalid Bearer {llm_key}"),
+            http.client.RemoteDisconnected(f"Socket drop {llm_key}"),
+        ]
+    )
+    cfg_tr = cfg_valid.model_copy(update={"db_path": tmp_path / "prod_tr.db"})
+    rt_tr = build_runtime(cfg_tr, transport=transport)
+    try:
+        parsed = rt_tr.llm.complete([{"role": "user", "content": "Hola"}])
+        assert parsed == {"questions": ["Qual usuario?"], "is_complete": False}
+        assert len(transport.calls) == 1
+        req_call = transport.calls[0]
+        assert req_call["url"] == "https://llm.provider.test/v1/chat/completions"
+        auth = req_call["headers"].get("Authorization") or req_call["headers"].get("authorization")
+        assert auth == f"Bearer {llm_key}"
+        assert req_call["payload"]["model"] in {"model-fast-01", "model-interview-01", "model-strong-01"}
+        assert req_call["payload"]["messages"] == [{"role": "user", "content": "Hola"}]
+
+        for _ in range(2):
+            with pytest.raises(LLMError) as llm_err:
+                rt_tr.llm.complete([{"role": "user", "content": "fail"}])
+            assert llm_key not in str(llm_err.value)
+            assert llm_err.value.__cause__ is None
+            assert llm_err.value.__context__ is None
+    finally:
+        rt_tr.store.close()
+
+    # 4. In-process execution of agent_factory.__main__ covers __main__.py cleanly
+    for env_key in list(os.environ):
+        if env_key in {"ALLOWED_CHAT_IDS", "ALLOWED_USER_IDS", "LLM_API_KEY"}:
+            monkeypatch.delenv(env_key, raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", tg_tok)
+    monkeypatch.setattr(sys, "argv", ["agent_factory"])
+    with pytest.raises(SystemExit) as sys_exit:
+        runpy.run_module("agent_factory", run_name="__main__")
+    assert sys_exit.value.code == 1
+    captured = capsys.readouterr()
+    assert tg_tok not in captured.out
+    assert tg_tok not in captured.err
+
+    import agent_factory.__main__ as main_mod
+
+    pre_stopped = threading.Event()
+    pre_stopped.set()
+    assert main_mod.main([], env=valid_env, stop_event=pre_stopped) == 0
+
+    # 5. .env.example documents ALLOWED_CHAT_IDS and ALLOWED_USER_IDS (H4-01)
+    env_example = (Path(__file__).resolve().parent.parent / ".env.example").read_text(encoding="utf-8")
+    assert "ALLOWED_CHAT_IDS=" in env_example
+    assert "ALLOWED_USER_IDS=" in env_example
+    assert "TELEGRAM_ALLOWED_USER_ID" not in env_example
+
+
+def test_cli_config_scrubs_exception_context_and_polling_loop_wakes_immediately_on_stop_event() -> None:
+    """H4-06 / H4-09 / H41-03 (INV-06, INV-19, INV-21, INV-23): CliConfigError clears __cause__/__context__ on parse failures and run_polling_loop wakes immediately via stop_event.wait."""
+    tok = "TEST_CTX_SECRET_987654"
+    for bad_key in (
+        "ALLOWED_CHAT_IDS",
+        "ALLOWED_USER_IDS",
+        "AGENT_FACTORY_POLL_TIMEOUT",
+        "AGENT_FACTORY_BACKOFF_INITIAL",
+        "AGENT_FACTORY_BACKOFF_MAX",
+    ):
+        with pytest.raises(CliConfigError) as err_info:
+            load_cli_config(
+                {
+                    "TELEGRAM_BOT_TOKEN": tok,
+                    "ALLOWED_CHAT_IDS": "1001",
+                    "ALLOWED_USER_IDS": "2001",
+                    bad_key: f"bad_{tok}",
+                }
+            )
+        assert tok not in str(err_info.value)
+        assert err_info.value.__cause__ is None
+        assert err_info.value.__context__ is None
+
+    # run_polling_loop with clock=None must wake on stop_event.set() instead of blocking 5.0s in time.sleep
+    stop_event = threading.Event()
+    timers: list[threading.Timer] = []
+
+    def _trigger_stop(_err: Exception, _delay: float) -> None:
+        t = threading.Timer(0.05, stop_event.set)
+        timers.append(t)
+        t.start()
+
+    bot = _ScriptedBot(script=[TelegramTransportError("transient blip")])
+    start = time.monotonic()
+    try:
+        iterations = run_polling_loop(
+            bot,  # type: ignore[arg-type]
+            clock=None,
+            stop_event=stop_event,
+            initial_backoff_seconds=5.0,
+            max_backoff_seconds=5.0,
+            on_error=_trigger_stop,
+        )
+    finally:
+        for t in timers:
+            t.cancel()
+    elapsed = time.monotonic() - start
+    assert iterations == 1
+    assert elapsed < 1.5

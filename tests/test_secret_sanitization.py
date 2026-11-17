@@ -1,6 +1,7 @@
 """Tests for strict secret sanitization across Telegram, GitRegistryPublisher, and BuildWorker (AC-3.5, INV-07, INV-19, INV-23)."""
 
 import http.client
+import json
 import traceback
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -474,3 +475,29 @@ def test_secret_sanitization_across_build_worker_paths_orchestrator_and_bot_egre
     assert bot_only_secret not in bot_out.reply_text
     assert bot_only_secret not in tg_e.sent_messages[-1].text
     assert "[REDACTED]" in tg_e.sent_messages[-1].text
+
+
+def test_redact_secrets_telegram_url_without_slash_preserves_quotes_and_kills_m4_n09() -> None:
+    """M4-N09 (INV-07, INV-19, INV-23): Redacts https://api.telegram.org/bot<digits>:<tok> without trailing slash cleanly both bare and inside JSON/quoted strings."""
+    bare = redact_secrets(
+        "Failed contacting https://api.telegram.org/bot123456:ABC_DEF",
+        extra_secrets=(),
+        env={},
+    )
+    assert bare == "Failed contacting https://api.telegram.org/bot[REDACTED]"
+    assert "ABC_DEF" not in bare
+
+    quoted_json = redact_secrets(
+        '{"error": "https://api.telegram.org/bot123456:ABC_DEF"}',
+        extra_secrets=(),
+        env={},
+    )
+    parsed = json.loads(quoted_json)
+    assert parsed == {"error": "https://api.telegram.org/bot[REDACTED]"}
+
+    single_quoted = redact_secrets(
+        "url='https://api.telegram.org/bot123456:ABC_DEF'",
+        extra_secrets=(),
+        env={},
+    )
+    assert single_quoted == "url='https://api.telegram.org/bot[REDACTED]'"

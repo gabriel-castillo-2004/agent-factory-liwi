@@ -17,11 +17,13 @@ from agent_factory.adapters.git_registry_publisher import GitRegistryPublisher
 from agent_factory.adapters.sqlite_store import SqliteEventStore
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.builder import BuildWorker, JobState, LocalJobQueue
+from agent_factory.domain.events import Event, EventType
 from agent_factory.domain.models import (
     AcceptanceTest,
     AcceptanceTestType,
     FileSpec,
     Plan,
+    ProjectLinks,
     ProjectStatus,
 )
 from agent_factory.domain.states import ProjectState
@@ -467,3 +469,109 @@ def test_telegram_bot_resume_rejected_cleanly_and_poll_once_isolates_reply_failu
         assert "DELIVERED" in outcomes[1].reply_text
     finally:
         store.close()
+
+
+def test_git_registry_publisher_scrubs_secrets_in_registry_index_project_json_and_events(
+    tmp_path: Path,
+) -> None:
+    """H4-10 (INV-07, INV-19, INV-21, INV-23, ADR-004): publish_project and publish redact secrets across registry.json and projects/<id>.json including passed events."""
+    bare_repo = _init_bare_repo(tmp_path)
+    runner = SubprocessRunner(default_timeout_seconds=15.0)
+    ts = datetime(2026, 11, 17, 11, 0, tzinfo=UTC)
+
+    sec_custom = "CUSTOM_REG_SECRET_111"
+    url_tok = "URL_REG_TOKEN_222"
+    repo_tok = "REPO_REG_API_KEY_333"
+    dep_tok = "DEPLOY_REG_ACC_444"
+    bear_tok = "BEARER_REG_555"
+    ev_tok = "EVENT_REG_SECRET_666"
+    pub_tok = "PUBLISH_ALIAS_SECRET_777"
+
+    pub = GitRegistryPublisher(
+        repo_path=bare_repo,
+        branch="registry",
+        push_to_remote=True,
+        runner=runner,
+        work_dir=tmp_path / "wt_reg_scrub",
+        secrets=(sec_custom, ev_tok, pub_tok),
+    )
+
+    status_1 = ProjectStatus(
+        project_id="sec-reg-one",
+        name=f"App {sec_custom}",
+        objective=f"https://example.com/app?token={url_tok}",
+        state=ProjectState.FAILED,
+        progress_pct=35,
+        failure_reason=f"Denied Authorization: Bearer {bear_tok}",
+        links=ProjectLinks(
+            repo=f"https://github.com/o/r?api_key={repo_tok}",
+            deploy=f"https://o.github.io/app?access_token={dep_tok}",
+        ),
+        updated_at=ts,
+    )
+    events_1 = [
+        Event(
+            id="evt-reg-1",
+            project_id="sec-reg-one",
+            type=EventType.PROJECT_CREATED,
+            payload={"name": f"Name {sec_custom}"},
+            at=ts,
+        ),
+        Event(
+            id="evt-reg-2",
+            project_id="sec-reg-one",
+            type=EventType.PROJECT_FAILED,
+            payload={"reason": f"Failure {ev_tok}"},
+            at=ts,
+        ),
+    ]
+
+    pub.publish_project(status_1, events=events_1)
+
+    status_2 = ProjectStatus(
+        project_id="sec-reg-two",
+        name=f"Alias {pub_tok}",
+        objective=f"https://svc.local?secret={pub_tok}",
+        state=ProjectState.DELIVERED,
+        progress_pct=100,
+        links=ProjectLinks(
+            repo=f"https://github.com/o/r2?password={pub_tok}",
+            deploy=f"https://o.github.io/r2?auth={pub_tok}",
+        ),
+        updated_at=ts,
+    )
+    pub.publish(status_2)
+
+    reg_raw = subprocess.run(
+        ["git", "-C", str(bare_repo), "show", "refs/heads/registry:registry.json"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    proj1_raw = subprocess.run(
+        ["git", "-C", str(bare_repo), "show", "refs/heads/registry:projects/sec-reg-one.json"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    proj2_raw = subprocess.run(
+        ["git", "-C", str(bare_repo), "show", "refs/heads/registry:projects/sec-reg-two.json"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    for leaked in (sec_custom, url_tok, repo_tok, dep_tok, bear_tok, ev_tok, pub_tok):
+        assert leaked not in reg_raw
+        assert leaked not in proj1_raw
+        assert leaked not in proj2_raw
+
+    assert "[REDACTED]" in reg_raw
+    assert "[REDACTED]" in proj1_raw
+    assert "[REDACTED]" in proj2_raw
+
+    proj1_data = json.loads(proj1_raw)
+    assert isinstance(proj1_data.get("events"), list)
+    assert len(proj1_data["events"]) == 2
+    assert proj1_data["events"][0]["type"] == "PROJECT_CREATED"
+    assert proj1_data["events"][1]["type"] == "PROJECT_FAILED"

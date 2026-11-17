@@ -308,3 +308,92 @@ def test_static_deploy_and_vcs_reject_unsafe_branch_scrub_context_and_own_tokens
         assert own_vc not in str(d_err.value)
         assert d_err.value.__cause__ is None
         assert d_err.value.__context__ is None
+
+
+def test_github_vcs_merge_deploys_via_deploy_publisher_and_static_deploy_routes_target_and_strict_branches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """H4-02 / H4-03 (INV-02, INV-19, INV-22, INV-23): merge_and_deploy invokes deploy_publisher, deploy_site routes vercel vs gh-pages, and strict branch validation rejects case/remote/separator bypasses."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "HOST_TG_SECRET_DEPLOY_1")
+    monkeypatch.setenv("LLM_API_KEY", "HOST_LLM_SECRET_DEPLOY_2")
+
+    vc_tok = "TEST_VERCEL_DEPLOY_TOK_333"
+    gh_tok = "TEST_GH_MERGE_DEPLOY_TOK_444"
+    ws_dir = tmp_path / "ws" / "app-mv"
+    ws_dir.mkdir(parents=True)
+    (ws_dir / "index.html").write_text("<h1>Live</h1>\n", encoding="utf-8")
+
+    # 1. H4-03: Case/remote/colon/backslash branches rejected BEFORE Runner
+    guard_runner = FakeRunner()
+    guard_deployer = StaticDeployPublisher(runner=guard_runner)
+    for bad_branch in (
+        "MAIN",
+        "Main",
+        "origin/main",
+        "refs/heads/MAIN",
+        "refs/heads/MASTER",
+        "feat:bad",
+        "bad\\branch",
+        "team/master",
+    ):
+        with pytest.raises(ValueError):
+            guard_deployer.deploy_site("app-mv", ws_dir, branch=bad_branch)
+    assert len(guard_runner.calls) == 0
+
+    # 2. StaticDeployPublisher target routing: vercel vs gh-pages / github-pages
+    vercel_runner = FakeRunner(results=[CommandResult(exit_code=0, stdout="https://acme-custom.vercel.app/app-mv\n")])
+    vercel_pub = StaticDeployPublisher(
+        runner=vercel_runner,
+        target="vercel",
+        deploy_base_url="https://acme-custom.vercel.app",
+        deploy_token=vc_tok,
+    )
+    vercel_url = vercel_pub.deploy_site("app-mv", ws_dir)
+    assert vercel_url == "https://acme-custom.vercel.app/app-mv"
+    assert len(vercel_runner.calls) == 1
+    v_call = vercel_runner.calls[0]
+    assert v_call["command"][0].lower() == "vercel"
+    assert v_call["env"] is not None
+    assert "TELEGRAM_BOT_TOKEN" not in v_call["env"]
+    assert "--token" in v_call["command"] or v_call["env"].get("VERCEL_TOKEN") == vc_tok
+
+    for gh_target in ("gh-pages", "github-pages"):
+        gh_pages_runner = FakeRunner(results=[CommandResult(exit_code=0, stdout="deployed\n")])
+        gh_pages_pub = StaticDeployPublisher(
+            runner=gh_pages_runner,
+            target=gh_target,
+            deploy_base_url="https://acme-org.github.io",
+            deploy_token=gh_tok,
+        )
+        gh_url = gh_pages_pub.deploy_site("app-mv", ws_dir)
+        assert gh_url == "https://acme-org.github.io/app-mv"
+        assert gh_pages_runner.calls[0]["command"][:3] == ["gh", "pages", "deploy"]
+
+    # 3. H4-02: GitHubVCSAdapter.merge_and_deploy invokes self.deploy_publisher and returns its URL
+    shared_runner = FakeRunner(
+        results=[
+            CommandResult(exit_code=0, stdout="pushed\n"),
+            CommandResult(exit_code=0, stdout="merged\n"),
+            CommandResult(exit_code=0, stdout="https://acme-custom.vercel.app/app-mv\n"),
+        ]
+    )
+    wired_deployer = StaticDeployPublisher(
+        runner=shared_runner,
+        target="vercel",
+        deploy_base_url="https://acme-custom.vercel.app",
+        deploy_token=vc_tok,
+    )
+    vcs = GitHubVCSAdapter(
+        runner=shared_runner,
+        owner="acme-org",
+        github_token=gh_tok,
+        deploy_publisher=wired_deployer,
+    )
+    vcs.push_branch("app-mv", ws_dir, branch="work")
+    repo_url, deploy_url = vcs.merge_and_deploy("app-mv", branch="work")
+    assert repo_url == "https://github.com/acme-org/app-mv"
+    assert deploy_url == "https://acme-custom.vercel.app/app-mv"
+    assert len(shared_runner.calls) == 3
+    assert shared_runner.calls[1]["command"][:3] == ["gh", "pr", "merge"]
+    assert shared_runner.calls[2]["command"][0].lower() == "vercel"

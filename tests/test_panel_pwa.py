@@ -377,3 +377,10 @@ def test_panel_pwa_detail_redaction_tolerates_telegram_url_without_trailing_slas
     rendered = json.dumps(detail)
     assert "SECRET_NO_SLASH_999" not in rendered
     assert "[REDACTED]" in rendered
+
+
+def test_panel_styles_css_targets_text_input_not_removed_url_input() -> None:
+    """H4-12 / H41-04 (INV-16, INV-23): styles.css must style #registry-base-input / input[type="text"] instead of relying on removed input[type="url"]."""
+    styles_css = (PANEL_DIR / "styles.css").read_text(encoding="utf-8")
+    assert re.search(r'input\[type=["\']url["\']\]', styles_css) is None
+    assert re.search(r'input\[type=["\']text["\']\]|#registry-base-input', styles_css) is not None
