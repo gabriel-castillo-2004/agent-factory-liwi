@@ -26,25 +26,47 @@ class UrllibHttpTransport:
         url: str,
         payload: Mapping[str, Any],
         timeout_seconds: float = 35.0,
+        headers: Mapping[str, str] | None = None,
+        extra_secrets: Sequence[str] = (),
     ) -> HttpResponse:
         """Execute outbound HTTPS POST using urllib.request."""
         data = json.dumps(payload).encode("utf-8")
+        req_headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        if headers:
+            req_headers.update(headers)
         req = urllib.request.Request(
             url,
             data=data,
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
+            headers=req_headers,
             method="POST",
         )
+        extra: list[str] = list(extra_secrets)
+        if headers:
+            for v in headers.values():
+                if v:
+                    extra.append(v)
+                    if v.startswith("Bearer "):
+                        extra.append(v.removeprefix("Bearer ").strip())
+
+        err_to_raise: TelegramTransportError | None = None
         try:
             with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
                 body = resp.read().decode("utf-8")
                 return HttpResponse(status_code=resp.status, body=body)
-        except urllib.error.HTTPError as err:
-            body = err.read().decode("utf-8", errors="replace")
-            return HttpResponse(status_code=err.code, body=body)
+        except (urllib.error.HTTPError, urllib.error.URLError, http.client.HTTPException, OSError) as err:
+            clean_msg = redact_secrets(
+                f"HTTP transport failed for {url}: {err}",
+                extra_secrets=extra,
+            )
+            err_to_raise = TelegramTransportError(clean_msg)
+
+        if err_to_raise is not None:
+            err_to_raise.__cause__ = None
+            err_to_raise.__context__ = None
+            raise err_to_raise
 
 
 class TelegramHttpClient:

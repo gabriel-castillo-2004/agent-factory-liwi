@@ -13,8 +13,13 @@ from agent_factory.domain.models import ApprovalEvent, ProjectStatus, validate_p
 from agent_factory.domain.states import IllegalTransition, ProjectState
 from agent_factory.inbox import Inbox
 from agent_factory.orchestrator import ApprovalError, Orchestrator
-from agent_factory.ports.notifier import InlineButton, TelegramClient, TelegramUpdate
-from agent_factory.ports.publisher import RegistryPublisher
+from agent_factory.ports.notifier import (
+    InlineButton,
+    TelegramClient,
+    TelegramTransportError,
+    TelegramUpdate,
+)
+from agent_factory.ports.publisher import RegistryPublisher, RegistryPublishError
 from agent_factory.scaffold import TemplateScaffold
 from agent_factory.secrets import redact_secrets
 from agent_factory.workspace import SandboxViolationError
@@ -126,6 +131,23 @@ class TelegramBotService:
         self.client.send_message(chat_id=chat_id, text=clean_text, buttons=buttons)
         return clean_text
 
+    def _publish_status_to_registry(self, pid: str) -> None:
+        """Best-effort publish current project status to registry_publisher if configured."""
+        if self.registry_publisher is not None:
+            from agent_factory.adapters.git_registry_publisher import GitRegistryPublisher
+
+            is_real_git = isinstance(self.registry_publisher, GitRegistryPublisher)
+            orch_has_pub = getattr(self.orchestrator, "publisher", None) is not None
+            if not is_real_git or orch_has_pub:
+                try:
+                    st = self.orchestrator.get_status(pid)
+                    self.registry_publisher.publish_project(st)
+                except (RegistryPublishError, OSError, RuntimeError, ValueError) as pub_exc:
+                    clean_pub_err = redact_secrets(
+                        str(pub_exc), extra_secrets=self.config.secrets_to_redact
+                    )
+                    _ = clean_pub_err
+
     def _error_outcome(
         self,
         update: TelegramUpdate,
@@ -205,6 +227,7 @@ class TelegramBotService:
         )
         questions = last_round.payload.get("questions", []) if last_round else []
         if questions:
+            self._publish_status_to_registry(pid)
             q_lines = "\n".join(f"- {q}" for q in questions)
             reply = self._send_reply(
                 update.chat_id,
@@ -256,6 +279,7 @@ class TelegramBotService:
                 ),
             ]
         ]
+        self._publish_status_to_registry(pid)
         reply = self._send_reply(update.chat_id, msg_text, buttons=buttons)
         return UpdateOutcome(
             update_id=update.update_id,
@@ -312,6 +336,7 @@ class TelegramBotService:
                     action="adjustment_rejected",
                 )
             self._set_active_project(update.chat_id, pid)
+            self._publish_status_to_registry(pid)
             msg = self._send_reply(
                 update.chat_id,
                 f"Plan ajustado para {pid}. ¿Qué modificaciones deseas agregar a la especificación?",
@@ -417,6 +442,9 @@ class TelegramBotService:
 
         try:
             self.orchestrator.create_project(pid, name=idea, objective=idea)
+            self.orchestrator.handle_interview_message(
+                pid, f"tg-msg-{update.update_id}", idea
+            )
         except (ValueError, IllegalTransition) as exc:
             return self._error_outcome(
                 update,
@@ -425,11 +453,10 @@ class TelegramBotService:
                 project_id=pid,
             )
 
-        self._set_active_project(update.chat_id, pid)
-        self.orchestrator.handle_interview_message(
-            pid, f"tg-msg-{update.update_id}", idea
-        )
-        return self._handle_interview_state(update, pid, command="/new")
+        outcome = self._handle_interview_state(update, pid, command="/new")
+        if outcome.action != "error":
+            self._set_active_project(update.chat_id, pid)
+        return outcome
 
     def _handle_status(self, update: TelegramUpdate, raw_text: str) -> UpdateOutcome:
         """Handle /status [project_id] or /estado [project_id]."""
@@ -492,6 +519,14 @@ class TelegramBotService:
 
         if self.build_worker is not None and self.build_worker.queue is not None:
             job = self.build_worker.queue.get_job(pid)
+            if job is not None and job.state == JobState.COMPLETED:
+                return self._error_outcome(
+                    update,
+                    f"El proyecto {pid} ya se encuentra completado.",
+                    command="/resume",
+                    project_id=pid,
+                    action="resume_rejected",
+                )
             if job is not None and job.state == JobState.PAUSED_QUOTA:
                 self.build_worker.run_job(pid)
                 st = self.orchestrator.get_status(pid)
@@ -547,11 +582,12 @@ class TelegramBotService:
             return self._handle_callback(update)
 
         raw_text = (update.text or "").strip()
-        if raw_text.startswith("/new"):
+        first_token = raw_text.split(None, 1)[0].lower() if raw_text else ""
+        if first_token == "/new":
             return self._handle_new(update, raw_text)
-        if raw_text.startswith(("/status", "/estado")):
+        if first_token in {"/status", "/estado"}:
             return self._handle_status(update, raw_text)
-        if raw_text.startswith("/resume"):
+        if first_token == "/resume":
             return self._handle_resume(update, raw_text)
 
         pid = self.active_project_by_chat.get(update.chat_id)
@@ -595,7 +631,19 @@ class TelegramBotService:
                 RuntimeError,
             ) as exc:
                 if self.is_authorized(update.chat_id, update.user_id):
-                    outcome = self._error_outcome(update, f"Error procesando actualización: {exc}")
+                    try:
+                        outcome = self._error_outcome(update, f"Error procesando actualización: {exc}")
+                    except (TelegramTransportError, OSError, RuntimeError):
+                        clean_msg = redact_secrets(
+                            f"Error procesando actualización: {exc}",
+                            extra_secrets=self.config.secrets_to_redact,
+                        )
+                        outcome = UpdateOutcome(
+                            update_id=update.update_id,
+                            accepted=False,
+                            action="error",
+                            reply_text=clean_msg,
+                        )
                 else:
                     outcome = UpdateOutcome(
                         update_id=update.update_id,

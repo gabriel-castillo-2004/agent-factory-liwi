@@ -232,3 +232,51 @@ def test_circuit_breaker_never_resets_across_redebates_and_trips_on_cumulative_b
     assert breaker.get_calls(project_id, ProjectState.DEBATE) == 3
     # 1 interview + 3 first debate/mediation + 1 second debate pragmatist = 5 calls
     assert len(fake_llm.calls) == 5
+
+
+def test_request_adjustment_never_resets_circuit_breaker_and_trips_cumulative_debate_limit() -> None:
+    """H43-01 / INV-17 / INV-06 (N-02): Calling request_adjustment() MUST NOT reset accumulated CircuitBreaker counts and second debate trips DEBATE=3 limit."""
+    breaker = CircuitBreaker(config_path=Path("config/limits.toml"))
+    store = MemoryEventStore()
+    fake_llm = FakeLLM(
+        responses=[
+            _complete_spec_response(),
+            # Round 1: DEBATE=2, MEDIATION=1 -> WAITING_APPROVAL
+            _pragmatist_dict(),
+            _structuralist_dict(),
+            _plan_dict(),
+            # Round 2 after request_adjustment(): INTERVIEW=2 -> run_debate hits 4th cumulative DEBATE call -> FAILED
+            _complete_spec_response(),
+            _pragmatist_dict(),
+            _structuralist_dict(),
+            _plan_dict(),
+        ]
+    )
+    orchestrator = Orchestrator(store=store, llm=fake_llm, circuit_breaker=breaker)
+    project_id = "proj-adj-never-resets-cb"
+
+    orchestrator.create_project(project_id=project_id, name="Adj CB", objective="Converter")
+    orchestrator.handle_interview_message(project_id, "evt-int-1", "Complete converter spec")
+    first_waiting = orchestrator.run_debate(project_id)
+    assert first_waiting.state == ProjectState.WAITING_APPROVAL
+    assert breaker.get_calls(project_id, ProjectState.INTERVIEW) == 1
+    assert breaker.get_calls(project_id, ProjectState.DEBATE) == 2
+    assert breaker.get_calls(project_id, ProjectState.MEDIATION) == 1
+
+    # Adjustment transitions WAITING_APPROVAL -> INTERVIEW without resetting any state's call counters
+    adj_status = orchestrator.request_adjustment(project_id, "Change architecture")
+    assert adj_status.state == ProjectState.INTERVIEW
+    assert breaker.get_calls(project_id, ProjectState.INTERVIEW) == 1
+    assert breaker.get_calls(project_id, ProjectState.DEBATE) == 2
+    assert breaker.get_calls(project_id, ProjectState.MEDIATION) == 1
+
+    orchestrator.handle_interview_message(project_id, "evt-int-2", "Updated requirements")
+    assert breaker.get_calls(project_id, ProjectState.INTERVIEW) == 2
+
+    second_debate = orchestrator.run_debate(project_id)
+    assert second_debate.state == ProjectState.FAILED
+    assert second_debate.failure_reason is not None
+    assert "DEBATE" in second_debate.failure_reason
+    assert breaker.get_calls(project_id, ProjectState.DEBATE) == 3
+    # 1 interview + 3 round1 + 1 interview + 1 round2 pragmatist = 6 calls (4th DEBATE call blocked)
+    assert len(fake_llm.calls) == 6

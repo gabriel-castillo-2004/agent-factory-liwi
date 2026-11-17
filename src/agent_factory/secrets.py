@@ -25,7 +25,7 @@ def redact_secrets(
     # 1. Redact via URL, header, and token prefix patterns
     # Telegram bot API URL pattern: https://api.telegram.org/bot<token>/...
     result = re.sub(
-        r"(https?://api\.telegram\.org/bot)[^/\s]+",
+        r"(https?://api\.telegram\.org/bot)[^/\s\"']+",
         r"\1[REDACTED]",
         result,
     )
@@ -39,9 +39,25 @@ def redact_secrets(
 
     # HTTP basic auth / userinfo credentials in URL authority only (never cross '/' into path)
     result = re.sub(
-        r"(https?://[^/\s:@]+:)[^/\s@]+(@)",
+        r"(https?://[^/\s:@\"']+:)[^/\s@\"']+(@)",
         r"\1[REDACTED]\2",
         result,
+    )
+
+    # Bare or header x-access-token credentials
+    result = re.sub(
+        r"(x-access-token:)[^@/\s;,\"']+",
+        r"\1[REDACTED]",
+        result,
+        flags=re.IGNORECASE,
+    )
+
+    # URL query parameter credentials (e.g. ?token=..., &api_key=..., ?access_token=..., ?key=..., etc.)
+    result = re.sub(
+        r"([?&](?:token|api_key|apikey|access_token|secret|password|auth|client_secret|key)=)[^&\s#\"']+",
+        r"\1[REDACTED]",
+        result,
+        flags=re.IGNORECASE,
     )
 
     # Bearer tokens in headers or messages
@@ -52,16 +68,16 @@ def redact_secrets(
         flags=re.IGNORECASE,
     )
 
-    # Well-known provider token prefixes (GitHub classic/fine-grained PATs, sk- API keys)
+    # Well-known provider token prefixes (GitHub classic/fine-grained PATs, sk- API keys, vercel_/vcp_ tokens)
     result = re.sub(
-        r"\b(?:gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,}|sk-[A-Za-z0-9_-]{12,})\b",
+        r"\b(?:gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,}|sk-[A-Za-z0-9_-]{12,}|vercel_[A-Za-z0-9_-]{10,}|vcp_[A-Za-z0-9_-]{10,})\b",
         "[REDACTED]",
         result,
     )
 
     # Key=value token assignments for standard secret variables
     result = re.sub(
-        r"((?:GITHUB_TOKEN|VERCEL_TOKEN|TELEGRAM_BOT_TOKEN)\s*=\s*)[^\s;&,]+",
+        r"((?:GITHUB_TOKEN|VERCEL_TOKEN|TELEGRAM_BOT_TOKEN|LLM_API_KEY)\s*=\s*)[^\s;&,\"']+",
         r"\1[REDACTED]",
         result,
         flags=re.IGNORECASE,

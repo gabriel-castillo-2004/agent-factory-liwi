@@ -23,7 +23,7 @@ from agent_factory.domain.states import IllegalTransition, ProjectState, validat
 from agent_factory.inbox import Inbox
 from agent_factory.ports.clock import Clock
 from agent_factory.ports.llm import LLM, LLMError
-from agent_factory.ports.publisher import StatusPublisher
+from agent_factory.ports.publisher import RegistryPublishError, StatusPublisher
 from agent_factory.ports.store import EventStore
 from agent_factory.secrets import redact_secrets
 
@@ -122,6 +122,7 @@ class Orchestrator:
         self.clock = clock if clock is not None else SystemClock()
         self.valid_templates = valid_templates
         self._specs: dict[str, Spec] = {}
+        self._last_published_status: dict[str, tuple[object, ...]] = {}
 
     def _now(self) -> datetime:
         return self.clock.now() if self.clock else datetime.now(UTC)
@@ -462,7 +463,21 @@ class Orchestrator:
         events = self.store.get_events(project_id)
         status = project_status_from_events(project_id, events)
         if self.publisher is not None:
-            self.publisher.publish(status)
+            last_key = (
+                project_id,
+                status.state,
+                status.progress_pct,
+                status.plan_hash,
+                status.failure_reason,
+                status.links.repo if status.links else "",
+                status.links.deploy if status.links else "",
+            )
+            if self._last_published_status.get(project_id) != last_key:
+                self._last_published_status[project_id] = last_key
+                try:
+                    self.publisher.publish(status)
+                except (RegistryPublishError, OSError, RuntimeError, ValueError):
+                    pass
         return status
 
     def get_plan(self, project_id: str) -> Plan | None:

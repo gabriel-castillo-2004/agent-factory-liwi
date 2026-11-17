@@ -455,7 +455,11 @@ class BuildWorker:
                 if self.registry_publisher is not None:
                     try:
                         delivered_status = self.orchestrator.get_status(project_id)
-                        self.registry_publisher.publish_project(delivered_status)
+                        events = self.orchestrator.store.get_events(project_id)
+                        self.registry_publisher.publish_project(
+                            delivered_status,
+                            events=events,
+                        )
                     except (
                         RegistryPublishError,
                         OSError,
