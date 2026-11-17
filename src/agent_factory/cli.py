@@ -77,28 +77,102 @@ class ProductionLLMAdapter:
             raise LLMError("No HttpTransport configured for ProductionLLMAdapter")
 
         endpoint = "https://api.openai.com/v1/chat/completions"
-        chosen_model = "model-fast-01"
+        chosen_model = ""
 
-        if self.models_config_path and self.models_config_path.is_file():
+        if self.models_config_path is not None:
+            if not self.models_config_path.is_file():
+                raise LLMError(f"Models config file not found: {self.models_config_path}")
             try:
                 with self.models_config_path.open("rb") as f:
                     cfg_data = tomllib.load(f)
-                if "endpoint" in cfg_data:
-                    endpoint = str(cfg_data["endpoint"])
-                chosen_model = str(
-                    cfg_data.get("INTERVIEW")
-                    or cfg_data.get("IDLE")
-                    or cfg_data.get("FAST")
-                    or "model-fast-01"
+            except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError, ValueError) as exc:
+                clean_err = redact_secrets(
+                    f"Failed to load models config from {self.models_config_path}: {exc}",
+                    extra_secrets=self.secrets,
                 )
-            except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError):
-                endpoint = "https://api.openai.com/v1/chat/completions"
-                chosen_model = "model-fast-01"
+                err = LLMError(clean_err)
+                err.__cause__ = None
+                err.__context__ = None
+                raise err
 
-        payload = {
+            if not isinstance(cfg_data, dict) or not cfg_data:
+                raise LLMError(f"Models config at {self.models_config_path} is empty or invalid")
+
+            if "endpoint" in cfg_data:
+                endpoint = str(cfg_data["endpoint"])
+
+            models_section = cfg_data.get("models")
+            if isinstance(models_section, dict):
+                models_cfg = models_section
+            else:
+                models_cfg = cfg_data
+
+            if not models_cfg:
+                raise LLMError(f"No models configured in {self.models_config_path}")
+
+            # State routing: MEDIATION (strong) vs INTERVIEW/DEBATE (fast)
+            is_mediation = False
+            if schema is not None:
+                schema_name = getattr(schema, "__name__", str(schema))
+                if "Plan" in schema_name:
+                    is_mediation = True
+
+            for msg in messages:
+                content = msg.get("content", "")
+                if "Mediator" in content or "mediation" in content.lower():
+                    is_mediation = True
+                    break
+
+            if is_mediation:
+                chosen_model = str(
+                    models_cfg.get("strong")
+                    or models_cfg.get("MEDIATION")
+                    or models_cfg.get("mediation")
+                    or models_cfg.get("STRONG")
+                    or ""
+                )
+            else:
+                chosen_model = str(
+                    models_cfg.get("fast")
+                    or models_cfg.get("INTERVIEW")
+                    or models_cfg.get("DEBATE")
+                    or models_cfg.get("FAST")
+                    or models_cfg.get("idle")
+                    or ""
+                )
+
+            if not chosen_model:
+                fallback_keys = ("fast", "strong") if not is_mediation else ("strong", "fast")
+                for k in fallback_keys:
+                    if k in models_cfg:
+                        chosen_model = str(models_cfg[k])
+                        break
+                if not chosen_model and models_cfg:
+                    chosen_model = str(next(iter(models_cfg.values())))
+
+            if not chosen_model:
+                raise LLMError("Could not resolve model from models configuration")
+        else:
+            chosen_model = "model-fast-01"
+
+        payload: dict[str, Any] = {
             "model": chosen_model,
-            "messages": messages,
+            "messages": list(messages),
         }
+        if schema is not None:
+            schema_dict = None
+            if hasattr(schema, "model_json_schema"):
+                schema_dict = schema.model_json_schema()
+            elif isinstance(schema, dict):
+                schema_dict = schema
+
+            payload["response_format"] = {
+                "type": "json_object",
+                **({"schema": schema_dict} if schema_dict else {}),
+            }
+            if schema_dict:
+                payload["response_schema"] = schema_dict
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -142,6 +216,8 @@ class ProductionLLMAdapter:
             data = json.loads(resp.body)
             choices = data.get("choices", [])
             if not choices:
+                if schema is not None:
+                    raise LLMError("Empty choices from LLM response when schema expected")
                 return {}
             msg = choices[0].get("message", {})
             content = msg.get("content", "")
@@ -150,12 +226,25 @@ class ProductionLLMAdapter:
                     parsed = json.loads(content)
                     if isinstance(parsed, dict):
                         return parsed
-                except (json.JSONDecodeError, ValueError):
-                    pass
+                except (json.JSONDecodeError, ValueError) as json_err:
+                    if schema is not None:
+                        clean_err = redact_secrets(
+                            f"Expected JSON object for schema {schema}, got non-JSON text: {json_err}",
+                            extra_secrets=self.secrets,
+                        )
+                        raise LLMError(clean_err)
+                if schema is not None:
+                    raise LLMError(f"Expected JSON dict for schema {schema}, got: {type(content)}")
                 return {"content": content}
             if isinstance(content, dict):
                 return content
+            if schema is not None:
+                raise LLMError(f"Expected JSON dict for schema {schema}, got: {type(content)}")
             return {"content": str(content)}
+        except LLMError as l_err:
+            l_err.__cause__ = None
+            l_err.__context__ = None
+            raise
         except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
             clean_msg = redact_secrets(
                 f"Failed to parse LLM response: {exc}",
@@ -410,11 +499,24 @@ def build_runtime(
     try:
         effective_runner = runner if runner is not None else SubprocessRunner()
         circuit_breaker = CircuitBreaker(config_path=config.limits_config_path)
+
+        effective_registry = (
+            registry_publisher
+            if registry_publisher is not None
+            else GitRegistryPublisher(
+                repo_path=config.registry_repo_path,
+                branch=config.registry_branch,
+                runner=effective_runner,
+                secrets=active_secrets,
+            )
+        )
+
         orchestrator = Orchestrator(
             store=store,
             llm=effective_llm,
             clock=clock,
             circuit_breaker=circuit_breaker,
+            publisher=effective_registry,
         )
 
         workspace_manager = WorkspaceManager(base_dir=config.workspaces_dir)
@@ -431,9 +533,15 @@ def build_runtime(
 
         deploy_publisher: StaticDeployPublisher | None = None
         if config.deploy_target or config.vercel_token:
+            deploy_base_url = (
+                f"https://{config.github_owner}.github.io"
+                if config.deploy_target in {"gh-pages", "github-pages"} or config.github_owner
+                else ""
+            )
             deploy_publisher = StaticDeployPublisher(
                 runner=effective_runner,
                 target=config.deploy_target,
+                deploy_base_url=deploy_base_url,
                 deploy_token=config.vercel_token,
                 secrets=active_secrets,
             )
@@ -447,17 +555,6 @@ def build_runtime(
                 github_token=config.github_token,
                 secrets=active_secrets,
                 deploy_publisher=deploy_publisher,
-            )
-        )
-
-        effective_registry = (
-            registry_publisher
-            if registry_publisher is not None
-            else GitRegistryPublisher(
-                repo_path=config.registry_repo_path,
-                branch=config.registry_branch,
-                runner=effective_runner,
-                secrets=active_secrets,
             )
         )
 

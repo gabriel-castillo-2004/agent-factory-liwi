@@ -34,7 +34,8 @@
       .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,}|sk-[A-Za-z0-9_-]{12,})\b/g, "[REDACTED]")
       .replace(/(Bearer\s+)[A-Za-z0-9_.-]+/gi, "$1[REDACTED]")
       .replace(/(https?:\/\/[^/\s:@]+:)[^/\s@]+(@)/g, "$1[REDACTED]$2")
-      .replace(/([?&](?:token|access_token|api_key|apikey|secret|password|auth)=)[^&\s#]+/gi, "$1[REDACTED]");
+      .replace(/([?&](?:token|access_token|api_key|apikey|secret|password|auth)=)[^&\s#]+/gi, "$1[REDACTED]")
+      .replace(/\bNaN\b/g, "");
   }
 
   function sanitizeLinkUrl(rawUrl) {
@@ -167,6 +168,11 @@
     });
   }
 
+  function toFiniteNonNegativeInt(val) {
+    var n = Number(val);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  }
+
   function normalizeProjectDetail(rawInput, expectedProjectId) {
     var data = rawInput;
     if (typeof rawInput === "string") {
@@ -212,12 +218,12 @@
       phase: String(data.phase || data.state || "IDLE"),
       progress_pct: Number.isFinite(pct) ? Math.max(0, Math.min(100, Math.round(pct))) : 0,
       plan_hash: data.plan_hash ? String(data.plan_hash) : null,
-      agent_invocations: Number(data.agent_invocations || 0),
-      ci_rounds: Number(data.ci_rounds || 0),
+      agent_invocations: toFiniteNonNegativeInt(data.agent_invocations),
+      ci_rounds: toFiniteNonNegativeInt(data.ci_rounds),
       tests: {
-        total: Number(tests.total || 0),
-        passed: Number(tests.passed || 0),
-        failed: Number(tests.failed || 0)
+        total: toFiniteNonNegativeInt(tests.total),
+        passed: toFiniteNonNegativeInt(tests.passed),
+        failed: toFiniteNonNegativeInt(tests.failed)
       },
       links: {
         repo: sanitizeLinkUrl(links.repo || data.repo_url),
@@ -227,8 +233,8 @@
       project_prompt: data.project_prompt ? redactDisplayText(data.project_prompt) : null,
       build_report: report
         ? {
-            invocations: Number(report.invocations || 0),
-            ci_rounds: Number(report.ci_rounds || 0),
+            invocations: toFiniteNonNegativeInt(report.invocations),
+            ci_rounds: toFiniteNonNegativeInt(report.ci_rounds),
             failure_cause: report.failure_cause ? redactDisplayText(report.failure_cause) : null
           }
         : null,

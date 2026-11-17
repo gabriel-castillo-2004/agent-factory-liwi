@@ -230,8 +230,6 @@ class StaticDeployPublisher:
         target_lower = self.target.lower()
         if target_lower == "vercel":
             cmd = ["vercel", "deploy", str(resolved_source), "--yes"]
-            if self.deploy_token:
-                cmd.extend(["--token", self.deploy_token])
         else:
             cmd = ["gh", "pages", "deploy", str(resolved_source), "--branch", effective_branch]
         clean_err: str | None = None

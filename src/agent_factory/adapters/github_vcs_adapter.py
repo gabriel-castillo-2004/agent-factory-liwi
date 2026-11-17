@@ -131,6 +131,13 @@ class GitHubVCSAdapter(VCS):
 
         self._last_workspace_dir[project_id] = workspace_dir
         clean_env = self.build_clean_env()
+        if (workspace_dir / ".git").is_dir():
+            self.runner.run(["git", "add", "-A"], cwd=workspace_dir, env=clean_env)
+            self.runner.run(
+                ["git", "commit", "-m", f"chore({project_id}): update {valid_branch}"],
+                cwd=workspace_dir,
+                env=clean_env,
+            )
         cmd = ["git", "push", "-u", "origin", valid_branch]
         clean_err: str | None = None
         res = None
@@ -236,6 +243,34 @@ class GitHubVCSAdapter(VCS):
         repo_target = f"{self.owner}/{project_id}" if self.owner else project_id
 
         clean_env = self.build_clean_env()
+        ws_dir = self._last_workspace_dir.get(
+            project_id, Path("workspaces") / project_id
+        )
+        if (ws_dir / ".git").is_dir():
+            try:
+                self.runner.run(
+                    [
+                        "gh",
+                        "pr",
+                        "create",
+                        "--head",
+                        valid_branch,
+                        "--base",
+                        self.default_branch,
+                        "--title",
+                        f"Merge {valid_branch}",
+                        "--body",
+                        f"Automated PR for {project_id}",
+                        "--repo",
+                        repo_target,
+                    ],
+                    cwd=ws_dir,
+                    env=clean_env,
+                )
+            except (CommandTimeoutError, OSError, RuntimeError, ValueError) as pr_exc:
+                clean_pr_err = redact_secrets(str(pr_exc), extra_secrets=self.secrets)
+                _ = clean_pr_err
+
         cmd = ["gh", "pr", "merge", valid_branch, "--repo", repo_target, "--merge", "--auto"]
         clean_err: str | None = None
         res = None
@@ -260,11 +295,8 @@ class GitHubVCSAdapter(VCS):
             else f"{self.repo_base_url}/{project_id}"
         )
         if self.deploy_publisher is not None:
-            ws_dir = self._last_workspace_dir.get(
-                project_id, Path("workspaces") / project_id
-            )
             deploy_url = self.deploy_publisher.deploy_site(
-                project_id, ws_dir, branch=valid_branch
+                project_id, ws_dir
             )
         else:
             deploy_url = f"{self.deploy_base_url}/{project_id}"

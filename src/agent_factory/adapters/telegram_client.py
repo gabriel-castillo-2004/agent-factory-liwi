@@ -42,13 +42,30 @@ class UrllibHttpTransport:
             headers=req_headers,
             method="POST",
         )
+        extra: list[str] = []
+        if headers:
+            for v in headers.values():
+                if v:
+                    extra.append(v)
+                    if v.startswith("Bearer "):
+                        extra.append(v.removeprefix("Bearer ").strip())
+
+        err_to_raise: TelegramTransportError | None = None
         try:
             with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
                 body = resp.read().decode("utf-8")
                 return HttpResponse(status_code=resp.status, body=body)
-        except urllib.error.HTTPError as err:
-            body = err.read().decode("utf-8", errors="replace")
-            return HttpResponse(status_code=err.code, body=body)
+        except (urllib.error.HTTPError, urllib.error.URLError, http.client.HTTPException, OSError) as err:
+            clean_msg = redact_secrets(
+                f"HTTP transport failed for {url}: {err}",
+                extra_secrets=extra,
+            )
+            err_to_raise = TelegramTransportError(clean_msg)
+
+        if err_to_raise is not None:
+            err_to_raise.__cause__ = None
+            err_to_raise.__context__ = None
+            raise err_to_raise
 
 
 class TelegramHttpClient:

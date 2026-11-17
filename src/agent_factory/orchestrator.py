@@ -122,6 +122,7 @@ class Orchestrator:
         self.clock = clock if clock is not None else SystemClock()
         self.valid_templates = valid_templates
         self._specs: dict[str, Spec] = {}
+        self._last_published_status: dict[str, tuple[object, ...]] = {}
 
     def _now(self) -> datetime:
         return self.clock.now() if self.clock else datetime.now(UTC)
@@ -407,6 +408,7 @@ class Orchestrator:
         if current_status.state != ProjectState.WAITING_APPROVAL:
             raise IllegalTransition(current_status.state, ProjectState.INTERVIEW)
         validate_transition(current_status.state, ProjectState.INTERVIEW)
+        self.circuit_breaker.reset(project_id)
         self.store.append(
             create_event(
                 project_id=project_id,
@@ -462,7 +464,18 @@ class Orchestrator:
         events = self.store.get_events(project_id)
         status = project_status_from_events(project_id, events)
         if self.publisher is not None:
-            self.publisher.publish(status)
+            last_key = (
+                project_id,
+                status.state,
+                status.progress_pct,
+                status.plan_hash,
+                status.failure_reason,
+                status.links.repo if status.links else "",
+                status.links.deploy if status.links else "",
+            )
+            if self._last_published_status.get(project_id) != last_key:
+                self._last_published_status[project_id] = last_key
+                self.publisher.publish(status)
         return status
 
     def get_plan(self, project_id: str) -> Plan | None:

@@ -129,6 +129,14 @@ class GitRegistryPublisher:
                         else:
                             child.unlink(missing_ok=True)
         else:
+            git_dir = work_dir / ".git"
+            if git_dir.is_dir() and (
+                (git_dir / "rebase-merge").exists()
+                or (git_dir / "rebase-apply").exists()
+                or (git_dir / "REBASE_HEAD").exists()
+            ):
+                self.runner.run(["git", "rebase", "--abort"], cwd=work_dir, env=self.env)
+                self.runner.run(["git", "reset", "--hard", "HEAD"], cwd=work_dir, env=self.env)
             self._run_git(["checkout", branch], cwd=work_dir)
             if self.push_to_remote:
                 fetch_res = self.runner.run(
