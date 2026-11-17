@@ -32,6 +32,21 @@ class SqliteEventStore:
                 )
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS telegram_processed_updates (
+                    update_id INTEGER PRIMARY KEY
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS telegram_active_projects (
+                    chat_id INTEGER PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                )
+                """
+            )
 
     def append(self, event: Event) -> None:
         """Append an event to the SQLite database."""
@@ -73,6 +88,34 @@ class SqliteEventStore:
         cursor.execute("SELECT DISTINCT project_id FROM events ORDER BY rowid ASC")
         rows = cursor.fetchall()
         return [row[0] for row in rows]
+
+    def record_telegram_update(self, update_id: int) -> None:
+        """Persist a processed Telegram update_id across restarts (INV-16)."""
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO telegram_processed_updates (update_id) VALUES (?)",
+                (int(update_id),),
+            )
+
+    def get_processed_telegram_updates(self) -> set[int]:
+        """Load all persistently recorded Telegram update_ids."""
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT update_id FROM telegram_processed_updates")
+        return {int(row[0]) for row in cursor.fetchall()}
+
+    def set_telegram_active_project(self, chat_id: int, project_id: str) -> None:
+        """Persist the active project_id associated with chat_id across restarts."""
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO telegram_active_projects (chat_id, project_id) VALUES (?, ?)",
+                (int(chat_id), project_id),
+            )
+
+    def get_telegram_active_projects(self) -> dict[int, str]:
+        """Load persisted chat_id -> project_id routing map."""
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT chat_id, project_id FROM telegram_active_projects")
+        return {int(row[0]): str(row[1]) for row in cursor.fetchall()}
 
     def close(self) -> None:
         """Close any underlying database connection."""

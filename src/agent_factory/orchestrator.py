@@ -25,6 +25,7 @@ from agent_factory.ports.clock import Clock
 from agent_factory.ports.llm import LLM, LLMError
 from agent_factory.ports.publisher import StatusPublisher
 from agent_factory.ports.store import EventStore
+from agent_factory.secrets import redact_secrets
 
 
 class ApprovalError(Exception):
@@ -199,7 +200,7 @@ class Orchestrator:
             fail_evt = create_event(
                 project_id=project_id,
                 event_type=EventType.PROJECT_FAILED,
-                payload={"reason": str(err)},
+                payload={"reason": redact_secrets(str(err))},
                 at=self._now(),
             )
             self.store.append(fail_evt)
@@ -230,7 +231,7 @@ class Orchestrator:
             fail_evt = create_event(
                 project_id=project_id,
                 event_type=EventType.PROJECT_FAILED,
-                payload={"reason": str(err)},
+                payload={"reason": redact_secrets(str(err))},
                 at=self._now(),
             )
             self.store.append(fail_evt)
@@ -319,7 +320,7 @@ class Orchestrator:
                 create_event(
                     project_id=project_id,
                     event_type=EventType.PROJECT_FAILED,
-                    payload={"reason": str(err)},
+                    payload={"reason": redact_secrets(str(err))},
                     at=self._now(),
                 )
             )
@@ -330,7 +331,7 @@ class Orchestrator:
                 create_event(
                     project_id=project_id,
                     event_type=EventType.PROJECT_FAILED,
-                    payload={"reason": result.failure_cause or "Debate pipeline failed"},
+                    payload={"reason": redact_secrets(result.failure_cause or "Debate pipeline failed")},
                     at=self._now(),
                 )
             )
@@ -395,6 +396,31 @@ class Orchestrator:
         )
         return self.get_status(project_id)
 
+    def request_adjustment(
+        self,
+        project_id: str,
+        reason: str = "",
+    ) -> ProjectStatus:
+        """Transition a project in WAITING_APPROVAL back to INTERVIEW for plan adjustment (INV-04, INV-05)."""
+        validate_project_id(project_id)
+        current_status = self.get_status(project_id)
+        if current_status.state != ProjectState.WAITING_APPROVAL:
+            raise IllegalTransition(current_status.state, ProjectState.INTERVIEW)
+        validate_transition(current_status.state, ProjectState.INTERVIEW)
+        self.store.append(
+            create_event(
+                project_id=project_id,
+                event_type=EventType.STATE_TRANSITIONED,
+                payload={
+                    "from": current_status.state.value,
+                    "to": ProjectState.INTERVIEW.value,
+                    "reason": reason or "Adjustment requested by user",
+                },
+                at=self._now(),
+            )
+        )
+        return self.get_status(project_id)
+
     def record_state_call(
         self,
         project_id: str,
@@ -424,7 +450,7 @@ class Orchestrator:
                 create_event(
                     project_id=project_id,
                     event_type=EventType.PROJECT_FAILED,
-                    payload={"reason": str(err)},
+                    payload={"reason": redact_secrets(str(err))},
                     at=self._now(),
                 )
             )
