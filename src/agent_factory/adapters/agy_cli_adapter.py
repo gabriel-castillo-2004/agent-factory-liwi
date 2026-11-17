@@ -82,15 +82,11 @@ class AgyCliAdapter(CodeAgent):
             )
         project_id = ws_path.name
         try:
-            expected_ws_dir = self.workspace_manager.get_workspace_dir(project_id)
+            self.workspace_manager.get_workspace_dir(project_id)
         except (ValueError, SandboxViolationError) as err:
             raise SandboxViolationError(
                 f"Invalid workspace directory name '{project_id}': {err}"
             ) from err
-        if expected_ws_dir != ws_path:
-            raise SandboxViolationError(
-                f"Workspace path '{ws_path}' does not match expected '{expected_ws_dir}'"
-            )
         return ws_path
 
     def build_clean_env(
@@ -185,22 +181,20 @@ class AgyCliAdapter(CodeAgent):
                 "too many requests",
                 "quota exhausted",
                 "quota exceeded",
-                "rate limit exceeded",
+                "rate limit",
+                "rate_limit",
                 "resource_exhausted",
+                "insufficient quota",
             )
             is_quota = (
-                res.exit_code in (42, 429)
+                res.exit_code in {42, 429}
                 or any(phrase in lowered for phrase in quota_phrases)
                 or bool(
                     re.search(
-                        r"\b(?:http|status|error|code)\s*429\b",
+                        r"\b(?:http|status|error|code)\s*[:=]?\s*429\b",
                         combined_output,
                         re.IGNORECASE,
                     )
-                )
-                or bool(
-                    re.search(r"\b429\b", combined_output)
-                    and not re.search(r"\bline\s+429\b", combined_output, re.IGNORECASE)
                 )
             )
 
