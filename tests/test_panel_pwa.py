@@ -2,6 +2,8 @@
 
 import json
 import re
+import shutil
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -192,3 +194,186 @@ def test_panel_pwa_bundle_export_sanitized_history_and_negative_cases(tmp_path: 
         raise AssertionError("Expected ValueError for invalid project_id")
     except ValueError:
         pass
+
+
+def test_panel_pwa_js_behavior_xss_id_links_detail_rendering_and_html_input() -> None:
+    """H4-04 / H4-08 / M4-19 / M4-20 (INV-16, INV-22, INV-23): Executes panel/app.js against real XSS/ID/URL/detail payloads and checks relative input support in index.html."""
+    js_exe = shutil.which("node") or shutil.which("deno")
+    assert js_exe is not None, "A JavaScript runtime (node or deno) is required to execute panel/app.js tests"
+
+    app_js_posix = (PANEL_DIR / "app.js").resolve().as_posix()
+    js_script = f"""
+const appPath = {json.dumps(app_js_posix)};
+const readFile = (p) => typeof Deno !== "undefined" ? Deno.readTextFileSync(p) : require("fs").readFileSync(p, "utf8");
+function makeEl(id) {{
+  let _html = "";
+  const children = [];
+  return {{
+    id, className: "", tabIndex: 0, textContent: "", value: "", children, listeners: {{}},
+    classList: {{ _s: new Set(), add(c){{ this._s.add(c); }}, remove(c){{ this._s.delete(c); }} }},
+    setAttribute(){{}},
+    addEventListener(t, fn){{ (this.listeners[t] = this.listeners[t] || []).push(fn); }},
+    appendChild(ch){{ children.push(ch); }},
+    get innerHTML(){{ return _html; }},
+    set innerHTML(v){{ _html = String(v); if (_html === "") children.length = 0; }}
+  }};
+}}
+const els = {{}};
+for (const id of [
+  "error-banner", "registry-base-input", "source-form", "refresh-btn", "search-input",
+  "state-filter", "projects-list", "projects-empty", "detail-placeholder", "detail-content",
+  "connection-badge", "updated-at-badge", "kpi-total", "kpi-delivered", "kpi-active", "kpi-failed"
+]) {{
+  els[id] = makeEl(id);
+}}
+const docListeners = {{}};
+globalThis.document = {{
+  getElementById: (id) => els[id] || null,
+  createElement: (tag) => makeEl(tag),
+  addEventListener: (t, fn) => {{ (docListeners[t] = docListeners[t] || []).push(fn); }}
+}};
+globalThis.window = {{
+  location: {{ search: "" }},
+  localStorage: {{ getItem: () => null, setItem: () => {{}} }},
+  addEventListener: () => {{}}
+}};
+globalThis.fetch = async (url) => {{
+  if (url.endsWith("/registry.json")) {{
+    return {{
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({{
+        version: "1.0",
+        projects: {{
+          "demo-app": {{
+            project_id: "demo-app",
+            name: "Demo <script>alert(1)</script>",
+            objective: "Obj",
+            state: "DELIVERED",
+            progress_pct: 100
+          }}
+        }}
+      }})
+    }};
+  }}
+  return {{
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({{
+      project_id: "demo-app",
+      name: "Demo",
+      objective: "Obj",
+      state: "DELIVERED",
+      phase: "DELIVERED",
+      progress_pct: 100,
+      agent_invocations: 4,
+      ci_rounds: 1,
+      project_prompt: "# PROJECT_PROMPT_MARKER\\nPrompt <img src=x onerror=alert(2)>",
+      build_report: {{ invocations: 4, ci_rounds: 1, failure_cause: "REPORT_CAUSE_MARKER <svg onload=alert(3)>" }},
+      events: []
+    }})
+  }};
+}};
+(async () => {{
+  new Function(readFile(appPath))();
+  const api = globalThis.AgentFactoryPanel;
+  for (const fn of (docListeners["DOMContentLoaded"] || [])) fn();
+  await new Promise((r) => setTimeout(r, 20));
+  if (els["projects-list"].children.length > 0 && els["projects-list"].children[0].listeners.click) {{
+    els["projects-list"].children[0].listeners.click[0]();
+    await new Promise((r) => setTimeout(r, 20));
+  }}
+  const catalog = api.parseRegistryCatalog({{
+    version: "1.0",
+    projects: {{
+      "demo-app": {{ name: "Demo", state: "DELIVERED", progress_pct: 100 }},
+      "../escape": {{ name: "Bad", state: "DELIVERED", progress_pct: 100 }},
+      "UPPER": {{ name: "Bad2", state: "DELIVERED", progress_pct: 100 }}
+    }}
+  }});
+  console.log(JSON.stringify({{
+    escapedScript: api.escapeHtml("<script>alert(1)</script>"),
+    escapedQuotes: api.escapeHtml("'\\"&"),
+    validOk: [api.isValidProjectId("demo-app"), api.isValidProjectId("a")],
+    validBad: [
+      api.isValidProjectId("../escape"),
+      api.isValidProjectId("UPPER"),
+      api.isValidProjectId("-lead"),
+      api.isValidProjectId("x".repeat(64)),
+      api.isValidProjectId("")
+    ],
+    catalogIds: catalog.projects.map((p) => p.project_id),
+    links: {{
+      ok: api.sanitizeLinkUrl("https://github.com/acme/demo-app"),
+      protoRel: api.sanitizeLinkUrl("//evil.com"),
+      jsScheme: api.sanitizeLinkUrl("javascript:alert(1)"),
+      dataScheme: api.sanitizeLinkUrl("data:text/html,hi"),
+      relPath: api.sanitizeLinkUrl("../rel"),
+      credUrl: api.sanitizeLinkUrl("https://user:pass@example.com")
+    }},
+    cardsHtml: els["projects-list"].children.map((c) => c.innerHTML).join(""),
+    detailHtml: els["detail-content"].innerHTML
+  }}));
+}})().catch((err) => {{
+  console.error(err);
+  if (typeof Deno !== "undefined") Deno.exit(1); else process.exit(1);
+}});
+"""
+    cmd = (
+        [js_exe, "-e", js_script]
+        if Path(js_exe).stem.lower() == "node"
+        else [js_exe, "eval", "--no-remote", js_script]
+    )
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=True)
+    out = json.loads(proc.stdout.strip())
+
+    # Hand-crafted oracles killing M4-19 and M4-20
+    assert out["escapedScript"] == "&lt;script&gt;alert(1)&lt;/script&gt;"
+    assert out["escapedQuotes"] == "&#39;&quot;&amp;"
+    assert out["validOk"] == [True, True]
+    assert out["validBad"] == [False, False, False, False, False]
+    assert out["catalogIds"] == ["demo-app"]
+    assert "<script>" not in out["cardsHtml"]
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in out["cardsHtml"]
+
+    # Link URL sanitization (H4-08)
+    assert out["links"]["ok"] == "https://github.com/acme/demo-app"
+    assert out["links"]["protoRel"] is None
+    assert out["links"]["jsScheme"] is None
+    assert out["links"]["dataScheme"] is None
+    assert out["links"]["relPath"] is None
+    assert out["links"]["credUrl"] is None
+
+    # Detail view must render escaped PROJECT_PROMPT.md and BuildReport (H4-08 / MASTER_PROMPT.md §7)
+    detail_html = out["detailHtml"]
+    assert "PROJECT_PROMPT_MARKER" in detail_html
+    assert "<img" not in detail_html
+    assert "&lt;img src=x onerror=alert(2)&gt;" in detail_html
+    assert "REPORT_CAUSE_MARKER" in detail_html
+    assert "<svg" not in detail_html
+    assert "&lt;svg onload=alert(3)&gt;" in detail_html
+
+    index_html = (PANEL_DIR / "index.html").read_text(encoding="utf-8")
+    assert re.search(r'<input[^>]*id="registry-base-input"[^>]*type="url"', index_html) is None
+    assert re.search(r'<input[^>]*type="url"[^>]*id="registry-base-input"', index_html) is None
+
+
+def test_panel_pwa_detail_redaction_tolerates_telegram_url_without_trailing_slash() -> None:
+    """H4-05 (INV-07, INV-19, INV-23): build_sanitized_project_detail does not break JSON when Telegram bot URL has no trailing slash."""
+    status = ProjectStatus(
+        project_id="app-tg-noslash",
+        name="TG NoSlash",
+        objective="Test",
+        state=ProjectState.FAILED,
+        progress_pct=35,
+    )
+    report = BuildReport(
+        invocations=1,
+        ci_rounds=0,
+        test_results={},
+        failure_cause="Failed contacting https://api.telegram.org/bot123456:SECRET_NO_SLASH_999",
+    )
+    detail = StaticDeployPublisher().build_sanitized_project_detail(status, build_report=report)
+    rendered = json.dumps(detail)
+    assert "SECRET_NO_SLASH_999" not in rendered
+    assert "[REDACTED]" in rendered

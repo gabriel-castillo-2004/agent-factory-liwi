@@ -2,14 +2,21 @@
 
 import json
 import subprocess
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
+from agent_factory.adapters.fake_code_agent import FakeCodeAgent
 from agent_factory.adapters.fake_llm import FakeLLM
+from agent_factory.adapters.fake_runner import FakeRunner
 from agent_factory.adapters.fake_telegram import FakeTelegramClient
+from agent_factory.adapters.fake_vcs import FakeVCS
 from agent_factory.adapters.git_registry_publisher import GitRegistryPublisher
 from agent_factory.adapters.sqlite_store import SqliteEventStore
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
+from agent_factory.builder import BuildWorker, JobState, LocalJobQueue
 from agent_factory.domain.models import (
     AcceptanceTest,
     AcceptanceTestType,
@@ -20,9 +27,18 @@ from agent_factory.domain.models import (
 from agent_factory.domain.states import ProjectState
 from agent_factory.orchestrator import Orchestrator
 from agent_factory.ports.llm import LLMError
-from agent_factory.ports.notifier import TelegramUpdate
+from agent_factory.ports.notifier import (
+    InlineButton,
+    SentMessage,
+    TelegramTransportError,
+    TelegramUpdate,
+)
+from agent_factory.ports.publisher import RegistryPublishError
+from agent_factory.ports.runner import CommandResult
+from agent_factory.ports.vcs import CIRunResult
 from agent_factory.secrets import redact_secrets
 from agent_factory.telegram_bot import TelegramBotConfig, TelegramBotService
+from agent_factory.workspace import WorkspaceManager
 
 
 def _init_bare_repo(tmp_path: Path) -> Path:
@@ -226,3 +242,228 @@ def test_redact_secrets_scrubs_sensitive_query_params_without_env_or_extra_secre
 
     public_url = "https://example.com:8080/users/@gabriel?tab=1&page=2"
     assert redact_secrets(public_url, extra_secrets=(), env={}) == public_url
+
+
+def test_git_registry_publisher_preserves_distinct_offline_projects_and_scrubs_error_context(
+    tmp_path: Path,
+) -> None:
+    """H4-06 / H4-10 / M4-15 (INV-07, INV-19, INV-21, INV-23): Rebase recovery preserves other offline projects even when publishing a different project, handles malformed projects list, and clears __context__."""
+    bare_repo = _init_bare_repo(tmp_path)
+    runner = SubprocessRunner(default_timeout_seconds=15.0)
+    ts = datetime(2026, 11, 17, 10, 30, tzinfo=UTC)
+
+    pub1 = GitRegistryPublisher(
+        repo_path=bare_repo,
+        branch="registry",
+        push_to_remote=True,
+        runner=runner,
+        work_dir=tmp_path / "wt1",
+    )
+    pub2 = GitRegistryPublisher(
+        repo_path=bare_repo,
+        branch="registry",
+        push_to_remote=True,
+        runner=runner,
+        work_dir=tmp_path / "wt2",
+    )
+
+    pub1.publish_project(
+        ProjectStatus(project_id="proj-one", name="One", state=ProjectState.DELIVERED, progress_pct=100, updated_at=ts)
+    )
+    pub2.publish_project(
+        ProjectStatus(project_id="proj-two", name="Two", state=ProjectState.DELIVERED, progress_pct=100, updated_at=ts)
+    )
+
+    # wt1 commits proj-three offline (not pushed); wt2 pushes proj-five creating divergence on registry.json
+    pub1_offline = GitRegistryPublisher(
+        repo_path=bare_repo,
+        branch="registry",
+        push_to_remote=False,
+        runner=runner,
+        work_dir=tmp_path / "wt1",
+    )
+    pub1_offline.publish_project(
+        ProjectStatus(project_id="proj-three", name="Three", state=ProjectState.DELIVERED, progress_pct=100, updated_at=ts)
+    )
+    pub2.publish_project(
+        ProjectStatus(project_id="proj-five", name="Five", state=ProjectState.DELIVERED, progress_pct=100, updated_at=ts)
+    )
+
+    # wt1 now publishes DIFFERENT project (proj-four): MUST preserve offline proj-three too (kills M4-15)
+    pub1.publish_project(
+        ProjectStatus(project_id="proj-four", name="Four", state=ProjectState.DELIVERED, progress_pct=100, updated_at=ts)
+    )
+
+    raw_index = subprocess.run(
+        ["git", "-C", str(bare_repo), "show", "refs/heads/registry:registry.json"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert sorted(json.loads(raw_index)["projects"].keys()) == [
+        "proj-five",
+        "proj-four",
+        "proj-one",
+        "proj-three",
+        "proj-two",
+    ]
+    proj3_raw = subprocess.run(
+        ["git", "-C", str(bare_repo), "show", "refs/heads/registry:projects/proj-three.json"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert json.loads(proj3_raw)["project_id"] == "proj-three"
+
+    # H4-06: RegistryPublishError must clear __cause__ and __context__ so raw secrets cannot escape
+    sec_tok = "TEST_REG_CTX_SECRET_777"
+    err_pub = GitRegistryPublisher(
+        repo_path=bare_repo,
+        runner=FakeRunner(results=[OSError(f"git transport failed {sec_tok}")]),
+        secrets=(sec_tok,),
+    )
+    with pytest.raises(RegistryPublishError) as reg_err:
+        err_pub._run_git(["status"], cwd=tmp_path)
+    assert sec_tok not in str(reg_err.value)
+    assert reg_err.value.__cause__ is None
+    assert reg_err.value.__context__ is None
+
+
+def test_telegram_bot_resume_rejected_cleanly_and_poll_once_isolates_reply_failures(
+    tmp_path: Path,
+) -> None:
+    """H4-11 / M4-21a (INV-04, INV-16, INV-19, INV-23): /resume on COMPLETED job rejects cleanly without invoking BuildWorker (kills M19/M4-21a), and poll_once isolates send_message errors."""
+    plan = Plan(
+        summary="Delivered App Plan",
+        rationale="Static",
+        template_id="static-web",
+        files=[FileSpec(path="src/app.js", purpose="App", contract="export {};", depends_on=[])],
+        acceptance_tests=[AcceptanceTest(id="AT-01", description="OK", type=AcceptanceTestType.UNIT)],
+        risks=[],
+        deployment_target="github-pages",
+    )
+    llm = FakeLLM(
+        responses=[
+            {
+                "spec": {
+                    "objective": "Delivered App",
+                    "users": ["Gabriel"],
+                    "features": ["f1"],
+                    "business_rules": ["r1"],
+                    "edge_cases": ["e1"],
+                    "constraints": ["c1"],
+                    "success_criteria": ["s1"],
+                    "assumptions": [],
+                },
+                "questions": [],
+            },
+            {"approach": "Static ES", "components": ["src/app.js"], "tradeoffs": []},
+            {"critique": ["c"], "robust_proposal": "r", "architectural_safeguards": []},
+            plan.model_dump(mode="json"),
+        ]
+    )
+
+    store = SqliteEventStore(db_path=tmp_path / "bot_h411.db")
+    try:
+        orch = Orchestrator(store=store, llm=llm)
+        worker = BuildWorker(
+            orchestrator=orch,
+            workspace_manager=WorkspaceManager(base_dir=tmp_path / "ws"),
+            code_agent=FakeCodeAgent(
+                test_gen_steps=[{"tests/test_app.py": "def test_ok(): assert True\n"}],
+                impl_steps=[{"src/app.js": "export const ok = 1;\n"}],
+            ),
+            runner=FakeRunner(results=[CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True})]),
+            vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
+            queue=LocalJobQueue(),
+        )
+        cfg = TelegramBotConfig(
+            allowed_chat_ids=frozenset({1001}),
+            allowed_user_ids=frozenset({2001}),
+            secrets_to_redact=("SECRET_REPLY_ERR_999",),
+        )
+        client = FakeTelegramClient()
+        bot = TelegramBotService(client=client, orchestrator=orch, config=cfg, build_worker=worker)
+
+        bot.handle_update(TelegramUpdate(update_id=1, chat_id=1001, user_id=2001, text="/new Delivered App"))
+        pid = "delivered-app"
+        status_wait = orch.get_status(pid)
+        assert status_wait.state == ProjectState.WAITING_APPROVAL
+        bot.handle_update(
+            TelegramUpdate(
+                update_id=2,
+                chat_id=1001,
+                user_id=2001,
+                callback_query_id="cb-deliv",
+                callback_data=f"approve:{pid}:{status_wait.plan_hash}",
+            )
+        )
+        assert orch.get_status(pid).state == ProjectState.DELIVERED
+        assert worker.queue.get_job(pid) is not None
+        assert worker.queue.get_job(pid).state == JobState.COMPLETED
+
+        # Direct handle_update + poll_once on COMPLETED job MUST return action == "resume_rejected" without touching BuildWorker (kills M4-21a / M19)
+        direct_out = bot.handle_update(
+            TelegramUpdate(update_id=3, chat_id=1001, user_id=2001, text=f"/resume {pid}")
+        )
+        assert direct_out.action == "resume_rejected"
+
+        client.enqueue_update(
+            TelegramUpdate(update_id=4, chat_id=1001, user_id=2001, text=f"/resume {pid}")
+        )
+        batch_out = bot.poll_once()
+        assert len(batch_out) == 1
+        assert batch_out[0].action == "resume_rejected"
+        assert worker.queue.get_job(pid).state == JobState.COMPLETED
+        assert orch.get_status(pid).state == ProjectState.DELIVERED
+
+        # H4-11 (H31-04): poll_once must isolate send_message failures inside an update batch
+        class _FlakyReplyTelegramClient:
+            def __init__(self) -> None:
+                self.send_attempts = 0
+                self.sent_texts: list[str] = []
+
+            def get_updates(
+                self, offset: int | None = None, timeout: int = 30
+            ) -> list[TelegramUpdate]:
+                return [
+                    TelegramUpdate(update_id=30, chat_id=1001, user_id=2001, text="/status nonexistent-app"),
+                    TelegramUpdate(update_id=31, chat_id=1001, user_id=2001, text=f"/status {pid}"),
+                ]
+
+            def send_message(
+                self,
+                chat_id: int,
+                text: str,
+                buttons: Sequence[Sequence[InlineButton]] | None = None,
+            ) -> SentMessage:
+                self.send_attempts += 1
+                if "DELIVERED" not in text:
+                    raise TelegramTransportError(
+                        "Connection reset contacting https://api.telegram.org/bot123456:SECRET_REPLY_ERR_999/sendMessage"
+                    )
+                self.sent_texts.append(text)
+                return SentMessage(message_id=self.send_attempts, chat_id=chat_id, text=text)
+
+            def answer_callback_query(
+                self, callback_query_id: str, text: str | None = None
+            ) -> None:
+                return None
+
+        flaky_client = _FlakyReplyTelegramClient()
+        flaky_bot = TelegramBotService(
+            client=flaky_client,
+            orchestrator=orch,
+            config=cfg,
+            build_worker=worker,
+        )
+        outcomes = flaky_bot.poll_once()
+        assert len(outcomes) == 2
+        assert outcomes[0].update_id == 30
+        assert outcomes[0].action == "error"
+        assert "SECRET_REPLY_ERR_999" not in outcomes[0].reply_text
+        assert outcomes[1].update_id == 31
+        assert outcomes[1].action == "status_reported"
+        assert "DELIVERED" in outcomes[1].reply_text
+    finally:
+        store.close()
