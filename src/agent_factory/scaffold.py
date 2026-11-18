@@ -57,7 +57,12 @@ class TemplateScaffold:
                 f"Traversal or absolute path rejected in template_id '{template_id}'"
             )
 
-        tpl_dir = (self.templates_root / template_id).resolve()
+        resolved_id = template_id
+        tpl_dir = (self.templates_root / resolved_id).resolve()
+        if resolved_id == "static-app" and not tpl_dir.is_dir():
+            resolved_id = "static-web"
+            tpl_dir = (self.templates_root / resolved_id).resolve()
+
         if not tpl_dir.is_relative_to(self.templates_root) or tpl_dir == self.templates_root:
             raise SandboxViolationError(
                 f"Template '{template_id}' escapes templates root '{self.templates_root}'"

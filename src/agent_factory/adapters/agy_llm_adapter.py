@@ -116,7 +116,9 @@ def _build_combined_prompt(
         if schema_dict and "properties" in schema_dict:
             props = schema_dict["properties"]
             if "template_id" in props:
-                rules.append("- 'template_id' must be exactly one of: 'static-app', 'static-web'")
+                rules.append(
+                    "- 'template_id' must be exactly one of: 'static-web', 'static-app' (recommended/primary template: 'static-web')"
+                )
             if "acceptance_tests" in props:
                 rules.append(
                     "- 'acceptance_tests' must be a non-empty list of objects, each containing: "

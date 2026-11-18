@@ -83,7 +83,7 @@ class Mediator:
                 "content": (
                     "You are Mediator, the final debate synthesis agent. Produce a validated Master Plan "
                     "reconciling Pragmatist and Structuralist positions. "
-                    f"template_id must be exactly one of: {templates_str}. "
+                    f"template_id must be exactly one of: {templates_str} (recommended/primary template: 'static-web'). "
                     "acceptance_tests must be non-empty, each containing 'id', 'description', and 'type' (allowed types: 'unit', 'integration', 'e2e'). "
                     "files must contain 'path', 'purpose', and a non-empty 'contract' for each file."
                 ),
@@ -134,7 +134,7 @@ class Mediator:
                             "content": (
                                 f"Previous attempt failed Plan validation: {validation_err}. "
                                 "Please correct the output and respond ONLY with a valid JSON object matching the Plan schema. "
-                                f"template_id must be one of: {templates_str}. "
+                                f"template_id must be one of: {templates_str} (recommended/primary template: 'static-web'). "
                                 "acceptance_tests must be non-empty with types 'unit', 'integration', or 'e2e'. "
                                 "Every file must specify a non-empty contract."
                             ),
@@ -152,7 +152,7 @@ class Mediator:
                             "content": (
                                 f"Previous attempt failed: {err}. "
                                 "Please correct the output and respond ONLY with a valid JSON object matching the Plan schema. "
-                                f"template_id must be one of: {templates_str}. "
+                                f"template_id must be one of: {templates_str} (recommended/primary template: 'static-web'). "
                                 "acceptance_tests must be non-empty with types 'unit', 'integration', or 'e2e'. "
                                 "Every file must specify a non-empty contract."
                             ),

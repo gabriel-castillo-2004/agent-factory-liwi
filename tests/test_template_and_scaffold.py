@@ -420,3 +420,40 @@ def test_template_scaffold_defensive_errors_on_invalid_or_missing_template_and_m
     (bad_json_dir / "package.json").write_text("{not valid json", encoding="utf-8")
     with pytest.raises(ValueError):
         scaffold.inspect_template("bad-json-web")
+
+
+def test_template_scaffold_resolves_static_app_to_static_web_without_error(
+    tmp_path: Path,
+) -> None:
+    """A2b-2 positive (INV-16, INV-20, INV-22, INV-23): TemplateScaffold resolves template_id='static-app' to 'static-web' when 'static-app' does not exist on disk."""
+    base_dir = tmp_path / "workspaces"
+    ws_mgr = WorkspaceManager(base_dir=base_dir)
+    scaffold = TemplateScaffold(workspace_manager=ws_mgr, templates_root=DEFAULT_TEMPLATES_ROOT)
+
+    # 1. inspect_template with "static-app" succeeds without FileNotFoundError
+    inspection = scaffold.inspect_template("static-app")
+    assert inspection.template_id == "static-app"
+    assert "index.html" in inspection.files
+    assert "package.json" in inspection.files
+    assert "playwright.config.mjs" in inspection.files
+    assert "styles.css" in inspection.files
+
+    # 2. scaffold with "static-app" copies files from static-web into workspace without error
+    ws_dir = scaffold.scaffold(project_id="proj-legacy-app", template_id="static-app")
+    assert ws_dir == (base_dir / "proj-legacy-app").resolve()
+    assert (ws_dir / "package.json").is_file()
+    assert (ws_dir / "playwright.config.mjs").is_file()
+    assert (ws_dir / "index.html").is_file()
+    assert (ws_dir / "styles.css").is_file()
+    assert (ws_dir / "src").is_dir()
+    assert [p for p in (ws_dir / "src").rglob("*") if p.is_file()] == []
+
+    # 3. If a distinct static-app directory actually exists, it uses it directly
+    custom_templates = tmp_path / "custom_templates"
+    custom_static_app = custom_templates / "static-app"
+    _write_valid_template_base(custom_static_app)
+    custom_scaffold = TemplateScaffold(workspace_manager=ws_mgr, templates_root=custom_templates)
+    custom_inspection = custom_scaffold.inspect_template("static-app")
+    assert custom_inspection.template_id == "static-app"
+    ws_custom = custom_scaffold.scaffold(project_id="proj-custom-app", template_id="static-app")
+    assert (ws_custom / "package.json").is_file()
