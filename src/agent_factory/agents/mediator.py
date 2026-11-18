@@ -98,7 +98,7 @@ class Mediator:
         while attempts <= self.max_retries:
             attempts += 1
             try:
-                data = self.llm.complete(messages=messages, schema=None)
+                data = self.llm.complete(messages=messages, schema=Plan)
                 plan = Plan.model_validate(data)
                 return validate_plan(plan, self.valid_templates)
             except PlanValidationError:

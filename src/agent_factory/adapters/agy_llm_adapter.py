@@ -29,6 +29,60 @@ def _extract_schema_dict(schema: type[BaseModel] | dict[str, Any] | None) -> dic
     return None
 
 
+def _build_example_skeleton(
+    schema: dict[str, Any],
+    defs: dict[str, Any] | None = None,
+    seen_refs: set[str] | None = None,
+) -> Any:
+    """Generate a clean JSON example skeleton from a JSON schema with resolved refs and types."""
+    if defs is None:
+        defs = schema.get("$defs") or schema.get("definitions") or {}
+    if seen_refs is None:
+        seen_refs = set()
+
+    ref = schema.get("$ref")
+    if ref and isinstance(ref, str):
+        ref_name = ref.split("/")[-1]
+        if ref_name in seen_refs:
+            return {}
+        target = defs.get(ref_name, {})
+        return _build_example_skeleton(target, defs=defs, seen_refs=seen_refs | {ref_name})
+
+    variants = schema.get("anyOf") or schema.get("oneOf")
+    if variants and isinstance(variants, list):
+        for variant in variants:
+            if isinstance(variant, dict) and variant.get("type") != "null":
+                return _build_example_skeleton(variant, defs=defs, seen_refs=seen_refs)
+
+    schema_type = schema.get("type")
+    if schema.get("enum"):
+        return schema["enum"][0]
+    if schema_type == "object" or "properties" in schema:
+        res: dict[str, Any] = {}
+        props = schema.get("properties", {})
+        if isinstance(props, dict):
+            for prop, p_schema in props.items():
+                if isinstance(p_schema, dict):
+                    res[prop] = _build_example_skeleton(p_schema, defs=defs, seen_refs=seen_refs)
+        return res
+    if schema_type == "array":
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            return [_build_example_skeleton(item_schema, defs=defs, seen_refs=seen_refs)]
+        return []
+    if schema_type == "string":
+        if "default" in schema:
+            return schema["default"]
+        return "string"
+    if schema_type == "integer":
+        return schema.get("default", 0)
+    if schema_type == "number":
+        return schema.get("default", 0.0)
+    if schema_type == "boolean":
+        return schema.get("default", True)
+    return None
+
+
 def _build_combined_prompt(
     messages: list[dict[str, str]],
     schema: type[BaseModel] | dict[str, Any] | None = None,
@@ -47,11 +101,18 @@ def _build_combined_prompt(
             if schema_dict
             else ""
         )
+        skeleton = _build_example_skeleton(schema_dict) if schema_dict else None
+        skeleton_block = (
+            f"\nExample JSON Skeleton:\n{json.dumps(skeleton, ensure_ascii=False, indent=2)}"
+            if skeleton
+            else ""
+        )
         sections.append(
             "[INSTRUCTIONS]\n"
             "Respond ONLY with a valid JSON object matching the requested schema. "
             "Do not include explanations or text outside the JSON object."
             + schema_block
+            + skeleton_block
         )
     else:
         sections.append(

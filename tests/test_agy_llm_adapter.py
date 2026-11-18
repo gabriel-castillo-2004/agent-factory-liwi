@@ -378,3 +378,67 @@ def test_cli_config_and_build_runtime_llm_provider_modes_and_env_example(tmp_pat
     env_example = (Path(__file__).resolve().parent.parent / ".env.example").read_text(encoding="utf-8")
     assert "LLM_PROVIDER=" in env_example
     assert "LLM_FALLBACK_TO_AGY=" in env_example
+
+
+def test_agy_llm_adapter_prompt_includes_json_schema_and_skeleton_for_plan(tmp_path: Path) -> None:
+    """AgyLLMAdapter injects explicit JSON Schema and example JSON skeleton containing all Plan properties and required fields."""
+    runner = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=0,
+                stdout=(
+                    "```json\n"
+                    "{\n"
+                    '  "summary": "Full CRM",\n'
+                    '  "rationale": "Modular",\n'
+                    '  "template_id": "static-web",\n'
+                    '  "files": [{"path": "index.html", "purpose": "UI", "contract": "renders app", "depends_on": []}],\n'
+                    '  "acceptance_tests": [{"id": "AT-01", "description": "Renders UI", "type": "unit"}],\n'
+                    '  "risks": ["Data loss"],\n'
+                    '  "deployment_target": "github-pages"\n'
+                    "}\n"
+                    "```"
+                ),
+            )
+        ]
+    )
+    adapter = AgyLLMAdapter(runner=runner, cwd=tmp_path)
+    res = adapter.complete(
+        [
+            {"role": "system", "content": "You are Mediator, the final debate synthesis agent."},
+            {"role": "user", "content": "Reconcile Pragmatist and Structuralist positions."},
+        ],
+        schema=Plan,
+    )
+    assert res["summary"] == "Full CRM"
+    assert res["template_id"] == "static-web"
+    plan = Plan.model_validate(res)
+    assert plan.summary == "Full CRM"
+    assert len(plan.files) == 1
+    assert len(plan.acceptance_tests) == 1
+
+    call = runner.calls[0]
+    prompt = " ".join(call["command"])
+
+    # 1. Structural headings
+    assert "JSON Schema:" in prompt
+    assert "Example JSON Skeleton:" in prompt
+
+    # 2. Plan top-level properties and required keys
+    for key in (
+        "summary",
+        "rationale",
+        "template_id",
+        "files",
+        "acceptance_tests",
+        "risks",
+        "deployment_target",
+    ):
+        assert key in prompt
+
+    # 3. Nested FileSpec and AcceptanceTest required properties
+    for key in ("path", "purpose", "contract", "depends_on", "id", "description", "type"):
+        assert key in prompt
+
+    # 4. Valid enum values
+    assert "unit" in prompt
