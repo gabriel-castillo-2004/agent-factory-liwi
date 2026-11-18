@@ -1,12 +1,30 @@
 """Multiplatform SubprocessRunner adapter with timeout and process-tree termination (A2a-2, INV-02, INV-06)."""
 
 import os
+import shutil
 import signal
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from agent_factory.ports.runner import CommandResult, CommandTimeoutError, Runner
+
+
+def _resolve_command(
+    command: Sequence[str],
+    env: Mapping[str, str] | None,
+) -> list[str]:
+    """Resolve bare executable names (such as .cmd shims on Windows) via effective PATH."""
+    cmd_list = list(command)
+    exe = cmd_list[0]
+    if os.sep not in exe and (os.altsep is None or os.altsep not in exe):
+        search_path: str | None = None
+        if env is not None:
+            search_path = next((v for k, v in env.items() if k.upper() == "PATH"), "")
+        resolved = shutil.which(exe, path=search_path)
+        if resolved:
+            cmd_list[0] = resolved
+    return cmd_list
 
 
 class SubprocessRunner(Runner):
@@ -30,11 +48,12 @@ class SubprocessRunner(Runner):
             timeout_seconds if timeout_seconds is not None else self.default_timeout_seconds
         )
         cwd_path = Path(cwd).resolve()
+        cmd_list = _resolve_command(command, env)
 
         if os.name == "nt":
             # On Windows, start process; on timeout kill entire process tree with taskkill
             proc = subprocess.Popen(
-                list(command),
+                cmd_list,
                 cwd=str(cwd_path),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -60,12 +79,12 @@ class SubprocessRunner(Runner):
                 except subprocess.TimeoutExpired:
                     proc.kill()
                 raise CommandTimeoutError(
-                    f"Command '{list(command)}' timed out after {timeout} seconds"
+                    f"Command '{cmd_list}' timed out after {timeout} seconds"
                 ) from exc
         else:
             # On POSIX, use a new process group session
             proc = subprocess.Popen(
-                list(command),
+                cmd_list,
                 cwd=str(cwd_path),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -91,5 +110,5 @@ class SubprocessRunner(Runner):
                 except subprocess.TimeoutExpired:
                     proc.kill()
                 raise CommandTimeoutError(
-                    f"Command '{list(command)}' timed out after {timeout} seconds"
+                    f"Command '{cmd_list}' timed out after {timeout} seconds"
                 ) from exc

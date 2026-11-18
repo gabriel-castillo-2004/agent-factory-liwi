@@ -81,3 +81,29 @@ def test_subprocess_runner_enforces_timeout_and_kills_parent_and_child_processes
     # Allow brief OS process table cleanup
     time.sleep(0.1)
     assert _is_pid_running(child_pid) is False
+
+
+def test_subprocess_runner_resolves_cmd_executable_via_effective_env_path(tmp_path: Path) -> None:
+    """SubprocessRunner resolves bare command names (including .cmd shims on Windows) using effective env PATH with shell=False."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    runner = SubprocessRunner(default_timeout_seconds=5.0)
+
+    if os.name == "nt":
+        shim = bin_dir / "agydummy.cmd"
+        shim.write_text("@echo off\r\necho shim-ok %1\r\n", encoding="utf-8")
+        env = {
+            "PATH": str(bin_dir),
+            "SYSTEMROOT": os.environ.get("SYSTEMROOT", r"C:\Windows"),
+            "COMSPEC": os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"),
+            "PATHEXT": os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD"),
+        }
+    else:
+        shim = bin_dir / "agydummy"
+        shim.write_text("#!/bin/sh\necho shim-ok \"$1\"\n", encoding="utf-8")
+        shim.chmod(0o755)
+        env = {"PATH": str(bin_dir)}
+
+    res = runner.run(command=["agydummy", "hello"], cwd=tmp_path, env=env)
+    assert res.exit_code == 0
+    assert "shim-ok hello" in res.stdout
