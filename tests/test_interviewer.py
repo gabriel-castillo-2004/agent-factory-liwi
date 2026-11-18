@@ -7,7 +7,11 @@ import pytest
 from agent_factory.adapters.fake_llm import FakeLLM
 from agent_factory.adapters.memory_store import MemoryEventStore
 from agent_factory.adapters.sqlite_store import SqliteEventStore
-from agent_factory.agents.interviewer import MAX_QUESTIONS_PER_ROUND, Interviewer
+from agent_factory.agents.interviewer import (
+    MAX_QUESTIONS_PER_ROUND,
+    Interviewer,
+    InterviewRoundOutput,
+)
 from agent_factory.domain.models import Spec
 from agent_factory.domain.states import IllegalTransition, ProjectState
 from agent_factory.orchestrator import Orchestrator
@@ -309,3 +313,65 @@ def test_two_orchestrators_sharing_sqlite_store_preserve_objective_and_sync_spec
     store.close()
 
     assert debate_status.state == ProjectState.WAITING_APPROVAL
+
+
+def test_interviewer_passes_explicit_schema_and_completes_spec() -> None:
+    """AC-1.2: Interviewer passes explicit InterviewRoundOutput schema and completes Spec checklist."""
+    complete_payload = {
+        "spec": {
+            "objective": "Offline Markdown Editor",
+            "users": ["Writers"],
+            "features": ["Offline editing", "Local persistence"],
+            "business_rules": ["Auto-save every 5s"],
+            "edge_cases": ["Storage quota full"],
+            "constraints": ["Zero backend dependencies"],
+            "success_criteria": ["Renders instantly under 50ms"],
+            "assumptions": [],
+        },
+        "questions": ["Any export formats needed?"],
+    }
+    fake_llm = FakeLLM(responses=[complete_payload])
+    interviewer = Interviewer(llm=fake_llm, max_rounds=3)
+
+    result = interviewer.run_round(
+        current_spec=Spec(),
+        user_message="Quiero un editor de markdown offline.",
+        round_number=1,
+    )
+
+    assert len(fake_llm.calls) == 1
+    assert fake_llm.calls[0]["schema"] is InterviewRoundOutput
+    assert result.is_complete is True
+    assert result.spec.is_complete() is True
+    assert result.spec.missing_fields() == []
+    assert result.spec.objective == "Offline Markdown Editor"
+    assert result.questions == []
+
+
+def test_interview_round_output_supports_nested_and_flat_payloads() -> None:
+    """InterviewRoundOutput model validator handles both nested {spec, questions} and flat payloads."""
+    nested_data = {
+        "spec": {
+            "objective": "Nested app",
+            "users": ["Alice"],
+            "features": ["Feature A"],
+        },
+        "questions": ["Q1"],
+    }
+    out_nested = InterviewRoundOutput.model_validate(nested_data)
+    assert out_nested.spec.objective == "Nested app"
+    assert out_nested.spec.users == ["Alice"]
+    assert out_nested.questions == ["Q1"]
+
+    flat_data = {
+        "objective": "Flat app",
+        "users": ["Bob"],
+        "features": ["Feature B"],
+        "business_rules": ["Rule 1"],
+        "questions": ["Q2"],
+    }
+    out_flat = InterviewRoundOutput.model_validate(flat_data)
+    assert out_flat.spec.objective == "Flat app"
+    assert out_flat.spec.users == ["Bob"]
+    assert out_flat.spec.business_rules == ["Rule 1"]
+    assert out_flat.questions == ["Q2"]

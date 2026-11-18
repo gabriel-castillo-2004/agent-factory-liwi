@@ -1,13 +1,45 @@
 """Interviewer agent for gathering complete project Spec (Section 7.3, AC-1.2)."""
 
 from collections.abc import Sequence
+from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from agent_factory.domain.models import Spec
 from agent_factory.ports.llm import LLM
 
 MAX_QUESTIONS_PER_ROUND: int = 3
+
+
+class InterviewRoundOutput(BaseModel):
+    """Structured response expected from the LLM during an interview round."""
+
+    spec: Spec = Field(default_factory=Spec)
+    questions: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _unwrap_if_flat_spec(cls, data: Any) -> Any:
+        if (
+            isinstance(data, dict)
+            and "spec" not in data
+            and any(
+                k in data
+                for k in (
+                    "objective",
+                    "features",
+                    "users",
+                    "business_rules",
+                    "edge_cases",
+                    "constraints",
+                    "success_criteria",
+                )
+            )
+        ):
+            spec_fields = {k: v for k, v in data.items() if k != "questions"}
+            questions = data.get("questions", [])
+            return {"spec": spec_fields, "questions": questions}
+        return data
 
 
 class InterviewRoundResult(BaseModel):
@@ -51,10 +83,17 @@ class Interviewer:
             },
         ]
 
-        response = self.llm.complete(messages=messages, schema=None)
-        spec_data = response.get("spec", response)
-        questions = list(response.get("questions", []))[:MAX_QUESTIONS_PER_ROUND]
-        new_spec = Spec.model_validate(spec_data)
+        response = self.llm.complete(messages=messages, schema=InterviewRoundOutput)
+        if isinstance(response, InterviewRoundOutput):
+            new_spec = response.spec
+            questions = list(response.questions)[:MAX_QUESTIONS_PER_ROUND]
+        elif isinstance(response, dict):
+            output = InterviewRoundOutput.model_validate(response)
+            new_spec = output.spec
+            questions = list(output.questions)[:MAX_QUESTIONS_PER_ROUND]
+        else:
+            new_spec = Spec()
+            questions = []
 
         if new_spec.is_complete():
             return InterviewRoundResult(

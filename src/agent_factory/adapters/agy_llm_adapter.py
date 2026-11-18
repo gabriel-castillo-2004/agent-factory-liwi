@@ -71,7 +71,7 @@ def _build_example_skeleton(
             return [_build_example_skeleton(item_schema, defs=defs, seen_refs=seen_refs)]
         return []
     if schema_type == "string":
-        if "default" in schema:
+        if schema.get("default"):
             return schema["default"]
         return "string"
     if schema_type == "integer":

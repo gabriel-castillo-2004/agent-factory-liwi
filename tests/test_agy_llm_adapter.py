@@ -442,3 +442,64 @@ def test_agy_llm_adapter_prompt_includes_json_schema_and_skeleton_for_plan(tmp_p
 
     # 4. Valid enum values
     assert "unit" in prompt
+
+
+def test_agy_llm_adapter_prompt_includes_json_schema_and_skeleton_for_interview_round_output(tmp_path: Path) -> None:
+    """AgyLLMAdapter injects explicit JSON Schema and example JSON skeleton for InterviewRoundOutput containing all Spec checklist fields."""
+    runner = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=0,
+                stdout=(
+                    "```json\n"
+                    "{\n"
+                    '  "spec": {\n'
+                    '    "objective": "CLI Tool",\n'
+                    '    "users": ["Devs"],\n'
+                    '    "features": ["Linting"],\n'
+                    '    "business_rules": ["Strict"],\n'
+                    '    "edge_cases": ["Empty input"],\n'
+                    '    "constraints": ["No network"],\n'
+                    '    "success_criteria": ["Fast"],\n'
+                    '    "assumptions": []\n'
+                    "  },\n"
+                    '  "questions": ["What language?"]\n'
+                    "}\n"
+                    "```"
+                ),
+            )
+        ]
+    )
+    adapter = AgyLLMAdapter(runner=runner, cwd=tmp_path)
+    from agent_factory.agents.interviewer import InterviewRoundOutput
+
+    res = adapter.complete(
+        [
+            {"role": "system", "content": "You are an expert product interviewer."},
+            {"role": "user", "content": "I want a CLI tool."},
+        ],
+        schema=InterviewRoundOutput,
+    )
+    assert "spec" in res
+    assert res["spec"]["objective"] == "CLI Tool"
+    output = InterviewRoundOutput.model_validate(res)
+    assert output.spec.is_complete() is True
+
+    call = runner.calls[0]
+    prompt = " ".join(call["command"])
+
+    assert "JSON Schema:" in prompt
+    assert "Example JSON Skeleton:" in prompt
+    assert "spec" in prompt
+    assert "questions" in prompt
+    for field in (
+        "objective",
+        "users",
+        "features",
+        "business_rules",
+        "edge_cases",
+        "constraints",
+        "success_criteria",
+        "assumptions",
+    ):
+        assert field in prompt
