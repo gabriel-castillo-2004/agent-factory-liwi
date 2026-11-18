@@ -642,10 +642,24 @@ def build_runtime(
             templates_root=config.templates_root,
         )
 
+        building_model: str | None = None
+        if config.models_config_path.is_file():
+            try:
+                with config.models_config_path.open("rb") as f:
+                    m_data = tomllib.load(f)
+                if isinstance(m_data, dict):
+                    building_model = m_data.get("BUILDING") or m_data.get("models", {}).get("strong")
+            except (OSError, tomllib.TOMLDecodeError):
+                building_model = None
+
         effective_code_agent = (
             code_agent
             if code_agent is not None
-            else AgyCliAdapter(workspace_manager=workspace_manager, runner=effective_runner)
+            else AgyCliAdapter(
+                workspace_manager=workspace_manager,
+                runner=effective_runner,
+                model=building_model,
+            )
         )
 
         deploy_publisher: StaticDeployPublisher | None = None

@@ -31,6 +31,7 @@ class Runner(Protocol):
         cwd: Path,
         timeout_seconds: float = 30.0,
         env: Mapping[str, str] | None = None,
+        input: str | bytes | None = None,
     ) -> CommandResult:
         """Execute command in cwd and return CommandResult, or raise CommandTimeoutError."""
         raise NotImplementedError

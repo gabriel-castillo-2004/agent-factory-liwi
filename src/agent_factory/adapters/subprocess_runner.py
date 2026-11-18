@@ -39,6 +39,7 @@ class SubprocessRunner(Runner):
         cwd: Path,
         timeout_seconds: float | None = None,
         env: Mapping[str, str] | None = None,
+        input: str | bytes | None = None,
     ) -> CommandResult:
         """Execute command in cwd with timeout, killing parent and all child processes on timeout."""
         if isinstance(command, (str, bytes)) or not command:
@@ -50,11 +51,20 @@ class SubprocessRunner(Runner):
         cwd_path = Path(cwd).resolve()
         cmd_list = _resolve_command(command, env)
 
+        input_str: str | None = None
+        if input is not None:
+            input_str = (
+                input.decode("utf-8", errors="replace")
+                if isinstance(input, bytes)
+                else str(input)
+            )
+
         if os.name == "nt":
             # On Windows, start process; on timeout kill entire process tree with taskkill
             proc = subprocess.Popen(
                 cmd_list,
                 cwd=str(cwd_path),
+                stdin=subprocess.PIPE if input_str is not None else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -63,7 +73,7 @@ class SubprocessRunner(Runner):
                 env=dict(env) if env is not None else None,
             )
             try:
-                stdout, stderr = proc.communicate(timeout=timeout)
+                stdout, stderr = proc.communicate(input=input_str, timeout=timeout)
                 return CommandResult(
                     exit_code=proc.returncode,
                     stdout=stdout or "",
@@ -88,6 +98,7 @@ class SubprocessRunner(Runner):
             proc = subprocess.Popen(
                 cmd_list,
                 cwd=str(cwd_path),
+                stdin=subprocess.PIPE if input_str is not None else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -97,7 +108,7 @@ class SubprocessRunner(Runner):
                 env=dict(env) if env is not None else None,
             )
             try:
-                stdout, stderr = proc.communicate(timeout=timeout)
+                stdout, stderr = proc.communicate(input=input_str, timeout=timeout)
                 return CommandResult(
                     exit_code=proc.returncode,
                     stdout=stdout or "",

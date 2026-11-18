@@ -26,6 +26,7 @@ class FakeRunner:
         cwd: Path,
         timeout_seconds: float = 30.0,
         env: Mapping[str, str] | None = None,
+        input: str | bytes | None = None,
     ) -> CommandResult:
         """Record call and return next scripted CommandResult or raise scripted Exception."""
         self.calls.append(
@@ -34,6 +35,7 @@ class FakeRunner:
                 "cwd": Path(cwd),
                 "timeout_seconds": timeout_seconds,
                 "env": dict(env) if env is not None else None,
+                "input": input,
             }
         )
         if not self._results:

@@ -243,10 +243,14 @@ def test_agy_cli_adapter_isolates_test_generation_prompt_from_plan_and_passes_pl
     cli_script.write_text(
         "import json, pathlib, sys\n"
         "args = sys.argv[1:]\n"
-        "mode = args[args.index('--mode') + 1]\n"
-        "payload = json.loads(args[args.index('--payload') + 1])\n"
+        "raw_in = sys.stdin.read()\n"
+        "if raw_in.strip():\n"
+        "    payload = json.loads(raw_in)\n"
+        "else:\n"
+        "    payload = json.loads(args[args.index('--payload') + 1])\n"
+        "mode = args[args.index('--mode') + 1] if '--mode' in args else payload.get('mode', '')\n"
         "ws = pathlib.Path.cwd()\n"
-        "if mode == 'generate-tests':\n"
+        "if mode in ('generate-tests', 'generate_tests'):\n"
         "    (ws / 'tests').mkdir(parents=True, exist_ok=True)\n"
         "    (ws / 'tests' / 'test_at.py').write_text('def test_at(): pass\\n', encoding='utf-8')\n"
         "    (ws / 'gen_payload.json').write_text(json.dumps(payload), encoding='utf-8')\n"
@@ -344,7 +348,11 @@ def test_agy_cli_adapter_translates_quota_errors_execution_failures_and_runner_t
     cli_script.write_text(
         "import json, sys, time\n"
         "args = sys.argv[1:]\n"
-        "payload = json.loads(args[args.index('--payload') + 1])\n"
+        "raw_in = sys.stdin.read()\n"
+        "if raw_in.strip():\n"
+        "    payload = json.loads(raw_in)\n"
+        "else:\n"
+        "    payload = json.loads(args[args.index('--payload') + 1])\n"
         "attempt = payload.get('attempt', 1)\n"
         "if attempt == 1:\n"
         "    sys.stderr.write('Error 429: Plan quota exhausted. retry_after=3.5\\n')\n"
@@ -408,10 +416,14 @@ def test_end_to_end_offline_scaffold_agy_cli_adapter_and_build_worker_converge(
     cli_script.write_text(
         "import json, pathlib, sys\n"
         "args = sys.argv[1:]\n"
-        "mode = args[args.index('--mode') + 1]\n"
-        "payload = json.loads(args[args.index('--payload') + 1])\n"
+        "raw_in = sys.stdin.read()\n"
+        "if raw_in.strip():\n"
+        "    payload = json.loads(raw_in)\n"
+        "else:\n"
+        "    payload = json.loads(args[args.index('--payload') + 1])\n"
+        "mode = args[args.index('--mode') + 1] if '--mode' in args else payload.get('mode', '')\n"
         "ws = pathlib.Path.cwd()\n"
-        "if mode == 'generate-tests':\n"
+        "if mode in ('generate-tests', 'generate_tests'):\n"
         "    tdir = ws / 'tests'\n"
         "    tdir.mkdir(parents=True, exist_ok=True)\n"
         "    (tdir / 'test_counter.py').write_text(\n"
@@ -696,7 +708,11 @@ def test_agy_cli_adapter_does_not_misclassify_429_substring_on_success_or_non_qu
     cli_script.write_text(
         "import json, sys\n"
         "args = sys.argv[1:]\n"
-        "payload = json.loads(args[args.index('--payload') + 1])\n"
+        "raw_in = sys.stdin.read()\n"
+        "if raw_in.strip():\n"
+        "    payload = json.loads(raw_in)\n"
+        "else:\n"
+        "    payload = json.loads(args[args.index('--payload') + 1])\n"
         "attempt = payload.get('attempt', 1)\n"
         "if attempt == 1:\n"
         "    print(json.dumps({'files_written': ['src/app.js'], 'summary': 'Wrote 429 bytes near line 429 rate limit check'}))\n"
@@ -846,4 +862,57 @@ def test_agy_cli_adapter_rejects_nested_workspace_subdir_and_handles_multiline_o
         adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=7)
     assert not isinstance(plain_fail_exc.value, QuotaExhaustedError)
     assert "Plain compiler failure without json" in str(plain_fail_exc.value)
+
+
+def test_agy_cli_adapter_command_has_no_payload_and_uses_stdin(tmp_path: Path) -> None:
+    """Verify agy command has no -payload/--payload, contains -p and --add-dir, and delivers payload via stdin."""
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+    ws_dir = ws_mgr.create_workspace("proj-stdin-cli")
+    plan = _sample_static_web_plan()
+
+    runner = FakeRunner()
+    adapter = AgyCliAdapter(
+        workspace_manager=ws_mgr,
+        runner=runner,
+        cli_command=("agy",),
+        model="custom-builder-model",
+    )
+
+    # 1. Test generate_tests
+    adapter.generate_tests(ws_dir, plan.acceptance_tests)
+    assert len(runner.calls) == 1
+    call_gen = runner.calls[0]
+    cmd_gen = call_gen["command"]
+    assert "-payload" not in cmd_gen
+    assert "--payload" not in cmd_gen
+    assert "-p" in cmd_gen
+    assert "--add-dir" in cmd_gen
+    assert str(ws_dir.resolve()) in cmd_gen
+    assert "--dangerously-skip-permissions" in cmd_gen
+    assert "--model" in cmd_gen
+    assert "custom-builder-model" in cmd_gen
+    assert call_gen["input"] is not None
+    payload_gen = json.loads(call_gen["input"])
+    assert payload_gen["mode"] == "generate_tests"
+    assert "acceptance_tests" in payload_gen
+
+    # 2. Test implement_or_fix
+    adapter.implement_or_fix(ws_dir, plan, failure_output="AssertionError: 1 != 0", attempt=1)
+    assert len(runner.calls) == 2
+    call_impl = runner.calls[1]
+    cmd_impl = call_impl["command"]
+    assert "-payload" not in cmd_impl
+    assert "--payload" not in cmd_impl
+    assert "-p" in cmd_impl
+    assert "--add-dir" in cmd_impl
+    assert str(ws_dir.resolve()) in cmd_impl
+    assert "--dangerously-skip-permissions" in cmd_impl
+    assert "--model" in cmd_impl
+    assert "custom-builder-model" in cmd_impl
+    assert call_impl["input"] is not None
+    payload_impl = json.loads(call_impl["input"])
+    assert payload_impl["mode"] == "implement_or_fix"
+    assert "plan" in payload_impl
+    assert payload_impl["failure_output"] == "AssertionError: 1 != 0"
+
 

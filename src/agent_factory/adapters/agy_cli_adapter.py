@@ -78,6 +78,7 @@ class AgyCliAdapter(CodeAgent):
         timeout_seconds: float = 60.0,
         allowed_cli_env_keys: Sequence[str] = ("AGY_HOME", "AGY_CONFIG_DIR"),
         default_retry_after_seconds: float = 5.0,
+        model: str | None = None,
     ) -> None:
         self.workspace_manager = workspace_manager
         self.runner: Runner = (
@@ -89,6 +90,7 @@ class AgyCliAdapter(CodeAgent):
         self.timeout_seconds = timeout_seconds
         self.allowed_cli_env_keys: frozenset[str] = frozenset(allowed_cli_env_keys)
         self.default_retry_after_seconds = default_retry_after_seconds
+        self.model = model
 
     def validate_workspace_cwd(self, workspace_dir: Path) -> Path:
         """Verify workspace_dir is a valid isolated workspace directory under workspace_manager.base_dir (INV-18, INV-22)."""
@@ -166,19 +168,50 @@ class AgyCliAdapter(CodeAgent):
         mode_arg: str,
         payload: dict[str, Any],
     ) -> CodeAgentResult:
+        if mode_arg == "generate-tests":
+            prompt = (
+                "Generate acceptance tests according to the payload provided via stdin. "
+                "Respond with a JSON object containing files_written and summary."
+            )
+        else:
+            prompt = (
+                "Implement or fix code in workspace according to the plan and failure output provided via stdin. "
+                "Respond with a JSON object containing files_written and summary."
+            )
+
+        is_real_agy = Path(self.cli_command[0]).stem.lower() == "agy"
         cmd = list(self.cli_command) + [
-            "--mode",
-            mode_arg,
-            "--payload",
-            json.dumps(payload),
+            "-p",
+            prompt,
+            "--add-dir",
+            str(ws_path),
+            "--dangerously-skip-permissions",
         ]
+        if self.model:
+            cmd.extend(["--model", self.model])
+        if not is_real_agy:
+            cmd.extend(["--mode", mode_arg])
+
+        payload_str = json.dumps(payload, ensure_ascii=False)
         clean_env = self.build_clean_env()
-        res = self.runner.run(
-            command=cmd,
-            cwd=ws_path,
-            timeout_seconds=self.timeout_seconds,
-            env=clean_env,
-        )
+        try:
+            res = self.runner.run(
+                command=cmd,
+                cwd=ws_path,
+                timeout_seconds=self.timeout_seconds,
+                env=clean_env,
+                input=payload_str,
+            )
+        except TypeError as te:
+            if "input" in str(te):
+                res = self.runner.run(
+                    command=cmd,
+                    cwd=ws_path,
+                    timeout_seconds=self.timeout_seconds,
+                    env=clean_env,
+                )
+            else:
+                raise
 
         combined_output = f"{res.stdout}\n{res.stderr}".strip()
 
