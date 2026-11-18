@@ -8,6 +8,7 @@ import logging
 import shutil
 import threading
 import urllib.parse
+import uuid
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,10 +20,11 @@ from agent_factory.domain.models import ApprovalEvent, ProjectStatus, validate_p
 from agent_factory.domain.states import IllegalTransition, ProjectState
 from agent_factory.orchestrator import ApprovalError, Orchestrator
 from agent_factory.ports.code_agent import CodeAgentError
+from agent_factory.ports.llm import LLMError
 from agent_factory.ports.runner import CommandTimeoutError
 from agent_factory.scaffold import TemplateScaffold
 from agent_factory.secrets import redact_secrets
-from agent_factory.telegram_bot import TelegramBotService
+from agent_factory.telegram_bot import TelegramBotService, _slugify
 from agent_factory.workspace import SandboxViolationError, WorkspaceManager
 
 logger = logging.getLogger(__name__)
@@ -355,8 +357,206 @@ class DashboardController:
             "background_started": background_started,
         }
 
+    def _next_project_id(self, prompt: str) -> str:
+        """Derive a unique valid project_id slug from a user prompt."""
+        base_pid = _slugify(prompt)
+        pid = base_pid
+        suffix = 2
+        while self.orchestrator.store.get_events(pid):
+            tail = f"-{suffix}"
+            pid = f"{base_pid[: 63 - len(tail)]}{tail}"
+            suffix += 1
+        return validate_project_id(pid)
+
+    def _run_debate_pipeline(
+        self,
+        project_id: str,
+        *,
+        agent_name: str,
+        failure_prefix: str,
+    ) -> None:
+        """Execute run_debate, notify chat on outcome, and record unexpected phase errors."""
+        try:
+            res = self.orchestrator.run_debate(project_id)
+            if res.state == ProjectState.WAITING_APPROVAL:
+                plan = self.orchestrator.get_plan(project_id)
+                summary = plan.summary if plan else project_id
+                self._notify_chat_best_effort(
+                    project_id,
+                    f"Plan listo para aprobación ({project_id}):\n{summary}",
+                )
+            elif res.state == ProjectState.FAILED:
+                self._notify_chat_best_effort(
+                    project_id,
+                    f"{failure_prefix} ({project_id}): {res.failure_reason or 'Error'}",
+                )
+        except (
+            LLMError,
+            IllegalTransition,
+            ValueError,
+            TypeError,
+            LookupError,
+            TimeoutError,
+            OSError,
+            RuntimeError,
+        ) as exc:
+            cur = self.orchestrator.get_status(project_id).state
+            if cur not in (ProjectState.FAILED, ProjectState.DELIVERED):
+                self.orchestrator.record_phase_failure(
+                    project_id,
+                    failed_state=cur,
+                    error=exc,
+                    agent=agent_name,
+                    extra_secrets=self.secrets_to_redact,
+                )
+
+    def _run_interview_and_maybe_debate(
+        self,
+        project_id: str,
+        event_id: str,
+        user_message: str,
+    ) -> None:
+        """Run one interview round and chain DEBATE -> MEDIATION when Spec completes."""
+        try:
+            status = self.orchestrator.handle_interview_message(
+                project_id, event_id, user_message
+            )
+            if status.state == ProjectState.FAILED:
+                self._notify_chat_best_effort(
+                    project_id,
+                    f"El proyecto {project_id} falló en entrevista: {status.failure_reason or 'Error'}",
+                )
+                return
+            if status.state != ProjectState.INTERVIEW:
+                return
+
+            events = self.orchestrator.store.get_events(project_id)
+            last_round = next(
+                (ev for ev in reversed(events) if ev.type == EventType.INTERVIEW_ROUND),
+                None,
+            )
+            questions = last_round.payload.get("questions", []) if last_round else []
+            if questions:
+                q_lines = "\n".join(f"- {q}" for q in questions)
+                self._notify_chat_best_effort(
+                    project_id,
+                    f"Preguntas para {project_id}:\n{q_lines}",
+                )
+                return
+        except (
+            LLMError,
+            IllegalTransition,
+            ValueError,
+            TypeError,
+            LookupError,
+            TimeoutError,
+            OSError,
+            RuntimeError,
+        ) as exc:
+            cur = self.orchestrator.get_status(project_id).state
+            if cur not in (ProjectState.FAILED, ProjectState.DELIVERED):
+                self.orchestrator.record_phase_failure(
+                    project_id,
+                    failed_state=cur,
+                    error=exc,
+                    agent="dashboard_interview",
+                    extra_secrets=self.secrets_to_redact,
+                )
+            return
+
+        self._run_debate_pipeline(
+            project_id,
+            agent_name="dashboard_interview",
+            failure_prefix="El debate falló",
+        )
+
+    def create_project(self, prompt: str) -> dict[str, Any]:
+        """Create a new project from prompt and start its first INTERVIEW round in background."""
+        clean_prompt = str(prompt or "").strip()
+        if not clean_prompt:
+            raise ValueError("El campo 'prompt' es obligatorio.")
+
+        with self._lock:
+            pid = self._next_project_id(clean_prompt)
+            created = self.orchestrator.create_project(
+                pid,
+                name=clean_prompt,
+                objective=clean_prompt,
+            )
+            event_id = f"web-msg-{uuid.uuid4().hex[:12]}"
+            background_started = self._start_background(
+                pid,
+                lambda: self._run_interview_and_maybe_debate(pid, event_id, clean_prompt),
+            )
+            summary = self._serialize_summary(
+                pid,
+                created,
+                self.orchestrator.store.get_events(pid),
+                has_plan=False,
+            )
+
+        return {
+            "ok": True,
+            "project_id": pid,
+            "status": summary,
+            "background_started": background_started,
+        }
+
+    def send_message(self, project_id: str, message: str) -> dict[str, Any]:
+        """Submit an interview reply or plan adjustment request for project_id in background."""
+        validate_project_id(project_id)
+        if not self.orchestrator.store.get_events(project_id):
+            raise ProjectNotFoundError(f"Project '{project_id}' not found")
+
+        clean_message = str(message or "").strip()
+        if not clean_message:
+            raise ValueError("El campo 'message' es obligatorio.")
+
+        with self._lock:
+            if project_id in self._active_projects:
+                raise ProjectConflictError(
+                    f"Project '{project_id}' already has an active background operation"
+                )
+            current = self.orchestrator.get_status(project_id)
+            if current.state == ProjectState.INTERVIEW:
+                updated = current
+            elif current.state == ProjectState.WAITING_APPROVAL:
+                try:
+                    updated = self.orchestrator.request_adjustment(
+                        project_id,
+                        reason=clean_message,
+                    )
+                except (IllegalTransition, ValueError) as exc:
+                    raise ProjectConflictError(str(exc)) from exc
+            else:
+                raise ProjectConflictError(
+                    f"Project '{project_id}' is in state {current.state.value}; "
+                    "expected INTERVIEW or WAITING_APPROVAL"
+                )
+
+            event_id = f"web-msg-{uuid.uuid4().hex[:12]}"
+            background_started = self._start_background(
+                project_id,
+                lambda: self._run_interview_and_maybe_debate(
+                    project_id, event_id, clean_message
+                ),
+            )
+            summary = self._serialize_summary(
+                project_id,
+                updated,
+                self.orchestrator.store.get_events(project_id),
+                has_plan=(self.orchestrator.get_plan(project_id) is not None),
+            )
+
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "status": summary,
+            "background_started": background_started,
+        }
+
     def retry_project(self, project_id: str) -> dict[str, Any]:
-        """Retry a FAILED project and resume DEBATE/MEDIATION pipeline in background if applicable."""
+        """Retry a FAILED or paused project and resume DEBATE/MEDIATION pipeline in background if applicable."""
         validate_project_id(project_id)
         events = self.orchestrator.store.get_events(project_id)
         if not events:
@@ -377,41 +577,14 @@ class DashboardController:
 
             background_started = False
             if updated.state in (ProjectState.DEBATE, ProjectState.MEDIATION):
-                def _run_pipeline() -> None:
-                    try:
-                        res = self.orchestrator.run_debate(project_id)
-                        if res.state == ProjectState.WAITING_APPROVAL:
-                            plan = self.orchestrator.get_plan(project_id)
-                            summary = plan.summary if plan else project_id
-                            self._notify_chat_best_effort(
-                                project_id,
-                                f"Plan listo para aprobación ({project_id}):\n{summary}",
-                            )
-                        elif res.state == ProjectState.FAILED:
-                            self._notify_chat_best_effort(
-                                project_id,
-                                f"Reintento de {project_id} falló: {res.failure_reason or 'Error'}",
-                            )
-                    except (
-                        IllegalTransition,
-                        ValueError,
-                        TypeError,
-                        LookupError,
-                        TimeoutError,
-                        OSError,
-                        RuntimeError,
-                    ) as exc:
-                        cur = self.orchestrator.get_status(project_id).state
-                        if cur not in (ProjectState.FAILED, ProjectState.DELIVERED):
-                            self.orchestrator.record_phase_failure(
-                                project_id,
-                                failed_state=cur,
-                                error=exc,
-                                agent="dashboard_retry",
-                                extra_secrets=self.secrets_to_redact,
-                            )
-
-                background_started = self._start_background(project_id, _run_pipeline)
+                background_started = self._start_background(
+                    project_id,
+                    lambda: self._run_debate_pipeline(
+                        project_id,
+                        agent_name="dashboard_retry",
+                        failure_prefix="Reintento fallido",
+                    ),
+                )
 
         return {
             "ok": True,
@@ -929,6 +1102,81 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
     .toast { font-size: 0.85rem; color: var(--accent); }
+    .btn-sm { padding: 5px 11px; font-size: 0.82rem; border-radius: 6px; }
+    .new-project-form {
+      margin-top: 12px;
+      padding: 12px;
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    .new-project-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .input-field {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 0.92rem;
+      line-height: 1.4;
+      resize: vertical;
+    }
+    .input-field:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .banner-form {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .question-list {
+      margin: 6px 0 4px 0;
+      padding-left: 20px;
+      font-size: 0.92rem;
+      line-height: 1.45;
+    }
+    .question-list li { margin-bottom: 4px; }
+    .inactivity-note {
+      font-size: 0.84rem;
+      color: var(--warn);
+      margin-top: 6px;
+      font-weight: 500;
+    }
+    details.adjust-details {
+      margin-top: 6px;
+      border-top: 1px dashed var(--border);
+      padding-top: 8px;
+    }
+    details.adjust-details summary {
+      cursor: pointer;
+      font-size: 0.85rem;
+      color: var(--muted);
+      font-weight: 500;
+      user-select: none;
+    }
+    details.adjust-details summary:hover {
+      color: var(--text);
+    }
+    .working-spinner {
+      display: inline-block;
+      width: 18px;
+      height: 18px;
+      border: 2.5px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
   </style>
 </head>
 <body>
@@ -947,7 +1195,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <section class="panel">
       <div class="panel-header">
         <h2 style="margin:0; font-size:1.15rem;">Tus proyectos</h2>
+        <button id="toggle-new-project-btn" class="btn btn-sm" type="button">+ Nuevo proyecto</button>
       </div>
+      <form id="new-project-form" class="new-project-form" style="display:none">
+        <textarea id="new-project-input" class="input-field" rows="3" placeholder="¿Qué quieres construir?" required></textarea>
+        <div class="new-project-actions">
+          <button id="cancel-new-project-btn" class="btn btn-sm" type="button">Cancelar</button>
+          <button id="submit-new-project-btn" class="btn btn-primary btn-sm" type="submit">Comenzar</button>
+        </div>
+      </form>
       <div id="project-list" class="muted" style="margin-top:14px;">Cargando proyectos...</div>
     </section>
 
@@ -985,6 +1241,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       selectedId: null,
       activeTab: 'spec',
       detail: null,
+      replyDrafts: {},
+      adjustDrafts: {},
+      adjustOpen: {},
+      lastBannerSignature: null,
     };
 
     function escapeHtml(text) {
@@ -1106,14 +1366,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const info = stepInfo(p.state);
         const title = escapeHtml(p.name || p.objective || p.project_id);
         const pct = Number(p.progress_pct || 0);
-        const busyTag = p.busy ? ' <span class="busy-pill">(en curso)</span>' : '';
+        const running = Boolean(p.is_running || p.busy);
+        const pausedActive = !running && (
+          p.state === 'DEBATE' || p.state === 'MEDIATION' ||
+          p.state === 'BUILDING' || p.state === 'VERIFYING'
+        );
+        const statusTag = running
+          ? ' <span class="busy-pill">(en curso)</span>'
+          : (pausedActive ? ' <span class="busy-pill" style="color:var(--warn)">(pausado)</span>' : '');
+        const badgeCls = pausedActive ? 'badge-warn' : info.cls;
         const timeHtml = p.last_event_at
           ? '<div class="muted" style="font-size:0.75rem; margin-top:4px; text-align:right;" title="' + escapeHtml(p.last_event_at) + '">' + escapeHtml(formatFriendlyTime(p.last_event_at)) + '</div>'
           : '';
         return '<div class="project-card ' + selected + '" data-id="' + escapeHtml(p.project_id) + '">' +
           '<div class="card-header">' +
-            '<div class="card-title">' + title + busyTag + '</div>' +
-            '<span class="badge ' + info.cls + '">' + escapeHtml(info.step) + '</span>' +
+            '<div class="card-title">' + title + statusTag + '</div>' +
+            '<span class="badge ' + badgeCls + '">' + escapeHtml(info.step) + '</span>' +
           '</div>' +
           '<div class="progress-track"><div class="progress-fill" style="width:' + pct + '%"></div></div>' +
           timeHtml +
@@ -1123,6 +1391,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       container.querySelectorAll('.project-card').forEach((card) => {
         card.addEventListener('click', () => {
           state.selectedId = card.dataset.id;
+          state.lastBannerSignature = null;
           renderProjectList();
           loadDetail(state.selectedId);
         });
@@ -1151,40 +1420,78 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       return labels[type] || type;
     }
 
-    function renderDetail() {
-      const empty = document.getElementById('detail-empty');
-      const box = document.getElementById('detail-content');
-      if (!state.detail) {
-        empty.style.display = 'block';
-        box.style.display = 'none';
-        return;
+    function extractLatestQuestions(events) {
+      if (!Array.isArray(events)) return [];
+      for (let i = events.length - 1; i >= 0; i--) {
+        const ev = events[i];
+        if (ev.type === 'STATE_TRANSITIONED' && ev.payload && ev.payload.to === 'INTERVIEW') {
+          return [];
+        }
+        if (ev.type === 'INTERVIEW_ROUND' && ev.payload) {
+          return Array.isArray(ev.payload.questions) ? ev.payload.questions : [];
+        }
       }
-      empty.style.display = 'none';
-      box.style.display = 'block';
+      return [];
+    }
 
-      const st = state.detail.status;
-      const info = stepInfo(st.state);
-      const titleText = st.name || st.objective || st.project_id;
-      document.getElementById('detail-title').textContent = titleText;
+    function formatInactivityNote(lastEventAt) {
+      if (!lastEventAt) return '';
+      const lastMs = new Date(lastEventAt).getTime();
+      if (isNaN(lastMs)) return '';
+      const elapsedMins = (Date.now() - lastMs) / 60000;
+      if (elapsedMins >= 120) {
+        return 'Sin actividad desde hace varias horas.';
+      }
+      if (elapsedMins > 30) {
+        return 'Sin actividad desde hace más de 30 minutos.';
+      }
+      return '';
+    }
 
-      const badge = document.getElementById('detail-badge');
-      badge.textContent = info.step + ' (' + (st.progress_pct || 0) + '%)';
-      badge.className = 'badge ' + info.cls;
-      document.getElementById('detail-progress').style.width = Number(st.progress_pct || 0) + '%';
-      const timeBox = document.getElementById('detail-time');
-      if (timeBox) {
-        timeBox.innerHTML = st.last_event_at
-          ? '<span title="' + escapeHtml(st.last_event_at) + '">Actualizado: ' + escapeHtml(formatFriendlyTime(st.last_event_at)) + '</span>'
-          : '';
+    function buildGuidanceBanner(st, events) {
+      const isRunning = Boolean(st.is_running || st.busy);
+      if (isRunning) {
+        return '<div class="guidance-banner banner-info">' +
+          '<div class="banner-content">' +
+            '<div class="banner-icon"><span class="working-spinner" aria-hidden="true"></span></div>' +
+            '<div class="banner-body">' +
+              '<div class="banner-title">Trabajando automáticamente</div>' +
+              '<div class="banner-desc">Los agentes están avanzando en esta etapa. Esta pantalla se actualiza sola cada 5 segundos.</div>' +
+            '</div>' +
+          '</div>' +
+        '</div>';
       }
 
-      // Contextual guidance banner
-      let bannerHtml = '';
-      const isRunning = Boolean(st.is_running || st.busy || (state.detail && state.detail.is_running));
-      const isOrphaned = !isRunning && (st.state === 'BUILDING' || st.state === 'DEBATE' || st.state === 'MEDIATION');
+      if (st.state === 'INTERVIEW') {
+        const questions = extractLatestQuestions(events);
+        const qHtml = questions.length
+          ? '<ul class="question-list">' + questions.map((q) => '<li>' + escapeHtml(q) + '</li>').join('') + '</ul>'
+          : '<div class="banner-desc">Cuéntanos los detalles que deseas incluir para completar la especificación.</div>';
+        const inact = formatInactivityNote(st.last_event_at);
+        const inactHtml = inact ? '<div class="inactivity-note">' + escapeHtml(inact) + '</div>' : '';
+        const draft = escapeHtml((state.replyDrafts && state.replyDrafts[st.project_id]) || '');
+        return '<div class="guidance-banner banner-info">' +
+          '<div class="banner-content">' +
+            '<div class="banner-icon">💬</div>' +
+            '<div class="banner-body">' +
+              '<div class="banner-title">Esperando tus respuestas</div>' +
+              qHtml +
+              inactHtml +
+            '</div>' +
+          '</div>' +
+          '<div class="banner-form">' +
+            '<textarea id="interview-reply-input" class="input-field" rows="3" placeholder="Escribe tu respuesta aquí...">' + draft + '</textarea>' +
+            '<div class="banner-actions">' +
+              '<button id="interview-reply-btn" class="btn btn-primary" type="button">Enviar respuesta</button>' +
+            '</div>' +
+          '</div>' +
+        '</div>';
+      }
 
       if (st.state === 'WAITING_APPROVAL') {
-        bannerHtml = '<div class="guidance-banner banner-warn">' +
+        const adjustDraft = escapeHtml((state.adjustDrafts && state.adjustDrafts[st.project_id]) || '');
+        const adjustOpenAttr = (state.adjustOpen && state.adjustOpen[st.project_id]) ? ' open' : '';
+        return '<div class="guidance-banner banner-warn">' +
           '<div class="banner-content">' +
             '<div class="banner-icon">📋</div>' +
             '<div class="banner-body">' +
@@ -1195,9 +1502,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           '<div class="banner-actions">' +
             '<button class="btn btn-success" data-dact="approve">Aprobar y construir</button>' +
           '</div>' +
+          '<details id="adjust-plan-details" class="adjust-details"' + adjustOpenAttr + '>' +
+            '<summary>Pedir un ajuste al plan</summary>' +
+            '<div class="banner-form" style="margin-top:8px;">' +
+              '<textarea id="adjust-plan-input" class="input-field" rows="2" placeholder="Describe qué quieres ajustar o agregar al plan...">' + adjustDraft + '</textarea>' +
+              '<div class="banner-actions">' +
+                '<button id="adjust-plan-btn" class="btn btn-sm" type="button">Enviar ajuste</button>' +
+              '</div>' +
+            '</div>' +
+          '</details>' +
         '</div>';
-      } else if (isOrphaned) {
-        bannerHtml = '<div class="guidance-banner banner-warn">' +
+      }
+
+      if (
+        st.state === 'DEBATE' || st.state === 'MEDIATION' ||
+        st.state === 'BUILDING' || st.state === 'VERIFYING'
+      ) {
+        return '<div class="guidance-banner banner-warn">' +
           '<div class="banner-content">' +
             '<div class="banner-icon">⏸️</div>' +
             '<div class="banner-body">' +
@@ -1209,8 +1530,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             '<button class="btn btn-warn" data-dact="retry">Reanudar proyecto</button>' +
           '</div>' +
         '</div>';
-      } else if (st.state === 'FAILED' || st.state === 'ERROR') {
-        bannerHtml = '<div class="guidance-banner banner-err">' +
+      }
+
+      if (st.state === 'FAILED' || st.state === 'ERROR') {
+        return '<div class="guidance-banner banner-err">' +
           '<div class="banner-content">' +
             '<div class="banner-icon">⚠️</div>' +
             '<div class="banner-body">' +
@@ -1226,14 +1549,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             '<button class="btn btn-warn" data-dact="retry">Volver a intentar</button>' +
           '</div>' +
         '</div>';
-      } else if (st.state === 'DELIVERED' || st.state === 'COMPLETED') {
+      }
+
+      if (st.state === 'DELIVERED' || st.state === 'COMPLETED') {
         const repoBtn = (st.links && st.links.repo)
           ? '<a href="' + escapeHtml(st.links.repo) + '" target="_blank" rel="noopener noreferrer" class="btn btn-primary">Abrir repositorio en GitHub</a>'
           : '';
         const deployBtn = (st.links && st.links.deploy)
           ? '<a href="' + escapeHtml(st.links.deploy) + '" target="_blank" rel="noopener noreferrer" class="btn">Ver despliegue en vivo</a>'
           : '';
-        bannerHtml = '<div class="guidance-banner banner-ok">' +
+        return '<div class="guidance-banner banner-ok">' +
           '<div class="banner-content">' +
             '<div class="banner-icon">🎉</div>' +
             '<div class="banner-body">' +
@@ -1243,26 +1568,122 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           '</div>' +
           ((repoBtn || deployBtn) ? '<div class="banner-actions">' + repoBtn + deployBtn + '</div>' : '') +
         '</div>';
-      } else {
-        bannerHtml = '<div class="guidance-banner banner-info">' +
-          '<div class="banner-content">' +
-            '<div class="banner-icon">⚙️</div>' +
-            '<div class="banner-body">' +
-              '<div class="banner-title">Trabajando automáticamente</div>' +
-              '<div class="banner-desc">Los agentes están avanzando en esta etapa. Esta pantalla se actualiza sola cada 5 segundos.</div>' +
-            '</div>' +
-          '</div>' +
-        '</div>';
       }
-      document.getElementById('detail-guidance').innerHTML = bannerHtml;
+
+      return '<div class="guidance-banner">' +
+        '<div class="banner-content">' +
+          '<div class="banner-body">' +
+            '<div class="banner-title">Estado actual: ' + escapeHtml(st.state) + '</div>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    }
+
+    function renderDetail() {
+      const empty = document.getElementById('detail-empty');
+      const box = document.getElementById('detail-content');
+      if (!state.detail) {
+        state.lastBannerSignature = null;
+        empty.style.display = 'block';
+        box.style.display = 'none';
+        return;
+      }
+      empty.style.display = 'none';
+      box.style.display = 'block';
+
+      const st = state.detail.status;
+      const events = state.detail.events || [];
+      const info = stepInfo(st.state);
+      const titleText = st.name || st.objective || st.project_id;
+      document.getElementById('detail-title').textContent = titleText;
+
+      const badge = document.getElementById('detail-badge');
+      badge.textContent = info.step + ' (' + (st.progress_pct || 0) + '%)';
+      badge.className = 'badge ' + info.cls;
+      document.getElementById('detail-progress').style.width = Number(st.progress_pct || 0) + '%';
+      const timeBox = document.getElementById('detail-time');
+      if (timeBox) {
+        timeBox.innerHTML = st.last_event_at
+          ? '<span title="' + escapeHtml(st.last_event_at) + '">Actualizado: ' + escapeHtml(formatFriendlyTime(st.last_event_at)) + '</span>'
+          : '';
+      }
+
+      // Contextual guidance banner (only rebuild when signature changes so active drafts stay intact)
+      const isRunning = Boolean(st.is_running || st.busy || (state.detail && state.detail.is_running));
+      const statusForBanner = Object.assign({}, st, { is_running: isRunning });
+      const questions = extractLatestQuestions(events);
+      const inact = st.state === 'INTERVIEW' && !isRunning ? formatInactivityNote(st.last_event_at) : '';
+      const bannerSig = JSON.stringify([
+        st.project_id,
+        st.state,
+        isRunning,
+        st.last_event_at,
+        st.last_error,
+        questions,
+        inact,
+        st.links,
+      ]);
+
+      const guidanceEl = document.getElementById('detail-guidance');
+      if (bannerSig !== state.lastBannerSignature) {
+        guidanceEl.innerHTML = buildGuidanceBanner(statusForBanner, events);
+        state.lastBannerSignature = bannerSig;
+
+        guidanceEl.querySelectorAll('button[data-dact]').forEach((btn) => {
+          btn.addEventListener('click', () => handleAction(btn.dataset.dact, st.project_id));
+        });
+
+        const replyInput = document.getElementById('interview-reply-input');
+        const replyBtn = document.getElementById('interview-reply-btn');
+        if (replyInput) {
+          replyInput.addEventListener('input', () => {
+            state.replyDrafts[st.project_id] = replyInput.value;
+          });
+        }
+        if (replyBtn && replyInput) {
+          replyBtn.addEventListener('click', async () => {
+            replyBtn.disabled = true;
+            try {
+              await sendProjectMessage(st.project_id, replyInput.value, 'reply');
+            } finally {
+              if (document.body.contains(replyBtn)) replyBtn.disabled = false;
+            }
+          });
+        }
+
+        const adjDetails = document.getElementById('adjust-plan-details');
+        const adjInput = document.getElementById('adjust-plan-input');
+        const adjBtn = document.getElementById('adjust-plan-btn');
+        if (adjDetails) {
+          adjDetails.addEventListener('toggle', () => {
+            state.adjustOpen[st.project_id] = adjDetails.open;
+          });
+        }
+        if (adjInput) {
+          adjInput.addEventListener('input', () => {
+            state.adjustDrafts[st.project_id] = adjInput.value;
+          });
+        }
+        if (adjBtn && adjInput) {
+          adjBtn.addEventListener('click', async () => {
+            adjBtn.disabled = true;
+            try {
+              await sendProjectMessage(st.project_id, adjInput.value, 'adjust');
+            } finally {
+              if (document.body.contains(adjBtn)) adjBtn.disabled = false;
+            }
+          });
+        }
+      }
 
       // Secondary action (Delete)
-      document.getElementById('detail-secondary').innerHTML =
+      const secEl = document.getElementById('detail-secondary');
+      secEl.innerHTML =
         '<div class="secondary-actions">' +
           '<button class="btn-subtle-danger" data-dact="delete">Eliminar proyecto</button>' +
         '</div>';
 
-      box.querySelectorAll('button[data-dact]').forEach((btn) => {
+      secEl.querySelectorAll('button[data-dact]').forEach((btn) => {
         btn.addEventListener('click', () => handleAction(btn.dataset.dact, st.project_id));
       });
 
@@ -1324,7 +1745,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
 
       // Events tab ("Historial")
-      const events = state.detail.events || [];
       if (!events.length) {
         document.getElementById('tab-events').innerHTML = '<div class="empty-box">No hay eventos registrados aún.</div>';
       } else {
@@ -1386,6 +1806,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    async function sendProjectMessage(pid, rawMsg, kind) {
+      const message = (rawMsg || '').trim();
+      if (!message) {
+        setNote('Por favor escribe un mensaje antes de enviar.');
+        return;
+      }
+      try {
+        await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/message', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message }),
+        });
+        if (kind === 'reply') {
+          delete state.replyDrafts[pid];
+          setNote('Respuesta enviada para ' + pid + '.');
+        } else {
+          delete state.adjustDrafts[pid];
+          state.adjustOpen[pid] = false;
+          setNote('Solicitud de ajuste enviada para ' + pid + '.');
+        }
+        state.lastBannerSignature = null;
+        await loadProjects();
+      } catch (err) {
+        setNote('Error enviando mensaje: ' + err.message);
+      }
+    }
+
     async function handleAction(action, pid) {
       try {
         if (action === 'delete') {
@@ -1405,11 +1852,62 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/retry', { method: 'POST' });
           setNote('Reintento iniciado para ' + pid + '.');
         }
+        state.lastBannerSignature = null;
         await loadProjects();
       } catch (err) {
         setNote('Error en ' + action + ': ' + err.message);
       }
     }
+
+    (function initNewProjectForm() {
+      const toggleBtn = document.getElementById('toggle-new-project-btn');
+      const cancelBtn = document.getElementById('cancel-new-project-btn');
+      const form = document.getElementById('new-project-form');
+      const input = document.getElementById('new-project-input');
+      const submitBtn = document.getElementById('submit-new-project-btn');
+
+      toggleBtn.addEventListener('click', () => {
+        const showing = form.style.display !== 'none';
+        form.style.display = showing ? 'none' : 'block';
+        if (!showing) {
+          input.focus();
+        }
+      });
+
+      cancelBtn.addEventListener('click', () => {
+        form.style.display = 'none';
+        input.value = '';
+      });
+
+      form.addEventListener('submit', async (ev) => {
+        ev.preventDefault();
+        const prompt = (input.value || '').trim();
+        if (!prompt) {
+          setNote('Describe qué quieres construir.');
+          return;
+        }
+        submitBtn.disabled = true;
+        try {
+          const res = await apiFetch('/api/projects', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt }),
+          });
+          input.value = '';
+          form.style.display = 'none';
+          if (res.project_id) {
+            state.selectedId = res.project_id;
+            state.lastBannerSignature = null;
+          }
+          setNote('Proyecto iniciado: ' + (res.project_id || '') + '.');
+          await loadProjects();
+        } catch (err) {
+          setNote('Error creando proyecto: ' + err.message);
+        } finally {
+          submitBtn.disabled = false;
+        }
+      });
+    })();
 
     setInterval(() => {
       loadProjects();
@@ -1479,6 +1977,39 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             except ValueError:
                 pass
 
+    def _read_json_body(self) -> dict[str, Any]:
+        raw_len = self.headers.get("Content-Length")
+        if not raw_len:
+            return {}
+        try:
+            length = int(raw_len)
+        except ValueError as exc:
+            raise ValueError("Invalid Content-Length header") from exc
+        if length <= 0:
+            return {}
+        if length > 1024 * 1024:
+            raise ValueError("Request body too large")
+        raw_bytes = self.rfile.read(length)
+        if not raw_bytes.strip():
+            return {}
+        try:
+            parsed = json.loads(raw_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Invalid JSON request body") from exc
+        if not isinstance(parsed, dict):
+            raise TypeError("JSON request body must be an object")
+        return parsed
+
+    @staticmethod
+    def _require_str_field(body: dict[str, Any], field: str) -> str:
+        val = body.get(field)
+        if not isinstance(val, str):
+            raise TypeError(f"El campo '{field}' es obligatorio y debe ser texto.")
+        clean = val.strip()
+        if not clean:
+            raise ValueError(f"El campo '{field}' es obligatorio.")
+        return clean
+
     def _parse_project_route(self) -> tuple[str | None, str | None]:
         """Parse /api/projects/<project_id>[/<action>] enforcing raw path safety."""
         raw_path = urllib.parse.urlsplit(self.path).path
@@ -1491,7 +2022,7 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         parts = rest.split("/")
         if len(parts) == 1:
             return urllib.parse.unquote(parts[0]), None
-        if len(parts) == 2 and parts[1] in {"approve", "retry"}:
+        if len(parts) == 2 and parts[1] in {"approve", "retry", "message"}:
             return urllib.parse.unquote(parts[0]), parts[1]
         # Reject multi-segment or path-traversal attempts (e.g., ../etc) as invalid project_id
         return urllib.parse.unquote(rest), None
@@ -1524,20 +2055,41 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         self._send_json(404, {"error": "Endpoint not found"})
 
     def do_POST(self) -> None:
-        self._drain_body()
+        path = urllib.parse.urlsplit(self.path).path
         ctrl = self.server.controller
-        pid, action = self._parse_project_route()
 
-        if pid is None or action not in {"approve", "retry"}:
+        if path == "/api/projects":
+            try:
+                body = self._read_json_body()
+                prompt = self._require_str_field(body, "prompt")
+                result = ctrl.create_project(prompt)
+            except (ValueError, TypeError) as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            except ProjectConflictError as exc:
+                self._send_json(409, {"error": str(exc)})
+                return
+            self._send_json(200, result)
+            return
+
+        pid, action = self._parse_project_route()
+        if pid is None or action not in {"approve", "retry", "message"}:
+            self._drain_body()
             self._send_json(404, {"error": "Endpoint not found"})
             return
 
         try:
             if action == "approve":
+                self._drain_body()
                 result = ctrl.approve_project(pid)
-            else:
+            elif action == "retry":
+                self._drain_body()
                 result = ctrl.retry_project(pid)
-        except ValueError as exc:
+            else:
+                body = self._read_json_body()
+                message = self._require_str_field(body, "message")
+                result = ctrl.send_message(pid, message)
+        except (ValueError, TypeError) as exc:
             self._send_json(400, {"error": str(exc)})
             return
         except ProjectNotFoundError as exc:

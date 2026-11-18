@@ -99,8 +99,11 @@ def _http_json(
     url: str,
     *,
     method: str = "GET",
+    body: dict[str, Any] | None = None,
 ) -> tuple[int, dict[str, Any]]:
-    req = urllib.request.Request(url, method=method)
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {"Content-Type": "application/json"} if data is not None else {}
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=5.0) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
@@ -790,6 +793,217 @@ def test_dashboard_orphaned_building_project_resumed_and_delivered(tmp_path: Pat
         assert final_detail["status"]["progress_pct"] == 100
         assert final_detail["is_running"] is False
     finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_create_project_interview_message_and_plan_adjustment(tmp_path: Path) -> None:
+    """Dashboard UI guards working banner strictly by is_running, creates projects, processes INTERVIEW turns to WAITING_APPROVAL, and handles plan adjustments."""
+    store = SqliteEventStore(str(tmp_path / "interactive_dash.db"))
+
+    partial_spec = {
+        "spec": {
+            "objective": "Calculadora de presupuestos",
+            "users": ["Usuario final"],
+            "features": [],
+            "business_rules": [],
+            "edge_cases": [],
+            "constraints": [],
+            "success_criteria": [],
+            "assumptions": [],
+        },
+        "questions": ["¿Qué funciones principales necesitas?"],
+    }
+
+    round1_started = threading.Event()
+    round1_release = threading.Event()
+
+    class _InteractiveLLM(FakeLLM):
+        def __init__(self, responses: list[Any]) -> None:
+            super().__init__(responses=responses)
+            self._call_idx = 0
+
+        def complete(
+            self,
+            messages: list[dict[str, str]],
+            schema: Any = None,
+        ) -> dict[str, Any]:
+            self._call_idx += 1
+            if self._call_idx == 1:
+                round1_started.set()
+                assert round1_release.wait(timeout=5.0) is True
+            return super().complete(messages=messages, schema=schema)
+
+    llm = _InteractiveLLM(
+        responses=[
+            # 1. POST /api/projects -> round 1 interview asks 1 question
+            partial_spec,
+            # 2. POST /api/projects/<pid>/message -> completes spec & chains DEBATE -> WAITING_APPROVAL
+            _spec_payload(),
+            _pragmatist_payload(),
+            _structuralist_payload(),
+            _plan_payload("Plan Web Interactivo v1"),
+            # 3. POST /api/projects/<pid>/message while WAITING_APPROVAL -> adjusts plan & regenerates
+            _spec_payload(),
+            _pragmatist_payload(),
+            _structuralist_payload(),
+            _plan_payload("Plan Web Interactivo v2 ajustado"),
+        ]
+    )
+
+    orch = Orchestrator(store=store, llm=llm)
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+    )
+    try:
+        # 1. UI HTML sanity and strict honesty guards
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            assert html_resp.status == 200
+            html = html_resp.read().decode("utf-8")
+
+        for expected in (
+            "+ Nuevo proyecto",
+            "¿Qué quieres construir?",
+            "Comenzar",
+            "Esperando tus respuestas",
+            "Enviar respuesta",
+            "Pedir un ajuste al plan",
+            "Enviar ajuste",
+            "Proceso pausado",
+            "Trabajando automáticamente",
+            "Sin actividad desde hace varias horas.",
+        ):
+            assert expected in html
+
+        fn_start = html.index("function buildGuidanceBanner(")
+        fn_end = html.index("function renderDetail()", fn_start)
+        fn_body = html[fn_start:fn_end]
+        running_block, non_running_body = fn_body.split("if (st.state === 'INTERVIEW')", 1)
+        assert "if (isRunning)" in running_block
+        assert "Trabajando automáticamente" in running_block
+        assert "Trabajando automáticamente" not in non_running_body
+
+        interview_block, after_interview = non_running_body.split(
+            "if (st.state === 'WAITING_APPROVAL')", 1
+        )
+        assert "Esperando tus respuestas" in interview_block
+        assert "Enviar respuesta" in interview_block
+        assert "Trabajando automáticamente" not in interview_block
+        assert "Pedir un ajuste al plan" in after_interview
+        assert "Enviar ajuste" in after_interview
+        assert "st.state === 'VERIFYING'" in after_interview
+        assert "Proceso pausado" in after_interview
+
+        # 2. Invalid POST /api/projects payloads -> 400
+        bad_code, _ = _http_json(f"{base_url}/api/projects", method="POST", body={"prompt": "   "})
+        assert bad_code == 400
+        bad_code2, _ = _http_json(f"{base_url}/api/projects", method="POST", body={})
+        assert bad_code2 == 400
+
+        # 3. POST /api/projects creates project, runs round 1 in background with is_running=True
+        create_code, create_res = _http_json(
+            f"{base_url}/api/projects",
+            method="POST",
+            body={"prompt": "Calculadora de presupuestos"},
+        )
+        assert create_code == 200
+        pid = create_res["project_id"]
+        assert pid == "calculadora-de-presupuestos"
+        assert create_res["background_started"] is True
+
+        assert round1_started.wait(timeout=5.0) is True
+        _, running_list = _http_json(f"{base_url}/api/projects")
+        running_entry = next(p for p in running_list["projects"] if p["project_id"] == pid)
+        assert running_entry["is_running"] is True
+        _, running_detail = _http_json(f"{base_url}/api/projects/{pid}")
+        assert running_detail["is_running"] is True
+
+        # Active operation rejects concurrent message with 409 Conflict
+        busy_code, _ = _http_json(
+            f"{base_url}/api/projects/{pid}/message",
+            method="POST",
+            body={"message": "Concurrent"},
+        )
+        assert busy_code == 409
+
+        round1_release.set()
+        assert server.controller.wait_for_idle(timeout=5.0) is True
+
+        # 4. After round 1 completes -> INTERVIEW with is_running=False and assistant question saved
+        _, int_detail = _http_json(f"{base_url}/api/projects/{pid}")
+        assert int_detail["status"]["state"] == "INTERVIEW"
+        assert int_detail["is_running"] is False
+        assert int_detail["status"]["is_running"] is False
+        last_round = next(
+            ev for ev in reversed(int_detail["events"]) if ev["type"] == EventType.INTERVIEW_ROUND
+        )
+        assert last_round["payload"]["questions"] == ["¿Qué funciones principales necesitas?"]
+
+        # 5. Message validation & missing project guards
+        empty_msg_code, _ = _http_json(
+            f"{base_url}/api/projects/{pid}/message",
+            method="POST",
+            body={"message": "   "},
+        )
+        assert empty_msg_code == 400
+        missing_code, _ = _http_json(
+            f"{base_url}/api/projects/no-existe/message",
+            method="POST",
+            body={"message": "Hola"},
+        )
+        assert missing_code == 404
+
+        # 6. POST /api/projects/<pid>/message in INTERVIEW -> completes Spec & advances to WAITING_APPROVAL
+        msg_code, msg_res = _http_json(
+            f"{base_url}/api/projects/{pid}/message",
+            method="POST",
+            body={"message": "Calcula ingresos y gastos mensuales con gráficas"},
+        )
+        assert msg_code == 200
+        assert msg_res["background_started"] is True
+        assert server.controller.wait_for_idle(timeout=5.0) is True
+
+        _, wait_detail = _http_json(f"{base_url}/api/projects/{pid}")
+        assert wait_detail["status"]["state"] == "WAITING_APPROVAL"
+        assert wait_detail["is_running"] is False
+        assert wait_detail["plan"]["summary"] == "Plan Web Interactivo v1"
+        first_plan_hash = wait_detail["status"]["plan_hash"]
+        assert first_plan_hash is not None
+
+        # 7. POST /api/projects/<pid>/message in WAITING_APPROVAL -> adjusts plan & regenerates mediation
+        adj_code, adj_res = _http_json(
+            f"{base_url}/api/projects/{pid}/message",
+            method="POST",
+            body={"message": "Agrega exportación a CSV"},
+        )
+        assert adj_code == 200
+        assert adj_res["background_started"] is True
+        assert server.controller.wait_for_idle(timeout=5.0) is True
+
+        _, adj_detail = _http_json(f"{base_url}/api/projects/{pid}")
+        assert adj_detail["status"]["state"] == "WAITING_APPROVAL"
+        assert adj_detail["is_running"] is False
+        assert adj_detail["plan"]["summary"] == "Plan Web Interactivo v2 ajustado"
+        assert adj_detail["status"]["plan_hash"] != first_plan_hash
+
+        # 8. Approve transitions to BUILDING; POST /message in BUILDING returns 409 Conflict
+        app_code, _ = _http_json(f"{base_url}/api/projects/{pid}/approve", method="POST")
+        assert app_code == 200
+        conf_msg_code, _ = _http_json(
+            f"{base_url}/api/projects/{pid}/message",
+            method="POST",
+            body={"message": "No permitido en BUILDING"},
+        )
+        assert conf_msg_code == 409
+    finally:
+        round1_release.set()
         server.shutdown()
         server.server_close()
         server.controller.wait_for_idle(timeout=5.0)
