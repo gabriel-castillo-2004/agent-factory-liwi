@@ -272,10 +272,10 @@ def test_dashboard_http_endpoints_ui_approve_retry_and_delete(tmp_path: Path) ->
         with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
             assert html_resp.status == 200
             html = html_resp.read().decode("utf-8")
-        assert "Agent Factory" in html
-        assert "Aprobar y Construir" in html
-        assert "Reintentar" in html
-        assert "Eliminar" in html
+        assert "Fábrica de Proyectos" in html
+        assert "Aprobar y construir" in html
+        assert "Volver a intentar" in html
+        assert "Eliminar proyecto" in html
         assert "5000" in html
         assert "data-theme" in html
         assert "cdn." not in html.lower()

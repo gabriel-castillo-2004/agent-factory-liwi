@@ -443,46 +443,48 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Agent Factory — Dashboard Local</title>
+  <title>Fábrica de Proyectos</title>
   <style>
     :root {
-      --bg: #0f172a;
-      --surface: #1e293b;
-      --surface-alt: #0b1324;
-      --border: #334155;
-      --text: #f1f5f9;
+      --bg: #0b0f19;
+      --surface: #131b2e;
+      --surface-alt: #1a243b;
+      --border: #26334d;
+      --text: #f8fafc;
       --muted: #94a3b8;
       --accent: #38bdf8;
       --accent-hover: #0ea5e9;
       --ok: #22c55e;
+      --ok-hover: #16a34a;
+      --ok-bg: rgba(34, 197, 94, 0.14);
       --warn: #f59e0b;
+      --warn-bg: rgba(245, 158, 11, 0.14);
       --err: #ef4444;
       --err-bg: rgba(239, 68, 68, 0.14);
-      --ok-bg: rgba(34, 197, 94, 0.14);
-      --warn-bg: rgba(245, 158, 11, 0.14);
-      --info-bg: rgba(56, 189, 248, 0.14);
+      --info-bg: rgba(56, 189, 248, 0.12);
     }
     html[data-theme="light"] {
       --bg: #f8fafc;
       --surface: #ffffff;
       --surface-alt: #f1f5f9;
-      --border: #cbd5e1;
+      --border: #e2e8f0;
       --text: #0f172a;
-      --muted: #475569;
+      --muted: #64748b;
       --accent: #0284c7;
       --accent-hover: #0369a1;
       --ok: #16a34a;
+      --ok-hover: #15803d;
+      --ok-bg: #dcfce7;
       --warn: #d97706;
+      --warn-bg: #fef3c7;
       --err: #dc2626;
-      --err-bg: rgba(220, 38, 38, 0.10);
-      --ok-bg: rgba(22, 163, 74, 0.10);
-      --warn-bg: rgba(217, 119, 6, 0.10);
-      --info-bg: rgba(2, 132, 199, 0.10);
+      --err-bg: #fee2e2;
+      --info-bg: #e0f2fe;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
       background: var(--bg);
       color: var(--text);
       line-height: 1.5;
@@ -493,36 +495,95 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       align-items: center;
       justify-content: space-between;
       gap: 12px;
-      padding: 14px 20px;
+      padding: 14px 24px;
       border-bottom: 1px solid var(--border);
       background: var(--surface);
       position: sticky;
       top: 0;
       z-index: 10;
     }
-    .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 1.1rem; }
-    .controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 1.15rem;
+      letter-spacing: -0.01em;
+    }
+    .live-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--ok);
+      display: inline-block;
+      box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.6);
+      animation: pulse-ring 2.5s infinite;
+    }
+    @keyframes pulse-ring {
+      0% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.6); }
+      70% { box-shadow: 0 0 0 7px rgba(34, 197, 94, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+    }
+    .controls { display: flex; align-items: center; gap: 10px; }
     .btn {
       border: 1px solid var(--border);
       background: var(--surface-alt);
       color: var(--text);
-      padding: 6px 12px;
-      border-radius: 6px;
+      padding: 8px 16px;
+      border-radius: 8px;
       cursor: pointer;
-      font-size: 0.875rem;
+      font-size: 0.9rem;
       font-weight: 500;
+      transition: all 0.15s ease;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      text-decoration: none;
     }
     .btn:hover { border-color: var(--accent); }
     .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-    .btn-primary { background: var(--accent); color: #082f49; border-color: var(--accent); font-weight: 600; }
+    .btn-primary {
+      background: var(--accent);
+      color: #082f49;
+      border-color: var(--accent);
+      font-weight: 600;
+    }
     .btn-primary:hover { background: var(--accent-hover); }
-    .btn-warn { background: var(--warn-bg); color: var(--warn); border-color: var(--warn); }
-    .btn-danger { background: var(--err-bg); color: var(--err); border-color: var(--err); }
+    .btn-success {
+      background: var(--ok);
+      color: #ffffff;
+      border-color: var(--ok);
+      font-weight: 600;
+      box-shadow: 0 2px 4px rgba(34, 197, 94, 0.2);
+    }
+    .btn-success:hover { background: var(--ok-hover); }
+    .btn-warn {
+      background: var(--warn);
+      color: #ffffff;
+      border-color: var(--warn);
+      font-weight: 600;
+    }
+    .btn-subtle-danger {
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--muted);
+      padding: 6px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      transition: all 0.15s ease;
+    }
+    .btn-subtle-danger:hover {
+      background: var(--err-bg);
+      color: var(--err);
+      border-color: rgba(239, 68, 68, 0.2);
+    }
     .layout {
       display: grid;
-      grid-template-columns: minmax(320px, 420px) 1fr;
-      gap: 16px;
-      padding: 16px 20px;
+      grid-template-columns: minmax(320px, 390px) 1fr;
+      gap: 20px;
+      padding: 20px 24px;
       max-width: 1440px;
       margin: 0 auto;
     }
@@ -532,26 +593,64 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .panel {
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 14px;
+      border-radius: 12px;
+      padding: 18px;
+    }
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
     }
     .project-card {
       border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 12px;
-      margin-bottom: 10px;
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 12px;
       cursor: pointer;
-      background: var(--surface-alt);
-      transition: border-color 0.15s;
+      background: var(--surface);
+      transition: all 0.2s ease;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.03);
     }
-    .project-card:hover, .project-card.selected { border-color: var(--accent); }
-    .card-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .project-card:hover {
+      border-color: var(--accent);
+      transform: translateY(-1px);
+      box-shadow: 0 4px 6px -1px rgba(0,0,0,0.06);
+    }
+    .project-card.selected {
+      border-color: var(--accent);
+      background: var(--surface-alt);
+      box-shadow: 0 0 0 1px var(--accent);
+    }
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .card-title {
+      font-size: 1rem;
+      font-weight: 600;
+      line-height: 1.4;
+      color: var(--text);
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .busy-pill {
+      font-size: 0.72rem;
+      font-weight: 500;
+      color: var(--muted);
+      margin-left: 4px;
+    }
     .badge {
       font-size: 0.75rem;
       font-weight: 600;
-      padding: 2px 8px;
+      padding: 3px 9px;
       border-radius: 999px;
       border: 1px solid transparent;
+      white-space: nowrap;
     }
     .badge-ok { background: var(--ok-bg); color: var(--ok); border-color: var(--ok); }
     .badge-err { background: var(--err-bg); color: var(--err); border-color: var(--err); }
@@ -559,35 +658,196 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .badge-info { background: var(--info-bg); color: var(--accent); border-color: var(--accent); }
     .progress-track {
       width: 100%;
-      height: 8px;
-      background: var(--bg);
+      height: 5px;
+      background: var(--surface-alt);
       border-radius: 999px;
       overflow: hidden;
-      margin: 8px 0;
+      margin: 6px 0;
     }
-    .progress-fill { height: 100%; background: var(--accent); transition: width 0.25s; }
-    .muted { color: var(--muted); font-size: 0.85rem; }
-    .error-box {
-      margin-top: 6px;
-      padding: 8px;
-      border-radius: 6px;
+    .progress-fill {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 999px;
+      transition: width 0.3s ease;
+    }
+    .muted { color: var(--muted); font-size: 0.88rem; }
+    .empty-box {
+      padding: 30px 16px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+    .detail-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .detail-titles { flex: 1; }
+    .detail-title {
+      margin: 0;
+      font-size: 1.35rem;
+      font-weight: 700;
+      line-height: 1.3;
+    }
+    .detail-sub {
+      margin-top: 4px;
+      font-size: 0.92rem;
+    }
+    .guidance-banner {
+      border-radius: 12px;
+      padding: 16px 18px;
+      margin: 16px 0 20px;
+      border: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .guidance-banner.banner-warn {
+      background: var(--warn-bg);
+      border-color: rgba(245, 158, 11, 0.35);
+    }
+    .guidance-banner.banner-err {
       background: var(--err-bg);
-      color: var(--err);
-      font-size: 0.82rem;
-      word-break: break-word;
+      border-color: rgba(239, 68, 68, 0.35);
     }
-    .actions-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
-    .tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--border); padding-bottom: 8px; margin-bottom: 12px; }
+    .guidance-banner.banner-ok {
+      background: var(--ok-bg);
+      border-color: rgba(34, 197, 94, 0.35);
+    }
+    .guidance-banner.banner-info {
+      background: var(--info-bg);
+      border-color: rgba(56, 189, 248, 0.35);
+    }
+    .banner-content {
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+    }
+    .banner-icon { font-size: 1.3rem; line-height: 1.2; }
+    .banner-body { flex: 1; }
+    .banner-title {
+      font-weight: 600;
+      font-size: 1rem;
+      margin-bottom: 4px;
+    }
+    .banner-desc {
+      font-size: 0.92rem;
+      color: var(--text);
+      line-height: 1.45;
+    }
+    .banner-actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    details.tech-details {
+      margin-top: 10px;
+      border-top: 1px dashed var(--border);
+      padding-top: 8px;
+    }
+    details.tech-details summary {
+      cursor: pointer;
+      font-size: 0.82rem;
+      color: var(--muted);
+      font-weight: 500;
+      user-select: none;
+    }
+    details.tech-details summary:hover {
+      color: var(--text);
+    }
+    details.tech-details pre {
+      margin-top: 8px;
+      background: var(--surface-alt);
+      padding: 8px 10px;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--err);
+      border: 1px solid var(--border);
+    }
+    .secondary-actions {
+      display: flex;
+      justify-content: flex-end;
+      padding-top: 12px;
+      margin-top: 16px;
+      border-top: 1px solid var(--border);
+    }
+    .tabs {
+      display: flex;
+      gap: 6px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 8px;
+      margin-bottom: 16px;
+    }
     .tab-btn {
       background: transparent;
       border: 1px solid transparent;
       color: var(--muted);
-      padding: 6px 12px;
+      padding: 6px 14px;
       border-radius: 6px;
       cursor: pointer;
       font-weight: 600;
+      font-size: 0.9rem;
+      transition: all 0.15s ease;
     }
-    .tab-btn.active { background: var(--info-bg); color: var(--accent); border-color: var(--accent); }
+    .tab-btn.active {
+      background: var(--info-bg);
+      color: var(--accent);
+      border-color: var(--accent);
+    }
+    .tab-content { padding-top: 4px; }
+    .spec-section { margin-bottom: 16px; }
+    .spec-section h4 {
+      margin: 0 0 6px 0;
+      font-size: 0.92rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .spec-section p {
+      margin: 0;
+      font-size: 0.92rem;
+      line-height: 1.5;
+    }
+    .spec-section ul {
+      margin: 0;
+      padding-left: 20px;
+      font-size: 0.92rem;
+      line-height: 1.5;
+    }
+    .spec-section li { margin-bottom: 4px; }
+    .plan-summary {
+      font-size: 0.92rem;
+      margin-bottom: 12px;
+      line-height: 1.5;
+    }
+    .plan-meta {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+    .file-card {
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 14px;
+      margin-bottom: 8px;
+    }
+    .file-path {
+      font-weight: 600;
+      font-family: monospace;
+      font-size: 0.88rem;
+    }
+    .file-purpose {
+      font-size: 0.84rem;
+      color: var(--muted);
+      margin-top: 2px;
+    }
     pre {
       background: var(--surface-alt);
       border: 1px solid var(--border);
@@ -598,14 +858,49 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       white-space: pre-wrap;
       word-break: break-word;
     }
-    .event-item {
-      border-left: 3px solid var(--accent);
-      padding: 8px 12px;
-      margin-bottom: 10px;
-      background: var(--surface-alt);
-      border-radius: 0 6px 6px 0;
+    .timeline {
+      display: flex;
+      flex-direction: column;
+      padding: 6px 0;
     }
-    .event-item.is-error { border-left-color: var(--err); }
+    .timeline-item {
+      position: relative;
+      padding-left: 22px;
+      padding-bottom: 16px;
+      border-left: 2px solid var(--border);
+    }
+    .timeline-item:last-child {
+      border-left-color: transparent;
+      padding-bottom: 0;
+    }
+    .timeline-dot {
+      position: absolute;
+      left: -6px;
+      top: 4px;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--border);
+    }
+    .timeline-dot.ok { background: var(--ok); }
+    .timeline-dot.warn { background: var(--warn); }
+    .timeline-dot.err { background: var(--err); }
+    .timeline-dot.info { background: var(--accent); }
+    .timeline-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+    .timeline-type {
+      font-weight: 600;
+      font-size: 0.88rem;
+    }
+    .timeline-time {
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
     .toast { font-size: 0.85rem; color: var(--accent); }
@@ -614,45 +909,47 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <body>
   <header>
     <div class="brand">
-      <span>Agent Factory</span>
-      <span class="badge badge-info">127.0.0.1</span>
+      <span class="live-dot" title="Sincronización activa"></span>
+      <span>Fábrica de Proyectos</span>
       <span id="status-note" class="toast"></span>
     </div>
     <div class="controls">
-      <label class="muted"><input id="auto-refresh" type="checkbox" checked> Auto-refresco (5s)</label>
-      <button id="refresh-btn" class="btn" type="button">Actualizar</button>
-      <button id="theme-btn" class="btn" type="button">Tema claro/oscuro</button>
+      <button id="theme-btn" class="btn" type="button">Modo claro</button>
     </div>
   </header>
 
   <main class="layout">
     <section class="panel">
-      <h2 style="margin-top:0">Proyectos</h2>
-      <div id="project-list" class="muted">Cargando proyectos...</div>
+      <div class="panel-header">
+        <h2 style="margin:0; font-size:1.15rem;">Tus proyectos</h2>
+      </div>
+      <div id="project-list" class="muted" style="margin-top:14px;">Cargando proyectos...</div>
     </section>
 
     <section class="panel" id="detail-panel">
-      <div id="detail-empty" class="muted">Selecciona un proyecto para inspeccionar Spec, Plan y Eventos.</div>
+      <div id="detail-empty" class="empty-box">Selecciona un proyecto de la lista para ver su estado y detalles.</div>
       <div id="detail-content" style="display:none">
-        <div class="card-top">
-          <div>
-            <h2 id="detail-title" style="margin:0"></h2>
-            <div id="detail-sub" class="muted"></div>
+        <div class="detail-header">
+          <div class="detail-titles">
+            <h2 id="detail-title" class="detail-title"></h2>
+            <div id="detail-sub" class="detail-sub muted"></div>
           </div>
           <span id="detail-badge" class="badge"></span>
         </div>
         <div class="progress-track"><div id="detail-progress" class="progress-fill" style="width:0%"></div></div>
-        <div id="detail-links" class="muted" style="margin-bottom:8px"></div>
-        <div id="detail-error" class="error-box" style="display:none"></div>
-        <div id="detail-actions" class="actions-row"></div>
-        <div class="tabs" style="margin-top:14px">
-          <button class="tab-btn active" data-tab="spec" type="button">Spec</button>
+
+        <div id="detail-guidance"></div>
+
+        <div class="tabs">
+          <button class="tab-btn active" data-tab="spec" type="button">Resumen</button>
           <button class="tab-btn" data-tab="plan" type="button">Plan</button>
-          <button class="tab-btn" data-tab="events" type="button">Eventos</button>
+          <button class="tab-btn" data-tab="events" type="button">Historial</button>
         </div>
-        <div id="tab-spec"></div>
-        <div id="tab-plan" style="display:none"></div>
-        <div id="tab-events" style="display:none"></div>
+        <div id="tab-spec" class="tab-content"></div>
+        <div id="tab-plan" class="tab-content" style="display:none"></div>
+        <div id="tab-events" class="tab-content" style="display:none"></div>
+
+        <div id="detail-secondary"></div>
       </div>
     </section>
   </main>
@@ -674,11 +971,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .replace(/'/g, '&#39;');
     }
 
-    function badgeClass(st) {
-      if (st === 'DELIVERED') return 'badge-ok';
-      if (st === 'FAILED' || st === 'ERROR') return 'badge-err';
-      if (st === 'WAITING_APPROVAL') return 'badge-warn';
-      return 'badge-info';
+    function stepInfo(st) {
+      switch (st) {
+        case 'INTERVIEW':
+        case 'CREATED':
+          return { step: 'Paso 1: Definiendo detalles', cls: 'badge-info' };
+        case 'DEBATE':
+        case 'MEDIATION':
+          return { step: 'Paso 2: Preparando el plan', cls: 'badge-info' };
+        case 'WAITING_APPROVAL':
+          return { step: 'Paso 3: Listo para aprobar', cls: 'badge-warn' };
+        case 'BUILDING':
+        case 'VERIFYING':
+          return { step: 'Paso 4: Construyendo...', cls: 'badge-info' };
+        case 'DELIVERED':
+        case 'COMPLETED':
+          return { step: '¡Terminado!', cls: 'badge-ok' };
+        case 'FAILED':
+        case 'ERROR':
+          return { step: 'Necesita atención', cls: 'badge-err' };
+        default:
+          return { step: st || 'Iniciando', cls: 'badge-info' };
+      }
     }
 
     function setNote(msg) {
@@ -687,6 +1001,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     function applyTheme(theme) {
       document.documentElement.setAttribute('data-theme', theme);
+      const btn = document.getElementById('theme-btn');
+      if (btn) {
+        btn.textContent = theme === 'dark' ? 'Modo claro' : 'Modo oscuro';
+      }
       try { localStorage.setItem('af_theme', theme); } catch (_) {}
     }
 
@@ -732,26 +1050,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     function renderProjectList() {
       const container = document.getElementById('project-list');
       if (!state.projects.length) {
-        container.innerHTML = '<div class="muted">No hay proyectos registrados todavía.</div>';
+        container.innerHTML = '<div class="empty-box">No hay proyectos registrados todavía.</div>';
         return;
       }
       container.innerHTML = state.projects.map((p) => {
         const selected = p.project_id === state.selectedId ? 'selected' : '';
-        const repoUrl = p.links && p.links.repo ? escapeHtml(p.links.repo) : '';
-        const repoLink = repoUrl ? '<div><a href="' + repoUrl + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">GitHub Repo</a></div>' : '';
-        const errHtml = p.last_error ? '<div class="error-box">' + escapeHtml(p.last_error) + '</div>' : '';
-        const busyTag = p.busy ? ' <span class="muted">(en curso)</span>' : '';
+        const info = stepInfo(p.state);
+        const title = escapeHtml(p.name || p.objective || p.project_id);
+        const pct = Number(p.progress_pct || 0);
+        const busyTag = p.busy ? ' <span class="busy-pill">(en curso)</span>' : '';
         return '<div class="project-card ' + selected + '" data-id="' + escapeHtml(p.project_id) + '">' +
-          '<div class="card-top"><strong>' + escapeHtml(p.project_id) + busyTag + '</strong>' +
-          '<span class="badge ' + badgeClass(p.state) + '">' + escapeHtml(p.state) + ' (' + escapeHtml(p.progress_pct) + '%)</span></div>' +
-          '<div class="muted">' + escapeHtml(p.objective || p.name || '') + '</div>' +
-          '<div class="progress-track"><div class="progress-fill" style="width:' + Number(p.progress_pct || 0) + '%"></div></div>' +
-          repoLink + errHtml +
-          '<div class="actions-row">' +
-            (p.state === 'WAITING_APPROVAL' ? '<button class="btn btn-primary" data-act="approve" data-id="' + escapeHtml(p.project_id) + '">Aprobar y Construir</button>' : '') +
-            (p.state === 'FAILED' ? '<button class="btn btn-warn" data-act="retry" data-id="' + escapeHtml(p.project_id) + '">Reintentar</button>' : '') +
-            '<button class="btn btn-danger" data-act="delete" data-id="' + escapeHtml(p.project_id) + '">Eliminar</button>' +
-          '</div></div>';
+          '<div class="card-header">' +
+            '<div class="card-title">' + title + busyTag + '</div>' +
+            '<span class="badge ' + info.cls + '">' + escapeHtml(info.step) + '</span>' +
+          '</div>' +
+          '<div class="progress-track"><div class="progress-fill" style="width:' + pct + '%"></div></div>' +
+        '</div>';
       }).join('');
 
       container.querySelectorAll('.project-card').forEach((card) => {
@@ -759,12 +1073,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           state.selectedId = card.dataset.id;
           renderProjectList();
           loadDetail(state.selectedId);
-        });
-      });
-      container.querySelectorAll('button[data-act]').forEach((btn) => {
-        btn.addEventListener('click', (ev) => {
-          ev.stopPropagation();
-          handleAction(btn.dataset.act, btn.dataset.id);
         });
       });
     }
@@ -781,80 +1089,168 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       box.style.display = 'block';
 
       const st = state.detail.status;
-      document.getElementById('detail-title').textContent = st.project_id + (st.name ? ' — ' + st.name : '');
-      document.getElementById('detail-sub').textContent = st.objective || '';
+      const info = stepInfo(st.state);
+      const titleText = st.name || st.objective || st.project_id;
+      document.getElementById('detail-title').textContent = titleText;
+      document.getElementById('detail-sub').textContent = (st.name && st.objective) ? st.objective : (st.project_id || '');
+
       const badge = document.getElementById('detail-badge');
-      badge.textContent = st.state + ' · ' + st.progress_pct + '%';
-      badge.className = 'badge ' + badgeClass(st.state);
+      badge.textContent = info.step + ' (' + (st.progress_pct || 0) + '%)';
+      badge.className = 'badge ' + info.cls;
       document.getElementById('detail-progress').style.width = Number(st.progress_pct || 0) + '%';
 
-      const links = [];
-      if (st.links && st.links.repo) {
-        links.push('<a href="' + escapeHtml(st.links.repo) + '" target="_blank" rel="noopener noreferrer">Repo GitHub</a>');
-      }
-      if (st.links && st.links.deploy) {
-        links.push('<a href="' + escapeHtml(st.links.deploy) + '" target="_blank" rel="noopener noreferrer">Deploy Live</a>');
-      }
-      document.getElementById('detail-links').innerHTML = links.join(' · ');
-
-      const errBox = document.getElementById('detail-error');
-      if (st.last_error) {
-        errBox.style.display = 'block';
-        errBox.textContent = 'Último error: ' + st.last_error;
+      // Contextual guidance banner
+      let bannerHtml = '';
+      if (st.state === 'WAITING_APPROVAL') {
+        bannerHtml = '<div class="guidance-banner banner-warn">' +
+          '<div class="banner-content">' +
+            '<div class="banner-icon">📋</div>' +
+            '<div class="banner-body">' +
+              '<div class="banner-title">El plan está listo para revisión</div>' +
+              '<div class="banner-desc">El plan está listo. Revisa qué se va a construir y pulsa el botón para iniciar.</div>' +
+            '</div>' +
+          '</div>' +
+          '<div class="banner-actions">' +
+            '<button class="btn btn-success" data-dact="approve">Aprobar y construir</button>' +
+          '</div>' +
+        '</div>';
+      } else if (st.state === 'FAILED' || st.state === 'ERROR') {
+        bannerHtml = '<div class="guidance-banner banner-err">' +
+          '<div class="banner-content">' +
+            '<div class="banner-icon">⚠️</div>' +
+            '<div class="banner-body">' +
+              '<div class="banner-title">Se requiere atención</div>' +
+              '<div class="banner-desc">El proceso se detuvo por un inconveniente técnico. Puedes volver a intentarlo con un clic.</div>' +
+              '<details class="tech-details">' +
+                '<summary>Ver detalle técnico</summary>' +
+                '<pre>' + escapeHtml(st.last_error || 'Sin detalle técnico disponible.') + '</pre>' +
+              '</details>' +
+            '</div>' +
+          '</div>' +
+          '<div class="banner-actions">' +
+            '<button class="btn btn-warn" data-dact="retry">Volver a intentar</button>' +
+          '</div>' +
+        '</div>';
+      } else if (st.state === 'DELIVERED' || st.state === 'COMPLETED') {
+        const repoBtn = (st.links && st.links.repo)
+          ? '<a href="' + escapeHtml(st.links.repo) + '" target="_blank" rel="noopener noreferrer" class="btn btn-primary">Abrir repositorio en GitHub</a>'
+          : '';
+        const deployBtn = (st.links && st.links.deploy)
+          ? '<a href="' + escapeHtml(st.links.deploy) + '" target="_blank" rel="noopener noreferrer" class="btn">Ver despliegue en vivo</a>'
+          : '';
+        bannerHtml = '<div class="guidance-banner banner-ok">' +
+          '<div class="banner-content">' +
+            '<div class="banner-icon">🎉</div>' +
+            '<div class="banner-body">' +
+              '<div class="banner-title">¡Proyecto terminado con éxito!</div>' +
+              '<div class="banner-desc">El proyecto ha sido construido y verificado exitosamente.</div>' +
+            '</div>' +
+          '</div>' +
+          ((repoBtn || deployBtn) ? '<div class="banner-actions">' + repoBtn + deployBtn + '</div>' : '') +
+        '</div>';
       } else {
-        errBox.style.display = 'none';
+        bannerHtml = '<div class="guidance-banner banner-info">' +
+          '<div class="banner-content">' +
+            '<div class="banner-icon">⚙️</div>' +
+            '<div class="banner-body">' +
+              '<div class="banner-title">Trabajando automáticamente</div>' +
+              '<div class="banner-desc">Los agentes están avanzando en esta etapa. Esta pantalla se actualiza sola cada 5 segundos.</div>' +
+            '</div>' +
+          '</div>' +
+        '</div>';
       }
+      document.getElementById('detail-guidance').innerHTML = bannerHtml;
 
-      const actions = document.getElementById('detail-actions');
-      actions.innerHTML =
-        (st.state === 'WAITING_APPROVAL' ? '<button class="btn btn-primary" data-dact="approve">Aprobar y Construir</button>' : '') +
-        (st.state === 'FAILED' ? '<button class="btn btn-warn" data-dact="retry">Reintentar</button>' : '') +
-        '<button class="btn btn-danger" data-dact="delete">Eliminar</button>';
-      actions.querySelectorAll('button[data-dact]').forEach((btn) => {
+      // Secondary action (Delete)
+      document.getElementById('detail-secondary').innerHTML =
+        '<div class="secondary-actions">' +
+          '<button class="btn-subtle-danger" data-dact="delete">Eliminar proyecto</button>' +
+        '</div>';
+
+      box.querySelectorAll('button[data-dact]').forEach((btn) => {
         btn.addEventListener('click', () => handleAction(btn.dataset.dact, st.project_id));
       });
 
+      // Spec tab ("Resumen")
       const spec = state.detail.spec || {};
-      const renderList = (arr) => Array.isArray(arr) && arr.length
-        ? '<ul>' + arr.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul>'
-        : '<span class="muted">Sin datos</span>';
-      document.getElementById('tab-spec').innerHTML =
-        '<p><strong>Objetivo:</strong> ' + escapeHtml(spec.objective || '') + '</p>' +
-        '<p><strong>Usuarios:</strong></p>' + renderList(spec.users) +
-        '<p><strong>Funcionalidades:</strong></p>' + renderList(spec.features) +
-        '<p><strong>Reglas de negocio:</strong></p>' + renderList(spec.business_rules) +
-        '<p><strong>Casos borde:</strong></p>' + renderList(spec.edge_cases) +
-        '<p><strong>Restricciones:</strong></p>' + renderList(spec.constraints) +
-        '<p><strong>Criterios de éxito:</strong></p>' + renderList(spec.success_criteria) +
-        '<p><strong>Supuestos:</strong></p>' + renderList(spec.assumptions);
+      const fields = [];
+      if (spec.objective && String(spec.objective).trim()) {
+        fields.push('<div class="spec-section"><h4>Objetivo</h4><p>' + escapeHtml(spec.objective) + '</p></div>');
+      }
+      if (Array.isArray(spec.users) && spec.users.length) {
+        fields.push('<div class="spec-section"><h4>Usuarios</h4><ul>' + spec.users.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
+      }
+      if (Array.isArray(spec.features) && spec.features.length) {
+        fields.push('<div class="spec-section"><h4>Funcionalidades</h4><ul>' + spec.features.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
+      }
+      if (Array.isArray(spec.business_rules) && spec.business_rules.length) {
+        fields.push('<div class="spec-section"><h4>Reglas de negocio</h4><ul>' + spec.business_rules.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
+      }
+      if (Array.isArray(spec.edge_cases) && spec.edge_cases.length) {
+        fields.push('<div class="spec-section"><h4>Casos borde</h4><ul>' + spec.edge_cases.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
+      }
+      if (Array.isArray(spec.constraints) && spec.constraints.length) {
+        fields.push('<div class="spec-section"><h4>Restricciones</h4><ul>' + spec.constraints.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
+      }
+      if (Array.isArray(spec.success_criteria) && spec.success_criteria.length) {
+        fields.push('<div class="spec-section"><h4>Criterios de éxito</h4><ul>' + spec.success_criteria.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
+      }
+      if (Array.isArray(spec.assumptions) && spec.assumptions.length) {
+        fields.push('<div class="spec-section"><h4>Supuestos</h4><ul>' + spec.assumptions.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
+      }
+      if (!fields.length) {
+        document.getElementById('tab-spec').innerHTML = '<div class="empty-box">Aún estamos definiendo los detalles de este proyecto.</div>';
+      } else {
+        document.getElementById('tab-spec').innerHTML = fields.join('');
+      }
 
+      // Plan tab ("Plan")
       const plan = state.detail.plan;
       if (!plan) {
-        document.getElementById('tab-plan').innerHTML = '<div class="muted">Aún no se ha generado un Plan.</div>';
+        document.getElementById('tab-plan').innerHTML = '<div class="empty-box">Aún no se ha generado un Plan.</div>';
       } else {
         const filesHtml = (plan.files || []).map((f) =>
-          '<div class="event-item"><strong>' + escapeHtml(f.path) + '</strong><div class="muted">' + escapeHtml(f.purpose) + '</div><pre>' + escapeHtml(f.contract) + '</pre></div>'
+          '<div class="file-card"><div class="file-path">' + escapeHtml(f.path) + '</div><div class="file-purpose">' + escapeHtml(f.purpose) + '</div>' +
+          (f.contract ? '<details class="tech-details"><summary>Contrato</summary><pre>' + escapeHtml(f.contract) + '</pre></details>' : '') +
+          '</div>'
         ).join('');
         const testsHtml = (plan.acceptance_tests || []).map((t) =>
           '<li><strong>[' + escapeHtml(t.id) + '] (' + escapeHtml(t.type) + ')</strong>: ' + escapeHtml(t.description) + '</li>'
         ).join('');
         document.getElementById('tab-plan').innerHTML =
-          '<p><strong>Resumen:</strong> ' + escapeHtml(plan.summary) + '</p>' +
-          '<p><strong>Justificación:</strong> ' + escapeHtml(plan.rationale) + '</p>' +
-          '<p><strong>Plantilla:</strong> <code>' + escapeHtml(plan.template_id) + '</code> · <strong>Target:</strong> <code>' + escapeHtml(plan.deployment_target) + '</code></p>' +
-          '<h3>Archivos (' + (plan.files || []).length + ')</h3>' + filesHtml +
-          '<h3>Pruebas de aceptación (' + (plan.acceptance_tests || []).length + ')</h3><ul>' + testsHtml + '</ul>';
+          '<div class="plan-summary"><strong>Resumen:</strong> ' + escapeHtml(plan.summary) + '</div>' +
+          (plan.rationale ? '<div class="plan-summary"><strong>Justificación:</strong> ' + escapeHtml(plan.rationale) + '</div>' : '') +
+          '<div class="plan-meta">' +
+            '<span class="badge badge-info">Plantilla: ' + escapeHtml(plan.template_id) + '</span>' +
+            '<span class="badge badge-info">Target: ' + escapeHtml(plan.deployment_target) + '</span>' +
+          '</div>' +
+          '<h4 style="margin:14px 0 8px 0;">Archivos (' + (plan.files || []).length + ')</h4>' + filesHtml +
+          '<h4 style="margin:14px 0 8px 0;">Pruebas de aceptación (' + (plan.acceptance_tests || []).length + ')</h4><ul style="padding-left:20px; font-size:0.92rem;">' + testsHtml + '</ul>';
       }
 
+      // Events tab ("Historial")
       const events = state.detail.events || [];
-      document.getElementById('tab-events').innerHTML = events.length
-        ? events.slice().reverse().map((ev) => {
-            const isErr = ev.type === 'PHASE_ERROR' || ev.type === 'PROJECT_FAILED';
-            return '<div class="event-item ' + (isErr ? 'is-error' : '') + '">' +
-              '<div class="card-top"><strong>' + escapeHtml(ev.type) + '</strong><span class="muted">' + escapeHtml(ev.at) + '</span></div>' +
-              '<pre>' + escapeHtml(JSON.stringify(ev.payload, null, 2)) + '</pre></div>';
-          }).join('')
-        : '<div class="muted">Sin eventos.</div>';
+      if (!events.length) {
+        document.getElementById('tab-events').innerHTML = '<div class="empty-box">No hay eventos registrados aún.</div>';
+      } else {
+        document.getElementById('tab-events').innerHTML = '<div class="timeline">' + events.slice().reverse().map((ev) => {
+          const isErr = ev.type === 'PHASE_ERROR' || ev.type === 'PROJECT_FAILED';
+          const isSuccess = ev.type === 'PROJECT_DELIVERED' || ev.type === 'PROJECT_COMPLETED';
+          let dotClass = 'info';
+          if (isErr) dotClass = 'err';
+          else if (isSuccess) dotClass = 'ok';
+          const dateStr = ev.at ? escapeHtml(ev.at) : '';
+          const hasPayload = ev.payload && Object.keys(ev.payload).length > 0;
+          return '<div class="timeline-item">' +
+            '<div class="timeline-dot ' + dotClass + '"></div>' +
+            '<div class="timeline-header">' +
+              '<span class="timeline-type">' + escapeHtml(ev.type) + '</span>' +
+              '<span class="timeline-time">' + dateStr + '</span>' +
+            '</div>' +
+            (hasPayload ? '<pre style="margin:4px 0 0 0;">' + escapeHtml(JSON.stringify(ev.payload, null, 2)) + '</pre>' : '') +
+          '</div>';
+        }).join('') + '</div>';
+      }
 
       renderTabs();
     }
@@ -896,7 +1292,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     async function handleAction(action, pid) {
       try {
         if (action === 'delete') {
-          if (!window.confirm('¿Eliminar permanentemente el proyecto "' + pid + '" y su workspace local?')) {
+          if (!window.confirm('¿Deseas eliminar el proyecto "' + pid + '"? Esta acción no se puede deshacer.')) {
             return;
           }
           await apiFetch('/api/projects/' + encodeURIComponent(pid), { method: 'DELETE' });
@@ -918,11 +1314,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    document.getElementById('refresh-btn').addEventListener('click', loadProjects);
     setInterval(() => {
-      if (document.getElementById('auto-refresh').checked) {
-        loadProjects();
-      }
+      loadProjects();
     }, 5000);
     loadProjects();
   </script>
