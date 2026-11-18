@@ -201,12 +201,15 @@ class TelegramHttpClient:
         chat_id: int,
         text: str,
         buttons: Sequence[Sequence[InlineButton]] | None = None,
+        parse_mode: str | None = None,
     ) -> SentMessage:
         """Call Telegram sendMessage API with optional inline keyboard."""
         payload: dict[str, Any] = {
             "chat_id": chat_id,
             "text": text,
         }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         if buttons:
             inline_keyboard = [
                 [{"text": btn.text, "callback_data": btn.callback_data} for btn in row]
@@ -226,6 +229,7 @@ class TelegramHttpClient:
             chat_id=resp_chat_id,
             text=text,
             buttons=[list(r) for r in (buttons or [])],
+            parse_mode=parse_mode,
         )
 
     def answer_callback_query(

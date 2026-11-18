@@ -32,6 +32,39 @@ def _slugify(text: str) -> str:
     return slug[:50] or "app"
 
 
+def _chunk_text(text: str, max_chars: int = 4000) -> list[str]:
+    """Split text into chunks <= max_chars respecting newline boundaries."""
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks: list[str] = []
+    current_chunk = ""
+
+    lines = text.splitlines(keepends=True)
+    for line in lines:
+        if len(line) > max_chars:
+            if current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = ""
+            for i in range(0, len(line), max_chars):
+                sub = line[i : i + max_chars]
+                if i + max_chars < len(line):
+                    chunks.append(sub)
+                else:
+                    current_chunk = sub
+        elif len(current_chunk) + len(line) <= max_chars:
+            current_chunk += line
+        else:
+            if current_chunk:
+                chunks.append(current_chunk)
+            current_chunk = line
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks if chunks else [text]
+
+
 class TelegramBotConfig(BaseModel):
     """Strict access-control and polling configuration for TelegramBotService."""
 
@@ -120,16 +153,88 @@ class TelegramBotService:
             and user_id in self.config.allowed_user_ids
         )
 
+    def _send_single_chunk(
+        self,
+        chat_id: int,
+        text: str,
+        buttons: Sequence[Sequence[InlineButton]] | None = None,
+        parse_mode: str | None = None,
+    ) -> None:
+        """Send a single message chunk, falling back to parse_mode=None on 400 Bad Request."""
+        try:
+            try:
+                self.client.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    buttons=buttons,
+                    parse_mode=parse_mode,
+                )
+            except TypeError as type_err:
+                if "parse_mode" in str(type_err) or "unexpected keyword argument" in str(type_err):
+                    self.client.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        buttons=buttons,
+                    )
+                else:
+                    raise
+        except TelegramTransportError as exc:
+            msg_str = str(exc).lower()
+            if parse_mode is not None and ("400" in msg_str or "bad request" in msg_str):
+                try:
+                    self.client.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        buttons=buttons,
+                        parse_mode=None,
+                    )
+                except TypeError as type_err:
+                    if "parse_mode" in str(type_err) or "unexpected keyword argument" in str(type_err):
+                        self.client.send_message(
+                            chat_id=chat_id,
+                            text=text,
+                            buttons=buttons,
+                        )
+                    else:
+                        raise
+            else:
+                raise
+
+    def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        buttons: Sequence[Sequence[InlineButton]] | None = None,
+        parse_mode: str | None = None,
+    ) -> str:
+        """Send message via client after redacting secrets, chunking, and falling back if needed."""
+        clean_text = redact_secrets(text, extra_secrets=self.config.secrets_to_redact)
+        chunks = _chunk_text(clean_text, max_chars=4000)
+        for idx, chunk in enumerate(chunks):
+            is_last = idx == len(chunks) - 1
+            chunk_buttons = buttons if is_last else None
+            self._send_single_chunk(
+                chat_id=chat_id,
+                text=chunk,
+                buttons=chunk_buttons,
+                parse_mode=parse_mode,
+            )
+        return clean_text
+
     def _send_reply(
         self,
         chat_id: int,
         text: str,
         buttons: Sequence[Sequence[InlineButton]] | None = None,
+        parse_mode: str | None = None,
     ) -> str:
         """Send message via client after redacting secrets and return sanitized text."""
-        clean_text = redact_secrets(text, extra_secrets=self.config.secrets_to_redact)
-        self.client.send_message(chat_id=chat_id, text=clean_text, buttons=buttons)
-        return clean_text
+        return self.send_message(
+            chat_id=chat_id,
+            text=text,
+            buttons=buttons,
+            parse_mode=parse_mode,
+        )
 
     def _publish_status_to_registry(self, pid: str) -> None:
         """Best-effort publish current project status to registry_publisher if configured."""
@@ -267,15 +372,20 @@ class TelegramBotService:
             f"Plan listo para aprobación:\n{plan_summary}\n\n"
             f"Progreso: {waiting_status.progress_pct}%"
         )
+        hash_prefix = (waiting_status.plan_hash or "")[:12]
+        cb_approve = f"approve:{hash_prefix}"
+        cb_adjust = f"adjust:{hash_prefix}"
+        assert len(cb_approve.encode("utf-8")) <= 64
+        assert len(cb_adjust.encode("utf-8")) <= 64
         buttons = [
             [
                 InlineButton(
                     text="Aprobar",
-                    callback_data=f"approve:{pid}:{waiting_status.plan_hash}",
+                    callback_data=cb_approve,
                 ),
                 InlineButton(
                     text="Ajustar",
-                    callback_data=f"adjust:{pid}:{waiting_status.plan_hash}",
+                    callback_data=cb_adjust,
                 ),
             ]
         ]
@@ -290,30 +400,132 @@ class TelegramBotService:
             reply_text=reply,
         )
 
+    def _execute_approval_and_build(
+        self,
+        update: TelegramUpdate,
+        pid: str,
+        plan_hash: str,
+        *,
+        command: str = "",
+    ) -> UpdateOutcome:
+        """Submit approval event and trigger scaffolding and build pipeline."""
+        now = (
+            self.orchestrator._now()
+            if hasattr(self.orchestrator, "_now")
+            else datetime.now(UTC)
+        )
+        try:
+            self.orchestrator.submit_approval(
+                pid,
+                ApprovalEvent(
+                    plan_hash=plan_hash,
+                    timestamp=now,
+                    decision="approved",
+                ),
+            )
+        except (ApprovalError, IllegalTransition, ValueError) as exc:
+            return self._error_outcome(
+                update,
+                f"No se pudo aprobar {pid}: {exc}",
+                command=command,
+                project_id=pid,
+                action="approval_rejected",
+            )
+
+        reply_msg = ""
+        if self.build_worker is not None:
+            try:
+                if self.template_scaffold is not None:
+                    plan = self.orchestrator.get_plan(pid)
+                    template_id = plan.template_id if plan else "static-web"
+                    self.template_scaffold.scaffold(pid, template_id)
+
+                self.build_worker.enqueue_approved_project(pid)
+                report = self.build_worker.run_job(pid)
+            except (
+                SandboxViolationError,
+                IllegalTransition,
+                ValueError,
+                OSError,
+                RuntimeError,
+            ) as exc:
+                return self._error_outcome(
+                    update,
+                    f"Error ejecutando build de {pid}: {exc}",
+                    command=command,
+                    project_id=pid,
+                )
+
+            final_status = self.orchestrator.get_status(pid)
+            if final_status.state == ProjectState.DELIVERED:
+                repo_url = final_status.links.repo if final_status.links else ""
+                deploy_url = final_status.links.deploy if final_status.links else ""
+                text = f"Proyecto {pid} entregado con éxito!\nRepo: {repo_url}\nDeploy: {deploy_url}"
+                if report.failure_cause:
+                    text += f"\nAviso: {report.failure_cause}"
+                reply_msg = self._send_reply(update.chat_id, text)
+            elif final_status.state == ProjectState.FAILED:
+                cause = (
+                    final_status.failure_reason
+                    or (report.failure_cause if report else "Error de construcción")
+                )
+                reply_msg = self._send_reply(
+                    update.chat_id,
+                    f"Proyecto {pid} falló durante el build: {cause}",
+                )
+        elif command:
+            reply_msg = self._send_reply(
+                update.chat_id,
+                f"Plan para {pid} aprobado exitosamente.",
+            )
+
+        return UpdateOutcome(
+            update_id=update.update_id,
+            accepted=True,
+            command=command,
+            project_id=pid,
+            action="approval_processed",
+            reply_text=reply_msg,
+        )
+
     def _handle_callback(self, update: TelegramUpdate) -> UpdateOutcome:
         """Process inline keyboard callbacks (approve / adjust) enforcing plan_hash and state guards."""
         if update.callback_query_id:
             self.client.answer_callback_query(update.callback_query_id)
 
-        parts = (update.callback_data or "").split(":", 2)
+        parts = (update.callback_data or "").split(":")
         cb_action = parts[0] if len(parts) > 0 else ""
-        pid = parts[1] if len(parts) > 1 else ""
-        expected_hash = parts[2] if len(parts) > 2 else ""
 
         if cb_action not in {"approve", "adjust"}:
             return UpdateOutcome(
                 update_id=update.update_id,
                 accepted=True,
-                project_id=pid or None,
+                project_id=None,
                 action="unknown_callback",
             )
+
+        if len(parts) >= 3:
+            # Legacy format: approve:<pid>:<hash>
+            pid = parts[1]
+            hash_prefix = parts[2]
+        elif len(parts) == 2:
+            # Compact format: approve:<hash_prefix>
+            pid = self.active_project_by_chat.get(update.chat_id) or ""
+            hash_prefix = parts[1]
+        else:
+            pid = self.active_project_by_chat.get(update.chat_id) or ""
+            hash_prefix = ""
 
         current_status, err_outcome = self._validate_existing_project(update, pid)
         if err_outcome is not None or current_status is None:
             assert err_outcome is not None
             return err_outcome
 
-        if not current_status.plan_hash or current_status.plan_hash != expected_hash:
+        if (
+            not current_status.plan_hash
+            or not hash_prefix
+            or not current_status.plan_hash.startswith(hash_prefix)
+        ):
             reject_action = "approval_rejected" if cb_action == "approve" else "adjustment_rejected"
             label = "Aprobación" if cb_action == "approve" else "Ajuste"
             return self._error_outcome(
@@ -350,75 +562,60 @@ class TelegramBotService:
             )
 
         # cb_action == "approve"
-        now = (
-            self.orchestrator._now()
-            if hasattr(self.orchestrator, "_now")
-            else datetime.now(UTC)
+        return self._execute_approval_and_build(
+            update,
+            pid,
+            current_status.plan_hash,
+            command="",
         )
-        try:
-            self.orchestrator.submit_approval(
-                pid,
-                ApprovalEvent(
-                    plan_hash=expected_hash,
-                    timestamp=now,
-                    decision="approved",
-                ),
-            )
-        except (ApprovalError, IllegalTransition, ValueError) as exc:
+
+    def _handle_approve(self, update: TelegramUpdate, raw_text: str) -> UpdateOutcome:
+        """Process /approve text command approving active project in WAITING_APPROVAL."""
+        tokens = raw_text.split()
+        command = tokens[0] if tokens else "/approve"
+        hash_arg = tokens[1].strip() if len(tokens) > 1 else ""
+
+        pid = self.active_project_by_chat.get(update.chat_id)
+        if not pid:
             return self._error_outcome(
                 update,
-                f"No se pudo aprobar {pid}: {exc}",
+                "No hay un proyecto activo en este chat para aprobar. Inicia uno con /new <idea>.",
+                command=command,
+                action="ignored",
+            )
+
+        current_status, err_outcome = self._validate_existing_project(
+            update, pid, command=command
+        )
+        if err_outcome is not None or current_status is None:
+            assert err_outcome is not None
+            return err_outcome
+
+        if current_status.state != ProjectState.WAITING_APPROVAL:
+            return self._error_outcome(
+                update,
+                f"El proyecto {pid} no está pendiente de aprobación (estado actual: {current_status.state.value}).",
+                command=command,
                 project_id=pid,
                 action="approval_rejected",
             )
 
-        reply_msg = ""
-        if self.build_worker is not None:
-            try:
-                if self.template_scaffold is not None:
-                    plan = self.orchestrator.get_plan(pid)
-                    template_id = plan.template_id if plan else "static-web"
-                    self.template_scaffold.scaffold(pid, template_id)
-
-                self.build_worker.enqueue_approved_project(pid)
-                report = self.build_worker.run_job(pid)
-            except (
-                SandboxViolationError,
-                IllegalTransition,
-                ValueError,
-                OSError,
-                RuntimeError,
-            ) as exc:
+        if hash_arg and (
+            not current_status.plan_hash or not current_status.plan_hash.startswith(hash_arg)
+        ):
                 return self._error_outcome(
                     update,
-                    f"Error ejecutando build de {pid}: {exc}",
+                    f"Aprobación rechazada: el hash del plan no coincide con {current_status.plan_hash}.",
+                    command=command,
                     project_id=pid,
+                    action="approval_rejected",
                 )
 
-            final_status = self.orchestrator.get_status(pid)
-            if final_status.state == ProjectState.DELIVERED:
-                repo_url = final_status.links.repo if final_status.links else ""
-                deploy_url = final_status.links.deploy if final_status.links else ""
-                text = f"Proyecto {pid} entregado con éxito!\nRepo: {repo_url}\nDeploy: {deploy_url}"
-                if report.failure_cause:
-                    text += f"\nAviso: {report.failure_cause}"
-                reply_msg = self._send_reply(update.chat_id, text)
-            elif final_status.state == ProjectState.FAILED:
-                cause = (
-                    final_status.failure_reason
-                    or (report.failure_cause if report else "Error de construcción")
-                )
-                reply_msg = self._send_reply(
-                    update.chat_id,
-                    f"Proyecto {pid} falló durante el build: {cause}",
-                )
-
-        return UpdateOutcome(
-            update_id=update.update_id,
-            accepted=True,
-            project_id=pid,
-            action="approval_processed",
-            reply_text=reply_msg,
+        return self._execute_approval_and_build(
+            update,
+            pid,
+            current_status.plan_hash or "",
+            command=command,
         )
 
     def _handle_new(self, update: TelegramUpdate, raw_text: str) -> UpdateOutcome:
@@ -589,6 +786,8 @@ class TelegramBotService:
             return self._handle_status(update, raw_text)
         if first_token == "/resume":
             return self._handle_resume(update, raw_text)
+        if first_token in {"/approve", "/aprobar"}:
+            return self._handle_approve(update, raw_text)
 
         pid = self.active_project_by_chat.get(update.chat_id)
         if not pid:

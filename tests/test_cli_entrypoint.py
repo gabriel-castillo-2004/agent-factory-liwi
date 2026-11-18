@@ -34,6 +34,7 @@ from agent_factory.cli import (
     build_runtime,
     install_signal_handlers,
     load_cli_config,
+    load_dotenv_into_environ,
     main,
     run_polling_loop,
 )
@@ -982,3 +983,54 @@ def test_cli_h42_01_rejects_none_models_path_invalid_models_toml_and_vercel_gith
         assert "github.io" not in rt_vc.vcs.deploy_publisher.deploy_base_url
     finally:
         rt_vc.store.close()
+
+
+def test_load_dotenv_into_environ_positive_and_negative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-4.2 / INV-19 / INV-21 / INV-23: load_dotenv_into_environ parses key-values, ignores comments/blanks, strips quotes, respects setdefault, and handles missing files gracefully."""
+    monkeypatch.setenv("TEST_EXISTING_KEY", "original_value")
+    monkeypatch.delenv("TEST_VAR_PLAIN", raising=False)
+    monkeypatch.delenv("TEST_VAR_DOUBLE_QUOTES", raising=False)
+    monkeypatch.delenv("TEST_VAR_SINGLE_QUOTES", raising=False)
+    monkeypatch.delenv("TEST_VAR_EMPTY_VAL", raising=False)
+
+    fake_env = tmp_path / "custom.env"
+    fake_env.write_text(
+        "# This is a comment\n"
+        "\n"
+        "   # Indented comment\n"
+        "TEST_EXISTING_KEY=new_overwritten_value\n"
+        "TEST_VAR_PLAIN=hello_world\n"
+        'TEST_VAR_DOUBLE_QUOTES="quoted value with spaces"\n'
+        "TEST_VAR_SINGLE_QUOTES='single quoted value'\n"
+        "TEST_VAR_EMPTY_VAL=\n"
+        "MALFORMED_LINE_WITHOUT_EQUALS\n"
+        "=MISSING_KEY\n",
+        encoding="utf-8",
+    )
+
+    load_dotenv_into_environ(fake_env)
+
+    # 1. Existing variable was NOT overwritten (setdefault behavior)
+    assert os.environ["TEST_EXISTING_KEY"] == "original_value"
+
+    # 2. Plain variable is loaded
+    assert os.environ["TEST_VAR_PLAIN"] == "hello_world"
+
+    # 3. Double-quoted variable stripped quotes
+    assert os.environ["TEST_VAR_DOUBLE_QUOTES"] == "quoted value with spaces"
+
+    # 4. Single-quoted variable stripped quotes
+    assert os.environ["TEST_VAR_SINGLE_QUOTES"] == "single quoted value"
+
+    # 5. Empty value is loaded as empty string
+    assert os.environ["TEST_VAR_EMPTY_VAL"] == ""
+
+    # 6. Malformed lines and missing keys did not crash or set invalid keys
+    assert "MALFORMED_LINE_WITHOUT_EQUALS" not in os.environ
+    assert "" not in os.environ
+
+    # 7. Non-existent file does not raise OSError
+    missing_env = tmp_path / "does_not_exist.env"
+    load_dotenv_into_environ(missing_env)

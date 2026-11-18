@@ -336,6 +336,36 @@ def _parse_id_whitelist(raw: str | None, var_name: str, secret_token: str = "") 
     return frozenset(result)
 
 
+def load_dotenv_into_environ(env_path: Path | str | None = None) -> None:
+    """Load key-value pairs from .env into os.environ without overwriting existing variables."""
+    target_path = Path(env_path) if env_path is not None else Path(".env")
+    if not target_path.is_file():
+        return
+
+    try:
+        content = target_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        val = val.strip()
+        if len(val) >= 2 and (
+            (val.startswith('"') and val.endswith('"'))
+            or (val.startswith("'") and val.endswith("'"))
+        ):
+            val = val[1:-1]
+        os.environ.setdefault(key, val)
+
+
 def load_cli_config(env: Mapping[str, str] | None = None) -> CliConfig:
     """Load and validate CLI configuration fail-closed without leaking secrets in errors."""
     effective = os.environ if env is None else env
@@ -752,6 +782,8 @@ def main(
     stop_event: threading.Event | None = None,
 ) -> int:
     """Entrypoint for `python -m agent_factory`."""
+    if env is None and not os.environ.get("TELEGRAM_BOT_TOKEN"):
+        load_dotenv_into_environ()
     effective_env = os.environ if env is None else env
     token = effective_env.get("TELEGRAM_BOT_TOKEN", "").strip()
     try:

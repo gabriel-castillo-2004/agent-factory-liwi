@@ -57,6 +57,7 @@ class FakeTelegramClient:
         chat_id: int,
         text: str,
         buttons: Sequence[Sequence[InlineButton]] | None = None,
+        parse_mode: str | None = None,
     ) -> SentMessage:
         """Record an outgoing Telegram message and return SentMessage."""
         msg = SentMessage(
@@ -64,6 +65,7 @@ class FakeTelegramClient:
             chat_id=chat_id,
             text=text,
             buttons=[list(row) for row in (buttons or [])],
+            parse_mode=parse_mode,
         )
         self._next_message_id += 1
         self.sent_messages.append(msg)

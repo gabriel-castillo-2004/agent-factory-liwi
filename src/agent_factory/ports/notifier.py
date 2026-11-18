@@ -36,6 +36,7 @@ class SentMessage(BaseModel):
     chat_id: int
     text: str
     buttons: list[list[InlineButton]] = Field(default_factory=list)
+    parse_mode: str | None = None
 
 
 class HttpResponse(BaseModel):
@@ -78,6 +79,7 @@ class TelegramClient(Protocol):
         chat_id: int,
         text: str,
         buttons: Sequence[Sequence[InlineButton]] | None = None,
+        parse_mode: str | None = None,
     ) -> SentMessage:
         """Send a text message with optional inline buttons to chat_id."""
         raise NotImplementedError

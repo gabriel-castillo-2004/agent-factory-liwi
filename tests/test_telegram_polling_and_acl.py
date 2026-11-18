@@ -1,7 +1,7 @@
 """Tests for Telegram Long Polling client, strict ACL, Q&A/approval flow, /status, /resume, and deduplication (AC-3.1, AC-3.2, AC-3.3, INV-03, INV-04, INV-05, INV-16, INV-21, INV-22, INV-23)."""
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -30,6 +30,7 @@ from agent_factory.ports.llm import LLMError
 from agent_factory.ports.notifier import (
     HttpResponse,
     InlineButton,
+    SentMessage,
     TelegramClient,
     TelegramTransportError,
     TelegramUpdate,
@@ -862,3 +863,222 @@ def test_telegram_http_client_handles_null_text_ok_false_invalid_json_and_answer
     # HTTP 200 with invalid JSON must raise TelegramTransportError
     with pytest.raises(TelegramTransportError):
         client.get_updates(offset=804, timeout=15)
+
+
+def test_telegram_compact_buttons_approve_command_chunking_and_400_fallback(tmp_path: Path) -> None:
+    """AC-3.2 / AC-3.3 / INV-04 / INV-05 / INV-16 / INV-21 / INV-23: Compact inline buttons <= 64 bytes, /approve & /aprobar command, message chunking > 4000 chars, and HTTP 400 parse_mode fallback."""
+    clock = _FakeClock()
+    store = MemoryEventStore()
+    llm = FakeLLM(
+        responses=[
+            # Project 1: Long project ID for button length check
+            {"spec": _complete_spec_payload("Super Sistema de Facturación y Finanzas Electrónicas"), "questions": []},
+            {"approach": "Pure TS", "components": ["src/app.ts"], "tradeoffs": []},
+            {"critique": ["None"], "robust_proposal": "Safe", "architectural_safeguards": []},
+            _complete_plan_payload("Super Sistema de Facturación"),
+            # Project 2: for /approve command tests
+            {"spec": _complete_spec_payload("Cronometro Simple"), "questions": []},
+            {"approach": "HTML/JS", "components": ["src/app.js"], "tradeoffs": []},
+            {"critique": ["None"], "robust_proposal": "Safe", "architectural_safeguards": []},
+            _complete_plan_payload("Cronometro Simple"),
+            # Project 3: for /aprobar with prefix test
+            {"spec": _complete_spec_payload("Reloj Mundial"), "questions": []},
+            {"approach": "HTML/JS", "components": ["src/app.js"], "tradeoffs": []},
+            {"critique": ["None"], "robust_proposal": "Safe", "architectural_safeguards": []},
+            _complete_plan_payload("Reloj Mundial"),
+        ]
+    )
+    orch = Orchestrator(store=store, llm=llm, clock=clock)
+    client = FakeTelegramClient()
+    bot = TelegramBotService(
+        client=client,
+        orchestrator=orch,
+        config=TelegramBotConfig(
+            allowed_chat_ids=frozenset({1001}),
+            allowed_user_ids=frozenset({2001}),
+        ),
+    )
+
+    # 1. Start long-name project -> transitions to WAITING_APPROVAL on /new directly
+    new_out = bot.handle_update(
+        TelegramUpdate(
+            update_id=1,
+            chat_id=1001,
+            user_id=2001,
+            text="/new Super Sistema de Facturación y Finanzas Electrónicas",
+        )
+    )
+    assert new_out.action == "plan_ready_for_approval"
+    pid_1 = new_out.project_id
+    assert pid_1 is not None
+    assert len(pid_1) == 50
+
+    # Verify buttons are compact: len(callback_data.encode("utf-8")) <= 64
+    plan_msg = client.sent_messages[-1]
+    assert len(plan_msg.buttons) == 1
+    row = plan_msg.buttons[0]
+    assert len(row) == 2
+    approve_btn, adjust_btn = row[0], row[1]
+    assert approve_btn.text == "Aprobar"
+    assert adjust_btn.text == "Ajustar"
+
+    # Strictly verify <= 64 UTF-8 bytes limit
+    assert len(approve_btn.callback_data.encode("utf-8")) <= 64
+    assert len(adjust_btn.callback_data.encode("utf-8")) <= 64
+    assert approve_btn.callback_data.startswith("approve:")
+    assert adjust_btn.callback_data.startswith("adjust:")
+    hash_prefix = approve_btn.callback_data.split(":")[1]
+    assert len(hash_prefix) == 12
+
+    # 2. Compact callback approval succeeds
+    cb_approve_out = bot.handle_update(
+        TelegramUpdate(
+            update_id=2,
+            chat_id=1001,
+            user_id=2001,
+            callback_query_id="cb-ok",
+            callback_data=approve_btn.callback_data,
+        )
+    )
+    assert cb_approve_out.accepted is True
+    assert cb_approve_out.action == "approval_processed"
+    status_1 = orch.get_status(pid_1)
+    assert status_1.state == ProjectState.BUILDING
+
+    # 3. Mismatched compact callback is rejected
+    mismatch_cb = bot.handle_update(
+        TelegramUpdate(
+            update_id=3,
+            chat_id=1001,
+            user_id=2001,
+            callback_query_id="cb-bad",
+            callback_data="approve:000000000000",
+        )
+    )
+    assert mismatch_cb.accepted is True
+    assert mismatch_cb.action == "approval_rejected"
+
+    # 4. Project 2: Test /approve command without argument
+    out_p2 = bot.handle_update(
+        TelegramUpdate(update_id=4, chat_id=1001, user_id=2001, text="/new Cronometro Simple")
+    )
+    assert out_p2.action == "plan_ready_for_approval"
+    status_p2 = orch.get_status("cronometro-simple")
+    assert status_p2.state == ProjectState.WAITING_APPROVAL
+
+    # /approve with wrong prefix fails
+    bad_cmd_out = bot.handle_update(
+        TelegramUpdate(update_id=5, chat_id=1001, user_id=2001, text="/approve wrongprefix")
+    )
+    assert bad_cmd_out.accepted is True
+    assert bad_cmd_out.action == "approval_rejected"
+    assert orch.get_status("cronometro-simple").state == ProjectState.WAITING_APPROVAL
+
+    # /approve without argument approves active project
+    ok_cmd_out = bot.handle_update(
+        TelegramUpdate(update_id=6, chat_id=1001, user_id=2001, text="/approve")
+    )
+    assert ok_cmd_out.accepted is True
+    assert ok_cmd_out.action == "approval_processed"
+    assert orch.get_status("cronometro-simple").state == ProjectState.BUILDING
+
+    # /approve on already BUILDING project rejects cleanly
+    dup_approve = bot.handle_update(
+        TelegramUpdate(update_id=7, chat_id=1001, user_id=2001, text="/approve")
+    )
+    assert dup_approve.accepted is True
+    assert dup_approve.action == "approval_rejected"
+    assert "no está pendiente de aprobación" in dup_approve.reply_text
+
+    # 5. Project 3: Test /aprobar (Spanish alias) with prefix
+    out_p3 = bot.handle_update(
+        TelegramUpdate(update_id=8, chat_id=1001, user_id=2001, text="/new Reloj Mundial")
+    )
+    assert out_p3.action == "plan_ready_for_approval"
+    status_p3 = orch.get_status("reloj-mundial")
+    assert status_p3.state == ProjectState.WAITING_APPROVAL
+    prefix_p3 = status_p3.plan_hash[:8]
+
+    aprobar_out = bot.handle_update(
+        TelegramUpdate(update_id=9, chat_id=1001, user_id=2001, text=f"/aprobar {prefix_p3}")
+    )
+    assert aprobar_out.accepted is True
+    assert aprobar_out.action == "approval_processed"
+    assert orch.get_status("reloj-mundial").state == ProjectState.BUILDING
+
+    # 6. /approve in unauthorized chat or when chat has no active project
+    empty_chat_out = bot.handle_update(
+        TelegramUpdate(update_id=10, chat_id=9999, user_id=2001, text="/approve")
+    )
+    assert empty_chat_out.accepted is False
+    assert empty_chat_out.action == "rejected_unauthorized"
+
+    # Reset active project in test by removing from active_project_by_chat
+    bot.active_project_by_chat.pop(1001, None)
+    no_act_out = bot.handle_update(
+        TelegramUpdate(update_id=11, chat_id=1001, user_id=2001, text="/approve")
+    )
+    assert no_act_out.action == "ignored"
+    assert "No hay un proyecto activo" in no_act_out.reply_text
+
+    # 7. Resilient message chunking (> 4000 chars)
+    btn_sample = [[InlineButton(text="Test", callback_data="test:123")]]
+    long_text = "\n".join(f"Paragraph line {i} of detailed plan explanation." for i in range(120))
+    assert len(long_text) > 5000
+
+    messages_before = len(client.sent_messages)
+    sent_res = bot.send_message(chat_id=1001, text=long_text, buttons=btn_sample)
+    assert sent_res == long_text
+
+    new_messages = client.sent_messages[messages_before:]
+    assert len(new_messages) >= 2
+    for msg in new_messages:
+        assert len(msg.text) <= 4000
+    # First chunk has NO buttons, last chunk HAS buttons
+    assert new_messages[0].buttons == []
+    assert new_messages[-1].buttons == btn_sample
+
+    # 8. Fallback to parse_mode=None when HTTP 400 Bad Request occurs
+    class _FlakyParseModeClient:
+        def __init__(self) -> None:
+            self.sent_calls: list[dict[str, Any]] = []
+
+        def get_updates(self, offset: int | None = None, timeout: int = 30) -> list[TelegramUpdate]:
+            return []
+
+        def send_message(
+            self,
+            chat_id: int,
+            text: str,
+            buttons: Sequence[Sequence[InlineButton]] | None = None,
+            parse_mode: str | None = None,
+        ) -> SentMessage:
+            if parse_mode == "Markdown":
+                raise TelegramTransportError(
+                    "Telegram API HTTP 400 for sendMessage: Bad Request: can't parse entities: Character '*' is reserved"
+                )
+            self.sent_calls.append({"chat_id": chat_id, "text": text, "parse_mode": parse_mode})
+            return SentMessage(message_id=999, chat_id=chat_id, text=text, parse_mode=parse_mode)
+
+        def answer_callback_query(self, callback_query_id: str, text: str = "") -> None:
+            pass
+
+    flaky_client = _FlakyParseModeClient()
+    bot_fallback = TelegramBotService(
+        client=flaky_client,
+        orchestrator=orch,
+        config=TelegramBotConfig(
+            allowed_chat_ids=frozenset({1001}),
+            allowed_user_ids=frozenset({2001}),
+        ),
+    )
+
+    clean_sent = bot_fallback.send_message(
+        chat_id=1001,
+        text="*Unclosed markdown bold text",
+        parse_mode="Markdown",
+    )
+    assert clean_sent == "*Unclosed markdown bold text"
+    assert len(flaky_client.sent_calls) == 1
+    assert flaky_client.sent_calls[0]["parse_mode"] is None
+    assert flaky_client.sent_calls[0]["text"] == "*Unclosed markdown bold text"
