@@ -193,6 +193,7 @@ def run_debate_pipeline(
     clock: Clock | None = None,
     on_llm_call: Callable[[ProjectState], None] | None = None,
     on_transition: Callable[[ProjectState, ProjectState], None] | None = None,
+    on_debate_complete: Callable[[PragmatistProposal, StructuralistCritique], None] | None = None,
 ) -> DebatePipelineResult:
     """Execute the fixed 3-call pipeline: Pragmatist -> Structuralist -> Mediator (AC-1.3)."""
     wrapper = _PipelineLLMWrapper(inner=llm, on_call=on_llm_call)
@@ -205,9 +206,14 @@ def run_debate_pipeline(
         clock=clock,
     )
 
+    proposal: PragmatistProposal | None = None
+    critique: StructuralistCritique | None = None
     try:
         proposal = pragmatist.propose(spec)
         critique = structuralist.critique(spec, proposal)
+
+        if on_debate_complete is not None:
+            on_debate_complete(proposal, critique)
 
         if on_transition is not None:
             on_transition(ProjectState.DEBATE, ProjectState.MEDIATION)
@@ -233,8 +239,8 @@ def run_debate_pipeline(
     ) as err:
         return DebatePipelineResult(
             state=ProjectState.FAILED,
-            proposal=None,
-            critique=None,
+            proposal=proposal,
+            critique=critique,
             plan=None,
             failure_cause=str(err),
             llm_calls=wrapper.call_count,

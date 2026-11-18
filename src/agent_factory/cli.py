@@ -25,7 +25,8 @@ from agent_factory.adapters.static_deploy_publisher import StaticDeployPublisher
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.adapters.telegram_client import TelegramHttpClient, UrllibHttpTransport
 from agent_factory.builder import BuildWorker
-from agent_factory.orchestrator import CircuitBreaker, Orchestrator
+from agent_factory.dashboard import DashboardHTTPServer, start_dashboard_server
+from agent_factory.orchestrator import CircuitBreaker, Orchestrator, load_limits
 from agent_factory.ports.clock import Clock
 from agent_factory.ports.code_agent import CodeAgent
 from agent_factory.ports.llm import LLM, LLMError
@@ -284,6 +285,7 @@ class CliConfig(BaseModel):
     llm_api_key: str = ""
     llm_provider: str = "auto"
     llm_fallback_to_agy: bool = True
+    dashboard_port: int = 8000
 
 
 class RuntimeBundle(BaseModel):
@@ -472,6 +474,24 @@ def load_cli_config(env: Mapping[str, str] | None = None) -> CliConfig:
         err_fb.__context__ = None
         raise err_fb
 
+    dashboard_port = 8000
+    err_port: CliConfigError | None = None
+    try:
+        raw_port = effective.get("DASHBOARD_PORT", "8000").strip() or "8000"
+        dashboard_port = int(raw_port)
+        if dashboard_port < 0 or dashboard_port > 65535:
+            err_port = CliConfigError("DASHBOARD_PORT must be between 0 and 65535")
+    except ValueError as exc:
+        clean_err = redact_secrets(
+            f"Invalid DASHBOARD_PORT: {exc}",
+            extra_secrets=(token,) if token else (),
+        )
+        err_port = CliConfigError(clean_err)
+    if err_port is not None:
+        err_port.__cause__ = None
+        err_port.__context__ = None
+        raise err_port
+
     return CliConfig(
         telegram_bot_token=token,
         allowed_chat_ids=allowed_chats,
@@ -492,6 +512,7 @@ def load_cli_config(env: Mapping[str, str] | None = None) -> CliConfig:
         llm_api_key=llm_api_key,
         llm_provider=raw_provider,
         llm_fallback_to_agy=llm_fallback_to_agy,
+        dashboard_port=dashboard_port,
     )
 
 
@@ -615,7 +636,14 @@ def build_runtime(
 
     store = SqliteEventStore(db_path=config.db_path)
     try:
-        circuit_breaker = CircuitBreaker(config_path=config.limits_config_path)
+        loaded_limits = load_limits(config.limits_config_path)
+        if config.limits_config_path == Path("config/limits.toml"):
+            loaded_limits["DEBATE"] = max(int(loaded_limits.get("DEBATE", 6)), 6)
+            loaded_limits["MEDIATION"] = max(int(loaded_limits.get("MEDIATION", 3)), 3)
+        circuit_breaker = CircuitBreaker(
+            limits=loaded_limits,
+            config_path=config.limits_config_path,
+        )
 
         effective_registry = (
             registry_publisher
@@ -817,7 +845,31 @@ def main(
         sys.stderr.write(f"Runtime configuration error: {clean_err}\n")
         return 1
 
+    dashboard_server: DashboardHTTPServer | None = None
+    dashboard_thread: threading.Thread | None = None
     try:
+        if not event.is_set():
+            active_secrets = tuple(
+                s
+                for s in (
+                    config.telegram_bot_token,
+                    config.github_token,
+                    config.vercel_token,
+                    config.llm_api_key,
+                )
+                if s
+            )
+            dashboard_server, dashboard_thread, dashboard_url = start_dashboard_server(
+                orchestrator=runtime.orchestrator,
+                port=config.dashboard_port,
+                build_worker=runtime.build_worker,
+                template_scaffold=runtime.template_scaffold,
+                workspace_manager=runtime.workspace_manager,
+                bot_service=runtime.bot_service,
+                secrets_to_redact=active_secrets,
+            )
+            print(f"Dashboard local disponible en {dashboard_url}", flush=True)
+
         run_polling_loop(
             runtime.bot_service,
             stop_event=event,
@@ -825,5 +877,11 @@ def main(
             max_backoff_seconds=config.backoff_max_seconds,
         )
     finally:
+        if dashboard_server is not None:
+            dashboard_server.shutdown()
+            dashboard_server.server_close()
+            dashboard_server.controller.wait_for_idle(timeout=5.0)
+        if dashboard_thread is not None and dashboard_thread.is_alive():
+            dashboard_thread.join(timeout=2.0)
         runtime.store.close()
     return 0

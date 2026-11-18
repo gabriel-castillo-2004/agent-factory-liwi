@@ -1,5 +1,6 @@
 """Local build worker, job queue, and write-test-fix loop (Section 7 Phase 2, INV-09, INV-13, INV-15, INV-17)."""
 
+import threading
 from collections.abc import Mapping, Sequence
 from enum import StrEnum
 
@@ -50,32 +51,44 @@ class BuildJob(BaseModel):
 
 
 class LocalJobQueue:
-    """In-memory/local queue of approved build jobs supporting quota pause and resume."""
+    """Thread-safe local queue of approved build jobs supporting quota pause and resume."""
 
     def __init__(self) -> None:
+        self._lock = threading.RLock()
         self._jobs: dict[str, BuildJob] = {}
         self._order: list[str] = []
 
     def enqueue(self, project_id: str, plan: Plan) -> BuildJob:
-        """Add or retrieve a BuildJob for project_id."""
-        if project_id in self._jobs:
-            return self._jobs[project_id]
-        job = BuildJob(project_id=project_id, plan=plan, state=JobState.QUEUED)
-        self._jobs[project_id] = job
-        self._order.append(project_id)
-        return job
+        """Add or retrieve a BuildJob for project_id, replacing any prior FAILED job."""
+        with self._lock:
+            existing = self._jobs.get(project_id)
+            if existing is not None and existing.state != JobState.FAILED:
+                return existing
+            job = BuildJob(project_id=project_id, plan=plan, state=JobState.QUEUED)
+            self._jobs[project_id] = job
+            if project_id not in self._order:
+                self._order.append(project_id)
+            return job
 
     def get_job(self, project_id: str) -> BuildJob | None:
         """Return the BuildJob for project_id, or None if not queued."""
-        return self._jobs.get(project_id)
+        with self._lock:
+            return self._jobs.get(project_id)
+
+    def remove(self, project_id: str) -> None:
+        """Remove project_id from the queue if present."""
+        with self._lock:
+            self._jobs.pop(project_id, None)
+            self._order = [pid for pid in self._order if pid != project_id]
 
     def next_runnable_job(self) -> BuildJob | None:
         """Return the next job in QUEUED or PAUSED_QUOTA state."""
-        for pid in self._order:
-            job = self._jobs[pid]
-            if job.state in (JobState.QUEUED, JobState.PAUSED_QUOTA):
-                return job
-        return None
+        with self._lock:
+            for pid in self._order:
+                job = self._jobs[pid]
+                if job.state in (JobState.QUEUED, JobState.PAUSED_QUOTA):
+                    return job
+            return None
 
 
 class BuildWorker:
@@ -116,20 +129,22 @@ class BuildWorker:
         self,
         project_id: str,
         job: BuildJob,
-        reason: str,
+        reason: BaseException | str,
         *,
         emit_event: bool = True,
+        failed_state: ProjectState | None = None,
     ) -> BuildReport:
-        """Sanitize reason, emit optional PROJECT_FAILED, mark job FAILED, and build report."""
-        clean_reason = self._redact(reason)
+        """Sanitize reason, emit optional PHASE_ERROR + PROJECT_FAILED, mark job FAILED, and build report."""
+        raw_reason = str(reason) if str(reason).strip() else type(reason).__name__
+        clean_reason = self._redact(raw_reason)
         if emit_event:
-            self.orchestrator.store.append(
-                create_event(
-                    project_id=project_id,
-                    event_type=EventType.PROJECT_FAILED,
-                    payload={"reason": clean_reason},
-                    at=self.orchestrator._now(),
-                )
+            target_state = failed_state or self.orchestrator.get_status(project_id).state
+            self.orchestrator.record_phase_failure(
+                project_id,
+                failed_state=target_state if target_state != ProjectState.FAILED else ProjectState.BUILDING,
+                error=reason,
+                agent="build_worker",
+                extra_secrets=self.secrets_to_redact,
             )
         job.state = JobState.FAILED
         report = BuildReport(
@@ -186,9 +201,23 @@ class BuildWorker:
                 for k in template_files:
                     norm = k.replace("\\", "/")
                     if norm.startswith("src/") or norm == "src":
-                        raise SandboxViolationError(
+                        msg = (
                             f"Production file '{k}' found in template files prior to test generation (INV-13)"
                         )
+                        self.orchestrator.store.append(
+                            create_event(
+                                project_id=project_id,
+                                event_type=EventType.PHASE_ERROR,
+                                payload={
+                                    "state": ProjectState.BUILDING.value,
+                                    "agent": "build_worker",
+                                    "error_type": "SandboxViolationError",
+                                    "detail": self._redact(msg),
+                                },
+                                at=self.orchestrator._now(),
+                            )
+                        )
+                        raise SandboxViolationError(msg)
 
             ws_dir = self.workspace_manager.create_workspace(
                 project_id, template_files=template_files
@@ -197,9 +226,23 @@ class BuildWorker:
             # Check existing workspace src directory for contamination on disk
             src_dir = ws_dir / "src"
             if src_dir.is_dir() and any(p.is_file() for p in src_dir.rglob("*")):
-                raise SandboxViolationError(
+                msg = (
                     "Production code in src/ exists before test generation; potential test contamination (INV-13)"
                 )
+                self.orchestrator.store.append(
+                    create_event(
+                        project_id=project_id,
+                        event_type=EventType.PHASE_ERROR,
+                        payload={
+                            "state": ProjectState.BUILDING.value,
+                            "agent": "build_worker",
+                            "error_type": "SandboxViolationError",
+                            "detail": self._redact(msg),
+                        },
+                        at=self.orchestrator._now(),
+                    )
+                )
+                raise SandboxViolationError(msg)
 
             # Check circuit breaker limit before invoking
             building_limit = (
@@ -238,7 +281,9 @@ class BuildWorker:
                 # Fatal code agent error: record the invocation in CircuitBreaker and AGENT_INVOKED before failing
                 self.orchestrator.record_state_call(project_id, ProjectState.BUILDING)
                 job.invocations_used += 1
-                return self._fail_job(project_id, job, str(err))
+                return self._fail_job(
+                    project_id, job, err, failed_state=ProjectState.BUILDING
+                )
 
             # Successful test generation: record call in CircuitBreaker and AGENT_INVOKED
             status = self.orchestrator.record_state_call(
@@ -320,7 +365,9 @@ class BuildWorker:
                 # Fatal code agent error: record the invocation in CircuitBreaker and AGENT_INVOKED before failing
                 self.orchestrator.record_state_call(project_id, ProjectState.BUILDING)
                 job.invocations_used += 1
-                return self._fail_job(project_id, job, str(err))
+                return self._fail_job(
+                    project_id, job, err, failed_state=ProjectState.BUILDING
+                )
 
             # Record successful agent invocation
             status = self.orchestrator.record_state_call(
@@ -352,7 +399,9 @@ class BuildWorker:
                     timeout_seconds=30.0,
                 )
             except (CommandTimeoutError, OSError, RuntimeError, ValueError) as err:
-                return self._fail_job(project_id, job, str(err))
+                return self._fail_job(
+                    project_id, job, err, failed_state=ProjectState.BUILDING
+                )
 
             # Update test results
             if runner_result.test_results:
@@ -409,7 +458,9 @@ class BuildWorker:
                 # Get CI result
                 ci_result = self.vcs.get_ci_result(project_id, branch="work")
             except (OSError, RuntimeError, ValueError) as err:
-                return self._fail_job(project_id, job, str(err))
+                return self._fail_job(
+                    project_id, job, err, failed_state=ProjectState.VERIFYING
+                )
 
             job.ci_rounds_used += 1
             clean_ci_summary = self._redact(ci_result.summary)
@@ -431,7 +482,9 @@ class BuildWorker:
                         project_id, branch="work"
                     )
                 except (OSError, RuntimeError, ValueError) as err:
-                    return self._fail_job(project_id, job, str(err))
+                    return self._fail_job(
+                        project_id, job, err, failed_state=ProjectState.VERIFYING
+                    )
 
                 self.orchestrator.store.append(
                     create_event(
@@ -495,6 +548,7 @@ class BuildWorker:
                     project_id,
                     job,
                     f"CI round limit reached ({self.max_ci_rounds}): {clean_ci_summary}",
+                    failed_state=ProjectState.VERIFYING,
                 )
 
             # Transition back to BUILDING for another fix attempt

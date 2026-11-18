@@ -24,3 +24,7 @@ class EventStore(Protocol):
     def list_project_ids(self) -> list[str]:
         """Return all distinct project IDs stored in the log."""
         raise NotImplementedError
+
+    def delete_project(self, project_id: str) -> bool:
+        """Delete all stored records for project_id and return True if any existed."""
+        raise NotImplementedError

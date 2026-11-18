@@ -449,6 +449,15 @@ class TelegramBotService:
                 OSError,
                 RuntimeError,
             ) as exc:
+                cur_state = self.orchestrator.get_status(pid).state
+                if cur_state not in (ProjectState.FAILED, ProjectState.DELIVERED):
+                    self.orchestrator.record_phase_failure(
+                        pid,
+                        failed_state=cur_state,
+                        error=exc,
+                        agent="telegram_build",
+                        extra_secrets=self.config.secrets_to_redact,
+                    )
                 return self._error_outcome(
                     update,
                     f"Error ejecutando build de {pid}: {exc}",

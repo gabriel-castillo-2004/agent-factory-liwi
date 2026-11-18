@@ -159,6 +159,23 @@ def project_status_from_events(project_id: str, events: Sequence[Event]) -> Proj
             failure_reason = payload.get("reason", "Unknown failure")
             # FAILED preserves the last progress value
 
+        elif event.type == EventType.PROJECT_RETRIED:
+            raw_target = payload.get("to")
+            if not raw_target:
+                raise ValueError("PROJECT_RETRIED event missing target 'to' state")
+            next_state = ProjectState(raw_target)
+            validate_transition(current_state, next_state, allow_retry=True)
+            current_state = next_state
+            failure_reason = None
+            if current_state == ProjectState.WAITING_APPROVAL:
+                tests = TestCounts(total=tests.total, passed=0, failed=0)
+            last_progress = calculate_progress(
+                current_state,
+                passed_tests=tests.passed,
+                total_tests=tests.total,
+                previous_progress=last_progress,
+            )
+
         elif event.type == EventType.PROJECT_DELIVERED:
             validate_transition(current_state, ProjectState.DELIVERED)
             current_state = ProjectState.DELIVERED
