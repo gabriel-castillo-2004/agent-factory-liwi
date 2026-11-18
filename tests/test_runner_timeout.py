@@ -107,3 +107,19 @@ def test_subprocess_runner_resolves_cmd_executable_via_effective_env_path(tmp_pa
     res = runner.run(command=["agydummy", "hello"], cwd=tmp_path, env=env)
     assert res.exit_code == 0
     assert "shim-ok hello" in res.stdout
+
+
+def test_subprocess_runner_decodes_utf8_and_replaces_invalid_bytes(tmp_path: Path) -> None:
+    """SubprocessRunner decodes stdout and stderr as UTF-8 (preventing Windows CP1252 mojibake) and replaces malformed bytes safely."""
+    runner = SubprocessRunner(default_timeout_seconds=5.0)
+    script = (
+        "import sys; "
+        "sys.stdout.buffer.write('¿Ayúdame con el menú?\\n'.encode('utf-8')); "
+        "sys.stderr.buffer.write(b'Aviso UTF-8: \\xc3\\xa1 y byte malo \\xff\\n')"
+    )
+    res = runner.run(command=[sys.executable, "-c", script], cwd=tmp_path)
+    assert res.exit_code == 0
+    assert "¿Ayúdame con el menú?" in res.stdout
+    assert "Ãº" not in res.stdout
+    assert "Aviso UTF-8: á" in res.stderr
+    assert "\ufffd" in res.stderr

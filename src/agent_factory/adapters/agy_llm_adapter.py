@@ -129,8 +129,8 @@ class AgyLLMAdapter:
         self,
         messages: list[dict[str, str]],
         schema: type[BaseModel] | dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Invoke `agy` CLI with combined prompt and parse returned JSON object."""
+    ) -> dict[str, Any] | str:
+        """Invoke `agy` CLI with combined prompt; return parsed JSON dict if schema is set or clean text otherwise."""
         prompt = _build_combined_prompt(messages, schema=schema)
         command = list(self.cli_command) + ["-p", prompt]
         clean_env = self.build_clean_env()
@@ -165,6 +165,12 @@ class AgyLLMAdapter:
                 else f"agy CLI exited with code {res.exit_code}"
             )
 
+        if schema is None:
+            text = res.stdout.strip()
+            if not text:
+                self._raise_error("agy CLI returned empty output", invalid_response=True)
+            return text
+
         return self._parse_json_dict(res.stdout)
 
 
@@ -184,7 +190,7 @@ class FallbackLLMAdapter:
         self,
         messages: list[dict[str, str]],
         schema: type[BaseModel] | dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | str:
         """Call primary.complete(...) and delegate to fallback.complete(...) on LLMError."""
         primary_failed = False
         try:

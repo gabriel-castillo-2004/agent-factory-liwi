@@ -16,7 +16,7 @@ from agent_factory.cli import (
     load_cli_config,
 )
 from agent_factory.domain.models import Plan
-from agent_factory.ports.llm import LLM, LLMError
+from agent_factory.ports.llm import LLM, InvalidLLMResponseError, LLMError
 from agent_factory.ports.notifier import HttpResponse
 from agent_factory.ports.runner import CommandResult, CommandTimeoutError
 
@@ -49,11 +49,11 @@ class _StaticHttpTransport:
         return step
 
 
-def test_agy_llm_adapter_parses_clean_and_fenced_json_and_sanitizes_env(
+def test_agy_llm_adapter_returns_plain_text_without_schema_and_parses_json_with_schema(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AgyLLMAdapter implements LLM protocol, invokes agy via Runner with clean env, includes schema prompt, and parses clean & markdown JSON."""
+    """AgyLLMAdapter returns clean plain text when schema is None (without JSON instruction) and parses clean/fenced JSON dict when schema is provided."""
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bot123456:SHOULD_NOT_LEAK_TG")
     monkeypatch.setenv("LLM_API_KEY", "sk-should-not-leak-host-env")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_shouldNotLeakEnvToken123")
@@ -64,7 +64,11 @@ def test_agy_llm_adapter_parses_clean_and_fenced_json_and_sanitizes_env(
         results=[
             CommandResult(
                 exit_code=0,
-                stdout='{"questions": ["¿Cuál es el nombre?"], "is_complete": false}',
+                stdout="  ¡Hola! ¿Qué funcionalidades necesitas en tu CRM?  \n",
+            ),
+            CommandResult(
+                exit_code=0,
+                stdout='{"approach": "Modular JS", "components": ["ui"], "tradeoffs": []}',
             ),
             CommandResult(
                 exit_code=0,
@@ -80,13 +84,16 @@ def test_agy_llm_adapter_parses_clean_and_fenced_json_and_sanitizes_env(
     adapter = AgyLLMAdapter(runner=runner, cwd=tmp_path)
     assert isinstance(adapter, LLM)
 
-    out_clean = adapter.complete(
+    # 1. schema=None -> plain natural text str, no forced JSON instruction
+    out_text = adapter.complete(
         [
             {"role": "system", "content": "Eres entrevistador."},
             {"role": "user", "content": "Quiero un CRM simple."},
-        ]
+        ],
+        schema=None,
     )
-    assert out_clean == {"questions": ["¿Cuál es el nombre?"], "is_complete": False}
+    assert out_text == "¡Hola! ¿Qué funcionalidades necesitas en tu CRM?"
+    assert isinstance(out_text, str)
 
     call1 = runner.calls[0]
     assert call1["command"][0] == "agy"
@@ -94,6 +101,7 @@ def test_agy_llm_adapter_parses_clean_and_fenced_json_and_sanitizes_env(
     prompt1 = " ".join(call1["command"])
     assert "Eres entrevistador." in prompt1
     assert "Quiero un CRM simple." in prompt1
+    assert "Respond ONLY with a valid JSON object" not in prompt1
 
     env1 = call1["env"]
     assert env1 is not None
@@ -103,6 +111,14 @@ def test_agy_llm_adapter_parses_clean_and_fenced_json_and_sanitizes_env(
     assert "CUSTOM_SECRET" not in env1
     assert env1.get("AGY_HOME") == str(tmp_path / "agy_home")
 
+    # 2. schema dict -> clean JSON dict
+    out_clean_json = adapter.complete(
+        [{"role": "user", "content": "Propón arquitectura."}],
+        schema={"type": "object"},
+    )
+    assert out_clean_json == {"approach": "Modular JS", "components": ["ui"], "tradeoffs": []}
+
+    # 3. schema Pydantic -> markdown-fenced JSON dict + schema instructions
     out_fenced = adapter.complete(
         [
             {"role": "system", "content": "Eres mediador."},
@@ -112,14 +128,14 @@ def test_agy_llm_adapter_parses_clean_and_fenced_json_and_sanitizes_env(
     )
     assert out_fenced == {"summary": "Mini CRM", "template_id": "static-web", "files": []}
 
-    prompt2 = " ".join(runner.calls[1]["command"])
-    assert "JSON" in prompt2
-    assert "acceptance_tests" in prompt2
-    assert "template_id" in prompt2
+    prompt3 = " ".join(runner.calls[2]["command"])
+    assert "Respond ONLY with a valid JSON object" in prompt3
+    assert "acceptance_tests" in prompt3
+    assert "template_id" in prompt3
 
 
 def test_agy_llm_adapter_errors_redact_secrets_and_clear_cause_context(tmp_path: Path) -> None:
-    """Non-zero exit code, timeout, OSError, non-JSON, empty, or non-dict JSON all raise LLMError with redacted secrets and clean exception chain."""
+    """Empty stdout (with or without schema), non-JSON/non-dict with schema, exit_code != 0, timeouts, and OSError raise LLMError/InvalidLLMResponseError cleanly."""
     secret_val = "AGY_TEST_SECRET_998877"
     runner = FakeRunner(
         results=[
@@ -130,10 +146,11 @@ def test_agy_llm_adapter_errors_redact_secrets_and_clear_cause_context(tmp_path:
             ),
             CommandTimeoutError(f"Timed out with {secret_val}"),
             CommandResult(exit_code=0, stdout="", timed_out=True),
-            CommandResult(exit_code=0, stdout="Esto no es JSON válido"),
             CommandResult(exit_code=0, stdout="   \n  "),
-            CommandResult(exit_code=0, stdout='["not", "a", "dict"]'),
             OSError(f"Cannot execute agy with {secret_val}"),
+            CommandResult(exit_code=0, stdout="Esto no es JSON válido"),
+            CommandResult(exit_code=0, stdout='["not", "a", "dict"]'),
+            CommandResult(exit_code=0, stdout="   "),
         ]
     )
     adapter = AgyLLMAdapter(
@@ -142,16 +159,27 @@ def test_agy_llm_adapter_errors_redact_secrets_and_clear_cause_context(tmp_path:
         secrets=(secret_val,),
     )
 
-    for _ in range(7):
-        with pytest.raises(LLMError) as exc_info:
-            adapter.complete([{"role": "user", "content": "hola"}])
+    # First 5 fail even with schema=None (process/timeout/OS errors + empty output)
+    for idx in range(5):
+        expected_cls = InvalidLLMResponseError if idx == 3 else LLMError
+        with pytest.raises(expected_cls) as exc_info:
+            adapter.complete([{"role": "user", "content": "hola"}], schema=None)
+        assert secret_val not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    # Remaining 3 fail with InvalidLLMResponseError when schema is provided
+    for _ in range(3):
+        with pytest.raises(InvalidLLMResponseError) as exc_info:
+            adapter.complete([{"role": "user", "content": "hola"}], schema={"type": "object"})
+        assert isinstance(exc_info.value, LLMError)
         assert secret_val not in str(exc_info.value)
         assert exc_info.value.__cause__ is None
         assert exc_info.value.__context__ is None
 
 
 def test_fallback_llm_adapter_delegates_only_on_llm_error(tmp_path: Path) -> None:
-    """FallbackLLMAdapter returns primary response when healthy and switches to AgyLLMAdapter on LLMError without chaining __context__."""
+    """FallbackLLMAdapter returns primary response when healthy and switches to AgyLLMAdapter on LLMError for both text and schema calls."""
     secret_val = "FALLBACK_SECRET_554433"
     ok_transport = _StaticHttpTransport(
         responses=[
@@ -178,9 +206,10 @@ def test_fallback_llm_adapter_delegates_only_on_llm_error(tmp_path: Path) -> Non
     assert combo_ok.complete([{"role": "user", "content": "hola"}]) == {"source": "api"}
     assert len(runner_unused.calls) == 0
 
-    # Primary raises LLMError -> automatically falls back to AgyLLMAdapter
+    # Primary raises LLMError -> automatically falls back to AgyLLMAdapter (both schema=None text and schema!=None JSON)
     fail_transport = _StaticHttpTransport(
         responses=[
+            HttpResponse(status_code=503, body="Service Unavailable"),
             HttpResponse(status_code=503, body="Service Unavailable"),
             HttpResponse(status_code=503, body="Still down"),
         ]
@@ -193,6 +222,7 @@ def test_fallback_llm_adapter_delegates_only_on_llm_error(tmp_path: Path) -> Non
     )
     runner_fb = FakeRunner(
         results=[
+            CommandResult(exit_code=0, stdout="Respuesta en texto natural desde agy"),
             CommandResult(exit_code=0, stdout='```json\n{"source": "agy", "ok": true}\n```'),
             CommandResult(exit_code=1, stdout="", stderr=f"agy crash {secret_val}"),
         ]
@@ -200,9 +230,12 @@ def test_fallback_llm_adapter_delegates_only_on_llm_error(tmp_path: Path) -> Non
     fallback_agy = AgyLLMAdapter(runner=runner_fb, cwd=tmp_path, secrets=(secret_val,))
     combo_fb = FallbackLLMAdapter(primary=primary_fail, fallback=fallback_agy)
 
-    res = combo_fb.complete([{"role": "user", "content": "hola"}], schema={"type": "object"})
-    assert res == {"source": "agy", "ok": True}
-    assert len(runner_fb.calls) == 1
+    res_text = combo_fb.complete([{"role": "user", "content": "hola"}], schema=None)
+    assert res_text == "Respuesta en texto natural desde agy"
+
+    res_json = combo_fb.complete([{"role": "user", "content": "hola"}], schema={"type": "object"})
+    assert res_json == {"source": "agy", "ok": True}
+    assert len(runner_fb.calls) == 2
 
     # When fallback ALSO fails, clean LLMError is raised with no __cause__/__context__ and secrets redacted
     with pytest.raises(LLMError) as both_err:
@@ -240,12 +273,21 @@ def test_cli_config_and_build_runtime_llm_provider_modes_and_env_example(tmp_pat
     cfg_agy = load_cli_config(agy_env)
     assert cfg_agy.llm_provider == "agy"
 
-    agy_runner = FakeRunner(results=[CommandResult(exit_code=0, stdout='{"via": "agy"}')])
+    agy_runner = FakeRunner(
+        results=[
+            CommandResult(exit_code=0, stdout="Hola desde agy"),
+            CommandResult(exit_code=0, stdout='{"via": "agy"}'),
+        ]
+    )
     rt_agy = build_runtime(cfg_agy, runner=agy_runner)
     try:
         assert isinstance(rt_agy.llm, AgyLLMAdapter)
-        assert rt_agy.llm.complete([{"role": "user", "content": "ping"}]) == {"via": "agy"}
-        assert len(agy_runner.calls) == 1
+        assert rt_agy.llm.complete([{"role": "user", "content": "ping"}]) == "Hola desde agy"
+        assert rt_agy.llm.complete(
+            [{"role": "user", "content": "ping"}],
+            schema={"type": "object"},
+        ) == {"via": "agy"}
+        assert len(agy_runner.calls) == 2
     finally:
         rt_agy.store.close()
 
@@ -272,9 +314,10 @@ def test_cli_config_and_build_runtime_llm_provider_modes_and_env_example(tmp_pat
     rt_auto = build_runtime(cfg_auto, runner=fb_runner, transport=failing_http)
     try:
         assert isinstance(rt_auto.llm, FallbackLLMAdapter)
-        assert rt_auto.llm.complete([{"role": "user", "content": "hola"}]) == {
-            "via": "fallback-agy"
-        }
+        assert rt_auto.llm.complete(
+            [{"role": "user", "content": "hola"}],
+            schema={"type": "object"},
+        ) == {"via": "fallback-agy"}
         assert len(failing_http.calls) == 1
         assert len(fb_runner.calls) == 1
     finally:

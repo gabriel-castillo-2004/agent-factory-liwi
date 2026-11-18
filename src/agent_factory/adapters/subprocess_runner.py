@@ -58,6 +58,8 @@ class SubprocessRunner(Runner):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 env=dict(env) if env is not None else None,
             )
             try:
@@ -89,6 +91,8 @@ class SubprocessRunner(Runner):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 start_new_session=True,
                 env=dict(env) if env is not None else None,
             )
