@@ -54,6 +54,16 @@ ALLOWED_TRANSITIONS: dict[ProjectState, frozenset[ProjectState]] = {
 }
 
 
+RETRYABLE_SOURCE_STATES: frozenset[ProjectState] = frozenset(
+    {
+        ProjectState.FAILED,
+        ProjectState.BUILDING,
+        ProjectState.VERIFYING,
+        ProjectState.DEBATE,
+        ProjectState.MEDIATION,
+    }
+)
+
 RETRYABLE_TARGET_STATES: frozenset[ProjectState] = frozenset(
     {
         ProjectState.INTERVIEW,
@@ -79,7 +89,7 @@ def validate_transition(
     allow_retry: bool = False,
 ) -> ProjectState:
     """Validate transition from current to target or raise IllegalTransition."""
-    if allow_retry and current == ProjectState.FAILED and target in RETRYABLE_TARGET_STATES:
+    if allow_retry and current in RETRYABLE_SOURCE_STATES and target in RETRYABLE_TARGET_STATES:
         return target
     if not can_transition(current, target):
         raise IllegalTransition(current, target)

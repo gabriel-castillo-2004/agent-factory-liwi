@@ -14,7 +14,7 @@ from agent_factory.adapters.fake_vcs import FakeVCS
 from agent_factory.adapters.memory_store import MemoryEventStore
 from agent_factory.adapters.sqlite_store import SqliteEventStore
 from agent_factory.builder import BuildWorker, LocalJobQueue
-from agent_factory.domain.events import Event, EventType
+from agent_factory.domain.events import Event, EventType, create_event
 from agent_factory.domain.models import (
     AcceptanceTest,
     AcceptanceTestType,
@@ -532,5 +532,75 @@ def test_sqlite_thread_safety_and_delete_project(tmp_path: Path) -> None:
 
         with pytest.raises(ValueError):
             orch.delete_project("../escape")
+    finally:
+        store.close()
+
+
+def test_retry_orphaned_project_in_building_debate_and_mediation(tmp_path: Path) -> None:
+    """retry_project recovers orphaned projects in BUILDING (to WAITING_APPROVAL), DEBATE, and MEDIATION."""
+    store = SqliteEventStore(db_path=tmp_path / "orphaned_retry.db")
+    try:
+        now = datetime(2026, 11, 18, 12, 0, tzinfo=UTC)
+
+        # 1. Orphaned in BUILDING: has plan, was approved, server restarted -> retry leaves it in WAITING_APPROVAL
+        pid_bld = "orphan-bld"
+        plan = Plan(
+            summary="Building Plan",
+            rationale="Testing",
+            template_id="static-web",
+            deployment_target="static",
+            files=[FileSpec(path="index.html", purpose="UI", contract="Contract")],
+            acceptance_tests=[AcceptanceTest(id="AT-01", type=AcceptanceTestType.UNIT, description="Pass")],
+        )
+        plan_dict = plan.model_dump(mode="json")
+        plan_hash = plan.compute_hash()
+        store.append(create_event(pid_bld, EventType.PROJECT_CREATED, {"project_id": pid_bld, "name": "Bld App", "objective": "Obj"}, at=now))
+        store.append(create_event(pid_bld, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now))
+        store.append(create_event(pid_bld, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now))
+        store.append(create_event(pid_bld, EventType.PLAN_CREATED, {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now))
+        store.append(create_event(pid_bld, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now))
+
+        orch = Orchestrator(store=store, llm=FakeLLM())
+        assert orch.get_status(pid_bld).state == ProjectState.BUILDING
+        # Simulate circuit breaker having had invocations
+        orch.circuit_breaker.record_call(pid_bld, ProjectState.BUILDING)
+        assert orch.circuit_breaker.get_calls(pid_bld, ProjectState.BUILDING) == 1
+
+        resumed_bld = orch.retry_project(pid_bld)
+        assert resumed_bld.state == ProjectState.WAITING_APPROVAL
+        assert resumed_bld.plan_hash == plan_hash
+        assert resumed_bld.progress_pct == 35
+        assert orch.circuit_breaker.get_calls(pid_bld, ProjectState.BUILDING) == 0
+
+        # 2. Orphaned in DEBATE: server restarted during debate -> retry resets breaker and keeps DEBATE
+        pid_deb = "orphan-deb"
+        store.append(create_event(pid_deb, EventType.PROJECT_CREATED, {"project_id": pid_deb, "name": "Deb App", "objective": "Obj"}, at=now))
+        store.append(create_event(pid_deb, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now))
+        assert orch.get_status(pid_deb).state == ProjectState.DEBATE
+        orch.circuit_breaker.record_call(pid_deb, ProjectState.DEBATE)
+        assert orch.circuit_breaker.get_calls(pid_deb, ProjectState.DEBATE) == 1
+
+        resumed_deb = orch.retry_project(pid_deb)
+        assert resumed_deb.state == ProjectState.DEBATE
+        assert resumed_deb.progress_pct == 25
+        assert orch.circuit_breaker.get_calls(pid_deb, ProjectState.DEBATE) == 0
+
+        # 3. Orphaned in MEDIATION: server restarted during mediation -> retry resets breaker and keeps MEDIATION
+        pid_med = "orphan-med"
+        store.append(create_event(pid_med, EventType.PROJECT_CREATED, {"project_id": pid_med, "name": "Med App", "objective": "Obj"}, at=now))
+        store.append(create_event(pid_med, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now))
+        store.append(create_event(pid_med, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now))
+        assert orch.get_status(pid_med).state == ProjectState.MEDIATION
+        orch.circuit_breaker.record_call(pid_med, ProjectState.MEDIATION)
+        assert orch.circuit_breaker.get_calls(pid_med, ProjectState.MEDIATION) == 1
+
+        resumed_med = orch.retry_project(pid_med)
+        assert resumed_med.state == ProjectState.MEDIATION
+        assert resumed_med.progress_pct == 30
+        assert orch.circuit_breaker.get_calls(pid_med, ProjectState.MEDIATION) == 0
+
+        # 4. Attempting to retry a project in an invalid state (e.g. WAITING_APPROVAL or DELIVERED) raises ValueError
+        with pytest.raises(ValueError, match="expected one of"):
+            orch.retry_project(pid_bld)  # now in WAITING_APPROVAL
     finally:
         store.close()

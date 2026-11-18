@@ -611,7 +611,7 @@ class Orchestrator:
             return self.get_status(project_id)
 
     def retry_project(self, project_id: str) -> ProjectStatus:
-        """Reset failure counters for a FAILED project and return it to its recoverable active state."""
+        """Reset failure counters for a FAILED or orphaned active project and return it to its recoverable active state."""
         validate_project_id(project_id)
         with self._project_lock(project_id):
             events = self.store.get_events(project_id)
@@ -619,9 +619,17 @@ class Orchestrator:
                 raise ValueError(f"Project '{project_id}' does not exist")
 
             current_status = self.get_status(project_id)
-            if current_status.state != ProjectState.FAILED:
+            allowed_retry_states = {
+                ProjectState.FAILED,
+                ProjectState.BUILDING,
+                ProjectState.VERIFYING,
+                ProjectState.DEBATE,
+                ProjectState.MEDIATION,
+            }
+            if current_status.state not in allowed_retry_states:
                 raise ValueError(
-                    f"Cannot retry project '{project_id}' in state {current_status.state.value}: expected FAILED"
+                    f"Cannot retry project '{project_id}' in state {current_status.state.value}: "
+                    f"expected one of {[s.value for s in allowed_retry_states]}"
                 )
 
             tracked = ProjectState.IDLE
@@ -696,7 +704,7 @@ class Orchestrator:
                     project_id=project_id,
                     event_type=EventType.PROJECT_RETRIED,
                     payload={
-                        "from": ProjectState.FAILED.value,
+                        "from": current_status.state.value,
                         "to": target_state.value,
                         "failed_from": last_active_state.value,
                     },

@@ -77,6 +77,21 @@ class DashboardController:
         with self._lock:
             return project_id in self._active_projects
 
+    def is_running(self, project_id: str) -> bool:
+        """Return True if an active task thread is currently running for project_id."""
+        with self._lock:
+            return project_id in self._active_projects
+
+    def mark_running(self, project_id: str) -> None:
+        """Register project_id as having an active task running in memory."""
+        with self._lock:
+            self._active_projects.add(project_id)
+
+    def mark_stopped(self, project_id: str) -> None:
+        """Unregister project_id from active running tasks."""
+        with self._lock:
+            self._active_projects.discard(project_id)
+
     def wait_for_idle(self, timeout: float = 5.0) -> bool:
         """Wait for all active background dashboard tasks to finish within timeout seconds."""
         deadline = datetime.now(UTC).timestamp() + timeout
@@ -162,10 +177,14 @@ class DashboardController:
         has_plan: bool,
     ) -> dict[str, Any]:
         last_error = self._extract_last_error(status, events)
+        last_event_at = events[-1].at.isoformat() if events else None
+        running = self.is_running(project_id)
         raw = status.model_dump(mode="json")
         raw["last_error"] = last_error
         raw["has_plan"] = has_plan
-        raw["busy"] = self.is_busy(project_id)
+        raw["busy"] = running
+        raw["is_running"] = running
+        raw["last_event_at"] = last_event_at
         return _scrub_value(raw, self.secrets_to_redact)
 
     def list_projects(self) -> list[dict[str, Any]]:
@@ -183,6 +202,7 @@ class DashboardController:
                     self._serialize_summary(pid, status, events, has_plan=has_plan)
                 )
             except (ValueError, IllegalTransition) as exc:
+                running = self.is_running(pid)
                 summaries.append(
                     {
                         "project_id": pid,
@@ -196,7 +216,9 @@ class DashboardController:
                         "links": {"repo": None, "deploy": None},
                         "tests": {"total": 0, "passed": 0, "failed": 0},
                         "has_plan": False,
-                        "busy": self.is_busy(pid),
+                        "busy": running,
+                        "is_running": running,
+                        "last_event_at": None,
                     }
                 )
         return summaries
@@ -223,11 +245,14 @@ class DashboardController:
             for ev in events
         ]
 
+        summary = self._serialize_summary(
+            project_id, status, events, has_plan=(plan is not None)
+        )
         return {
             "project_id": project_id,
-            "status": self._serialize_summary(
-                project_id, status, events, has_plan=(plan is not None)
-            ),
+            "status": summary,
+            "is_running": self.is_running(project_id),
+            "last_event_at": summary["last_event_at"],
             "spec": _scrub_value(spec.model_dump(mode="json"), self.secrets_to_redact),
             "plan": _scrub_value(plan.model_dump(mode="json"), self.secrets_to_redact)
             if plan is not None
@@ -932,7 +957,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="detail-header">
           <div class="detail-titles">
             <h2 id="detail-title" class="detail-title"></h2>
-            <div id="detail-sub" class="detail-sub muted"></div>
           </div>
           <span id="detail-badge" class="badge"></span>
         </div>
@@ -1077,6 +1101,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       });
     }
 
+    function eventLabel(type) {
+      const labels = {
+        'PROJECT_CREATED': 'Proyecto creado',
+        'STATE_TRANSITIONED': 'Cambio de estado',
+        'INTERVIEW_ROUND': 'Ronda de entrevista',
+        'SPEC_UPDATED': 'Especificación actualizada',
+        'PRAGMATIST_PROPOSED': 'Propuesta de debate',
+        'STRUCTURALIST_CRITIQUED': 'Crítica de debate',
+        'PLAN_CREATED': 'Plan generado',
+        'APPROVAL_RECORDED': 'Aprobación del plan',
+        'TESTS_UPDATED': 'Pruebas actualizadas',
+        'AGENT_INVOKED': 'Agente invocado',
+        'CI_ROUND_COMPLETED': 'Verificación CI completada',
+        'PROJECT_FAILED': 'Detenido por error',
+        'PROJECT_RETRIED': 'Reanudación iniciada',
+        'PHASE_ERROR': 'Error en la etapa',
+        'PROJECT_DELIVERED': '¡Proyecto entregado con éxito!',
+        'REGISTRY_PUBLISH_FAILED': 'Error al publicar registro',
+      };
+      return labels[type] || type;
+    }
+
     function renderDetail() {
       const empty = document.getElementById('detail-empty');
       const box = document.getElementById('detail-content');
@@ -1092,7 +1138,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const info = stepInfo(st.state);
       const titleText = st.name || st.objective || st.project_id;
       document.getElementById('detail-title').textContent = titleText;
-      document.getElementById('detail-sub').textContent = (st.name && st.objective) ? st.objective : (st.project_id || '');
 
       const badge = document.getElementById('detail-badge');
       badge.textContent = info.step + ' (' + (st.progress_pct || 0) + '%)';
@@ -1101,6 +1146,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       // Contextual guidance banner
       let bannerHtml = '';
+      const isRunning = Boolean(st.is_running || st.busy || (state.detail && state.detail.is_running));
+      const isOrphaned = !isRunning && (st.state === 'BUILDING' || st.state === 'DEBATE' || st.state === 'MEDIATION');
+
       if (st.state === 'WAITING_APPROVAL') {
         bannerHtml = '<div class="guidance-banner banner-warn">' +
           '<div class="banner-content">' +
@@ -1112,6 +1160,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           '</div>' +
           '<div class="banner-actions">' +
             '<button class="btn btn-success" data-dact="approve">Aprobar y construir</button>' +
+          '</div>' +
+        '</div>';
+      } else if (isOrphaned) {
+        bannerHtml = '<div class="guidance-banner banner-warn">' +
+          '<div class="banner-content">' +
+            '<div class="banner-icon">⏸️</div>' +
+            '<div class="banner-body">' +
+              '<div class="banner-title">Proceso pausado</div>' +
+              '<div class="banner-desc">El proceso se detuvo al reiniciar la aplicación.</div>' +
+            '</div>' +
+          '</div>' +
+          '<div class="banner-actions">' +
+            '<button class="btn btn-warn" data-dact="retry">Reanudar proyecto</button>' +
           '</div>' +
         '</div>';
       } else if (st.state === 'FAILED' || st.state === 'ERROR') {
@@ -1241,13 +1302,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           else if (isSuccess) dotClass = 'ok';
           const dateStr = ev.at ? escapeHtml(ev.at) : '';
           const hasPayload = ev.payload && Object.keys(ev.payload).length > 0;
+          const label = eventLabel(ev.type);
           return '<div class="timeline-item">' +
             '<div class="timeline-dot ' + dotClass + '"></div>' +
             '<div class="timeline-header">' +
-              '<span class="timeline-type">' + escapeHtml(ev.type) + '</span>' +
+              '<span class="timeline-type">' + escapeHtml(label) + '</span>' +
               '<span class="timeline-time">' + dateStr + '</span>' +
             '</div>' +
-            (hasPayload ? '<pre style="margin:4px 0 0 0;">' + escapeHtml(JSON.stringify(ev.payload, null, 2)) + '</pre>' : '') +
+            (hasPayload ? '<details class="tech-details" style="margin-top:4px;"><summary>Ver datos técnicos</summary><pre style="margin:4px 0 0 0;">' + escapeHtml(JSON.stringify(ev.payload, null, 2)) + '</pre></details>' : '') +
           '</div>';
         }).join('') + '</div>';
       }

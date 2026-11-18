@@ -275,6 +275,9 @@ def test_dashboard_http_endpoints_ui_approve_retry_and_delete(tmp_path: Path) ->
         assert "Fábrica de Proyectos" in html
         assert "Aprobar y construir" in html
         assert "Volver a intentar" in html
+        assert "Reanudar proyecto" in html
+        assert "El proceso se detuvo al reiniciar la aplicación." in html
+        assert "Ver datos técnicos" in html
         assert "Eliminar proyecto" in html
         assert "5000" in html
         assert "data-theme" in html
@@ -288,6 +291,8 @@ def test_dashboard_http_endpoints_ui_approve_retry_and_delete(tmp_path: Path) ->
         assert set(by_id) == {"proj-wait", "proj-failed-debate", "proj-failed-plan", "proj-done"}
         assert by_id["proj-wait"]["state"] == "WAITING_APPROVAL"
         assert by_id["proj-wait"]["progress_pct"] == 35
+        assert by_id["proj-wait"]["is_running"] is False
+        assert by_id["proj-wait"]["last_event_at"] is not None
         assert by_id["proj-done"]["state"] == "DELIVERED"
         assert by_id["proj-done"]["links"]["repo"] == "https://github.com/gabriel-test/proj-done"
         assert by_id["proj-failed-debate"]["state"] == "FAILED"
@@ -297,6 +302,10 @@ def test_dashboard_http_endpoints_ui_approve_retry_and_delete(tmp_path: Path) ->
         # 3. GET /api/projects/<id> -> detail with status, spec, plan, events
         d_code, detail = _http_json(f"{base_url}/api/projects/proj-wait")
         assert d_code == 200
+        assert detail["is_running"] is False
+        assert detail["last_event_at"] is not None
+        assert detail["status"]["is_running"] is False
+        assert detail["status"]["last_event_at"] is not None
         assert detail["spec"]["objective"] == "Pomodoro timer static app"
         assert detail["plan"]["summary"] == "Waiting Approval Pomodoro"
         assert detail["plan"]["acceptance_tests"][0]["id"] == "AT-01"
@@ -653,3 +662,132 @@ def test_dashboard_notifies_telegram_checks_busy_conflicts_and_corrupted_events(
             thread.join(timeout=2.0)
         store.close()
     _ = DashboardController
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_orphaned_building_project_resumed_and_delivered(tmp_path: Path) -> None:
+    """An orphaned project in BUILDING (from server restart) shows is_running=False and resumes cleanly."""
+    store = SqliteEventStore(str(tmp_path / "orphaned_dash.db"))
+    pid = "proj-orphan-bld"
+    now = datetime(2026, 11, 18, 12, 0, tzinfo=UTC)
+
+    # Simulate events leading up to BUILDING before restart
+    store.append(
+        create_event(
+            pid,
+            EventType.PROJECT_CREATED,
+            {"project_id": pid, "name": "Orphan App", "objective": "Obj"},
+            at=now,
+        )
+    )
+    store.append(
+        create_event(
+            pid,
+            EventType.STATE_TRANSITIONED,
+            {"from": "INTERVIEW", "to": "DEBATE"},
+            at=now,
+        )
+    )
+    store.append(
+        create_event(
+            pid,
+            EventType.STATE_TRANSITIONED,
+            {"from": "DEBATE", "to": "MEDIATION"},
+            at=now,
+        )
+    )
+    plan = Plan(
+        summary="Orphan Plan",
+        rationale="Testing restart",
+        template_id="static-web",
+        deployment_target="static",
+        files=[FileSpec(path="index.html", purpose="UI", contract="Contract")],
+        acceptance_tests=[AcceptanceTest(id="AT-01", type=AcceptanceTestType.UNIT, description="Pass")],
+    )
+    plan_dict = plan.model_dump(mode="json")
+    plan_hash = plan.compute_hash()
+    store.append(
+        create_event(
+            pid,
+            EventType.PLAN_CREATED,
+            {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"},
+            at=now,
+        )
+    )
+    store.append(
+        create_event(
+            pid,
+            EventType.APPROVAL_RECORDED,
+            {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"},
+            at=now,
+        )
+    )
+
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    assert orch.get_status(pid).state == ProjectState.BUILDING
+
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_orphan")
+    runner = FakeRunner(
+        results=[CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True})]
+    )
+    vcs = FakeVCS()
+    code_agent = FakeCodeAgent(
+        test_gen_steps=[{"tests/test_app.py": "def test_ok(): assert True\n"}],
+        impl_steps=[{"index.html": "<!DOCTYPE html><html><body><h1>Done</h1></body></html>\n"}],
+    )
+    worker = BuildWorker(
+        orchestrator=orch,
+        workspace_manager=ws_mgr,
+        code_agent=code_agent,
+        runner=runner,
+        vcs=vcs,
+    )
+    scaffold = TemplateScaffold(
+        workspace_manager=ws_mgr,
+        templates_root=DEFAULT_TEMPLATES_ROOT,
+    )
+
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        build_worker=worker,
+        template_scaffold=scaffold,
+        workspace_manager=ws_mgr,
+    )
+    try:
+        # 1. Check GET /api/projects and GET /api/projects/<id>
+        _, list_res = _http_json(f"{base_url}/api/projects")
+        proj_item = next(p for p in list_res["projects"] if p["project_id"] == pid)
+        assert proj_item["state"] == "BUILDING"
+        assert proj_item["is_running"] is False
+        assert proj_item["last_event_at"] is not None
+
+        _, detail = _http_json(f"{base_url}/api/projects/{pid}")
+        assert detail["status"]["state"] == "BUILDING"
+        assert detail["is_running"] is False
+        assert detail["last_event_at"] is not None
+
+        # 2. POST /api/projects/<id>/retry -> resumes to WAITING_APPROVAL
+        ret_code, ret_res = _http_json(f"{base_url}/api/projects/{pid}/retry", method="POST")
+        assert ret_code == 200
+        assert ret_res["status"]["state"] == "WAITING_APPROVAL"
+        assert ret_res["background_started"] is False
+
+        # 3. POST /api/projects/<id>/approve -> starts background build and delivers project
+        app_code, app_res = _http_json(f"{base_url}/api/projects/{pid}/approve", method="POST")
+        assert app_code == 200
+        assert app_res["background_started"] is True
+        assert server.controller.wait_for_idle(timeout=5.0) is True
+
+        _, final_detail = _http_json(f"{base_url}/api/projects/{pid}")
+        assert final_detail["status"]["state"] == "DELIVERED"
+        assert final_detail["status"]["progress_pct"] == 100
+        assert final_detail["is_running"] is False
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
