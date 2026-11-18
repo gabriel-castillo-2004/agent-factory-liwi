@@ -1,0 +1,325 @@
+"""Unit and offline integration tests for AgyLLMAdapter, FallbackLLMAdapter, and CLI LLM provider wiring (INV-01, INV-02, INV-03, INV-18, INV-19, INV-21, INV-23)."""
+
+import json
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from agent_factory.adapters.agy_llm_adapter import AgyLLMAdapter, FallbackLLMAdapter
+from agent_factory.adapters.fake_runner import FakeRunner
+from agent_factory.cli import (
+    CliConfigError,
+    ProductionLLMAdapter,
+    build_runtime,
+    load_cli_config,
+)
+from agent_factory.domain.models import Plan
+from agent_factory.ports.llm import LLM, LLMError
+from agent_factory.ports.notifier import HttpResponse
+from agent_factory.ports.runner import CommandResult, CommandTimeoutError
+
+
+class _StaticHttpTransport:
+    """Offline scripted HttpTransport returning preconfigured responses."""
+
+    def __init__(self, responses: list[HttpResponse | Exception]) -> None:
+        self._responses = list(responses)
+        self.calls: list[dict[str, Any]] = []
+
+    def post_json(
+        self,
+        url: str,
+        payload: Mapping[str, Any],
+        timeout_seconds: float = 35.0,
+        headers: Mapping[str, str] | None = None,
+    ) -> HttpResponse:
+        self.calls.append(
+            {
+                "url": url,
+                "payload": dict(payload),
+                "timeout_seconds": timeout_seconds,
+                "headers": dict(headers or {}),
+            }
+        )
+        step = self._responses.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        return step
+
+
+def test_agy_llm_adapter_parses_clean_and_fenced_json_and_sanitizes_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AgyLLMAdapter implements LLM protocol, invokes agy via Runner with clean env, includes schema prompt, and parses clean & markdown JSON."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bot123456:SHOULD_NOT_LEAK_TG")
+    monkeypatch.setenv("LLM_API_KEY", "sk-should-not-leak-host-env")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_shouldNotLeakEnvToken123")
+    monkeypatch.setenv("CUSTOM_SECRET", "super-secret-val")
+    monkeypatch.setenv("AGY_HOME", str(tmp_path / "agy_home"))
+
+    runner = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=0,
+                stdout='{"questions": ["¿Cuál es el nombre?"], "is_complete": false}',
+            ),
+            CommandResult(
+                exit_code=0,
+                stdout=(
+                    "Aquí tienes el plan solicitado:\n"
+                    "```json\n"
+                    '{"summary": "Mini CRM", "template_id": "static-web", "files": []}\n'
+                    "```\n"
+                ),
+            ),
+        ]
+    )
+    adapter = AgyLLMAdapter(runner=runner, cwd=tmp_path)
+    assert isinstance(adapter, LLM)
+
+    out_clean = adapter.complete(
+        [
+            {"role": "system", "content": "Eres entrevistador."},
+            {"role": "user", "content": "Quiero un CRM simple."},
+        ]
+    )
+    assert out_clean == {"questions": ["¿Cuál es el nombre?"], "is_complete": False}
+
+    call1 = runner.calls[0]
+    assert call1["command"][0] == "agy"
+    assert call1["cwd"] == tmp_path.resolve()
+    prompt1 = " ".join(call1["command"])
+    assert "Eres entrevistador." in prompt1
+    assert "Quiero un CRM simple." in prompt1
+
+    env1 = call1["env"]
+    assert env1 is not None
+    assert "TELEGRAM_BOT_TOKEN" not in env1
+    assert "LLM_API_KEY" not in env1
+    assert "GITHUB_TOKEN" not in env1
+    assert "CUSTOM_SECRET" not in env1
+    assert env1.get("AGY_HOME") == str(tmp_path / "agy_home")
+
+    out_fenced = adapter.complete(
+        [
+            {"role": "system", "content": "Eres mediador."},
+            {"role": "user", "content": "Genera el Plan."},
+        ],
+        schema=Plan,
+    )
+    assert out_fenced == {"summary": "Mini CRM", "template_id": "static-web", "files": []}
+
+    prompt2 = " ".join(runner.calls[1]["command"])
+    assert "JSON" in prompt2
+    assert "acceptance_tests" in prompt2
+    assert "template_id" in prompt2
+
+
+def test_agy_llm_adapter_errors_redact_secrets_and_clear_cause_context(tmp_path: Path) -> None:
+    """Non-zero exit code, timeout, OSError, non-JSON, empty, or non-dict JSON all raise LLMError with redacted secrets and clean exception chain."""
+    secret_val = "AGY_TEST_SECRET_998877"
+    runner = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=1,
+                stdout="",
+                stderr=f"Auth failure using token={secret_val}",
+            ),
+            CommandTimeoutError(f"Timed out with {secret_val}"),
+            CommandResult(exit_code=0, stdout="", timed_out=True),
+            CommandResult(exit_code=0, stdout="Esto no es JSON válido"),
+            CommandResult(exit_code=0, stdout="   \n  "),
+            CommandResult(exit_code=0, stdout='["not", "a", "dict"]'),
+            OSError(f"Cannot execute agy with {secret_val}"),
+        ]
+    )
+    adapter = AgyLLMAdapter(
+        runner=runner,
+        cwd=tmp_path,
+        secrets=(secret_val,),
+    )
+
+    for _ in range(7):
+        with pytest.raises(LLMError) as exc_info:
+            adapter.complete([{"role": "user", "content": "hola"}])
+        assert secret_val not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+
+def test_fallback_llm_adapter_delegates_only_on_llm_error(tmp_path: Path) -> None:
+    """FallbackLLMAdapter returns primary response when healthy and switches to AgyLLMAdapter on LLMError without chaining __context__."""
+    secret_val = "FALLBACK_SECRET_554433"
+    ok_transport = _StaticHttpTransport(
+        responses=[
+            HttpResponse(
+                status_code=200,
+                body=json.dumps({"choices": [{"message": {"content": '{"source": "api"}'}}]}),
+            )
+        ]
+    )
+    models_toml = tmp_path / "models.toml"
+    models_toml.write_text('[models]\nfast = "fast-m"\nstrong = "strong-m"\n', encoding="utf-8")
+
+    primary_ok = ProductionLLMAdapter(
+        api_key=secret_val,
+        models_config_path=models_toml,
+        transport=ok_transport,
+        secrets=(secret_val,),
+    )
+    runner_unused = FakeRunner(results=[CommandResult(exit_code=0, stdout='{"source": "agy"}')])
+    fallback_unused = AgyLLMAdapter(runner=runner_unused, cwd=tmp_path, secrets=(secret_val,))
+    combo_ok = FallbackLLMAdapter(primary=primary_ok, fallback=fallback_unused)
+
+    assert combo_ok.transport is ok_transport
+    assert combo_ok.complete([{"role": "user", "content": "hola"}]) == {"source": "api"}
+    assert len(runner_unused.calls) == 0
+
+    # Primary raises LLMError -> automatically falls back to AgyLLMAdapter
+    fail_transport = _StaticHttpTransport(
+        responses=[
+            HttpResponse(status_code=503, body="Service Unavailable"),
+            HttpResponse(status_code=503, body="Still down"),
+        ]
+    )
+    primary_fail = ProductionLLMAdapter(
+        api_key=secret_val,
+        models_config_path=models_toml,
+        transport=fail_transport,
+        secrets=(secret_val,),
+    )
+    runner_fb = FakeRunner(
+        results=[
+            CommandResult(exit_code=0, stdout='```json\n{"source": "agy", "ok": true}\n```'),
+            CommandResult(exit_code=1, stdout="", stderr=f"agy crash {secret_val}"),
+        ]
+    )
+    fallback_agy = AgyLLMAdapter(runner=runner_fb, cwd=tmp_path, secrets=(secret_val,))
+    combo_fb = FallbackLLMAdapter(primary=primary_fail, fallback=fallback_agy)
+
+    res = combo_fb.complete([{"role": "user", "content": "hola"}], schema={"type": "object"})
+    assert res == {"source": "agy", "ok": True}
+    assert len(runner_fb.calls) == 1
+
+    # When fallback ALSO fails, clean LLMError is raised with no __cause__/__context__ and secrets redacted
+    with pytest.raises(LLMError) as both_err:
+        combo_fb.complete([{"role": "user", "content": "hola"}])
+    assert secret_val not in str(both_err.value)
+    assert both_err.value.__cause__ is None
+    assert both_err.value.__context__ is None
+
+
+def test_cli_config_and_build_runtime_llm_provider_modes_and_env_example(tmp_path: Path) -> None:
+    """CLI wiring supports LLM_PROVIDER=agy (no API key/models.toml), auto with/without fallback, api-only, and fail-closed invalid values."""
+    tg_tok = "TEST_AGY_CLI_TG_TOK_123"
+    llm_key = "TEST_AGY_CLI_KEY_456"
+
+    limits_toml = tmp_path / "limits.toml"
+    limits_toml.write_text(
+        "INTERVIEW = 6\nDEBATE = 3\nMEDIATION = 2\nBUILDING = 15\nci_rounds = 3\n",
+        encoding="utf-8",
+    )
+    unconfigured_models = tmp_path / "unconfigured_models.toml"
+    unconfigured_models.write_text('INTERVIEW = "CONFIGURE_ME"\n', encoding="utf-8")
+
+    # 1. LLM_PROVIDER=agy works WITHOUT LLM_API_KEY and WITHOUT valid models.toml
+    agy_env = {
+        "TELEGRAM_BOT_TOKEN": tg_tok,
+        "ALLOWED_CHAT_IDS": "1001",
+        "ALLOWED_USER_IDS": "2001",
+        "LLM_PROVIDER": "agy",
+        "AGENT_FACTORY_DB_PATH": str(tmp_path / "agy.db"),
+        "AGENT_FACTORY_WORKSPACES_DIR": str(tmp_path / "ws_agy"),
+        "AGENT_FACTORY_REGISTRY_REPO": str(tmp_path / "origin.git"),
+        "AGENT_FACTORY_MODELS_CONFIG": str(unconfigured_models),
+        "AGENT_FACTORY_LIMITS_CONFIG": str(limits_toml),
+    }
+    cfg_agy = load_cli_config(agy_env)
+    assert cfg_agy.llm_provider == "agy"
+
+    agy_runner = FakeRunner(results=[CommandResult(exit_code=0, stdout='{"via": "agy"}')])
+    rt_agy = build_runtime(cfg_agy, runner=agy_runner)
+    try:
+        assert isinstance(rt_agy.llm, AgyLLMAdapter)
+        assert rt_agy.llm.complete([{"role": "user", "content": "ping"}]) == {"via": "agy"}
+        assert len(agy_runner.calls) == 1
+    finally:
+        rt_agy.store.close()
+
+    # 2. LLM_PROVIDER=auto (default) + LLM_API_KEY + LLM_FALLBACK_TO_AGY=true (default) -> FallbackLLMAdapter
+    valid_models = tmp_path / "valid_models.toml"
+    valid_models.write_text('[models]\nfast = "m-fast"\nstrong = "m-strong"\n', encoding="utf-8")
+    auto_env = {
+        "TELEGRAM_BOT_TOKEN": tg_tok,
+        "ALLOWED_CHAT_IDS": "1001",
+        "ALLOWED_USER_IDS": "2001",
+        "LLM_API_KEY": llm_key,
+        "AGENT_FACTORY_DB_PATH": str(tmp_path / "auto.db"),
+        "AGENT_FACTORY_WORKSPACES_DIR": str(tmp_path / "ws_auto"),
+        "AGENT_FACTORY_REGISTRY_REPO": str(tmp_path / "origin.git"),
+        "AGENT_FACTORY_MODELS_CONFIG": str(valid_models),
+        "AGENT_FACTORY_LIMITS_CONFIG": str(limits_toml),
+    }
+    cfg_auto = load_cli_config(auto_env)
+    assert cfg_auto.llm_provider == "auto"
+    assert cfg_auto.llm_fallback_to_agy is True
+
+    failing_http = _StaticHttpTransport(responses=[HttpResponse(status_code=502, body="Bad Gateway")])
+    fb_runner = FakeRunner(results=[CommandResult(exit_code=0, stdout='{"via": "fallback-agy"}')])
+    rt_auto = build_runtime(cfg_auto, runner=fb_runner, transport=failing_http)
+    try:
+        assert isinstance(rt_auto.llm, FallbackLLMAdapter)
+        assert rt_auto.llm.complete([{"role": "user", "content": "hola"}]) == {
+            "via": "fallback-agy"
+        }
+        assert len(failing_http.calls) == 1
+        assert len(fb_runner.calls) == 1
+    finally:
+        rt_auto.store.close()
+
+    # 3. LLM_PROVIDER=auto with LLM_FALLBACK_TO_AGY=false -> ProductionLLMAdapter only (no fallback)
+    no_fb_env = dict(auto_env)
+    no_fb_env["LLM_FALLBACK_TO_AGY"] = "false"
+    no_fb_env["AGENT_FACTORY_DB_PATH"] = str(tmp_path / "nofb.db")
+    cfg_no_fb = load_cli_config(no_fb_env)
+    assert cfg_no_fb.llm_fallback_to_agy is False
+
+    failing_http2 = _StaticHttpTransport(responses=[HttpResponse(status_code=502, body="Bad Gateway")])
+    unused_runner = FakeRunner(results=[CommandResult(exit_code=0, stdout='{"via": "agy"}')])
+    rt_no_fb = build_runtime(cfg_no_fb, runner=unused_runner, transport=failing_http2)
+    try:
+        assert isinstance(rt_no_fb.llm, ProductionLLMAdapter)
+        with pytest.raises(LLMError):
+            rt_no_fb.llm.complete([{"role": "user", "content": "hola"}])
+        assert len(unused_runner.calls) == 0
+    finally:
+        rt_no_fb.store.close()
+
+    # 4. LLM_PROVIDER=api without LLM_API_KEY fails closed with CliConfigError
+    api_no_key_env = dict(agy_env)
+    api_no_key_env["LLM_PROVIDER"] = "api"
+    api_no_key_env["AGENT_FACTORY_DB_PATH"] = str(tmp_path / "apifail.db")
+    cfg_api_no_key = load_cli_config(api_no_key_env)
+    with pytest.raises(CliConfigError):
+        build_runtime(cfg_api_no_key)
+
+    # 5. Invalid LLM_PROVIDER or LLM_FALLBACK_TO_AGY fail closed without leaking token
+    for bad_key, bad_val in (
+        ("LLM_PROVIDER", f"invalid_{tg_tok}"),
+        ("LLM_FALLBACK_TO_AGY", f"maybe_{tg_tok}"),
+    ):
+        bad_env = dict(auto_env)
+        bad_env[bad_key] = bad_val
+        with pytest.raises(CliConfigError) as err_cfg:
+            load_cli_config(bad_env)
+        assert tg_tok not in str(err_cfg.value)
+        assert err_cfg.value.__cause__ is None
+        assert err_cfg.value.__context__ is None
+
+    # 6. .env.example documents LLM_PROVIDER and LLM_FALLBACK_TO_AGY
+    env_example = (Path(__file__).resolve().parent.parent / ".env.example").read_text(encoding="utf-8")
+    assert "LLM_PROVIDER=" in env_example
+    assert "LLM_FALLBACK_TO_AGY=" in env_example

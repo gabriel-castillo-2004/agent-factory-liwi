@@ -17,6 +17,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_factory.adapters.agy_cli_adapter import AgyCliAdapter
+from agent_factory.adapters.agy_llm_adapter import AgyLLMAdapter, FallbackLLMAdapter
 from agent_factory.adapters.git_registry_publisher import GitRegistryPublisher
 from agent_factory.adapters.github_vcs_adapter import GitHubVCSAdapter
 from agent_factory.adapters.sqlite_store import SqliteEventStore
@@ -281,6 +282,8 @@ class CliConfig(BaseModel):
     github_token: str = ""
     vercel_token: str = ""
     llm_api_key: str = ""
+    llm_provider: str = "auto"
+    llm_fallback_to_agy: bool = True
 
 
 class RuntimeBundle(BaseModel):
@@ -413,6 +416,32 @@ def load_cli_config(env: Mapping[str, str] | None = None) -> CliConfig:
     vercel_token = effective.get("VERCEL_TOKEN", "").strip()
     llm_api_key = effective.get("LLM_API_KEY", "").strip()
 
+    raw_provider = effective.get("LLM_PROVIDER", "auto").strip().lower() or "auto"
+    if raw_provider not in {"auto", "api", "agy"}:
+        clean_err = redact_secrets(
+            f"Invalid LLM_PROVIDER '{raw_provider}': expected auto, api, or agy",
+            extra_secrets=(token,) if token else (),
+        )
+        err_provider = CliConfigError(clean_err)
+        err_provider.__cause__ = None
+        err_provider.__context__ = None
+        raise err_provider
+
+    raw_fallback = effective.get("LLM_FALLBACK_TO_AGY", "true").strip().lower() or "true"
+    if raw_fallback in {"1", "true", "yes", "on"}:
+        llm_fallback_to_agy = True
+    elif raw_fallback in {"0", "false", "no", "off"}:
+        llm_fallback_to_agy = False
+    else:
+        clean_err = redact_secrets(
+            f"Invalid LLM_FALLBACK_TO_AGY '{raw_fallback}': expected boolean",
+            extra_secrets=(token,) if token else (),
+        )
+        err_fb = CliConfigError(clean_err)
+        err_fb.__cause__ = None
+        err_fb.__context__ = None
+        raise err_fb
+
     return CliConfig(
         telegram_bot_token=token,
         allowed_chat_ids=allowed_chats,
@@ -431,7 +460,65 @@ def load_cli_config(env: Mapping[str, str] | None = None) -> CliConfig:
         github_token=github_token,
         vercel_token=vercel_token,
         llm_api_key=llm_api_key,
+        llm_provider=raw_provider,
+        llm_fallback_to_agy=llm_fallback_to_agy,
     )
+
+
+def _validate_models_toml(models_config_path: Path) -> None:
+    """Validate that models.toml exists, contains valid model mappings, and has no placeholders."""
+    if not models_config_path.is_file():
+        raise CliConfigError(f"Models configuration file not found: {models_config_path}")
+
+    try:
+        with models_config_path.open("rb") as f:
+            models_data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        err = CliConfigError(f"Failed to parse models configuration: {exc}")
+        err.__cause__ = None
+        err.__context__ = None
+        raise err
+
+    if not isinstance(models_data, dict) or not models_data:
+        raise CliConfigError(f"Models configuration file is empty or invalid: {models_config_path}")
+
+    models_section = models_data.get("models")
+    if isinstance(models_section, dict):
+        if not models_section:
+            raise CliConfigError("models.toml missing required non-empty [models] section")
+        models_cfg = models_section
+    else:
+        known_keys = {
+            "fast",
+            "strong",
+            "interview",
+            "debate",
+            "mediation",
+            "building",
+            "waiting_approval",
+            "verifying",
+            "delivered",
+            "failed",
+            "idle",
+            "change_request",
+        }
+        if not any(k.lower() in known_keys for k in models_data):
+            raise CliConfigError(
+                "models.toml missing required non-empty [models] section or model keys"
+            )
+        models_cfg = models_data
+
+    for state_key, model_val in models_cfg.items():
+        if str(model_val).strip().upper() == "CONFIGURE_ME":
+            raise CliConfigError(
+                f"Models configuration contains unconfigured placeholder 'CONFIGURE_ME' for {state_key}"
+            )
+
+    for state_key, model_val in models_data.items():
+        if str(model_val).strip().upper() == "CONFIGURE_ME":
+            raise CliConfigError(
+                f"Models configuration contains unconfigured placeholder 'CONFIGURE_ME' for {state_key}"
+            )
 
 
 def build_runtime(
@@ -452,89 +539,52 @@ def build_runtime(
             f"Limits configuration file not found: {config.limits_config_path}"
         )
 
-    if llm is None:
-        if not config.llm_api_key:
-            raise CliConfigError("Missing required environment variable LLM_API_KEY")
-
-        if not config.models_config_path.is_file():
-            raise CliConfigError(
-                f"Models configuration file not found: {config.models_config_path}"
-            )
-
-        try:
-            with config.models_config_path.open("rb") as f:
-                models_data = tomllib.load(f)
-        except (OSError, tomllib.TOMLDecodeError) as exc:
-            err = CliConfigError(f"Failed to parse models configuration: {exc}")
-            err.__cause__ = None
-            err.__context__ = None
-            raise err
-
-        if not isinstance(models_data, dict) or not models_data:
-            raise CliConfigError(
-                f"Models configuration file is empty or invalid: {config.models_config_path}"
-            )
-
-        models_section = models_data.get("models")
-        if isinstance(models_section, dict):
-            if not models_section:
-                raise CliConfigError("models.toml missing required non-empty [models] section")
-            models_cfg = models_section
-        else:
-            known_keys = {
-                "fast",
-                "strong",
-                "interview",
-                "debate",
-                "mediation",
-                "building",
-                "waiting_approval",
-                "verifying",
-                "delivered",
-                "failed",
-                "idle",
-                "change_request",
-            }
-            if not any(k.lower() in known_keys for k in models_data):
-                raise CliConfigError(
-                    "models.toml missing required non-empty [models] section or model keys"
-                )
-            models_cfg = models_data
-
-        for state_key, model_val in models_cfg.items():
-            if str(model_val).strip().upper() == "CONFIGURE_ME":
-                raise CliConfigError(
-                    f"Models configuration contains unconfigured placeholder 'CONFIGURE_ME' for {state_key}"
-                )
-
-        for state_key, model_val in models_data.items():
-            if str(model_val).strip().upper() == "CONFIGURE_ME":
-                raise CliConfigError(
-                    f"Models configuration contains unconfigured placeholder 'CONFIGURE_ME' for {state_key}"
-                )
-
     active_secrets = tuple(
         s for s in (config.telegram_bot_token, config.github_token, config.vercel_token, config.llm_api_key) if s
     )
 
     effective_transport = transport if transport is not None else UrllibHttpTransport()
+    effective_runner = runner if runner is not None else SubprocessRunner()
 
     if llm is not None:
         effective_llm = llm
     else:
-        effective_llm = ProductionLLMAdapter(
-            api_key=config.llm_api_key,
-            models_config_path=config.models_config_path,
-            transport=effective_transport,
-            secrets=active_secrets,
-        )
+        provider = (config.llm_provider or "auto").strip().lower() or "auto"
+        if provider not in {"auto", "api", "agy"}:
+            raise CliConfigError(
+                f"Invalid LLM_PROVIDER '{config.llm_provider}': expected auto, api, or agy"
+            )
+        if provider == "agy":
+            effective_llm = AgyLLMAdapter(
+                runner=effective_runner,
+                cwd=config.workspaces_dir,
+                secrets=active_secrets,
+            )
+        else:
+            if not config.llm_api_key:
+                raise CliConfigError("Missing required environment variable LLM_API_KEY")
+            _validate_models_toml(config.models_config_path)
+            primary_llm = ProductionLLMAdapter(
+                api_key=config.llm_api_key,
+                models_config_path=config.models_config_path,
+                transport=effective_transport,
+                secrets=active_secrets,
+            )
+            if provider == "auto" and config.llm_fallback_to_agy:
+                agy_fallback = AgyLLMAdapter(
+                    runner=effective_runner,
+                    cwd=config.workspaces_dir,
+                    secrets=active_secrets,
+                )
+                effective_llm = FallbackLLMAdapter(primary=primary_llm, fallback=agy_fallback)
+            else:
+                effective_llm = primary_llm
 
     config.db_path.parent.mkdir(parents=True, exist_ok=True)
     config.workspaces_dir.mkdir(parents=True, exist_ok=True)
 
     store = SqliteEventStore(db_path=config.db_path)
     try:
-        effective_runner = runner if runner is not None else SubprocessRunner()
         circuit_breaker = CircuitBreaker(config_path=config.limits_config_path)
 
         effective_registry = (
