@@ -49,11 +49,11 @@ class _StaticHttpTransport:
         return step
 
 
-def test_agy_llm_adapter_returns_plain_text_without_schema_and_parses_json_with_schema(
+def test_agy_llm_adapter_enforces_json_dict_with_and_without_schema(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AgyLLMAdapter returns clean plain text when schema is None (without JSON instruction) and parses clean/fenced JSON dict when schema is provided."""
+    """AgyLLMAdapter injects strict JSON object instructions and returns parsed JSON dict both with and without schema (raising on plain non-JSON text)."""
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bot123456:SHOULD_NOT_LEAK_TG")
     monkeypatch.setenv("LLM_API_KEY", "sk-should-not-leak-host-env")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_shouldNotLeakEnvToken123")
@@ -64,7 +64,7 @@ def test_agy_llm_adapter_returns_plain_text_without_schema_and_parses_json_with_
         results=[
             CommandResult(
                 exit_code=0,
-                stdout="  ¡Hola! ¿Qué funcionalidades necesitas en tu CRM?  \n",
+                stdout='{"questions": ["¿Qué funcionalidades necesitas en tu CRM?"]}',
             ),
             CommandResult(
                 exit_code=0,
@@ -79,21 +79,25 @@ def test_agy_llm_adapter_returns_plain_text_without_schema_and_parses_json_with_
                     "```\n"
                 ),
             ),
+            CommandResult(
+                exit_code=0,
+                stdout="¡Hola! Esto es texto plano no JSON.",
+            ),
         ]
     )
     adapter = AgyLLMAdapter(runner=runner, cwd=tmp_path)
     assert isinstance(adapter, LLM)
 
-    # 1. schema=None -> plain natural text str, no forced JSON instruction
-    out_text = adapter.complete(
+    # 1. schema=None -> strict JSON instruction injected and returns parsed dict
+    out_dict = adapter.complete(
         [
             {"role": "system", "content": "Eres entrevistador."},
             {"role": "user", "content": "Quiero un CRM simple."},
         ],
         schema=None,
     )
-    assert out_text == "¡Hola! ¿Qué funcionalidades necesitas en tu CRM?"
-    assert isinstance(out_text, str)
+    assert out_dict == {"questions": ["¿Qué funcionalidades necesitas en tu CRM?"]}
+    assert isinstance(out_dict, dict)
 
     call1 = runner.calls[0]
     assert call1["command"][0] == "agy"
@@ -101,7 +105,8 @@ def test_agy_llm_adapter_returns_plain_text_without_schema_and_parses_json_with_
     prompt1 = " ".join(call1["command"])
     assert "Eres entrevistador." in prompt1
     assert "Quiero un CRM simple." in prompt1
-    assert "Respond ONLY with a valid JSON object" not in prompt1
+    assert "Respond ONLY with a valid JSON object." in prompt1
+    assert "JSON Schema:" not in prompt1
 
     env1 = call1["env"]
     assert env1 is not None
@@ -111,12 +116,15 @@ def test_agy_llm_adapter_returns_plain_text_without_schema_and_parses_json_with_
     assert "CUSTOM_SECRET" not in env1
     assert env1.get("AGY_HOME") == str(tmp_path / "agy_home")
 
-    # 2. schema dict -> clean JSON dict
+    # 2. schema dict -> clean JSON dict + schema block
     out_clean_json = adapter.complete(
         [{"role": "user", "content": "Propón arquitectura."}],
         schema={"type": "object"},
     )
     assert out_clean_json == {"approach": "Modular JS", "components": ["ui"], "tradeoffs": []}
+    prompt2 = " ".join(runner.calls[1]["command"])
+    assert "Respond ONLY with a valid JSON object matching the requested schema." in prompt2
+    assert "JSON Schema:" in prompt2
 
     # 3. schema Pydantic -> markdown-fenced JSON dict + schema instructions
     out_fenced = adapter.complete(
@@ -129,13 +137,17 @@ def test_agy_llm_adapter_returns_plain_text_without_schema_and_parses_json_with_
     assert out_fenced == {"summary": "Mini CRM", "template_id": "static-web", "files": []}
 
     prompt3 = " ".join(runner.calls[2]["command"])
-    assert "Respond ONLY with a valid JSON object" in prompt3
+    assert "Respond ONLY with a valid JSON object matching the requested schema." in prompt3
     assert "acceptance_tests" in prompt3
     assert "template_id" in prompt3
 
+    # 4. schema=None but non-JSON plain text response -> raises InvalidLLMResponseError
+    with pytest.raises(InvalidLLMResponseError):
+        adapter.complete([{"role": "user", "content": "Quiero algo"}], schema=None)
+
 
 def test_agy_llm_adapter_errors_redact_secrets_and_clear_cause_context(tmp_path: Path) -> None:
-    """Empty stdout (with or without schema), non-JSON/non-dict with schema, exit_code != 0, timeouts, and OSError raise LLMError/InvalidLLMResponseError cleanly."""
+    """Empty stdout, non-JSON/non-dict (with or without schema), exit_code != 0, timeouts, and OSError raise LLMError/InvalidLLMResponseError cleanly."""
     secret_val = "AGY_TEST_SECRET_998877"
     runner = FakeRunner(
         results=[
@@ -148,8 +160,8 @@ def test_agy_llm_adapter_errors_redact_secrets_and_clear_cause_context(tmp_path:
             CommandResult(exit_code=0, stdout="", timed_out=True),
             CommandResult(exit_code=0, stdout="   \n  "),
             OSError(f"Cannot execute agy with {secret_val}"),
-            CommandResult(exit_code=0, stdout="Esto no es JSON válido"),
-            CommandResult(exit_code=0, stdout='["not", "a", "dict"]'),
+            CommandResult(exit_code=0, stdout=f"Esto no es JSON válido con {secret_val}"),
+            CommandResult(exit_code=0, stdout=f'["not", "a", "dict", "{secret_val}"]'),
             CommandResult(exit_code=0, stdout="   "),
         ]
     )
@@ -159,17 +171,17 @@ def test_agy_llm_adapter_errors_redact_secrets_and_clear_cause_context(tmp_path:
         secrets=(secret_val,),
     )
 
-    # First 5 fail even with schema=None (process/timeout/OS errors + empty output)
-    for idx in range(5):
-        expected_cls = InvalidLLMResponseError if idx == 3 else LLMError
+    # First 6 fail even with schema=None (process/timeout/OS errors + empty output + non-JSON text)
+    for idx in range(6):
+        expected_cls = InvalidLLMResponseError if idx in (3, 5) else LLMError
         with pytest.raises(expected_cls) as exc_info:
             adapter.complete([{"role": "user", "content": "hola"}], schema=None)
         assert secret_val not in str(exc_info.value)
         assert exc_info.value.__cause__ is None
         assert exc_info.value.__context__ is None
 
-    # Remaining 3 fail with InvalidLLMResponseError when schema is provided
-    for _ in range(3):
+    # Remaining 2 fail with InvalidLLMResponseError when schema is provided
+    for _ in range(2):
         with pytest.raises(InvalidLLMResponseError) as exc_info:
             adapter.complete([{"role": "user", "content": "hola"}], schema={"type": "object"})
         assert isinstance(exc_info.value, LLMError)
@@ -222,7 +234,7 @@ def test_fallback_llm_adapter_delegates_only_on_llm_error(tmp_path: Path) -> Non
     )
     runner_fb = FakeRunner(
         results=[
-            CommandResult(exit_code=0, stdout="Respuesta en texto natural desde agy"),
+            CommandResult(exit_code=0, stdout='{"answer": "Respuesta en JSON desde agy"}'),
             CommandResult(exit_code=0, stdout='```json\n{"source": "agy", "ok": true}\n```'),
             CommandResult(exit_code=1, stdout="", stderr=f"agy crash {secret_val}"),
         ]
@@ -230,8 +242,8 @@ def test_fallback_llm_adapter_delegates_only_on_llm_error(tmp_path: Path) -> Non
     fallback_agy = AgyLLMAdapter(runner=runner_fb, cwd=tmp_path, secrets=(secret_val,))
     combo_fb = FallbackLLMAdapter(primary=primary_fail, fallback=fallback_agy)
 
-    res_text = combo_fb.complete([{"role": "user", "content": "hola"}], schema=None)
-    assert res_text == "Respuesta en texto natural desde agy"
+    res_dict = combo_fb.complete([{"role": "user", "content": "hola"}], schema=None)
+    assert res_dict == {"answer": "Respuesta en JSON desde agy"}
 
     res_json = combo_fb.complete([{"role": "user", "content": "hola"}], schema={"type": "object"})
     assert res_json == {"source": "agy", "ok": True}
@@ -275,14 +287,14 @@ def test_cli_config_and_build_runtime_llm_provider_modes_and_env_example(tmp_pat
 
     agy_runner = FakeRunner(
         results=[
-            CommandResult(exit_code=0, stdout="Hola desde agy"),
+            CommandResult(exit_code=0, stdout='{"greeting": "Hola desde agy"}'),
             CommandResult(exit_code=0, stdout='{"via": "agy"}'),
         ]
     )
     rt_agy = build_runtime(cfg_agy, runner=agy_runner)
     try:
         assert isinstance(rt_agy.llm, AgyLLMAdapter)
-        assert rt_agy.llm.complete([{"role": "user", "content": "ping"}]) == "Hola desde agy"
+        assert rt_agy.llm.complete([{"role": "user", "content": "ping"}]) == {"greeting": "Hola desde agy"}
         assert rt_agy.llm.complete(
             [{"role": "user", "content": "ping"}],
             schema={"type": "object"},

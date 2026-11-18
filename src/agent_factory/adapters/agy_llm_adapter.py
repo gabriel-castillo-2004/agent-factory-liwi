@@ -33,7 +33,7 @@ def _build_combined_prompt(
     messages: list[dict[str, str]],
     schema: type[BaseModel] | dict[str, Any] | None = None,
 ) -> str:
-    """Format system/user messages and optional strict JSON schema instruction into a single prompt."""
+    """Format system/user messages and strict JSON instruction into a single prompt."""
     sections: list[str] = []
     for msg in messages:
         role = str(msg.get("role", "user")).strip().upper() or "USER"
@@ -52,6 +52,12 @@ def _build_combined_prompt(
             "Respond ONLY with a valid JSON object matching the requested schema. "
             "Do not include explanations or text outside the JSON object."
             + schema_block
+        )
+    else:
+        sections.append(
+            "[INSTRUCTIONS]\n"
+            "Respond ONLY with a valid JSON object. "
+            "Do not include explanations or text outside the JSON object."
         )
 
     return "\n\n".join(sections)
@@ -129,8 +135,8 @@ class AgyLLMAdapter:
         self,
         messages: list[dict[str, str]],
         schema: type[BaseModel] | dict[str, Any] | None = None,
-    ) -> dict[str, Any] | str:
-        """Invoke `agy` CLI with combined prompt; return parsed JSON dict if schema is set or clean text otherwise."""
+    ) -> dict[str, Any]:
+        """Invoke `agy` CLI with combined prompt and return parsed JSON dict (INV-02, INV-18)."""
         prompt = _build_combined_prompt(messages, schema=schema)
         command = list(self.cli_command) + ["-p", prompt]
         clean_env = self.build_clean_env()
@@ -165,12 +171,6 @@ class AgyLLMAdapter:
                 else f"agy CLI exited with code {res.exit_code}"
             )
 
-        if schema is None:
-            text = res.stdout.strip()
-            if not text:
-                self._raise_error("agy CLI returned empty output", invalid_response=True)
-            return text
-
         return self._parse_json_dict(res.stdout)
 
 
@@ -190,7 +190,7 @@ class FallbackLLMAdapter:
         self,
         messages: list[dict[str, str]],
         schema: type[BaseModel] | dict[str, Any] | None = None,
-    ) -> dict[str, Any] | str:
+    ) -> dict[str, Any]:
         """Call primary.complete(...) and delegate to fallback.complete(...) on LLMError."""
         primary_failed = False
         try:
