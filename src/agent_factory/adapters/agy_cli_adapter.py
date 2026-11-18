@@ -45,6 +45,28 @@ FORBIDDEN_SECRET_ENV_SUBSTRINGS: tuple[str, ...] = (
 )
 
 
+def build_sanitized_cli_env(
+    allowed_cli_env_keys: Sequence[str] = ("AGY_HOME", "AGY_CONFIG_DIR"),
+    host_env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Construct a sanitized environment keeping only whitelisted variables and stripping host secrets (INV-19)."""
+    source = os.environ if host_env is None else host_env
+    clean_env: dict[str, str] = {}
+    allowed_sys_upper = {k.upper() for k in ALLOWED_SYSTEM_ENV_VARS}
+    allowed_cli_upper = {k.upper() for k in allowed_cli_env_keys}
+
+    for k, v in source.items():
+        k_upper = k.upper()
+        if any(sub in k_upper for sub in FORBIDDEN_SECRET_ENV_SUBSTRINGS):
+            continue
+        if k_upper in allowed_sys_upper:
+            canonical_k = "PATH" if k_upper == "PATH" else k
+            clean_env[canonical_k] = v
+        elif k_upper in allowed_cli_upper or k in allowed_cli_env_keys:
+            clean_env[k] = v
+    return clean_env
+
+
 class AgyCliAdapter(CodeAgent):
     """Executes the local CLI code agent inside an isolated workspace with a clean environment."""
 
@@ -94,21 +116,7 @@ class AgyCliAdapter(CodeAgent):
         host_env: Mapping[str, str] | None = None,
     ) -> dict[str, str]:
         """Construct a sanitized environment dictionary keeping only whitelisted variables and stripping host secrets (INV-19)."""
-        source = os.environ if host_env is None else host_env
-        clean_env: dict[str, str] = {}
-        allowed_sys_upper = {k.upper() for k in ALLOWED_SYSTEM_ENV_VARS}
-        allowed_cli_upper = {k.upper() for k in self.allowed_cli_env_keys}
-
-        for k, v in source.items():
-            k_upper = k.upper()
-            if any(sub in k_upper for sub in FORBIDDEN_SECRET_ENV_SUBSTRINGS):
-                continue
-            if k_upper in allowed_sys_upper:
-                canonical_k = "PATH" if k_upper == "PATH" else k
-                clean_env[canonical_k] = v
-            elif k_upper in allowed_cli_upper or k in self.allowed_cli_env_keys:
-                clean_env[k] = v
-        return clean_env
+        return build_sanitized_cli_env(self.allowed_cli_env_keys, host_env=host_env)
 
     def build_test_generation_payload(
         self,
