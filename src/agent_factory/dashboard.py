@@ -961,6 +961,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <span id="detail-badge" class="badge"></span>
         </div>
         <div class="progress-track"><div id="detail-progress" class="progress-fill" style="width:0%"></div></div>
+        <div id="detail-time" class="muted" style="font-size:0.78rem; margin:-2px 0 10px 0; text-align:right;"></div>
 
         <div id="detail-guidance"></div>
 
@@ -1016,6 +1017,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           return { step: 'Necesita atención', cls: 'badge-err' };
         default:
           return { step: st || 'Iniciando', cls: 'badge-info' };
+      }
+    }
+
+    function formatFriendlyTime(isoString) {
+      if (!isoString) return '';
+      const d = new Date(isoString);
+      if (isNaN(d.getTime())) return String(isoString);
+      try {
+        const timeStr = d.toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' });
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const targetDate = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+        const diffDays = Math.round((today - targetDate) / (1000 * 60 * 60 * 24));
+        if (diffDays === 0) {
+          return 'Hoy, ' + timeStr;
+        } else if (diffDays === 1) {
+          return 'Ayer, ' + timeStr;
+        } else {
+          const datePart = d.toLocaleDateString('es-MX', { day: 'numeric', month: 'short' }).replace('.', '');
+          return datePart + ', ' + timeStr;
+        }
+      } catch (_) {
+        return String(isoString);
       }
     }
 
@@ -1083,12 +1107,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const title = escapeHtml(p.name || p.objective || p.project_id);
         const pct = Number(p.progress_pct || 0);
         const busyTag = p.busy ? ' <span class="busy-pill">(en curso)</span>' : '';
+        const timeHtml = p.last_event_at
+          ? '<div class="muted" style="font-size:0.75rem; margin-top:4px; text-align:right;" title="' + escapeHtml(p.last_event_at) + '">' + escapeHtml(formatFriendlyTime(p.last_event_at)) + '</div>'
+          : '';
         return '<div class="project-card ' + selected + '" data-id="' + escapeHtml(p.project_id) + '">' +
           '<div class="card-header">' +
             '<div class="card-title">' + title + busyTag + '</div>' +
             '<span class="badge ' + info.cls + '">' + escapeHtml(info.step) + '</span>' +
           '</div>' +
           '<div class="progress-track"><div class="progress-fill" style="width:' + pct + '%"></div></div>' +
+          timeHtml +
         '</div>';
       }).join('');
 
@@ -1143,6 +1171,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       badge.textContent = info.step + ' (' + (st.progress_pct || 0) + '%)';
       badge.className = 'badge ' + info.cls;
       document.getElementById('detail-progress').style.width = Number(st.progress_pct || 0) + '%';
+      const timeBox = document.getElementById('detail-time');
+      if (timeBox) {
+        timeBox.innerHTML = st.last_event_at
+          ? '<span title="' + escapeHtml(st.last_event_at) + '">Actualizado: ' + escapeHtml(formatFriendlyTime(st.last_event_at)) + '</span>'
+          : '';
+      }
 
       // Contextual guidance banner
       let bannerHtml = '';
@@ -1300,14 +1334,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           let dotClass = 'info';
           if (isErr) dotClass = 'err';
           else if (isSuccess) dotClass = 'ok';
-          const dateStr = ev.at ? escapeHtml(ev.at) : '';
+          const rawDate = ev.at ? String(ev.at) : '';
+          const friendlyDate = rawDate ? escapeHtml(formatFriendlyTime(rawDate)) : '';
           const hasPayload = ev.payload && Object.keys(ev.payload).length > 0;
           const label = eventLabel(ev.type);
           return '<div class="timeline-item">' +
             '<div class="timeline-dot ' + dotClass + '"></div>' +
             '<div class="timeline-header">' +
               '<span class="timeline-type">' + escapeHtml(label) + '</span>' +
-              '<span class="timeline-time">' + dateStr + '</span>' +
+              '<span class="timeline-time" title="' + escapeHtml(rawDate) + '">' + friendlyDate + '</span>' +
             '</div>' +
             (hasPayload ? '<details class="tech-details" style="margin-top:4px;"><summary>Ver datos técnicos</summary><pre style="margin:4px 0 0 0;">' + escapeHtml(JSON.stringify(ev.payload, null, 2)) + '</pre></details>' : '') +
           '</div>';

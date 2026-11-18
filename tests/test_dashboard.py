@@ -279,6 +279,11 @@ def test_dashboard_http_endpoints_ui_approve_retry_and_delete(tmp_path: Path) ->
         assert "El proceso se detuvo al reiniciar la aplicación." in html
         assert "Ver datos técnicos" in html
         assert "Eliminar proyecto" in html
+        assert "formatFriendlyTime" in html
+        assert "toLocaleTimeString" in html
+        assert "es-MX" in html
+        assert "Ayer," in html
+        assert "Hoy," in html
         assert "5000" in html
         assert "data-theme" in html
         assert "cdn." not in html.lower()
