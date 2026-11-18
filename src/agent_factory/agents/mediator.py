@@ -1,10 +1,11 @@
 """Mediator agent and fixed 3-step debate pipeline (Section 4, Section 7.4, AC-1.3, AC-1.4)."""
 
+import logging
 from collections.abc import Callable
 from collections.abc import Set as AbstractSet
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from agent_factory.agents.pragmatist import Pragmatist, PragmatistProposal
 from agent_factory.agents.structuralist import Structuralist, StructuralistCritique
@@ -12,6 +13,8 @@ from agent_factory.domain.models import VALID_TEMPLATES, Plan, Spec
 from agent_factory.domain.states import ProjectState
 from agent_factory.ports.clock import Clock
 from agent_factory.ports.llm import LLM, LLMError
+
+logger = logging.getLogger(__name__)
 
 
 class PlanValidationError(ValueError):
@@ -73,13 +76,16 @@ class Mediator:
         critique: StructuralistCritique,
     ) -> Plan:
         """Produce and validate the Master Plan with bounded retries on invalid JSON."""
+        templates_str = ", ".join(f"'{t}'" for t in sorted(self.valid_templates))
         messages = [
             {
                 "role": "system",
                 "content": (
                     "You are Mediator, the final debate synthesis agent. Produce a validated Master Plan "
-                    "reconciling Pragmatist and Structuralist positions. You must specify exact file contracts, "
-                    "non-empty acceptance tests, and use an existing template_id."
+                    "reconciling Pragmatist and Structuralist positions. "
+                    f"template_id must be exactly one of: {templates_str}. "
+                    "acceptance_tests must be non-empty, each containing 'id', 'description', and 'type' (allowed types: 'unit', 'integration', 'e2e'). "
+                    "files must contain 'path', 'purpose', and a non-empty 'contract' for each file."
                 ),
             },
             {
@@ -92,13 +98,14 @@ class Mediator:
             },
         ]
 
+        attempt_messages = list(messages)
         attempts = 0
         last_err: Exception | None = None
 
         while attempts <= self.max_retries:
             attempts += 1
             try:
-                data = self.llm.complete(messages=messages, schema=Plan)
+                data = self.llm.complete(messages=attempt_messages, schema=Plan)
                 plan = Plan.model_validate(data)
                 return validate_plan(plan, self.valid_templates)
             except PlanValidationError:
@@ -106,6 +113,51 @@ class Mediator:
                 raise
             except (LLMError, ValueError, TimeoutError, OSError) as err:
                 last_err = err
+                validation_err = (
+                    err
+                    if isinstance(err, ValidationError)
+                    else (
+                        err.__cause__
+                        if isinstance(getattr(err, "__cause__", None), ValidationError)
+                        else None
+                    )
+                )
+                if validation_err is not None:
+                    logger.warning(
+                        "Mediator attempt %d failed Plan validation: %s",
+                        attempts,
+                        validation_err,
+                    )
+                    attempt_messages = list(messages) + [
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Previous attempt failed Plan validation: {validation_err}. "
+                                "Please correct the output and respond ONLY with a valid JSON object matching the Plan schema. "
+                                f"template_id must be one of: {templates_str}. "
+                                "acceptance_tests must be non-empty with types 'unit', 'integration', or 'e2e'. "
+                                "Every file must specify a non-empty contract."
+                            ),
+                        }
+                    ]
+                elif isinstance(err, LLMError):
+                    logger.warning(
+                        "Mediator attempt %d failed with LLM error: %s",
+                        attempts,
+                        err,
+                    )
+                    attempt_messages = list(messages) + [
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Previous attempt failed: {err}. "
+                                "Please correct the output and respond ONLY with a valid JSON object matching the Plan schema. "
+                                f"template_id must be one of: {templates_str}. "
+                                "acceptance_tests must be non-empty with types 'unit', 'integration', or 'e2e'. "
+                                "Every file must specify a non-empty contract."
+                            ),
+                        }
+                    ]
                 if attempts <= self.max_retries and self.clock is not None and hasattr(self.clock, "sleep"):
                     self.clock.sleep(0.1 * (2 ** (attempts - 1)))
 

@@ -440,8 +440,13 @@ def test_agy_llm_adapter_prompt_includes_json_schema_and_skeleton_for_plan(tmp_p
     for key in ("path", "purpose", "contract", "depends_on", "id", "description", "type"):
         assert key in prompt
 
-    # 4. Valid enum values
+    # 4. Valid enum values and explicit template constraints
     assert "unit" in prompt
+    assert "integration" in prompt
+    assert "e2e" in prompt
+    assert "static-app" in prompt
+    assert "static-web" in prompt
+    assert "AT-01" in prompt
 
 
 def test_agy_llm_adapter_prompt_includes_json_schema_and_skeleton_for_interview_round_output(tmp_path: Path) -> None:

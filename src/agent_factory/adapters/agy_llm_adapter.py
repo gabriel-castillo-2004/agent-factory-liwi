@@ -63,7 +63,12 @@ def _build_example_skeleton(
         if isinstance(props, dict):
             for prop, p_schema in props.items():
                 if isinstance(p_schema, dict):
-                    res[prop] = _build_example_skeleton(p_schema, defs=defs, seen_refs=seen_refs)
+                    if prop == "template_id" and p_schema.get("type") == "string" and not p_schema.get("default"):
+                        res[prop] = "static-web"
+                    elif prop == "id" and p_schema.get("type") == "string" and not p_schema.get("default"):
+                        res[prop] = "AT-01"
+                    else:
+                        res[prop] = _build_example_skeleton(p_schema, defs=defs, seen_refs=seen_refs)
         return res
     if schema_type == "array":
         item_schema = schema.get("items")
@@ -107,12 +112,29 @@ def _build_combined_prompt(
             if skeleton
             else ""
         )
+        rules: list[str] = []
+        if schema_dict and "properties" in schema_dict:
+            props = schema_dict["properties"]
+            if "template_id" in props:
+                rules.append("- 'template_id' must be exactly one of: 'static-app', 'static-web'")
+            if "acceptance_tests" in props:
+                rules.append(
+                    "- 'acceptance_tests' must be a non-empty list of objects, each containing: "
+                    "'id' (string, e.g. 'AT-01'), 'description' (string), and 'type' (must be exactly 'unit', 'integration', or 'e2e')"
+                )
+            if "files" in props:
+                rules.append(
+                    "- 'files' must be a list of objects, each containing: "
+                    "'path' (string), 'purpose' (string), and non-empty 'contract' (string)"
+                )
+        rules_block = ("\nSpecific Schema Constraints:\n" + "\n".join(rules)) if rules else ""
         sections.append(
             "[INSTRUCTIONS]\n"
             "Respond ONLY with a valid JSON object matching the requested schema. "
             "Do not include explanations or text outside the JSON object."
             + schema_block
             + skeleton_block
+            + rules_block
         )
     else:
         sections.append(

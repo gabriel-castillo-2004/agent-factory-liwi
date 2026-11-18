@@ -1,5 +1,6 @@
 """Tests for Pragmatist, Structuralist, and Mediator pipeline (AC-1.3, AC-1.4, F-12, N-05)."""
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
@@ -325,3 +326,96 @@ def test_system_clock_implements_clock_port_and_is_default_in_orchestrator() -> 
 
     orchestrator = Orchestrator(store=MemoryEventStore(), llm=FakeLLM())
     assert isinstance(orchestrator.clock, SystemClock)
+
+
+def test_mediator_retries_with_validation_error_feedback_and_warning_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Mediator logs warning and includes exact ValidationError in correction message on retry."""
+    spec = _sample_complete_spec()
+    proposal = PragmatistProposal.model_validate(_valid_pragmatist_dict())
+    critique = StructuralistCritique.model_validate(_valid_structuralist_dict())
+
+    # Attempt 1 returns dict missing required 'rationale' and 'template_id'
+    bad_plan_payload = {
+        "summary": "Incomplete plan",
+    }
+    good_plan_payload = _valid_plan_dict()
+
+    fake_llm = FakeLLM(responses=[bad_plan_payload, good_plan_payload])
+    mediator = Mediator(llm=fake_llm, max_retries=1)
+
+    with caplog.at_level(logging.WARNING):
+        plan = mediator.mediate(spec, proposal, critique)
+
+    assert plan.template_id == "static-app"
+    assert len(fake_llm.calls) == 2
+
+    # Verify logging.warning was recorded
+    assert "failed Plan validation" in caplog.text
+
+    # Verify attempt 2 received correction message containing exact ValidationError details
+    second_call_messages = fake_llm.calls[1]["messages"]
+    assert len(second_call_messages) == 3
+    retry_prompt = second_call_messages[-1]["content"]
+    assert "Previous attempt failed Plan validation" in retry_prompt
+    assert "rationale" in retry_prompt
+    assert "template_id" in retry_prompt
+
+
+def test_mediator_system_prompt_specifies_allowed_templates_and_test_types() -> None:
+    """Mediator prompt explicitly defines allowed template_id catalog and test types."""
+    spec = _sample_complete_spec()
+    proposal = PragmatistProposal.model_validate(_valid_pragmatist_dict())
+    critique = StructuralistCritique.model_validate(_valid_structuralist_dict())
+
+    fake_llm = FakeLLM(responses=[_valid_plan_dict()])
+    mediator = Mediator(llm=fake_llm, max_retries=0)
+    mediator.mediate(spec, proposal, critique)
+
+    first_call_messages = fake_llm.calls[0]["messages"]
+    system_prompt = first_call_messages[0]["content"]
+
+    assert "template_id must be exactly one of:" in system_prompt
+    assert "'static-app'" in system_prompt
+    assert "'static-web'" in system_prompt
+    assert "unit" in system_prompt
+    assert "integration" in system_prompt
+    assert "e2e" in system_prompt
+    assert "contract" in system_prompt
+
+
+def test_mediator_retries_with_validation_error_when_adapter_returns_raw_dict(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Mediator catches direct ValidationError from Plan.model_validate and adds correction message."""
+    spec = _sample_complete_spec()
+    proposal = PragmatistProposal.model_validate(_valid_pragmatist_dict())
+    critique = StructuralistCritique.model_validate(_valid_structuralist_dict())
+
+    class _RawDictLLM:
+        def __init__(self, responses: list[dict[str, Any]]) -> None:
+            self.responses = list(responses)
+            self.calls: list[dict[str, Any]] = []
+
+        def complete(self, messages: list[dict[str, str]], schema: Any = None) -> dict[str, Any]:
+            self.calls.append({"messages": messages, "schema": schema})
+            return self.responses.pop(0)
+
+    llm = _RawDictLLM(
+        responses=[
+            {"summary": "Missing fields"},
+            _valid_plan_dict(),
+        ]
+    )
+    mediator = Mediator(llm=llm, max_retries=1)
+
+    with caplog.at_level(logging.WARNING):
+        plan = mediator.mediate(spec, proposal, critique)
+
+    assert plan.template_id == "static-app"
+    assert len(llm.calls) == 2
+    assert "failed Plan validation" in caplog.text
+    second_prompt = str(llm.calls[1]["messages"])
+    assert "Previous attempt failed Plan validation" in second_prompt
+    assert "rationale" in second_prompt
