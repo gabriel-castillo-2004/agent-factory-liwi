@@ -1107,3 +1107,113 @@ def test_build_worker_emits_phase_b_event_metadata_with_inv13_and_inv19(
     assert r3.payload["outcome"] == "ok"
     assert orchestrator.get_status(project_id).state == ProjectState.DELIVERED
 
+
+def test_build_worker_stops_early_after_two_consecutive_noop_rounds_with_identical_failure(
+    tmp_path: Path,
+) -> None:
+    """BuildWorker halts immediately after 2 consecutive implement_or_fix rounds with files_written==[] and same pytest error instead of burning all 14 rounds."""
+    # Case A: Round 1 writes files, then Rounds 2 & 3 return files_written=[] on identical missing-playwright error
+    pid_a = "proj-stagnate-after-write"
+    orch_a, store_a = _create_approved_project(pid_a, num_tests=2, approve=True)
+    ws_mgr_a = WorkspaceManager(base_dir=tmp_path / "ws_stag_a")
+
+    agent_a = FakeCodeAgent(
+        test_gen_steps=[
+            {"tests/test_web.py": "def test_ui(): assert False\n"},
+        ],
+        impl_steps=[
+            {"src/deck.ts": "export const ready = true;\n"},
+            {},
+            {},
+            {"src/deck.ts": "export const neverReached = true;\n"},
+            {"src/deck.ts": "export const neverReached2 = true;\n"},
+        ],
+    )
+    runner_a = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=1,
+                stdout="FAILED tests/test_web.py::test_ui\n1 failed in 0.41s",
+                stderr="ModuleNotFoundError: No module named 'playwright'",
+                test_results={"AT-01": False, "AT-02": False},
+            ),
+            CommandResult(
+                exit_code=1,
+                stdout="FAILED tests/test_web.py::test_ui\n1 failed in 0.39s",
+                stderr="ModuleNotFoundError: No module named 'playwright'",
+                test_results={"AT-01": False, "AT-02": False},
+            ),
+            CommandResult(
+                exit_code=1,
+                stdout="FAILED tests/test_web.py::test_ui\n1 failed in 0.52s",
+                stderr="ModuleNotFoundError: No module named 'playwright'",
+                test_results={"AT-01": False, "AT-02": False},
+            ),
+        ]
+    )
+    worker_a = BuildWorker(
+        orchestrator=orch_a,
+        workspace_manager=ws_mgr_a,
+        code_agent=agent_a,
+        runner=runner_a,
+        vcs=FakeVCS(),
+    )
+    report_a = worker_a.run_job(
+        project_id=pid_a,
+        template_files={"pyproject.toml": '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'},
+    )
+
+    assert orch_a.get_status(pid_a).state == ProjectState.FAILED
+    assert report_a.invocations == 4  # 1 generate_tests + 3 impl rounds (stops before 4th)
+    assert len(agent_a.impl_calls) == 3
+    assert report_a.failure_cause is not None
+    assert "sin cambios" in report_a.failure_cause.lower()
+    assert "playwright" in report_a.failure_cause.lower()
+    failed_events_a = [ev for ev in store_a.get_events(pid_a) if ev.type == EventType.PROJECT_FAILED]
+    assert len(failed_events_a) == 1
+    assert "playwright" in failed_events_a[0].payload["reason"].lower()
+
+    # Case B: Immediate 2 consecutive no-op rounds from Round 1 stops after Round 2
+    pid_b = "proj-stagnate-from-start"
+    orch_b, _ = _create_approved_project(pid_b, num_tests=2, approve=True)
+    ws_mgr_b = WorkspaceManager(base_dir=tmp_path / "ws_stag_b")
+    agent_b = FakeCodeAgent(
+        test_gen_steps=[{"tests/test_web.py": "def test_ui(): assert False\n"}],
+        impl_steps=[{}, {}, {"src/deck.ts": "never_called\n"}],
+    )
+    runner_b = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=1,
+                stdout="AssertionError: expected button visible\n1 failed in 0.12s",
+                test_results={"AT-01": False, "AT-02": False},
+            ),
+            CommandResult(
+                exit_code=1,
+                stdout="AssertionError: expected button visible\n1 failed in 0.19s",
+                test_results={"AT-01": False, "AT-02": False},
+            ),
+        ]
+    )
+    worker_b = BuildWorker(
+        orchestrator=orch_b,
+        workspace_manager=ws_mgr_b,
+        code_agent=agent_b,
+        runner=runner_b,
+        vcs=FakeVCS(),
+    )
+    report_b = worker_b.run_job(
+        project_id=pid_b,
+        template_files={"pyproject.toml": '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'},
+    )
+    assert orch_b.get_status(pid_b).state == ProjectState.FAILED
+    assert report_b.invocations == 3  # 1 generate_tests + 2 impl rounds
+    assert len(agent_b.impl_calls) == 2
+    assert report_b.failure_cause is not None
+    assert "sin cambios" in report_b.failure_cause.lower()
+
+    # Verify _summarize_short strips fenced JSON leakage if an agent emits raw JSON
+    leaked = '```json\n{"files_written": ["src/a.py"], "summary": "Solo resumen limpio"}\n```'
+    assert worker_b._summarize_short(leaked) == "Solo resumen limpio"
+
+

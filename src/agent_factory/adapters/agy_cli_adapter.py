@@ -77,6 +77,13 @@ def build_sanitized_cli_env(
 
 
 _FENCED_BLOCK_RE = re.compile(r"```([^\r\n`]*)\r?\n(.*?)\r?\n?```", re.DOTALL)
+_JSON_FENCE_OR_TAIL_RE = re.compile(r"```json\b[\s\S]*?(?:```|$)", re.IGNORECASE)
+_EMBEDDED_JSON_SUMMARY_RE = re.compile(
+    r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)(?:"|$)', re.IGNORECASE
+)
+_RESIDUAL_AGENT_JSON_RE = re.compile(
+    r'\{\s*"(?:files_written|summary)"\s*:[\s\S]*$', re.IGNORECASE
+)
 _ATTR_PATH_RE = re.compile(
     r"""(?:file|path|title)\s*=\s*(?:["'`]([^"'`]+)["'`]|(\S+))""",
     re.IGNORECASE,
@@ -181,16 +188,121 @@ def _resolve_safe_test_path(ws_path: Path, raw_path: str) -> Path | None:
     return target
 
 
+def _extract_json_payload_dict(raw_text: str) -> tuple[dict[str, Any] | None, str]:
+    """Extract a structured JSON dict (whole text, fenced ```json```, or embedded JSON object) and remaining prose."""
+    text = raw_text.strip()
+    if not text:
+        return None, ""
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed, ""
+        return None, text
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    matches = list(_FENCED_BLOCK_RE.finditer(text))
+    for match in reversed(matches):
+        info = match.group(1).strip().lower()
+        if info and info != "json":
+            continue
+        try:
+            candidate = json.loads(match.group(2).strip())
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(candidate, dict) and (
+            "files_written" in candidate or "summary" in candidate
+        ):
+            prose = (text[: match.start()] + text[match.end() :]).strip()
+            return candidate, prose
+
+    decoder = json.JSONDecoder()
+    for pos in reversed([idx for idx, ch in enumerate(text) if ch == "{"]):
+        try:
+            obj, end_offset = decoder.raw_decode(text[pos:])
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        is_known = "files_written" in obj or "summary" in obj
+        at_tail = end_offset == len(text) - pos and (pos == 0 or text[pos - 1] in "\r\n")
+        if is_known or at_tail:
+            prose = (text[:pos] + text[pos + end_offset :]).strip()
+            return obj, prose
+    return None, text
+
+
+def sanitize_agent_summary(raw_summary: object) -> str:
+    """Strip fenced ```json``` blocks and residual agent JSON wrappers while preserving plain text."""
+    if raw_summary is None:
+        return ""
+    text = str(raw_summary).strip()
+    if not text:
+        return ""
+
+    data, prose = _extract_json_payload_dict(text)
+    if isinstance(data, dict) and (
+        "files_written" in data or "summary" in data or "debug" in data
+    ):
+        inner = data.get("summary")
+        if isinstance(inner, str) and inner.strip():
+            text = inner.strip()
+        elif prose:
+            text = prose
+        else:
+            text = ""
+
+    extracted_partial = ""
+    for fence_m in _JSON_FENCE_OR_TAIL_RE.finditer(text):
+        m_sum = _EMBEDDED_JSON_SUMMARY_RE.search(fence_m.group(0))
+        if m_sum and m_sum.group(1).strip():
+            extracted_partial = m_sum.group(1).strip()
+    cleaned = _JSON_FENCE_OR_TAIL_RE.sub("", text).strip()
+
+    res_m = _RESIDUAL_AGENT_JSON_RE.search(cleaned)
+    if res_m:
+        if not extracted_partial:
+            m_sum = _EMBEDDED_JSON_SUMMARY_RE.search(res_m.group(0))
+            if m_sum and m_sum.group(1).strip():
+                extracted_partial = m_sum.group(1).strip()
+        cleaned = _RESIDUAL_AGENT_JSON_RE.sub("", cleaned).strip()
+
+    if not cleaned and extracted_partial:
+        cleaned = extracted_partial
+    if "```" in cleaned:
+        cleaned = cleaned.replace("```", "").strip()
+    return cleaned
+
+
+def _parse_cli_output(output_text: str) -> tuple[list[str], str]:
+    """Parse files_written and clean human-readable summary from CLI stdout."""
+    data, prose = _extract_json_payload_dict(output_text)
+    if not isinstance(data, dict):
+        return [], sanitize_agent_summary(output_text)
+
+    raw_files = data.get("files_written", [])
+    files_written = (
+        [str(p).strip() for p in raw_files if isinstance(p, (str, Path)) and str(p).strip()]
+        if isinstance(raw_files, list)
+        else []
+    )
+    raw_summary = data.get("summary", "")
+    if isinstance(raw_summary, str):
+        summary = sanitize_agent_summary(raw_summary)
+    elif prose:
+        summary = sanitize_agent_summary(prose)
+    else:
+        summary = ""
+    return files_written, summary
+
+
 def _extract_and_write_test_files(ws_path: Path, output_text: str) -> list[str]:
     """Extract labeled test code blocks from CLI output and write safely under workspace/tests/."""
     if not output_text or not output_text.strip():
         return []
 
     texts_to_scan = [output_text]
-    try:
-        parsed = json.loads(output_text.strip())
-    except (json.JSONDecodeError, ValueError):
-        parsed = None
+    parsed, _ = _extract_json_payload_dict(output_text)
     if isinstance(parsed, dict) and isinstance(parsed.get("summary"), str):
         texts_to_scan.append(parsed["summary"])
 
@@ -392,8 +504,11 @@ class AgyCliAdapter(CodeAgent):
                 "Requirements:\n"
                 "1. Write test file(s) directly to the workspace filesystem under tests/ (for example tests/test_app.py).\n"
                 "2. Do NOT read or create files under src/.\n"
-                "3. Respond with a JSON object containing files_written (e.g. [\"tests/test_app.py\"]) and summary.\n"
+                "3. Respond with a JSON object containing files_written (e.g. [\"tests/test_app.py\"]) and a short plain-text summary (no nested markdown or JSON).\n"
                 "4. If direct file tool writes are unavailable, output each file inside a fenced code block labeled with its relative path (e.g. ```python tests/test_app.py).\n"
+                "5. Self-contained execution: tests in tests/ MUST run using ONLY the Python standard library and pytest already installed in this environment "
+                "(e.g. inspect static HTML/CSS/JS with pathlib, html.parser, re, ast, json). "
+                "NEVER import external packages or browser automation runners such as playwright, selenium, or puppeteer unless already declared in the workspace project.\n"
                 f"Acceptance tests (also passed via stdin JSON):\n{tests_block}"
             )
         else:
@@ -419,7 +534,7 @@ class AgyCliAdapter(CodeAgent):
                 "Requirements:\n"
                 "1. Create and edit those workspace files directly on the filesystem.\n"
                 "2. NEVER modify tests/, pyproject.toml, setup.cfg, conftest.py, or package.json.\n"
-                "3. Respond with a JSON object containing files_written and summary (full payload also passed via stdin).\n"
+                "3. Respond with a JSON object containing files_written and a short plain-text summary (no nested markdown or JSON; full payload also passed via stdin).\n"
                 f"Plan summary: {plan.get('summary', '')}\n"
                 f"File specifications:\n{contracts_block}\n"
                 + (f"Latest failure output:\n{failure_tail}" if failure_tail else "")
@@ -542,32 +657,12 @@ class AgyCliAdapter(CodeAgent):
 
         assert res is not None
 
-        # Parse success output
+        # Parse success output using shared fenced/inline JSON & summary cleaner
         files_written: list[str] = []
         summary = ""
         output_text = res.stdout.strip()
         if output_text:
-            try:
-                try:
-                    data = json.loads(output_text)
-                    if isinstance(data, dict):
-                        files_written = data.get("files_written", [])
-                        summary = data.get("summary", "")
-                    else:
-                        summary = output_text
-                except (json.JSONDecodeError, ValueError):
-                    for line in output_text.splitlines()[::-1]:
-                        line_s = line.strip()
-                        if line_s.startswith("{") and line_s.endswith("}"):
-                            data = json.loads(line_s)
-                            if isinstance(data, dict):
-                                files_written = data.get("files_written", [])
-                                summary = data.get("summary", "")
-                                break
-                    else:
-                        summary = output_text
-            except (json.JSONDecodeError, ValueError, TypeError):
-                summary = output_text
+            files_written, summary = _parse_cli_output(output_text)
 
         resolved_model = (
             redact_secrets(active_model, extra_secrets=self.secrets)

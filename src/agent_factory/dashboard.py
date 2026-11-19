@@ -1783,8 +1783,54 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       return '<div class="stage-segments" aria-label="Etapa ' + stage + ' de 5">' + segs.join('') + '</div>';
     }
 
+    function sanitizeDisplaySummary(text) {
+      if (text === null || text === undefined) return '';
+      let s = String(text).trim();
+      if (!s) return '';
+      const fenceRe = /```json[\\s\\S]*?```/gi;
+      const fenceMatches = s.match(fenceRe);
+      if (fenceMatches && fenceMatches.length) {
+        for (let idx = fenceMatches.length - 1; idx >= 0; idx--) {
+          const inner = fenceMatches[idx].replace(/^```json\\s*/i, '').replace(/```$/, '').trim();
+          try {
+            const parsed = JSON.parse(inner);
+            if (parsed && typeof parsed.summary === 'string' && parsed.summary.trim()) {
+              s = parsed.summary.trim();
+              break;
+            }
+          } catch (_) {}
+        }
+        s = s.replace(fenceRe, ' ').trim();
+      }
+      s = s.replace(/```json[\\s\\S]*/gi, ' ').replace(/```/g, ' ').trim();
+      if (s.indexOf('files_written') !== -1 || (s.startsWith('{') && s.indexOf('"summary"') !== -1)) {
+        try {
+          const obj = JSON.parse(s);
+          if (obj && typeof obj === 'object' && typeof obj.summary === 'string') {
+            s = obj.summary.trim();
+          } else {
+            s = '';
+          }
+        } catch (_) {
+          const m = /"summary"\\s*:\\s*"([^"]*)/i.exec(s);
+          if (m && m[1] && m[1].trim()) {
+            s = m[1].trim();
+          } else {
+            s = s.replace(/\\{[\\s\\S]*"(?:files_written|summary)"[\\s\\S]*$/i, '').trim();
+          }
+        }
+      }
+      return s.replace(/\\s+/g, ' ').trim();
+    }
+
     function humanizeError(rawErr) {
       const txt = String(rawErr || '');
+      if (/sin cambios/i.test(txt)) {
+        return txt.split('\\n')[0].trim();
+      }
+      if (/ModuleNotFoundError|ImportError|No module named|librería externa/i.test(txt)) {
+        return 'Las pruebas fallaron por una dependencia externa no instalada en el entorno local.';
+      }
       if (/timed?\\s*out|timeout/i.test(txt)) {
         return 'La operación tardó más de lo esperado y superó el tiempo límite.';
       }
@@ -2563,6 +2609,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const modelPill = pl.model ? '<span class="model-pill tech-only">' + escapeHtml(String(pl.model)) + '</span>' : '';
         const durPill = item.durSecs !== null ? '<span class="duration-pill">Tardó ' + escapeHtml(formatDurationHuman(item.durSecs, '< 1s')) + '</span>' : '';
         const hasPayload = ev.payload && Object.keys(ev.payload).length > 0;
+        const cleanGenSummary = sanitizeDisplaySummary(item.summaryShort);
         return '<div class="timeline-item">' +
           '<div class="timeline-dot ok"></div>' +
           '<div class="timeline-header">' +
@@ -2573,7 +2620,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             '</span>' +
             '<span class="timeline-time" title="' + escapeHtml(rawDate) + '">' + friendlyDate + '</span>' +
           '</div>' +
-          (item.summaryShort ? '<div class="round-summary">' + escapeHtml(item.summaryShort) + '</div>' : '') +
+          (cleanGenSummary ? '<div class="round-summary">' + escapeHtml(cleanGenSummary) + '</div>' : '') +
           renderFileChips(item.filesWritten) +
           (hasPayload ? '<details class="tech-details tech-only" style="margin-top:4px;"><summary>Ver datos técnicos</summary><pre style="margin:4px 0 0 0;">' + escapeHtml(JSON.stringify(ev.payload, null, 2)) + '</pre></details>' : '') +
         '</div>';
@@ -2585,6 +2632,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const passed = hasTests ? Number(tpl.passed || 0) : 0;
         const allOk = hasTests && passed >= tpl.total;
         const isTamper = item.outcome === 'reverted_tamper';
+        const testsFailed = (hasTests && passed < tpl.total) ||
+          item.outcome === 'failed' ||
+          (!hasTests && Array.isArray(item.failingTests) && item.failingTests.length > 0);
         const dotClass = isTamper ? 'warn' : (allOk ? 'ok' : (hasTests ? 'warn' : 'info'));
         const roundTitle = isTamper
           ? ('Ronda ' + item.roundNum + ': ajuste no permitido revertido')
@@ -2595,9 +2645,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const ciBadge = item.ciEv ? '<span class="test-badge ok">CI ✓</span>' : '';
         const modelPill = pl.model ? '<span class="model-pill tech-only">' + escapeHtml(String(pl.model)) + '</span>' : '';
         const durPill = item.durSecs !== null ? '<span class="duration-pill">Tardó ' + escapeHtml(formatDurationHuman(item.durSecs, '< 1s')) + '</span>' : '';
+        const cleanRoundSummary = sanitizeDisplaySummary(item.summaryShort);
         const bodyText = isTamper
           ? 'Se detectó un cambio no autorizado en las pruebas automáticas y se restauró su versión protegida.'
-          : item.summaryShort;
+          : (testsFailed
+            ? ('Falló la verificación de pruebas' + (cleanRoundSummary ? (' · ' + cleanRoundSummary) : ''))
+            : cleanRoundSummary);
         const combinedTech = {
           agent: ev.payload || {},
           tests: tpl || undefined,

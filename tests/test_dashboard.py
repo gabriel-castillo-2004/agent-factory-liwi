@@ -1615,6 +1615,13 @@ def test_dashboard_phases_abc_rounds_file_chips_prior_attempts_and_tech_mode(
         assert idle_detail["tests_passed"] is None
         assert idle_detail["tests_total"] is None
         assert secret_val not in json.dumps(idle_detail)
+
+        # Verify UI embeds sanitizeDisplaySummary defense and failed round reason in Spanish
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as resp:
+            html_body = resp.read().decode("utf-8")
+        assert "sanitizeDisplaySummary" in html_body
+        assert "Falló la verificación de pruebas" in html_body
+        assert "ModuleNotFoundError" in html_body
     finally:
         server.shutdown()
         server.server_close()

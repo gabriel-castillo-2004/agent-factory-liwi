@@ -1248,6 +1248,102 @@ def test_agy_cli_adapter_defaults_to_300s_timeout_closes_stdin_and_redacts_timeo
     assert "timed out" in str(exc_info.value).lower()
 
 
+def test_agy_cli_adapter_cleans_fenced_json_summary_and_enforces_stdlib_test_prompt(
+    tmp_path: Path,
+) -> None:
+    """Fenced JSON stdout blocks extract inner summary without leaking backticks/braces, and generate-tests forbids uninstalled browser packages."""
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+    ws_dir = ws_mgr.create_workspace("proj-clean-summary")
+    plan = _sample_static_web_plan()
+
+    fenced_stdout = (
+        "Trabajo completado.\n\n"
+        "```json\n"
+        "{\n"
+        '  "files_written": ["index.html", "src/app.js"],\n'
+        '  "summary": "Construida la interfaz y lógica principal."\n'
+        "}\n"
+        "```\n"
+    )
+    nested_fence_summary = json.dumps(
+        {
+            "files_written": ["src/app.js"],
+            "summary": 'Actualizado módulo.\n```json\n{"files_written": ["src/app.js"], "debug": 1}\n```',
+        }
+    )
+    truncated_fenced_stdout = (
+        "```json\n"
+        '{\n  "files_written": ["src/app.js"],\n  "summary": "Parcial...'
+    )
+    plain_with_leaked_json = (
+        'Hecho. {"files_written": ["src/app.js"], "summary": "Se corrigió el contador."}'
+    )
+
+    runner = FakeRunner(
+        results=[
+            # 1. Fenced JSON block (multiline)
+            CommandResult(exit_code=0, stdout=fenced_stdout),
+            # 2. Inner summary containing a nested ```json``` block
+            CommandResult(exit_code=0, stdout=nested_fence_summary),
+            # 3. Unclosed/truncated ```json``` fence in plain text fallback
+            CommandResult(exit_code=0, stdout=truncated_fenced_stdout),
+            # 4. Inline single-line JSON embedded in prose
+            CommandResult(exit_code=0, stdout=plain_with_leaked_json),
+            # 5. generate_tests response
+            CommandResult(
+                exit_code=0,
+                stdout=(
+                    "```python tests/test_selfcontained.py\n"
+                    "def test_ok(): assert True\n"
+                    "```\n"
+                    "```json\n"
+                    '{"files_written": ["tests/test_selfcontained.py"], "summary": "Pruebas listas"}\n'
+                    "```"
+                ),
+            ),
+        ]
+    )
+    adapter = AgyCliAdapter(
+        workspace_manager=ws_mgr,
+        runner=runner,
+        cli_command=("agy",),
+        retry_if_no_tests_written=False,
+    )
+
+    r1 = adapter.implement_or_fix(ws_dir, plan, attempt=1)
+    assert r1.files_written == ["index.html", "src/app.js"]
+    assert r1.summary == "Construida la interfaz y lógica principal."
+    assert "```" not in r1.summary
+    assert "files_written" not in r1.summary
+
+    r2 = adapter.implement_or_fix(ws_dir, plan, attempt=2)
+    assert r2.files_written == ["src/app.js"]
+    assert r2.summary == "Actualizado módulo."
+    assert "```" not in r2.summary
+    assert "files_written" not in r2.summary
+
+    r3 = adapter.implement_or_fix(ws_dir, plan, attempt=3)
+    assert "```" not in r3.summary
+    assert "files_written" not in r3.summary
+
+    r4 = adapter.implement_or_fix(ws_dir, plan, attempt=4)
+    assert r4.files_written == ["src/app.js"]
+    assert r4.summary == "Se corrigió el contador."
+    assert "files_written" not in r4.summary
+
+    r_gen = adapter.generate_tests(ws_dir, plan.acceptance_tests)
+    assert r_gen.files_written == ["tests/test_selfcontained.py"]
+    assert r_gen.summary == "Pruebas listas"
+    gen_cmd = runner.calls[-1]["command"]
+    gen_prompt = gen_cmd[gen_cmd.index("-p") + 1]
+    assert "pathlib" in gen_prompt
+    assert "html.parser" in gen_prompt
+    assert "playwright" in gen_prompt.lower()
+    assert "selenium" in gen_prompt.lower()
+    assert "standard library" in gen_prompt.lower()
+
+
+
 
 
 

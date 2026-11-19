@@ -1,5 +1,6 @@
 """Local build worker, job queue, and write-test-fix loop (Section 7 Phase 2, INV-09, INV-13, INV-15, INV-17)."""
 
+import re
 import threading
 import time
 from collections.abc import Mapping, Sequence
@@ -7,6 +8,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
+from agent_factory.adapters.agy_cli_adapter import sanitize_agent_summary
 from agent_factory.adapters.model_resolver import ACTIVITY_MESSAGES
 from agent_factory.domain.events import EventType, create_event
 from agent_factory.domain.models import BuildReport, Plan, validate_project_id
@@ -161,16 +163,74 @@ class BuildWorker:
         return cleaned
 
     def _summarize_short(self, raw_summary: object) -> str | None:
-        """Redact and compress agent summary text to a clean single line <= 140 chars."""
-        if raw_summary is None:
-            return None
-        collapsed = " ".join(str(raw_summary).split())
+        """Strip JSON wrappers, redact, and compress agent summary text to a clean line <= 140 chars."""
+        cleaned = sanitize_agent_summary(raw_summary)
+        collapsed = " ".join(cleaned.split())
         if not collapsed:
             return None
         redacted = self._redact(collapsed)
         if len(redacted) > 140:
             return redacted[:137].rstrip() + "..."
         return redacted
+
+    @staticmethod
+    def _failure_signature(
+        runner_result: object,
+        failing_tests: Sequence[str],
+    ) -> tuple[int, tuple[str, ...], str]:
+        """Compute normalized test-failure signature ignoring volatile pytest timings/addresses."""
+        raw_stdout = str(getattr(runner_result, "stdout", "") or "")
+        raw_stderr = str(getattr(runner_result, "stderr", "") or "")
+        combined = f"{raw_stdout}\n{raw_stderr}".strip()
+        # Strip ANSI escapes, pytest duration suffixes (`in 0.41s`), hex pointers, and extra whitespace
+        cleaned = re.sub(r"\x1b\[[0-9;]*m", "", combined)
+        cleaned = re.sub(r"\bin\s+\d+(?:\.\d+)?s\b", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"0x[0-9a-fA-F]+", "0xADDR", cleaned)
+        cleaned = re.sub(r"[=-]{3,}", " ", cleaned)
+        normalized = " ".join(cleaned.split())[-600:]
+        exit_code = int(getattr(runner_result, "exit_code", 1))
+        return exit_code, tuple(sorted(failing_tests)), normalized
+
+    def _summarize_stagnation_cause(
+        self,
+        runner_result: object,
+        failing_tests: Sequence[str],
+    ) -> str:
+        """Build a concise plain-Spanish explanation of why repeated no-op rounds stalled."""
+        raw_stdout = str(getattr(runner_result, "stdout", "") or "")
+        raw_stderr = str(getattr(runner_result, "stderr", "") or "")
+        combined = f"{raw_stderr}\n{raw_stdout}".strip()
+        prefix = "Proceso detenido automáticamente tras 2 rondas consecutivas sin cambios"
+
+        if getattr(runner_result, "timed_out", False):
+            return f"{prefix}: las pruebas excedieron el tiempo límite."
+
+        mod_match = re.search(r"No module named ['\"]?([^'\"\r\n\s]+)['\"]?", combined)
+        if mod_match:
+            missing_mod = self._redact(mod_match.group(1))
+            return (
+                f"{prefix} mientras las pruebas siguen fallando: "
+                f"falta la librería externa '{missing_mod}' en el entorno local."
+            )
+
+        imp_match = re.search(r"ImportError:\s*([^\r\n]+)", combined)
+        if imp_match:
+            imp_err = self._redact(imp_match.group(1).strip())[:100]
+            return f"{prefix} mientras las pruebas siguen fallando: error de importación ({imp_err})."
+
+        detail = ""
+        for raw_line in combined.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if re.search(r"(AssertionError|SyntaxError|TypeError|NameError|Error:|FAILED |^E\s+)", line):
+                detail = self._redact(" ".join(line.split()))[:110]
+                break
+        if not detail and failing_tests:
+            detail = "pruebas pendientes: " + ", ".join(failing_tests[:5])
+        if detail:
+            return f"{prefix} mientras las pruebas siguen fallando ({detail})."
+        return f"{prefix} porque las pruebas continúan fallando."
 
     def _report_activity(
         self,
@@ -439,6 +499,8 @@ class BuildWorker:
         tests_passed_count = 0
         tests_total_count = len(job.plan.acceptance_tests)
         target_files_preview = ", ".join(f.path for f in job.plan.files[:3])
+        consecutive_noop_rounds = 0
+        last_failure_sig: tuple[int, tuple[str, ...], str] | None = None
 
         while True:
             # Check invocation limit against CircuitBreaker
@@ -561,6 +623,8 @@ class BuildWorker:
 
             if tampered:
                 # Tampering detected and reverted: do not run tests, do not push
+                consecutive_noop_rounds = 0
+                last_failure_sig = None
                 job.last_failure_output = (
                     "Test or runner config tampered; changes reverted (INV-13)"
                 )
@@ -639,9 +703,34 @@ class BuildWorker:
                 if runner_result.stderr:
                     output = f"{output}\n{runner_result.stderr}".strip()
                 job.last_failure_output = output
+
+                current_sig = self._failure_signature(runner_result, failing_tests)
+                if not impl_files:
+                    same_failure = (
+                        last_failure_sig is None or current_sig == last_failure_sig
+                    )
+                    consecutive_noop_rounds = (
+                        consecutive_noop_rounds + 1 if same_failure else 1
+                    )
+                    last_failure_sig = current_sig
+                    if consecutive_noop_rounds >= 2:
+                        stagnation_reason = self._summarize_stagnation_cause(
+                            runner_result, failing_tests
+                        )
+                        return self._fail_job(
+                            project_id,
+                            job,
+                            stagnation_reason,
+                            failed_state=ProjectState.BUILDING,
+                        )
+                else:
+                    consecutive_noop_rounds = 0
+                    last_failure_sig = current_sig
                 continue
 
-            # Local tests passed! Transition to VERIFYING for CI verification
+            # Local tests passed! Reset stagnation tracking and transition to VERIFYING
+            consecutive_noop_rounds = 0
+            last_failure_sig = None
             self.orchestrator.store.append(
                 create_event(
                     project_id=project_id,
