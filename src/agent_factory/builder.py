@@ -137,19 +137,68 @@ class BuildWorker:
         raw_model = usage.get("model") if isinstance(usage, dict) else None
         return self._redact(str(raw_model)) if raw_model else None
 
+    def _sanitize_files_written(
+        self,
+        raw_files: Sequence[str] | None,
+        *,
+        tests_only: bool = False,
+    ) -> list[str]:
+        """Normalize, redact (INV-19), bound, and enforce INV-13 tests/ filter when needed."""
+        if not raw_files:
+            return []
+        cleaned: list[str] = []
+        for raw_path in raw_files:
+            norm = self._redact(str(raw_path).strip().replace("\\", "/")).lstrip("./")
+            if not norm or ".." in norm.split("/"):
+                continue
+            if tests_only and not (norm == "tests" or norm.startswith("tests/")):
+                continue
+            short = norm[:120]
+            if short not in cleaned:
+                cleaned.append(short)
+            if len(cleaned) >= 10:
+                break
+        return cleaned
+
+    def _summarize_short(self, raw_summary: object) -> str | None:
+        """Redact and compress agent summary text to a clean single line <= 140 chars."""
+        if raw_summary is None:
+            return None
+        collapsed = " ".join(str(raw_summary).split())
+        if not collapsed:
+            return None
+        redacted = self._redact(collapsed)
+        if len(redacted) > 140:
+            return redacted[:137].rstrip() + "..."
+        return redacted
+
     def _report_activity(
         self,
         activity_summary: str,
         *,
         agents_count: int = 1,
         stage: str | None = None,
+        detail: str | None = None,
+        tests_passed: int | None = None,
+        tests_total: int | None = None,
+        build_round: int | None = None,
+        max_rounds: int | None = None,
     ) -> None:
         resolver = getattr(self.code_agent, "model_resolver", None) or getattr(
             self.orchestrator.llm, "model_resolver", None
         )
         recorder = getattr(resolver, "record_activity", None) if resolver is not None else None
         if callable(recorder):
-            recorder(activity_summary, agents_count=agents_count, stage=stage)
+            recorder(
+                activity_summary,
+                agents_count=agents_count,
+                stage=stage,
+                detail=detail,
+                tests_passed=tests_passed,
+                tests_total=tests_total,
+                build_round=build_round,
+                max_rounds=max_rounds,
+            )
 
     def _fail_job(
         self,
@@ -289,10 +338,14 @@ class BuildWorker:
                     emit_event=False,
                 )
 
+            total_acceptance_tests = len(job.plan.acceptance_tests)
             self._report_activity(
                 ACTIVITY_MESSAGES["BUILDING_TESTS"],
                 agents_count=1,
                 stage="BUILDING",
+                detail=f"{total_acceptance_tests} criterios de aceptación",
+                tests_passed=0,
+                tests_total=total_acceptance_tests,
             )
             gen_t0 = time.monotonic()
             try:
@@ -318,6 +371,9 @@ class BuildWorker:
                     model=self._active_code_agent_model(),
                     agent="generate_tests",
                     duration_seconds=gen_duration,
+                    summary_short=self._summarize_short(err),
+                    outcome="failed",
+                    extra_secrets=self.secrets_to_redact,
                 )
                 job.invocations_used += 1
                 return self._fail_job(
@@ -325,6 +381,10 @@ class BuildWorker:
                 )
 
             gen_duration = round(max(0.0, time.monotonic() - gen_t0), 3)
+            gen_files = self._sanitize_files_written(
+                getattr(gen_result, "files_written", None), tests_only=True
+            )
+            gen_summary = self._summarize_short(getattr(gen_result, "summary", None))
             # Successful test generation: record call in CircuitBreaker and AGENT_INVOKED
             status = self.orchestrator.record_state_call(
                 project_id,
@@ -332,6 +392,10 @@ class BuildWorker:
                 model=getattr(gen_result, "model", None) or self._active_code_agent_model(),
                 agent="generate_tests",
                 duration_seconds=gen_duration,
+                files_written=gen_files,
+                summary_short=gen_summary,
+                outcome="ok",
+                extra_secrets=self.secrets_to_redact,
             )
             job.invocations_used += 1
 
@@ -366,6 +430,15 @@ class BuildWorker:
         building_limit = (
             self.orchestrator.circuit_breaker.get_limit(ProjectState.BUILDING) or 15
         )
+        initial_calls = self.orchestrator.circuit_breaker.get_calls(
+            project_id, ProjectState.BUILDING
+        )
+        max_code_rounds = max(1, building_limit - initial_calls)
+        build_round = 0
+        failing_tests: list[str] = []
+        tests_passed_count = 0
+        tests_total_count = len(job.plan.acceptance_tests)
+        target_files_preview = ", ".join(f.path for f in job.plan.files[:3])
 
         while True:
             # Check invocation limit against CircuitBreaker
@@ -385,11 +458,28 @@ class BuildWorker:
                 )
 
             # Code agent writes / fixes code
+            build_round += 1
             attempt_num = job.invocations_used + 1
+            if not failing_tests:
+                active_summary = ACTIVITY_MESSAGES["BUILDING_CODE"]
+            elif len(failing_tests) == 1:
+                active_summary = "Corrigiendo 1 prueba pendiente..."
+            else:
+                active_summary = f"Corrigiendo {len(failing_tests)} pruebas pendientes..."
+            round_detail_parts = []
+            if target_files_preview:
+                round_detail_parts.append(f"Archivos: {target_files_preview}")
+            round_detail_parts.append(f"Ronda {build_round} de hasta {max_code_rounds}")
+
             self._report_activity(
-                ACTIVITY_MESSAGES["BUILDING_CODE"],
+                active_summary,
                 agents_count=1,
                 stage="BUILDING",
+                detail=" · ".join(round_detail_parts),
+                tests_passed=tests_passed_count,
+                tests_total=tests_total_count,
+                build_round=build_round,
+                max_rounds=max_code_rounds,
             )
             impl_t0 = time.monotonic()
             try:
@@ -420,6 +510,12 @@ class BuildWorker:
                     model=self._active_code_agent_model(),
                     agent="implement_or_fix",
                     duration_seconds=impl_duration,
+                    round_num=build_round,
+                    max_rounds=max_code_rounds,
+                    failing_tests=failing_tests or None,
+                    summary_short=self._summarize_short(err),
+                    outcome="failed",
+                    extra_secrets=self.secrets_to_redact,
                 )
                 job.invocations_used += 1
                 return self._fail_job(
@@ -427,13 +523,31 @@ class BuildWorker:
                 )
 
             impl_duration = round(max(0.0, time.monotonic() - impl_t0), 3)
-            # Record successful agent invocation
+            # Verify test lock BEFORE recording invocation so reverted tamper is flagged cleanly (INV-13)
+            tampered = not verify_and_restore_test_lock(ws_dir, job.lock_snapshot)
+            impl_files = self._sanitize_files_written(
+                getattr(impl_result, "files_written", None), tests_only=False
+            )
+            impl_summary = (
+                "Intentó modificar pruebas protegidas; cambios revertidos"
+                if tampered
+                else self._summarize_short(getattr(impl_result, "summary", None))
+            )
+
+            # Record agent invocation with round/files/outcome metadata
             status = self.orchestrator.record_state_call(
                 project_id,
                 ProjectState.BUILDING,
                 model=getattr(impl_result, "model", None) or self._active_code_agent_model(),
                 agent="implement_or_fix",
                 duration_seconds=impl_duration,
+                round_num=build_round,
+                max_rounds=max_code_rounds,
+                files_written=impl_files,
+                summary_short=impl_summary,
+                failing_tests=failing_tests or None,
+                outcome="reverted_tamper" if tampered else "ok",
+                extra_secrets=self.secrets_to_redact,
             )
             job.invocations_used += 1
 
@@ -445,8 +559,7 @@ class BuildWorker:
                     emit_event=False,
                 )
 
-            # Verify test lock
-            if not verify_and_restore_test_lock(ws_dir, job.lock_snapshot):
+            if tampered:
                 # Tampering detected and reverted: do not run tests, do not push
                 job.last_failure_output = (
                     "Test or runner config tampered; changes reverted (INV-13)"
@@ -458,6 +571,11 @@ class BuildWorker:
                 ACTIVITY_MESSAGES["VERIFYING"],
                 agents_count=1,
                 stage="VERIFYING",
+                detail=f"Ronda {build_round} de hasta {max_code_rounds}",
+                tests_passed=tests_passed_count,
+                tests_total=tests_total_count,
+                build_round=build_round,
+                max_rounds=max_code_rounds,
             )
             verify_t0 = time.monotonic()
             try:
@@ -472,12 +590,24 @@ class BuildWorker:
                 )
 
             local_test_duration = round(max(0.0, time.monotonic() - verify_t0), 3)
+            required_test_ids = [at.id for at in job.plan.acceptance_tests]
             # Update test results
             if runner_result.test_results:
                 job.test_results = dict(runner_result.test_results)
                 passed = sum(1 for v in runner_result.test_results.values() if v)
                 failed = sum(1 for v in runner_result.test_results.values() if not v)
                 total = len(runner_result.test_results)
+                tests_passed_count = passed
+                tests_total_count = total
+                failing_tests = [
+                    tid
+                    for tid in required_test_ids
+                    if runner_result.test_results.get(tid) is not True
+                ] + [
+                    k
+                    for k, v in runner_result.test_results.items()
+                    if not v and k not in required_test_ids
+                ]
                 self.orchestrator.store.append(
                     create_event(
                         project_id=project_id,
@@ -486,13 +616,12 @@ class BuildWorker:
                             "passed": passed,
                             "failed": failed,
                             "total": total,
+                            "round": build_round,
                             "duration_seconds": local_test_duration,
                         },
                         at=self.orchestrator._now(),
                     )
                 )
-
-            required_test_ids = [at.id for at in job.plan.acceptance_tests]
             has_all_plan_tests = bool(runner_result.test_results) and all(
                 runner_result.test_results.get(tid) is True for tid in required_test_ids
             )
@@ -557,6 +686,11 @@ class BuildWorker:
                     ACTIVITY_MESSAGES["PUBLISHING"],
                     agents_count=1,
                     stage="PUBLISHING",
+                    detail=f"Ronda {build_round} de hasta {max_code_rounds}",
+                    tests_passed=tests_passed_count,
+                    tests_total=tests_total_count,
+                    build_round=build_round,
+                    max_rounds=max_code_rounds,
                 )
                 pub_t0 = time.monotonic()
                 try:

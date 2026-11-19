@@ -1098,10 +1098,13 @@ def test_dashboard_exposes_active_model_while_running_and_renders_history_model(
         assert "1 agente trabajando" in running_block
         assert "2 agentes colaborando" in running_block
         assert "live-step-timer" in running_block
-        assert "model-pill" in html
+        assert "model-pill" in running_block
+        assert "activity_detail" in running_block
+        assert "pruebas aprobadas" in running_block
+        assert "Es normal que tome varias rondas" in running_block
         assert "Tardó " in html
 
-        # 5-phase grouped timeline, states, readable actions, Etapa X de 5 badge, and 4s toast auto-hide
+        # 5-phase grouped timeline, 5 segments, rounds, file chips, prior attempts, and tech mode
         for expected_phase in (
             "1. Idea y requisitos",
             "2. Diseño de la solución",
@@ -1112,14 +1115,19 @@ def test_dashboard_exposes_active_model_while_running_and_renders_history_model(
             "Completado en ",
             "opacity: 0.55",
             "✓",
-            "Creando pruebas automáticas",
-            "Escribiendo código",
-            "Verificando funcionamiento",
+            "Pruebas automáticas",
             "Propuesta del especialista",
             "Crítica de estructura",
             "Etapa ",
             " de 5",
             "4000",
+            "stage-segments",
+            "Modo técnico",
+            "af_tech_mode",
+            "Ver intentos anteriores",
+            "Copiar diagnóstico",
+            "file-chip",
+            "round-card",
         ):
             assert expected_phase in html
         assert "Siguiente paso:" not in html
@@ -1402,4 +1410,217 @@ def test_dashboard_retry_cleans_partial_workspace_safely_and_prevents_test_colli
         if thread.is_alive():
             thread.join(timeout=2.0)
         store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_phases_abc_rounds_file_chips_prior_attempts_and_tech_mode(
+    tmp_path: Path,
+) -> None:
+    """Verify Phases A+B+C: rich AGENT_INVOKED round/file/tamper metadata, redacted summaries (INV-19), strict tests/ isolation (INV-13), live detail & test counts, and INV-11 legacy compat."""
+    store = SqliteEventStore(str(tmp_path / "phases_abc.db"))
+    secret_val = "SECRET_PHASE_B_LEAK_GUARD_42"
+    pid = "proj-phases-abc"
+    now = datetime(2026, 11, 19, 16, 0, tzinfo=UTC)
+
+    plan_obj = Plan(
+        summary="Timer Web App",
+        rationale="Pure ES modules",
+        template_id="static-web",
+        files=[
+            FileSpec(path="index.html", purpose="Layout", contract="HTML5"),
+            FileSpec(path="src/app.js", purpose="Timer logic", contract="export function tick() {}"),
+        ],
+        acceptance_tests=[
+            AcceptanceTest(id="AT-01", description="Renders page", type=AcceptanceTestType.UNIT),
+            AcceptanceTest(id="AT-02", description="Starts timer", type=AcceptanceTestType.E2E),
+        ],
+        risks=[],
+        deployment_target="github-pages",
+    )
+    plan_hash = plan_obj.compute_hash()
+    plan_dict = plan_obj.model_dump(mode="json")
+
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "Timer", "objective": "Timer", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+    ):
+        store.append(ev)
+
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_abc")
+    scaffold = TemplateScaffold(workspace_manager=ws_mgr, templates_root=DEFAULT_TEMPLATES_ROOT)
+    scaffold.scaffold(pid, "static-web")
+
+    runner = FakeRunner(
+        results=[
+            # Round 1: AT-01 passes, AT-02 fails
+            CommandResult(
+                exit_code=1,
+                stdout="1 passed, 1 failed",
+                test_results={"AT-01": True, "AT-02": False},
+            ),
+            # Round 2 is tampered -> runner is NOT invoked!
+            # Round 3: both pass
+            CommandResult(
+                exit_code=0,
+                stdout="2 passed",
+                test_results={"AT-01": True, "AT-02": True},
+            ),
+        ]
+    )
+    resolver = ModelResolver(runner=runner, auto_probe=False, secrets=(secret_val,))
+    resolver.record_active_usage("Gemini 4 Hydrogen (Medium)", "BUILDING")
+
+    code_agent = FakeCodeAgent(
+        test_gen_steps=[
+            lambda ws, _ats: (
+                (ws / "tests").mkdir(parents=True, exist_ok=True),
+                (ws / "tests" / "test_timer.py").write_text("def test_at_01(): assert True\n", encoding="utf-8"),
+                type(
+                    "Res",
+                    (),
+                    {
+                        "files_written": ["tests/test_timer.py", "src/should_be_ignored.js"],
+                        "summary": f"Generated tests with {secret_val}",
+                        "model": "Gemini 4 Hydrogen (Medium)",
+                    },
+                )(),
+            )[-1],
+        ],
+        impl_steps=[
+            lambda ws, _p, _f, _a: (
+                (ws / "src").mkdir(parents=True, exist_ok=True),
+                (ws / "src" / "app.js").write_text("// v1\n", encoding="utf-8"),
+                type(
+                    "Res",
+                    (),
+                    {
+                        "files_written": ["index.html", "src/app.js"],
+                        "summary": f"First build with token={secret_val}",
+                        "model": "Gemini 4 Hydrogen (Medium)",
+                    },
+                )(),
+            )[-1],
+            # Attempt 2 tampers tests/ -> must be reverted and flagged outcome=reverted_tamper
+            lambda ws, _p, _f, _a: (
+                (ws / "tests" / "test_timer.py").write_text("def test_at_01(): pass\n", encoding="utf-8"),
+                type(
+                    "Res",
+                    (),
+                    {
+                        "files_written": ["tests/test_timer.py"],
+                        "summary": "Tried weakening tests",
+                        "model": "Gemini 4 Hydrogen (Medium)",
+                    },
+                )(),
+            )[-1],
+            lambda ws, _p, _f, _a: (
+                (ws / "src" / "app.js").write_text("export function tick() { return 1; }\n", encoding="utf-8"),
+                type(
+                    "Res",
+                    (),
+                    {
+                        "files_written": ["src/app.js"],
+                        "summary": "Fixed timer start button",
+                        "model": "Gemini 4 Hydrogen (Medium)",
+                    },
+                )(),
+            )[-1],
+        ],
+    )
+    # Attach model_resolver so BuildWorker records live activity & tests counts on it
+    code_agent.model_resolver = resolver  # type: ignore[attr-defined]
+
+    orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
+    worker = BuildWorker(
+        orchestrator=orch,
+        workspace_manager=ws_mgr,
+        code_agent=code_agent,
+        runner=runner,
+        vcs=FakeVCS(),
+        secrets_to_redact=(secret_val,),
+    )
+    report = worker.run_job(pid)
+    assert report.failure_cause is None
+    assert orch.get_status(pid).state == ProjectState.DELIVERED
+
+    invoked_events = [
+        ev for ev in store.get_events(pid) if ev.type == EventType.AGENT_INVOKED
+    ]
+    assert len(invoked_events) == 4  # 1 gen_tests + 3 impl rounds
+
+    # gen_tests files_written MUST strictly obey INV-13 (only tests/ paths, redacted)
+    gen_pl = invoked_events[0].payload
+    assert gen_pl["agent"] == "generate_tests"
+    assert gen_pl["files_written"] == ["tests/test_timer.py"]
+    assert secret_val not in str(gen_pl)
+
+    # Round 1: round=1, files_written, redacted summary_short, no failing_tests yet
+    r1_pl = invoked_events[1].payload
+    assert r1_pl["agent"] == "implement_or_fix"
+    assert r1_pl["round"] == 1
+    assert r1_pl["max_rounds"] >= 14
+    assert r1_pl["files_written"] == ["index.html", "src/app.js"]
+    assert secret_val not in r1_pl["summary_short"]
+    assert r1_pl["outcome"] == "ok"
+
+    # Round 2 (tampered): round=2, failing_tests recorded from round 1, outcome="reverted_tamper"
+    r2_pl = invoked_events[2].payload
+    assert r2_pl["round"] == 2
+    assert r2_pl["failing_tests"] == ["AT-02"]
+    assert r2_pl["outcome"] == "reverted_tamper"
+
+    # Round 3: round=3, outcome="ok"
+    r3_pl = invoked_events[3].payload
+    assert r3_pl["round"] == 3
+    assert r3_pl["outcome"] == "ok"
+
+    # Verify ModelResolver live detail + test progress API exposure when running
+    resolver.record_activity(
+        "Corrigiendo 1 prueba pendiente...",
+        agents_count=1,
+        stage="BUILDING",
+        detail="Archivos: src/app.js · Ronda 3 de hasta 14",
+        tests_passed=1,
+        tests_total=2,
+        build_round=3,
+        max_rounds=14,
+    )
+
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        build_worker=worker,
+        template_scaffold=scaffold,
+        workspace_manager=ws_mgr,
+        model_resolver=resolver,
+        secrets_to_redact=(secret_val,),
+    )
+    try:
+        # Mark running temporarily to verify /api/projects/<pid> exposes live Phase C fields
+        server.controller.mark_running(pid)
+        _, live_detail = _http_json(f"{base_url}/api/projects/{pid}")
+        assert live_detail["activity_detail"] == "Archivos: src/app.js · Ronda 3 de hasta 14"
+        assert live_detail["tests_passed"] == 1
+        assert live_detail["tests_total"] == 2
+        assert live_detail["build_round"] == 3
+        assert live_detail["max_rounds"] == 14
+        server.controller.mark_stopped(pid)
+
+        _, idle_detail = _http_json(f"{base_url}/api/projects/{pid}")
+        assert idle_detail["activity_detail"] is None
+        assert idle_detail["tests_passed"] is None
+        assert idle_detail["tests_total"] is None
+        assert secret_val not in json.dumps(idle_detail)
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
 

@@ -392,3 +392,41 @@ def test_agy_llm_adapter_retries_on_invalid_model_and_shares_resolver_in_cli(
         finally:
             rt.store.close()
     _ = sys.executable
+
+
+def test_model_resolver_tracks_rich_live_activity_progress_and_clears() -> None:
+    """Phase C: ModelResolver tracks activity_detail, test progress counts, and build rounds without breaking get_active_usage."""
+    resolver = ModelResolver(runner=FakeRunner(), auto_probe=False)
+    resolver.record_active_usage("Gemini 4 Hydrogen (Medium)", "BUILDING")
+    act = resolver.record_activity(
+        "Corrigiendo errores",
+        agents_count=1,
+        stage="BUILDING",
+        detail="Corrigiendo 1 prueba pendiente (Ronda 2 de hasta 15)",
+        tests_passed=2,
+        tests_total=3,
+        build_round=2,
+        max_rounds=15,
+    )
+    assert act["activity_summary"] == "Corrigiendo errores"
+    assert act["activity_detail"] == "Corrigiendo 1 prueba pendiente (Ronda 2 de hasta 15)"
+    assert act["tests_passed"] == 2
+    assert act["tests_total"] == 3
+    assert act["build_round"] == 2
+    assert act["max_rounds"] == 15
+
+    live = resolver.get_live_status()
+    assert live["model"] == "Gemini 4 Hydrogen (Medium)"
+    assert live["activity_detail"] == "Corrigiendo 1 prueba pendiente (Ronda 2 de hasta 15)"
+    assert live["tests_passed"] == 2
+    assert live["tests_total"] == 3
+    assert live["build_round"] == 2
+    assert live["max_rounds"] == 15
+    assert resolver.get_active_usage()["model"] == "Gemini 4 Hydrogen (Medium)"
+
+    resolver.clear_active_activity()
+    cleared = resolver.get_active_activity()
+    assert cleared["activity_summary"] is None
+    assert cleared["activity_detail"] is None
+    assert cleared["tests_passed"] is None
+    assert cleared["build_round"] is None

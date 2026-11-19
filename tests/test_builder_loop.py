@@ -1007,3 +1007,103 @@ def test_project_delivered_projects_repo_and_deploy_links_in_status(
     assert reprojected.links.repo == "https://github.com/af-org/proj-links-delivered"
     assert reprojected.links.deploy == "https://af-org.github.io/proj-links-delivered"
 
+
+def test_build_worker_emits_phase_b_event_metadata_with_inv13_and_inv19(
+    tmp_path: Path,
+) -> None:
+    """Phase B: BuildWorker annotates AGENT_INVOKED with bounded redacted files_written, round/max_rounds, failing_tests, and outcome."""
+    from agent_factory.ports.code_agent import CodeAgentResult
+
+    project_id = "proj-phase-b-meta"
+    secret = "SECRET_PHASE_B_9876"
+    orchestrator, store = _create_approved_project(
+        project_id, num_tests=2, approve=True
+    )
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+
+    many_files = {f"src/mod_{i:02d}.py": f"VAL_{i} = {i}\n" for i in range(12)}
+
+    class _RichAgent(FakeCodeAgent):
+        def generate_tests(self, *args, **kwargs):  # type: ignore[override]
+            res = super().generate_tests(*args, **kwargs)
+            return CodeAgentResult(
+                files_written=res.files_written + ["src/leaked_impl.py"],
+                summary=f"Generated tests with {secret}",
+                model_used="Gemini 4 Hydrogen (Medium)",
+            )
+
+        def implement_or_fix(self, *args, **kwargs):  # type: ignore[override]
+            res = super().implement_or_fix(*args, **kwargs)
+            return CodeAgentResult(
+                files_written=res.files_written,
+                summary=f"Fixed logic ({secret}) " + ("x" * 160),
+                model_used="Gemini 4 Hydrogen (Medium)",
+            )
+
+    fake_agent = _RichAgent(
+        test_gen_steps=[
+            {"tests/test_app.py": "def test_at_01(): pass\ndef test_at_02(): pass\n"},
+        ],
+        impl_steps=[
+            many_files,
+            {"tests/test_app.py": "# tampered!\n", "src/mod_00.py": "VAL_0 = 99\n"},
+            {"src/mod_00.py": "VAL_0 = 100\n"},
+        ],
+    )
+    fake_runner = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=1,
+                stdout="1 passed, 1 failed",
+                test_results={"AT-01": True, "AT-02": False},
+            ),
+            CommandResult(
+                exit_code=0,
+                stdout="2 passed",
+                test_results={"AT-01": True, "AT-02": True},
+            ),
+        ]
+    )
+    fake_vcs = FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")])
+    worker = BuildWorker(
+        orchestrator=orchestrator,
+        workspace_manager=ws_mgr,
+        code_agent=fake_agent,
+        runner=fake_runner,
+        vcs=fake_vcs,
+        secrets_to_redact=(secret,),
+    )
+    worker.run_job(
+        project_id=project_id,
+        template_files={"pyproject.toml": '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'},
+    )
+
+    events = store.get_events(project_id)
+    invoked = [
+        ev
+        for ev in events
+        if ev.type == EventType.AGENT_INVOKED
+        and ev.payload.get("state") == ProjectState.BUILDING.value
+    ]
+    assert len(invoked) == 4  # 1 test gen + 3 impl rounds (tamper adds no extra event)
+
+    gen_ev = invoked[0]
+    assert gen_ev.payload["agent"] == "generate_tests"
+    assert gen_ev.payload["files_written"] == ["tests/test_app.py"]
+    assert secret not in gen_ev.payload["summary_short"]
+
+    r1, r2, r3 = invoked[1], invoked[2], invoked[3]
+    assert r1.payload["round"] == 1
+    assert r1.payload["outcome"] == "ok"
+    assert len(r1.payload["files_written"]) == 10
+    assert len(r1.payload["summary_short"]) <= 140
+    assert secret not in r1.payload["summary_short"]
+
+    assert r2.payload["round"] == 2
+    assert r2.payload["failing_tests"] == ["AT-02"]
+    assert r2.payload["outcome"] == "reverted_tamper"
+
+    assert r3.payload["round"] == 3
+    assert r3.payload["outcome"] == "ok"
+    assert orchestrator.get_status(project_id).state == ProjectState.DELIVERED
+

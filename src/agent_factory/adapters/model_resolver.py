@@ -388,9 +388,14 @@ class ModelResolver:
         }
         self._active_activity: dict[str, Any] = {
             "activity_summary": None,
+            "activity_detail": None,
             "agents_count": None,
             "step_started_at": None,
             "stage": None,
+            "tests_passed": None,
+            "tests_total": None,
+            "build_round": None,
+            "max_rounds": None,
         }
 
     def record_active_usage(
@@ -439,37 +444,53 @@ class ModelResolver:
         agents_count: int = 1,
         stage: str | None = None,
         started_at: str | None = None,
+        detail: str | None = None,
+        tests_passed: int | None = None,
+        tests_total: int | None = None,
+        build_round: int | None = None,
+        max_rounds: int | None = None,
     ) -> dict[str, Any]:
-        """Record the active plain-Spanish sub-step summary, agent count, and start time."""
+        """Record active plain-Spanish sub-step summary, detail, counts, and start time."""
         clean_summary = (
             redact_secrets(str(activity_summary).strip(), extra_secrets=self.secrets)
             if activity_summary and str(activity_summary).strip()
+            else None
+        )
+        clean_detail = (
+            redact_secrets(str(detail).strip(), extra_secrets=self.secrets)
+            if detail and str(detail).strip()
             else None
         )
         clean_stage = str(stage).strip().upper() if stage and str(stage).strip() else None
         count = max(1, int(agents_count))
         with self._lock:
             prev_summary = self._active_activity.get("activity_summary")
+            prev_detail = self._active_activity.get("activity_detail")
             prev_started = self._active_activity.get("step_started_at")
             if started_at is not None:
                 effective_started: str | None = started_at
             elif clean_summary is None:
                 effective_started = None
-            elif clean_summary != prev_summary or not prev_started:
+            elif clean_summary != prev_summary or clean_detail != prev_detail or not prev_started:
                 effective_started = datetime.now(UTC).isoformat()
             else:
                 effective_started = str(prev_started)
 
             self._active_activity = {
                 "activity_summary": clean_summary,
+                "activity_detail": clean_detail,
                 "agents_count": count if clean_summary is not None else None,
                 "step_started_at": effective_started,
                 "stage": clean_stage or self._active_usage.get("stage"),
+                "tests_passed": int(tests_passed) if tests_passed is not None else None,
+                "tests_total": int(tests_total) if tests_total is not None else None,
+                "build_round": int(build_round) if build_round is not None else None,
+                "max_rounds": int(max_rounds) if max_rounds is not None else None,
             }
             return dict(self._active_activity)
 
     def get_active_activity(self) -> dict[str, Any]:
-        """Return a thread-safe snapshot of active sub-step description, agent count, and start timestamp."""
+        """Return a thread-safe snapshot of active sub-step description, detail, counts, and start timestamp."""
         with self._lock:
             return dict(self._active_activity)
 
@@ -480,8 +501,13 @@ class ModelResolver:
             combined.update(
                 {
                     "activity_summary": self._active_activity.get("activity_summary"),
+                    "activity_detail": self._active_activity.get("activity_detail"),
                     "agents_count": self._active_activity.get("agents_count"),
                     "step_started_at": self._active_activity.get("step_started_at"),
+                    "tests_passed": self._active_activity.get("tests_passed"),
+                    "tests_total": self._active_activity.get("tests_total"),
+                    "build_round": self._active_activity.get("build_round"),
+                    "max_rounds": self._active_activity.get("max_rounds"),
                 }
             )
             if not combined.get("stage"):
@@ -493,9 +519,14 @@ class ModelResolver:
         with self._lock:
             self._active_activity = {
                 "activity_summary": None,
+                "activity_detail": None,
                 "agents_count": None,
                 "step_started_at": None,
                 "stage": None,
+                "tests_passed": None,
+                "tests_total": None,
+                "build_round": None,
+                "max_rounds": None,
             }
 
     def _build_clean_env(self) -> dict[str, str]:

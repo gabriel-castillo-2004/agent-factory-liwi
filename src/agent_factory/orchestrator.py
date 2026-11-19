@@ -834,6 +834,13 @@ class Orchestrator:
         model: str | None = None,
         agent: str | None = None,
         duration_seconds: float | None = None,
+        round_num: int | None = None,
+        max_rounds: int | None = None,
+        files_written: Sequence[str] | None = None,
+        summary_short: str | None = None,
+        failing_tests: Sequence[str] | None = None,
+        outcome: str | None = None,
+        extra_secrets: Sequence[str] = (),
     ) -> ProjectStatus:
         """Record a call in the given state or transition to FAILED if budget exceeded (INV-17)."""
         validate_project_id(project_id)
@@ -850,9 +857,38 @@ class Orchestrator:
                 if agent:
                     payload["agent"] = agent
                 if model:
-                    payload["model"] = model
+                    payload["model"] = redact_secrets(str(model), extra_secrets=extra_secrets)
                 if duration_seconds is not None:
                     payload["duration_seconds"] = round(max(0.0, float(duration_seconds)), 3)
+                if round_num is not None:
+                    payload["round"] = int(round_num)
+                if max_rounds is not None:
+                    payload["max_rounds"] = int(max_rounds)
+                if files_written is not None:
+                    cleaned_files: list[str] = []
+                    for item in list(files_written)[:10]:
+                        norm_item = redact_secrets(
+                            str(item).strip().replace("\\", "/"),
+                            extra_secrets=extra_secrets,
+                        )[:120]
+                        if norm_item and norm_item not in cleaned_files:
+                            cleaned_files.append(norm_item)
+                    payload["files_written"] = cleaned_files
+                if summary_short is not None:
+                    collapsed = " ".join(str(summary_short).split())
+                    redacted_sum = redact_secrets(collapsed, extra_secrets=extra_secrets)
+                    if len(redacted_sum) > 140:
+                        redacted_sum = redacted_sum[:137].rstrip() + "..."
+                    if redacted_sum:
+                        payload["summary_short"] = redacted_sum
+                if failing_tests is not None:
+                    payload["failing_tests"] = [
+                        redact_secrets(str(t).strip(), extra_secrets=extra_secrets)[:40]
+                        for t in list(failing_tests)[:10]
+                        if str(t).strip()
+                    ]
+                if outcome:
+                    payload["outcome"] = str(outcome)
                 self.store.append(
                     create_event(
                         project_id=project_id,

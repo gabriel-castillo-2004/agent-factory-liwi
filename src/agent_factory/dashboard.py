@@ -81,13 +81,18 @@ class DashboardController:
         self._threads: list[threading.Thread] = []
 
     def _get_live_status_info(self, running: bool) -> dict[str, Any]:
-        """Return live active model, stage, activity summary, agent count, and start time when running."""
+        """Return live active model, stage, activity summary/detail, test progress, and timer."""
         empty: dict[str, Any] = {
             "active_model": None,
             "active_stage": None,
             "activity_summary": None,
+            "activity_detail": None,
             "agents_count": None,
             "step_started_at": None,
+            "tests_passed": None,
+            "tests_total": None,
+            "build_round": None,
+            "max_rounds": None,
         }
         if not running or self.model_resolver is None:
             return empty
@@ -116,14 +121,25 @@ class DashboardController:
         def _scrub_opt(val: Any) -> str | None:
             return redact_secrets(str(val), extra_secrets=self.secrets_to_redact) if val else None
 
-        raw_count = live.get("agents_count")
-        agents_count = int(raw_count) if isinstance(raw_count, (int, float)) and raw_count > 0 else None
+        def _opt_int(val: Any, *, allow_zero: bool) -> int | None:
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                return None
+            iv = int(val)
+            if iv < 0 or (not allow_zero and iv == 0):
+                return None
+            return iv
+
         return {
             "active_model": _scrub_opt(live.get("model")),
             "active_stage": _scrub_opt(live.get("stage")),
             "activity_summary": _scrub_opt(live.get("activity_summary")),
-            "agents_count": agents_count,
+            "activity_detail": _scrub_opt(live.get("activity_detail")),
+            "agents_count": _opt_int(live.get("agents_count"), allow_zero=False),
             "step_started_at": _scrub_opt(live.get("step_started_at")),
+            "tests_passed": _opt_int(live.get("tests_passed"), allow_zero=True),
+            "tests_total": _opt_int(live.get("tests_total"), allow_zero=True),
+            "build_round": _opt_int(live.get("build_round"), allow_zero=False),
+            "max_rounds": _opt_int(live.get("max_rounds"), allow_zero=False),
         }
 
     def is_busy(self, project_id: str) -> bool:
@@ -244,11 +260,7 @@ class DashboardController:
         raw["has_plan"] = has_plan
         raw["busy"] = running
         raw["is_running"] = running
-        raw["active_model"] = live_info["active_model"]
-        raw["active_stage"] = live_info["active_stage"]
-        raw["activity_summary"] = live_info["activity_summary"]
-        raw["agents_count"] = live_info["agents_count"]
-        raw["step_started_at"] = live_info["step_started_at"]
+        raw.update(live_info)
         raw["last_event_at"] = last_event_at
         return _scrub_value(raw, self.secrets_to_redact)
 
@@ -284,11 +296,7 @@ class DashboardController:
                         "has_plan": False,
                         "busy": running,
                         "is_running": running,
-                        "active_model": live_info["active_model"],
-                        "active_stage": live_info["active_stage"],
-                        "activity_summary": live_info["activity_summary"],
-                        "agents_count": live_info["agents_count"],
-                        "step_started_at": live_info["step_started_at"],
+                        **live_info,
                         "last_event_at": None,
                     }
                 )
@@ -326,8 +334,13 @@ class DashboardController:
             "active_model": summary["active_model"],
             "active_stage": summary["active_stage"],
             "activity_summary": summary["activity_summary"],
+            "activity_detail": summary["activity_detail"],
             "agents_count": summary["agents_count"],
             "step_started_at": summary["step_started_at"],
+            "tests_passed": summary["tests_passed"],
+            "tests_total": summary["tests_total"],
+            "build_round": summary["build_round"],
+            "max_rounds": summary["max_rounds"],
             "last_event_at": summary["last_event_at"],
             "spec": _scrub_value(spec.model_dump(mode="json"), self.secrets_to_redact),
             "plan": _scrub_value(plan.model_dump(mode="json"), self.secrets_to_redact)
@@ -752,7 +765,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       --surface-alt: #f1f5f9;
       --border: #e2e8f0;
       --text: #0f172a;
-      --muted: #64748b;
+      --muted: #475569;
       --accent: #0284c7;
       --accent-hover: #0369a1;
       --ok: #16a34a;
@@ -957,20 +970,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .badge-err { background: var(--err-bg); color: var(--err); border-color: var(--err); }
     .badge-warn { background: var(--warn-bg); color: var(--warn); border-color: var(--warn); }
     .badge-info { background: var(--info-bg); color: var(--accent); border-color: var(--accent); }
-    .progress-track {
-      width: 100%;
+    .stage-segments {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 5px;
+      margin: 8px 0 6px;
+    }
+    .stage-seg {
       height: 5px;
-      background: var(--surface-alt);
       border-radius: 999px;
-      overflow: hidden;
-      margin: 6px 0;
+      background: var(--border);
+      transition: background 0.25s ease;
     }
-    .progress-fill {
-      height: 100%;
-      background: var(--accent);
-      border-radius: 999px;
-      transition: width 0.3s ease;
-    }
+    .stage-seg.done { background: var(--ok); }
+    .stage-seg.active { background: var(--accent); }
+    .stage-seg.error { background: var(--err); }
+    .stage-seg.warn { background: var(--warn); }
     .muted { color: var(--muted); font-size: 0.88rem; }
     .empty-box {
       padding: 30px 16px;
@@ -1408,6 +1423,116 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     @keyframes spin {
       to { transform: rotate(360deg); }
     }
+    .banner-subdesc {
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-top: 4px;
+      line-height: 1.4;
+    }
+    .banner-tests {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--ok);
+      margin-top: 6px;
+    }
+    .banner-tests.pending { color: var(--accent); }
+    .banner-calm {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-top: 8px;
+    }
+    .tech-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.85rem;
+      color: var(--muted);
+      cursor: pointer;
+      user-select: none;
+      padding: 4px 8px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+    }
+    body:not(.tech-mode) .tech-only { display: none; }
+    .history-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .round-card {
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
+      border-radius: 8px;
+      padding: 8px 11px;
+      margin-top: 4px;
+    }
+    .round-summary {
+      font-size: 0.85rem;
+      color: var(--text);
+      margin-top: 4px;
+      line-height: 1.4;
+    }
+    .round-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      margin-top: 6px;
+    }
+    .file-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-top: 6px;
+    }
+    .file-chip {
+      display: inline-block;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.74rem;
+      padding: 1px 7px;
+      border-radius: 5px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+    .test-badge {
+      display: inline-flex;
+      align-items: center;
+      font-size: 0.74rem;
+      font-weight: 600;
+      padding: 1px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--muted);
+    }
+    .test-badge.ok {
+      color: var(--ok);
+      border-color: rgba(34, 197, 94, 0.35);
+      background: var(--ok-bg);
+    }
+    details.prior-attempts-box {
+      margin-top: 14px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface-alt);
+      padding: 10px 14px;
+    }
+    details.prior-attempts-box > summary {
+      cursor: pointer;
+      font-size: 0.86rem;
+      font-weight: 600;
+      color: var(--muted);
+      user-select: none;
+    }
+    details.prior-attempts-box > summary:hover { color: var(--text); }
   </style>
 </head>
 <body>
@@ -1418,6 +1543,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <span id="status-note" class="toast"></span>
     </div>
     <div class="controls">
+      <label class="tech-toggle" title="Mostrar IDs, detalles JSON, modelos por paso y trazas técnicas">
+        <input id="tech-mode-toggle" type="checkbox" />
+        <span>Modo técnico</span>
+      </label>
       <button id="theme-btn" class="btn" type="button">Modo claro</button>
     </div>
   </header>
@@ -1447,7 +1576,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
           <span id="detail-badge" class="badge"></span>
         </div>
-        <div class="progress-track"><div id="detail-progress" class="progress-fill" style="width:0%"></div></div>
+        <div id="detail-segments" class="stage-segments"></div>
         <div id="detail-time" class="muted" style="font-size:0.78rem; margin:-2px 0 10px 0; text-align:right;"></div>
 
         <div id="detail-guidance"></div>
@@ -1476,6 +1605,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       adjustDrafts: {},
       adjustOpen: {},
       phaseOpen: {},
+      priorOpen: {},
       lastBannerSignature: null,
     };
     let statusNoteTimer = null;
@@ -1615,6 +1745,64 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       applyTheme(cur === 'dark' ? 'light' : 'dark');
     });
 
+    function applyTechMode(enabled) {
+      const on = Boolean(enabled);
+      document.body.classList.toggle('tech-mode', on);
+      const cb = document.getElementById('tech-mode-toggle');
+      if (cb) cb.checked = on;
+      try { localStorage.setItem('af_tech_mode', on ? '1' : '0'); } catch (_) {}
+    }
+
+    (function initTechMode() {
+      let saved = false;
+      try { saved = localStorage.getItem('af_tech_mode') === '1'; } catch (_) {}
+      applyTechMode(saved);
+    })();
+
+    const techToggleEl = document.getElementById('tech-mode-toggle');
+    if (techToggleEl) {
+      techToggleEl.addEventListener('change', () => {
+        applyTechMode(techToggleEl.checked);
+      });
+    }
+
+    function renderStageSegments(stageNum, mode) {
+      const stage = Math.max(1, Math.min(5, Number(stageNum || 1)));
+      const segs = [];
+      for (let i = 1; i <= 5; i++) {
+        let cls = '';
+        if (mode === 'delivered') {
+          cls = 'done';
+        } else if (i < stage) {
+          cls = 'done';
+        } else if (i === stage) {
+          cls = mode === 'error' ? 'error' : (mode === 'paused' ? 'warn' : 'active');
+        }
+        segs.push('<div class="stage-seg' + (cls ? (' ' + cls) : '') + '"></div>');
+      }
+      return '<div class="stage-segments" aria-label="Etapa ' + stage + ' de 5">' + segs.join('') + '</div>';
+    }
+
+    function humanizeError(rawErr) {
+      const txt = String(rawErr || '');
+      if (/timed?\\s*out|timeout/i.test(txt)) {
+        return 'La operación tardó más de lo esperado y superó el tiempo límite.';
+      }
+      if (/tamper|INV-13|zero test files/i.test(txt)) {
+        return 'No se pudieron generar o validar correctamente las pruebas automáticas.';
+      }
+      if (/circuit breaker|max.*invocations|budget/i.test(txt)) {
+        return 'Se alcanzó el límite máximo de intentos automáticos para proteger tus créditos.';
+      }
+      if (/rate\\s*limit|429|quota|capacity/i.test(txt)) {
+        return 'El servicio de inteligencia artificial alcanzó un límite temporal. Intenta de nuevo en unos minutos.';
+      }
+      if (/exit code|command.*failed|subprocess/i.test(txt)) {
+        return 'Ocurrió un fallo técnico al ejecutar la verificación automática.';
+      }
+      return 'El proceso se detuvo por un inconveniente técnico. Puedes volver a intentarlo con un clic.';
+    }
+
     document.querySelectorAll('.tab-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
         state.activeTab = btn.dataset.tab;
@@ -1650,7 +1838,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const selected = p.project_id === state.selectedId ? 'selected' : '';
         const info = stepInfo(p.state);
         const title = escapeHtml(p.name || p.objective || p.project_id);
-        const pct = Number(p.progress_pct || 0);
         const running = Boolean(p.is_running || p.busy);
         const pausedActive = !running && (
           p.state === 'DEBATE' || p.state === 'MEDIATION' ||
@@ -1660,6 +1847,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           ? ' <span class="busy-pill">(en curso)</span>'
           : (pausedActive ? ' <span class="busy-pill" style="color:var(--warn)">(pausado)</span>' : '');
         const badgeCls = pausedActive ? 'badge-warn' : info.cls;
+        const segMode = (p.state === 'DELIVERED' || p.state === 'COMPLETED')
+          ? 'delivered'
+          : ((p.state === 'FAILED' || p.state === 'ERROR') ? 'error' : (pausedActive ? 'paused' : 'active'));
         const timeHtml = p.last_event_at
           ? '<div class="muted" style="font-size:0.75rem; margin-top:4px; text-align:right;" title="' + escapeHtml(p.last_event_at) + '">' + escapeHtml(formatFriendlyTime(p.last_event_at)) + '</div>'
           : '';
@@ -1668,7 +1858,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             '<div class="card-title">' + title + statusTag + '</div>' +
             '<span class="badge ' + badgeCls + '">' + escapeHtml(info.cardStep || info.step) + '</span>' +
           '</div>' +
-          '<div class="progress-track"><div class="progress-fill" style="width:' + pct + '%"></div></div>' +
+          renderStageSegments(info.stage, segMode) +
           timeHtml +
         '</div>';
       }).join('');
@@ -1773,8 +1963,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           return 3;
         case 'TESTS_UPDATED':
         case 'CI_ROUND_COMPLETED':
-        case 'PROJECT_RETRIED':
           return 4;
+        case 'PROJECT_RETRIED':
+          return pl.to ? stateToPhaseNum(pl.to) : 4;
         case 'PROJECT_DELIVERED':
         case 'PROJECT_COMPLETED':
         case 'COMPLETED':
@@ -1922,6 +2113,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const descText = st.activity_summary
           ? escapeHtml(st.activity_summary)
           : 'Los agentes están avanzando en esta etapa. Esta pantalla se actualiza sola cada 5 segundos.';
+        const subDescHtml = st.activity_detail
+          ? '<div class="banner-subdesc">' + escapeHtml(st.activity_detail) + '</div>'
+          : '';
+        const hasTests = typeof st.tests_passed === 'number' && typeof st.tests_total === 'number' && st.tests_total > 0;
+        const testsPending = hasTests && st.tests_passed < st.tests_total;
+        const testsHtml = hasTests
+          ? '<div class="banner-tests' + (testsPending ? ' pending' : '') + '">' +
+              (testsPending ? '' : '✓ ') + st.tests_passed + ' de ' + st.tests_total + ' pruebas aprobadas' +
+            '</div>'
+          : '';
         const agentsCount = Number(st.agents_count || 1);
         const agentsText = agentsCount === 2
           ? '2 agentes colaborando'
@@ -1940,7 +2141,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             '<div class="banner-body">' +
               '<div class="banner-title">Trabajando automáticamente</div>' +
               '<div class="banner-desc">' + descText + '</div>' +
+              subDescHtml +
+              testsHtml +
               '<div class="model-usage-row">' + agentsPill + modelPill + timerPill + '</div>' +
+              '<div class="banner-calm">Es normal que tome varias rondas. Te avisaremos si necesita tu ayuda.</div>' +
             '</div>' +
           '</div>' +
         '</div>';
@@ -2017,13 +2221,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
 
       if (st.state === 'FAILED' || st.state === 'ERROR') {
+        const friendlyErr = humanizeError(st.last_error);
         return '<div class="guidance-banner banner-err">' +
           '<div class="banner-content">' +
             '<div class="banner-icon">⚠️</div>' +
             '<div class="banner-body">' +
               '<div class="banner-title">Se requiere atención</div>' +
-              '<div class="banner-desc">El proceso se detuvo por un inconveniente técnico. Puedes volver a intentarlo con un clic.</div>' +
-              '<details class="tech-details">' +
+              '<div class="banner-desc">' + escapeHtml(friendlyErr) + '</div>' +
+              '<details class="tech-details tech-only">' +
                 '<summary>Ver detalle técnico</summary>' +
                 '<pre>' + escapeHtml(st.last_error || 'Sin detalle técnico disponible.') + '</pre>' +
               '</details>' +
@@ -2063,6 +2268,382 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       '</div>';
     }
 
+    function splitProjectAttempts(events) {
+      if (!Array.isArray(events) || !events.length) {
+        return { activeEvents: [], priorEvents: [], priorGroups: [] };
+      }
+      let lastRetryIdx = -1;
+      for (let i = events.length - 1; i >= 0; i--) {
+        if (events[i].type === 'PROJECT_RETRIED') {
+          lastRetryIdx = i;
+          break;
+        }
+      }
+      if (lastRetryIdx < 0) {
+        return { activeEvents: events, priorEvents: [], priorGroups: [] };
+      }
+      const targetPhase = phaseNumForEvent(events[lastRetryIdx]);
+      const activeEvents = [];
+      const priorEvents = [];
+      for (let i = 0; i < events.length; i++) {
+        const ev = events[i];
+        if (i < lastRetryIdx) {
+          const evPhase = phaseNumForEvent(ev);
+          if (
+            evPhase >= targetPhase ||
+            ev.type === 'PHASE_ERROR' ||
+            ev.type === 'PROJECT_FAILED' ||
+            ev.type === 'PROJECT_RETRIED'
+          ) {
+            priorEvents.push(ev);
+            continue;
+          }
+        }
+        activeEvents.push(ev);
+      }
+      const priorGroups = [];
+      let currentChunk = [];
+      priorEvents.forEach((ev) => {
+        if (ev.type === 'PROJECT_RETRIED' && currentChunk.length) {
+          priorGroups.push(currentChunk);
+          currentChunk = [ev];
+        } else {
+          currentChunk.push(ev);
+        }
+      });
+      if (currentChunk.length) {
+        priorGroups.push(currentChunk);
+      }
+      return { activeEvents, priorEvents, priorGroups };
+    }
+
+    function explicitEventDurationSeconds(ev) {
+      const pl = ev && ev.payload ? ev.payload : null;
+      if (pl && typeof pl.duration_seconds === 'number' && isFinite(pl.duration_seconds) && pl.duration_seconds >= 0) {
+        return pl.duration_seconds;
+      }
+      return null;
+    }
+
+    function failedRoundRatio(entry) {
+      if (!entry || entry.kind !== 'round' || entry.outcome === 'reverted_tamper') return '';
+      const tpl = entry.testsEv && entry.testsEv.payload ? entry.testsEv.payload : null;
+      if (!tpl || typeof tpl.total !== 'number' || tpl.total <= 0) return '';
+      const passed = Number(tpl.passed || 0);
+      if (passed >= tpl.total) return '';
+      return passed + '/' + tpl.total;
+    }
+
+    function pairAndGroupPhaseEvents(rawEvents) {
+      const items = [];
+      let roundCounter = 0;
+      let i = 0;
+      while (i < rawEvents.length) {
+        const ev = rawEvents[i];
+        const pl = ev && ev.payload ? ev.payload : {};
+        if (ev.type === 'STATE_TRANSITIONED') {
+          items.push({ kind: 'tech_only', ev });
+          i++;
+          continue;
+        }
+        if (ev.type === 'PHASE_ERROR') {
+          let k = i + 1;
+          const techBetween = [];
+          while (k < rawEvents.length && rawEvents[k].type === 'STATE_TRANSITIONED') {
+            techBetween.push({ kind: 'tech_only', ev: rawEvents[k] });
+            k++;
+          }
+          if (k < rawEvents.length && rawEvents[k].type === 'PROJECT_FAILED') {
+            const failEv = rawEvents[k];
+            const fpl = failEv.payload || {};
+            const rawErr = fpl.reason || pl.error || '';
+            items.push({
+              kind: 'fused_error',
+              ev: failEv,
+              causeEv: ev,
+              rawError: rawErr,
+              msg: humanizeError(rawErr),
+              durSecs: explicitEventDurationSeconds(failEv) ?? explicitEventDurationSeconds(ev),
+            });
+            techBetween.forEach((t) => items.push(t));
+            i = k + 1;
+            continue;
+          }
+          const rawErr = pl.error || '';
+          items.push({
+            kind: 'fused_error',
+            ev,
+            rawError: rawErr,
+            msg: humanizeError(rawErr),
+            durSecs: explicitEventDurationSeconds(ev),
+          });
+          i++;
+          continue;
+        }
+        if (ev.type === 'PROJECT_FAILED') {
+          const rawErr = pl.reason || pl.error || '';
+          items.push({
+            kind: 'fused_error',
+            ev,
+            rawError: rawErr,
+            msg: humanizeError(rawErr),
+            durSecs: explicitEventDurationSeconds(ev),
+          });
+          i++;
+          continue;
+        }
+        if (ev.type === 'AGENT_INVOKED' && pl.agent === 'generate_tests') {
+          const files = Array.isArray(pl.files_written) ? pl.files_written.slice(0, 10) : [];
+          items.push({
+            kind: 'gen_tests',
+            ev,
+            filesWritten: files,
+            summaryShort: pl.summary_short ? String(pl.summary_short) : '',
+            durSecs: explicitEventDurationSeconds(ev),
+          });
+          i++;
+          continue;
+        }
+        if (ev.type === 'AGENT_INVOKED' && (pl.agent === 'implement_or_fix' || pl.round !== undefined)) {
+          roundCounter++;
+          const roundNum = (typeof pl.round === 'number' && pl.round > 0) ? pl.round : roundCounter;
+          const maxRounds = (typeof pl.max_rounds === 'number' && pl.max_rounds > 0) ? pl.max_rounds : null;
+          let testsEv = null;
+          let ciEv = null;
+          const deferredTech = [];
+          let j = i + 1;
+          while (j < rawEvents.length) {
+            const nxt = rawEvents[j];
+            if (nxt.type === 'STATE_TRANSITIONED') {
+              deferredTech.push({ kind: 'tech_only', ev: nxt });
+              j++;
+              continue;
+            }
+            if (nxt.type === 'TESTS_UPDATED' && !testsEv) {
+              testsEv = nxt;
+              j++;
+              continue;
+            }
+            if (nxt.type === 'CI_ROUND_COMPLETED' && !ciEv) {
+              ciEv = nxt;
+              j++;
+              continue;
+            }
+            break;
+          }
+          let durSum = 0;
+          let hasDur = false;
+          [ev, testsEv, ciEv].forEach((part) => {
+            if (!part) return;
+            const d = explicitEventDurationSeconds(part);
+            if (d !== null) {
+              durSum += d;
+              hasDur = true;
+            }
+          });
+          const files = Array.isArray(pl.files_written) ? pl.files_written.slice(0, 10) : [];
+          items.push({
+            kind: 'round',
+            ev,
+            testsEv,
+            ciEv,
+            roundNum,
+            maxRounds,
+            filesWritten: files,
+            summaryShort: pl.summary_short ? String(pl.summary_short) : '',
+            outcome: pl.outcome ? String(pl.outcome) : '',
+            failingTests: Array.isArray(pl.failing_tests) ? pl.failing_tests : [],
+            durSecs: hasDur ? durSum : null,
+          });
+          deferredTech.forEach((t) => items.push(t));
+          i = j;
+          continue;
+        }
+        items.push({
+          kind: 'step',
+          ev,
+          durSecs: explicitEventDurationSeconds(ev),
+        });
+        i++;
+      }
+
+      // Collapse intermediate repeated failed rounds with identical test counts
+      const collapsed = [];
+      let idx = 0;
+      while (idx < items.length) {
+        const ratio = failedRoundRatio(items[idx]);
+        if (!ratio) {
+          collapsed.push(items[idx]);
+          idx++;
+          continue;
+        }
+        let end = idx;
+        while (end + 1 < items.length && failedRoundRatio(items[end + 1]) === ratio) {
+          end++;
+        }
+        const keepFirst = idx === 0 ? 1 : 0;
+        const collStart = idx + keepFirst;
+        if (keepFirst) {
+          collapsed.push(items[idx]);
+        }
+        if (end - collStart + 1 >= 2) {
+          collapsed.push({
+            kind: 'stalled_group',
+            rounds: items.slice(collStart, end + 1),
+            ratio,
+          });
+        } else {
+          for (let c = collStart; c <= end; c++) {
+            collapsed.push(items[c]);
+          }
+        }
+        idx = end + 1;
+      }
+      return collapsed;
+    }
+
+    function renderFileChips(files) {
+      if (!Array.isArray(files) || !files.length) return '';
+      return '<div class="file-chips">' + files.map((f) =>
+        '<span class="file-chip">' + escapeHtml(f) + '</span>'
+      ).join('') + '</div>';
+    }
+
+    function renderTimelineEntry(item) {
+      if (item.kind === 'stalled_group') {
+        return '<div class="timeline-item">' +
+          '<div class="timeline-dot warn"></div>' +
+          '<details class="tech-details" style="margin-top:0; border-top:none; padding-top:0;">' +
+            '<summary>' + item.rounds.length + ' rondas intermedias con mismo resultado (' + escapeHtml(item.ratio) + ' pruebas)</summary>' +
+            '<div style="margin-top:8px;">' + item.rounds.map((r) => renderTimelineEntry(r)).join('') + '</div>' +
+          '</details>' +
+        '</div>';
+      }
+
+      const ev = item.ev;
+      const pl = ev && ev.payload ? ev.payload : {};
+      const rawDate = ev && ev.at ? String(ev.at) : '';
+      const friendlyDate = rawDate ? escapeHtml(formatFriendlyTime(rawDate)) : '';
+
+      if (item.kind === 'tech_only') {
+        const hasPayload = ev.payload && Object.keys(ev.payload).length > 0;
+        return '<div class="timeline-item tech-only">' +
+          '<div class="timeline-dot info"></div>' +
+          '<div class="timeline-header">' +
+            '<span class="timeline-title-group">' +
+              '<span class="timeline-type">' + escapeHtml(friendlyEventAction(ev)) + '</span>' +
+            '</span>' +
+            '<span class="timeline-time" title="' + escapeHtml(rawDate) + '">' + friendlyDate + '</span>' +
+          '</div>' +
+          (hasPayload ? '<details class="tech-details tech-only" style="margin-top:4px;"><summary>Ver datos técnicos</summary><pre style="margin:4px 0 0 0;">' + escapeHtml(JSON.stringify(ev.payload, null, 2)) + '</pre></details>' : '') +
+        '</div>';
+      }
+
+      if (item.kind === 'fused_error') {
+        const techPayload = item.causeEv
+          ? { phase_error: item.causeEv.payload || {}, project_failed: ev.payload || {} }
+          : (ev.payload || {});
+        const techText = item.rawError ? (String(item.rawError) + '\\n\\n' + JSON.stringify(techPayload, null, 2)) : JSON.stringify(techPayload, null, 2);
+        const durPill = item.durSecs !== null ? '<span class="duration-pill">Tardó ' + escapeHtml(formatDurationHuman(item.durSecs, '< 1s')) + '</span>' : '';
+        return '<div class="timeline-item">' +
+          '<div class="timeline-dot err"></div>' +
+          '<div class="timeline-header">' +
+            '<span class="timeline-title-group">' +
+              '<span class="timeline-type">El proceso se detuvo</span>' +
+              durPill +
+            '</span>' +
+            '<span class="timeline-time" title="' + escapeHtml(rawDate) + '">' + friendlyDate + '</span>' +
+          '</div>' +
+          '<div class="round-summary">' + escapeHtml(item.msg) + '</div>' +
+          '<details class="tech-details tech-only" style="margin-top:4px;"><summary>Ver detalle técnico</summary><pre style="margin:4px 0 0 0;">' + escapeHtml(techText) + '</pre></details>' +
+        '</div>';
+      }
+
+      if (item.kind === 'gen_tests') {
+        const modelPill = pl.model ? '<span class="model-pill tech-only">' + escapeHtml(String(pl.model)) + '</span>' : '';
+        const durPill = item.durSecs !== null ? '<span class="duration-pill">Tardó ' + escapeHtml(formatDurationHuman(item.durSecs, '< 1s')) + '</span>' : '';
+        const hasPayload = ev.payload && Object.keys(ev.payload).length > 0;
+        return '<div class="timeline-item">' +
+          '<div class="timeline-dot ok"></div>' +
+          '<div class="timeline-header">' +
+            '<span class="timeline-title-group">' +
+              '<span class="timeline-type">Pruebas automáticas creadas</span>' +
+              modelPill +
+              durPill +
+            '</span>' +
+            '<span class="timeline-time" title="' + escapeHtml(rawDate) + '">' + friendlyDate + '</span>' +
+          '</div>' +
+          (item.summaryShort ? '<div class="round-summary">' + escapeHtml(item.summaryShort) + '</div>' : '') +
+          renderFileChips(item.filesWritten) +
+          (hasPayload ? '<details class="tech-details tech-only" style="margin-top:4px;"><summary>Ver datos técnicos</summary><pre style="margin:4px 0 0 0;">' + escapeHtml(JSON.stringify(ev.payload, null, 2)) + '</pre></details>' : '') +
+        '</div>';
+      }
+
+      if (item.kind === 'round') {
+        const tpl = item.testsEv && item.testsEv.payload ? item.testsEv.payload : null;
+        const hasTests = tpl && typeof tpl.total === 'number' && tpl.total > 0;
+        const passed = hasTests ? Number(tpl.passed || 0) : 0;
+        const allOk = hasTests && passed >= tpl.total;
+        const isTamper = item.outcome === 'reverted_tamper';
+        const dotClass = isTamper ? 'warn' : (allOk ? 'ok' : (hasTests ? 'warn' : 'info'));
+        const roundTitle = isTamper
+          ? ('Ronda ' + item.roundNum + ': ajuste no permitido revertido')
+          : ('Ronda ' + item.roundNum + (item.maxRounds ? (' de ' + item.maxRounds) : ''));
+        const testBadge = hasTests
+          ? '<span class="test-badge' + (allOk ? ' ok' : '') + '">' + passed + '/' + tpl.total + (allOk ? ' ✓' : ' pruebas') + '</span>'
+          : '';
+        const ciBadge = item.ciEv ? '<span class="test-badge ok">CI ✓</span>' : '';
+        const modelPill = pl.model ? '<span class="model-pill tech-only">' + escapeHtml(String(pl.model)) + '</span>' : '';
+        const durPill = item.durSecs !== null ? '<span class="duration-pill">Tardó ' + escapeHtml(formatDurationHuman(item.durSecs, '< 1s')) + '</span>' : '';
+        const bodyText = isTamper
+          ? 'Se detectó un cambio no autorizado en las pruebas automáticas y se restauró su versión protegida.'
+          : item.summaryShort;
+        const combinedTech = {
+          agent: ev.payload || {},
+          tests: tpl || undefined,
+          ci: item.ciEv ? (item.ciEv.payload || {}) : undefined,
+        };
+        const endDate = (item.ciEv && item.ciEv.at) || (item.testsEv && item.testsEv.at) || rawDate;
+        const friendlyEnd = endDate ? escapeHtml(formatFriendlyTime(endDate)) : '';
+        return '<div class="timeline-item">' +
+          '<div class="timeline-dot ' + dotClass + '"></div>' +
+          '<div class="round-card">' +
+            '<div class="timeline-header">' +
+              '<span class="timeline-title-group">' +
+                '<span class="timeline-type">' + escapeHtml(roundTitle) + '</span>' +
+                testBadge +
+                ciBadge +
+                durPill +
+                modelPill +
+              '</span>' +
+              '<span class="timeline-time" title="' + escapeHtml(endDate) + '">' + friendlyEnd + '</span>' +
+            '</div>' +
+            (bodyText ? '<div class="round-summary">' + escapeHtml(bodyText) + '</div>' : '') +
+            renderFileChips(item.filesWritten) +
+            '<details class="tech-details tech-only" style="margin-top:6px;"><summary>Ver datos técnicos</summary><pre style="margin:4px 0 0 0;">' + escapeHtml(JSON.stringify(combinedTech, null, 2)) + '</pre></details>' +
+          '</div>' +
+        '</div>';
+      }
+
+      const isSuccess = ev.type === 'PROJECT_DELIVERED' || ev.type === 'PROJECT_COMPLETED' || ev.type === 'COMPLETED';
+      const hasPayload = ev.payload && Object.keys(ev.payload).length > 0;
+      const actionTitle = friendlyEventAction(ev);
+      const modelPill = pl.model ? '<span class="model-pill tech-only">' + escapeHtml(String(pl.model)) + '</span>' : '';
+      const durPill = item.durSecs !== null ? '<span class="duration-pill">Tardó ' + escapeHtml(formatDurationHuman(item.durSecs, '< 1s')) + '</span>' : '';
+      return '<div class="timeline-item">' +
+        '<div class="timeline-dot ' + (isSuccess ? 'ok' : 'info') + '"></div>' +
+        '<div class="timeline-header">' +
+          '<span class="timeline-title-group">' +
+            '<span class="timeline-type">' + escapeHtml(actionTitle) + '</span>' +
+            modelPill +
+            durPill +
+          '</span>' +
+          '<span class="timeline-time" title="' + escapeHtml(rawDate) + '">' + friendlyDate + '</span>' +
+        '</div>' +
+        (hasPayload ? '<details class="tech-details tech-only" style="margin-top:4px;"><summary>Ver datos técnicos</summary><pre style="margin:4px 0 0 0;">' + escapeHtml(JSON.stringify(ev.payload, null, 2)) + '</pre></details>' : '') +
+      '</div>';
+    }
+
     function renderDetail() {
       const empty = document.getElementById('detail-empty');
       const box = document.getElementById('detail-content');
@@ -2084,7 +2665,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const badge = document.getElementById('detail-badge');
       badge.textContent = info.step;
       badge.className = 'badge ' + info.cls;
-      document.getElementById('detail-progress').style.width = Number(st.progress_pct || 0) + '%';
+      const isRunning = Boolean(st.is_running || st.busy || (state.detail && state.detail.is_running));
+      const pausedActive = !isRunning && (
+        st.state === 'DEBATE' || st.state === 'MEDIATION' ||
+        st.state === 'BUILDING' || st.state === 'VERIFYING'
+      );
+      const segMode = (st.state === 'DELIVERED' || st.state === 'COMPLETED')
+        ? 'delivered'
+        : ((st.state === 'FAILED' || st.state === 'ERROR') ? 'error' : (pausedActive ? 'paused' : 'active'));
+      const segBox = document.getElementById('detail-segments');
+      if (segBox) {
+        segBox.innerHTML = renderStageSegments(info.stage, segMode);
+      }
       const timeBox = document.getElementById('detail-time');
       if (timeBox) {
         timeBox.innerHTML = st.last_event_at
@@ -2093,19 +2685,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
 
       // Contextual guidance banner (only rebuild when signature changes so active drafts stay intact)
-      const isRunning = Boolean(st.is_running || st.busy || (state.detail && state.detail.is_running));
       const activeModel = st.active_model || (state.detail && state.detail.active_model) || null;
       const activeStage = st.active_stage || (state.detail && state.detail.active_stage) || null;
       const activitySummary = st.activity_summary || (state.detail && state.detail.activity_summary) || null;
+      const activityDetail = st.activity_detail || (state.detail && state.detail.activity_detail) || null;
       const agentsCount = st.agents_count || (state.detail && state.detail.agents_count) || null;
       const stepStartedAt = st.step_started_at || (state.detail && state.detail.step_started_at) || null;
+      const testsPassed = (st.tests_passed !== null && st.tests_passed !== undefined)
+        ? st.tests_passed
+        : ((state.detail && state.detail.tests_passed !== undefined) ? state.detail.tests_passed : null);
+      const testsTotal = (st.tests_total !== null && st.tests_total !== undefined)
+        ? st.tests_total
+        : ((state.detail && state.detail.tests_total !== undefined) ? state.detail.tests_total : null);
+      const buildRound = st.build_round || (state.detail && state.detail.build_round) || null;
+      const maxRounds = st.max_rounds || (state.detail && state.detail.max_rounds) || null;
       const statusForBanner = Object.assign({}, st, {
         is_running: isRunning,
         active_model: activeModel,
         active_stage: activeStage,
         activity_summary: activitySummary,
+        activity_detail: activityDetail,
         agents_count: agentsCount,
         step_started_at: stepStartedAt,
+        tests_passed: testsPassed,
+        tests_total: testsTotal,
+        build_round: buildRound,
+        max_rounds: maxRounds,
       });
       const questions = extractLatestQuestions(events);
       const inact = st.state === 'INTERVIEW' && !isRunning ? formatInactivityNote(st.last_event_at) : '';
@@ -2116,8 +2721,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         activeModel,
         activeStage,
         activitySummary,
+        activityDetail,
         agentsCount,
         stepStartedAt,
+        testsPassed,
+        testsTotal,
+        buildRound,
+        maxRounds,
         st.last_event_at,
         st.last_error,
         questions,
@@ -2230,7 +2840,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       } else {
         const filesHtml = (plan.files || []).map((f) =>
           '<div class="file-card"><div class="file-path">' + escapeHtml(f.path) + '</div><div class="file-purpose">' + escapeHtml(f.purpose) + '</div>' +
-          (f.contract ? '<details class="tech-details"><summary>Contrato</summary><pre>' + escapeHtml(f.contract) + '</pre></details>' : '') +
+          (f.contract ? '<details class="tech-details tech-only"><summary>Contrato</summary><pre>' + escapeHtml(f.contract) + '</pre></details>' : '') +
           '</div>'
         ).join('');
         const testsHtml = (plan.acceptance_tests || []).map((t) =>
@@ -2256,31 +2866,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         { num: 5, id: 'delivery', title: '5. Entrega final' },
       ];
 
-      const enriched = events.map((ev, idx) => {
-        const nextEv = (idx + 1 < events.length) ? events[idx + 1] : null;
-        let durSecs = null;
-        if (ev.payload && typeof ev.payload.duration_seconds === 'number' && isFinite(ev.payload.duration_seconds)) {
-          durSecs = ev.payload.duration_seconds;
-        } else if (nextEv && ev.at && nextEv.at) {
-          const diffSecs = (Date.parse(nextEv.at) - Date.parse(ev.at)) / 1000;
-          if (isFinite(diffSecs) && diffSecs >= 0) {
-            durSecs = diffSecs;
-          }
-        }
-        return {
-          ev,
-          phaseNum: phaseNumForEvent(ev),
-          durationText: durSecs !== null ? formatDurationHuman(durSecs, '< 1s') : '',
-        };
-      });
+      const splitRes = splitProjectAttempts(events);
+      const activeEnriched = splitRes.activeEvents.map((ev) => ({
+        ev,
+        phaseNum: phaseNumForEvent(ev),
+      }));
 
       const isDelivered = st.state === 'DELIVERED' || st.state === 'COMPLETED';
       const isFailed = st.state === 'FAILED' || st.state === 'ERROR';
       const activePhaseNum = isDelivered ? 6 : info.stage;
 
-      const eventsEl = document.getElementById('tab-events');
-      eventsEl.innerHTML = '<div class="phase-list">' + LIFECYCLE_PHASES.map((ph) => {
-        const phaseItems = enriched.filter((it) => it.phaseNum === ph.num);
+      const phasesHtml = '<div class="phase-list">' + LIFECYCLE_PHASES.map((ph) => {
+        const phaseItems = activeEnriched.filter((it) => it.phaseNum === ph.num);
         let phaseStatus = 'pending';
         if (isDelivered) {
           phaseStatus = 'completed';
@@ -2309,7 +2906,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         let badgeLabel = 'En curso';
         let circleHtml = String(ph.num);
         if (phaseStatus === 'completed') {
-          const durStr = computePhaseDuration(ph.num, phaseItems, enriched);
+          const durStr = computePhaseDuration(ph.num, phaseItems, activeEnriched);
           badgeLabel = durStr ? ('Completado en ' + durStr) : 'Completado';
           circleHtml = '✓';
         } else if (phaseStatus === 'error') {
@@ -2322,34 +2919,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const isOpen = (stateKey in state.phaseOpen) ? state.phaseOpen[stateKey] : defaultOpen;
         const openAttr = isOpen ? ' open' : '';
 
-        const stepsHtml = phaseItems.length
-          ? '<div class="timeline">' + phaseItems.map((item) => {
-              const ev = item.ev;
-              const isErr = ev.type === 'PHASE_ERROR' || ev.type === 'PROJECT_FAILED';
-              const isSuccess = ev.type === 'PROJECT_DELIVERED' || ev.type === 'PROJECT_COMPLETED' || ev.type === 'COMPLETED';
-              let dotClass = 'info';
-              if (isErr) dotClass = 'err';
-              else if (isSuccess) dotClass = 'ok';
-              const rawDate = ev.at ? String(ev.at) : '';
-              const friendlyDate = rawDate ? escapeHtml(formatFriendlyTime(rawDate)) : '';
-              const hasPayload = ev.payload && Object.keys(ev.payload).length > 0;
-              const actionTitle = friendlyEventAction(ev);
-              const payloadModel = (ev.payload && ev.payload.model) ? String(ev.payload.model) : '';
-              const modelPill = payloadModel ? '<span class="model-pill">' + escapeHtml(payloadModel) + '</span>' : '';
-              const durPill = item.durationText ? '<span class="duration-pill">Tardó ' + escapeHtml(item.durationText) + '</span>' : '';
-              return '<div class="timeline-item">' +
-                '<div class="timeline-dot ' + dotClass + '"></div>' +
-                '<div class="timeline-header">' +
-                  '<span class="timeline-title-group">' +
-                    '<span class="timeline-type">' + escapeHtml(actionTitle) + '</span>' +
-                    modelPill +
-                    durPill +
-                  '</span>' +
-                  '<span class="timeline-time" title="' + escapeHtml(rawDate) + '">' + friendlyDate + '</span>' +
-                '</div>' +
-                (hasPayload ? '<details class="tech-details" style="margin-top:4px;"><summary>Ver datos técnicos</summary><pre style="margin:4px 0 0 0;">' + escapeHtml(JSON.stringify(ev.payload, null, 2)) + '</pre></details>' : '') +
-              '</div>';
-            }).join('') + '</div>'
+        const phaseRawEvents = phaseItems.map((it) => it.ev);
+        const grouped = pairAndGroupPhaseEvents(phaseRawEvents);
+        const hasVisible = grouped.some((g) => g.kind !== 'tech_only');
+        const emptyFallback = !hasVisible
+          ? '<div class="muted" style="font-size:0.86rem;">' + (phaseStatus === 'completed' ? 'Etapa completada.' : 'En progreso en esta fase...') + '</div>'
+          : '';
+        const stepsHtml = grouped.length
+          ? (emptyFallback + '<div class="timeline">' + grouped.map(renderTimelineEntry).join('') + '</div>')
           : '<div class="muted" style="font-size:0.86rem;">En progreso en esta fase...</div>';
 
         return '<details class="phase-card phase-' + phaseStatus + '" data-phase-key="' + escapeHtml(stateKey) + '"' + openAttr + '>' +
@@ -2364,11 +2941,73 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         '</details>';
       }).join('') + '</div>';
 
+      let priorHtml = '';
+      if (splitRes.priorGroups.length) {
+        const priorKey = st.project_id + ':prior';
+        const priorOpenAttr = state.priorOpen[priorKey] ? ' open' : '';
+        const attemptsMarkup = splitRes.priorGroups.map((grp, idx) => {
+          const grpGrouped = pairAndGroupPhaseEvents(grp);
+          const lbl = splitRes.priorGroups.length > 1 ? ('Intento ' + (idx + 1)) : 'Intento anterior';
+          return '<div style="margin-top:10px;">' +
+            '<div class="muted" style="font-size:0.8rem; font-weight:600; margin-bottom:6px;">' + escapeHtml(lbl) + '</div>' +
+            '<div class="timeline">' + grpGrouped.map(renderTimelineEntry).join('') + '</div>' +
+          '</div>';
+        }).join('');
+        priorHtml = '<details class="prior-attempts-box" data-prior-key="' + escapeHtml(priorKey) + '"' + priorOpenAttr + '>' +
+          '<summary>Ver intentos anteriores (' + splitRes.priorGroups.length + ')</summary>' +
+          attemptsMarkup +
+        '</details>';
+      }
+
+      const toolbarHtml = '<div class="history-toolbar">' +
+        '<span class="muted tech-only">ID: <code>' + escapeHtml(st.project_id) + '</code></span>' +
+        '<button id="copy-diag-btn" class="btn btn-sm tech-only" type="button">Copiar diagnóstico</button>' +
+      '</div>';
+
+      const eventsEl = document.getElementById('tab-events');
+      eventsEl.innerHTML = toolbarHtml + phasesHtml + priorHtml;
+
       eventsEl.querySelectorAll('details.phase-card[data-phase-key]').forEach((det) => {
         det.addEventListener('toggle', () => {
           state.phaseOpen[det.getAttribute('data-phase-key')] = det.open;
         });
       });
+      eventsEl.querySelectorAll('details.prior-attempts-box[data-prior-key]').forEach((det) => {
+        det.addEventListener('toggle', () => {
+          state.priorOpen[det.getAttribute('data-prior-key')] = det.open;
+        });
+      });
+
+      const copyDiagBtn = document.getElementById('copy-diag-btn');
+      if (copyDiagBtn) {
+        copyDiagBtn.addEventListener('click', async () => {
+          const diagPayload = JSON.stringify({
+            project_id: st.project_id,
+            state: st.state,
+            is_running: isRunning,
+            active_model: activeModel,
+            tests: st.tests || null,
+            last_error: st.last_error || null,
+            events_count: events.length,
+            events: events,
+          }, null, 2);
+          try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              await navigator.clipboard.writeText(diagPayload);
+            } else {
+              const tmp = document.createElement('textarea');
+              tmp.value = diagPayload;
+              document.body.appendChild(tmp);
+              tmp.select();
+              document.execCommand('copy');
+              document.body.removeChild(tmp);
+            }
+            setNote('Diagnóstico copiado al portapapeles.');
+          } catch (err) {
+            setNote('No se pudo copiar el diagnóstico: ' + err.message);
+          }
+        });
+      }
 
       renderTabs();
     }
