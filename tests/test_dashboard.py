@@ -1087,12 +1087,21 @@ def test_dashboard_exposes_active_model_while_running_and_renders_history_model(
         fn_start = html.index("function buildGuidanceBanner(")
         fn_end = html.index("function renderDetail()", fn_start)
         running_block = html[fn_start:fn_end].split("if (st.state === 'INTERVIEW')", 1)[0]
-        assert "Modelo en uso:" in running_block
+        assert "Modelo:" in running_block
         assert "active_model" in running_block
+        assert "activity_summary" in running_block
+        assert "agents_count" in running_block
+        assert "step_started_at" in running_block
+        assert "Tiempo en este paso:" in running_block
+        assert "1 agente trabajando" in running_block
+        assert "2 agentes colaborando" in running_block
+        assert "live-step-timer" in running_block
         assert "ev.type === 'AGENT_INVOKED'" in html
         assert "model-pill" in html
+        assert "Tardó " in html
+        assert "Avanzó a:" in html
 
-        # Trigger live background run -> AgyLLMAdapter records active_model right before runner
+        # Trigger live background run -> Orchestrator + AgyLLMAdapter record activity and active_model right before runner
         code, res = _http_json(
             f"{base_url}/api/projects",
             method="POST",
@@ -1102,36 +1111,89 @@ def test_dashboard_exposes_active_model_while_running_and_renders_history_model(
         pid = res["project_id"]
         assert started_evt.wait(timeout=5.0) is True
 
-        # Wait briefly until runner call triggers record_active_usage -> API reflects active_model
+        # Wait briefly until runner call triggers record_active_usage -> API reflects live activity & model
         _, proj_list = _http_json(f"{base_url}/api/projects")
         by_id = {p["project_id"]: p for p in proj_list["projects"]}
         assert by_id[pid]["is_running"] is True
         assert by_id[pid]["active_model"] == "Gemini 3.8 Flash (Low)"
         assert by_id[pid]["active_stage"] == "INTERVIEW"
+        assert (
+            by_id[pid]["activity_summary"]
+            == "Analizando tu idea y preparando preguntas..."
+        )
+        assert by_id[pid]["agents_count"] == 1
+        assert isinstance(by_id[pid]["step_started_at"], str)
+        assert "T" in by_id[pid]["step_started_at"]
+
         assert by_id["proj-idle-hist"]["is_running"] is False
         assert by_id["proj-idle-hist"]["active_model"] is None
         assert by_id["proj-idle-hist"]["active_stage"] is None
+        assert by_id["proj-idle-hist"]["activity_summary"] is None
+        assert by_id["proj-idle-hist"]["agents_count"] is None
+        assert by_id["proj-idle-hist"]["step_started_at"] is None
 
         _, detail = _http_json(f"{base_url}/api/projects/{pid}")
         assert detail["is_running"] is True
         assert detail["active_model"] == "Gemini 3.8 Flash (Low)"
         assert detail["active_stage"] == "INTERVIEW"
+        assert (
+            detail["activity_summary"]
+            == "Analizando tu idea y preparando preguntas..."
+        )
+        assert detail["agents_count"] == 1
+        assert detail["step_started_at"] == by_id[pid]["step_started_at"]
         assert detail["status"]["active_model"] == "Gemini 3.8 Flash (Low)"
+        assert detail["status"]["agents_count"] == 1
 
-        # Live fallback update while still running is reflected immediately in API
-        resolver.record_active_usage("Gemini 4 Hydrogen (Medium)", "BUILDING")
+        # Live step switch while still running updates activity_summary, agents_count=2, and step_started_at
+        first_started_at = detail["step_started_at"]
+        resolver.record_active_usage("Gemini 4 Hydrogen (Medium)", "DEBATE")
+        resolver.record_activity(
+            "2 especialistas están evaluando la mejor forma de construirlo...",
+            agents_count=2,
+            stage="DEBATE",
+        )
         _, updated_detail = _http_json(f"{base_url}/api/projects/{pid}")
         assert updated_detail["active_model"] == "Gemini 4 Hydrogen (Medium)"
-        assert updated_detail["active_stage"] == "BUILDING"
+        assert updated_detail["active_stage"] == "DEBATE"
+        assert (
+            updated_detail["activity_summary"]
+            == "2 especialistas están evaluando la mejor forma de construirlo..."
+        )
+        assert updated_detail["agents_count"] == 2
+        assert updated_detail["step_started_at"] is not None
+
+        # Repeating exact same activity phrase keeps original step_started_at
+        deb_started_at = updated_detail["step_started_at"]
+        resolver.record_activity(
+            "2 especialistas están evaluando la mejor forma de construirlo...",
+            agents_count=2,
+            stage="DEBATE",
+        )
+        assert resolver.get_active_activity()["step_started_at"] == deb_started_at
+        assert first_started_at != "" or deb_started_at != ""
 
         release_evt.set()
         assert server.controller.wait_for_idle(timeout=5.0) is True
 
-        # Once stopped (is_running == False), active_model and active_stage become None
+        # Once stopped (is_running == False), live fields become None and history contains duration_seconds
         _, stopped_detail = _http_json(f"{base_url}/api/projects/{pid}")
         assert stopped_detail["is_running"] is False
         assert stopped_detail["active_model"] is None
         assert stopped_detail["active_stage"] is None
+        assert stopped_detail["activity_summary"] is None
+        assert stopped_detail["agents_count"] is None
+        assert stopped_detail["step_started_at"] is None
+        interview_ev = next(
+            ev
+            for ev in stopped_detail["events"]
+            if ev["type"] == EventType.INTERVIEW_ROUND
+        )
+        assert isinstance(interview_ev["payload"].get("duration_seconds"), (int, float))
+        plan_ev = next(
+            ev for ev in stopped_detail["events"] if ev["type"] == EventType.PLAN_CREATED
+        )
+        assert isinstance(plan_ev["payload"].get("duration_seconds"), (int, float))
 
         # Idle project retains model metadata inside AGENT_INVOKED history payload
         _, hist_detail = _http_json(f"{base_url}/api/projects/proj-idle-hist")

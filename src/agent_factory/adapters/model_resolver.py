@@ -9,6 +9,7 @@ import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from agent_factory.ports.runner import CommandTimeoutError, Runner
 from agent_factory.secrets import redact_secrets
@@ -57,6 +58,16 @@ DEFAULT_STAGE_PREFERENCES: dict[str, tuple[str, ...]] = {
 }
 
 _VERSION_NUM_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+)*)\b")
+
+ACTIVITY_MESSAGES: dict[str, str] = {
+    "INTERVIEW": "Analizando tu idea y preparando preguntas...",
+    "DEBATE": "2 especialistas están evaluando la mejor forma de construirlo...",
+    "MEDIATION": "Unificando propuestas en un plan paso a paso...",
+    "BUILDING_TESTS": "Creando las pruebas para asegurar que todo funcione...",
+    "BUILDING_CODE": "Escribiendo el código de tu aplicación...",
+    "VERIFYING": "Probando que la aplicación funcione sin errores...",
+    "PUBLISHING": "Guardando tu proyecto terminado en GitHub...",
+}
 
 _MODEL_ERROR_PHRASES: tuple[str, ...] = (
     "invalid model selection",
@@ -375,6 +386,12 @@ class ModelResolver:
             "stage": None,
             "updated_at": None,
         }
+        self._active_activity: dict[str, Any] = {
+            "activity_summary": None,
+            "agents_count": None,
+            "step_started_at": None,
+            "stage": None,
+        }
 
     def record_active_usage(
         self,
@@ -388,19 +405,98 @@ class ModelResolver:
             if trimmed:
                 clean_model = redact_secrets(trimmed, extra_secrets=self.secrets)
         clean_stage = str(role_or_stage or "").strip().upper() or None
+        now_iso = datetime.now(UTC).isoformat()
         usage: dict[str, str | None] = {
             "model": clean_model,
             "stage": clean_stage,
-            "updated_at": datetime.now(UTC).isoformat(),
+            "updated_at": now_iso,
         }
         with self._lock:
             self._active_usage = usage
+            if self._active_activity["activity_summary"] is None and clean_stage:
+                default_msg = ACTIVITY_MESSAGES.get(
+                    clean_stage,
+                    ACTIVITY_MESSAGES["BUILDING_CODE"] if clean_stage == "BUILDING" else None,
+                )
+                if default_msg is not None:
+                    self._active_activity = {
+                        "activity_summary": default_msg,
+                        "agents_count": 2 if clean_stage == "DEBATE" else 1,
+                        "step_started_at": now_iso,
+                        "stage": clean_stage,
+                    }
             return dict(self._active_usage)
 
     def get_active_usage(self) -> dict[str, str | None]:
         """Return a thread-safe snapshot of the last recorded active model usage."""
         with self._lock:
             return dict(self._active_usage)
+
+    def record_activity(
+        self,
+        activity_summary: str | None,
+        *,
+        agents_count: int = 1,
+        stage: str | None = None,
+        started_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Record the active plain-Spanish sub-step summary, agent count, and start time."""
+        clean_summary = (
+            redact_secrets(str(activity_summary).strip(), extra_secrets=self.secrets)
+            if activity_summary and str(activity_summary).strip()
+            else None
+        )
+        clean_stage = str(stage).strip().upper() if stage and str(stage).strip() else None
+        count = max(1, int(agents_count))
+        with self._lock:
+            prev_summary = self._active_activity.get("activity_summary")
+            prev_started = self._active_activity.get("step_started_at")
+            if started_at is not None:
+                effective_started: str | None = started_at
+            elif clean_summary is None:
+                effective_started = None
+            elif clean_summary != prev_summary or not prev_started:
+                effective_started = datetime.now(UTC).isoformat()
+            else:
+                effective_started = str(prev_started)
+
+            self._active_activity = {
+                "activity_summary": clean_summary,
+                "agents_count": count if clean_summary is not None else None,
+                "step_started_at": effective_started,
+                "stage": clean_stage or self._active_usage.get("stage"),
+            }
+            return dict(self._active_activity)
+
+    def get_active_activity(self) -> dict[str, Any]:
+        """Return a thread-safe snapshot of active sub-step description, agent count, and start timestamp."""
+        with self._lock:
+            return dict(self._active_activity)
+
+    def get_live_status(self) -> dict[str, Any]:
+        """Return combined snapshot of active model usage and current sub-step activity."""
+        with self._lock:
+            combined: dict[str, Any] = dict(self._active_usage)
+            combined.update(
+                {
+                    "activity_summary": self._active_activity.get("activity_summary"),
+                    "agents_count": self._active_activity.get("agents_count"),
+                    "step_started_at": self._active_activity.get("step_started_at"),
+                }
+            )
+            if not combined.get("stage"):
+                combined["stage"] = self._active_activity.get("stage")
+            return combined
+
+    def clear_active_activity(self) -> None:
+        """Clear sub-step activity tracking when background execution completes."""
+        with self._lock:
+            self._active_activity = {
+                "activity_summary": None,
+                "agents_count": None,
+                "step_started_at": None,
+                "stage": None,
+            }
 
     def _build_clean_env(self) -> dict[str, str]:
         if self._env_builder is not None:

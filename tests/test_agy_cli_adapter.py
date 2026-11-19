@@ -490,6 +490,17 @@ def test_end_to_end_offline_scaffold_agy_cli_adapter_and_build_worker_converge(
     assert (ws_dir / "PROJECT_PROMPT.md").is_file()
     assert "return c + 1;" in (ws_dir / "src" / "app.js").read_text(encoding="utf-8")
 
+    events_e2e = orchestrator.store.get_events(project_id)
+    for ev_type in (
+        EventType.AGENT_INVOKED,
+        EventType.TESTS_UPDATED,
+        EventType.CI_ROUND_COMPLETED,
+        EventType.PROJECT_DELIVERED,
+    ):
+        matching = [e for e in events_e2e if e.type == ev_type and "duration_seconds" in (e.payload or {})]
+        assert matching, f"Expected duration_seconds on {ev_type}"
+    assert adapter.model_resolver.get_active_activity()["activity_summary"] == "Guardando tu proyecto terminado en GitHub..."
+
 
 def test_end_to_end_offline_build_worker_pauses_on_agy_cli_quota_and_fails_on_cli_crash(
     tmp_path: Path,
@@ -1175,6 +1186,67 @@ def test_agy_cli_adapter_extracts_test_blocks_retries_zero_tests_and_enforces_in
         with pytest.raises(SandboxViolationError):
             mal_adapter.generate_tests(ws_dir_d, plan.acceptance_tests)
         assert not outside_target.exists()
+
+
+def test_agy_cli_adapter_defaults_to_300s_timeout_closes_stdin_and_redacts_timeout_errors(
+    tmp_path: Path,
+) -> None:
+    """Default timeout is 300.0s, stdin closes cleanly on EOF without hanging, and timeout errors redact secrets."""
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+    ws_dir = ws_mgr.create_workspace("proj-timeout-300")
+    plan = _sample_static_web_plan()
+    secret_tok = "DUMMY_CLI_TIMEOUT_SECRET_888"
+
+    default_adapter = AgyCliAdapter(workspace_manager=ws_mgr)
+    assert default_adapter.timeout_seconds == 300.0
+    assert default_adapter.runner.default_timeout_seconds == 300.0
+
+    explicit_adapter = AgyCliAdapter(workspace_manager=ws_mgr, timeout_seconds=45.0)
+    assert explicit_adapter.timeout_seconds == 45.0
+
+    # Real subprocess reading stdin must receive EOF cleanly and not block
+    eof_script = tmp_path / "read_stdin_eof.py"
+    eof_script.write_text(
+        "import json, sys\n"
+        "data = sys.stdin.read()\n"
+        "print(json.dumps({'files_written': ['src/app.js'], 'summary': f'read {len(data)} bytes'}))\n",
+        encoding="utf-8",
+    )
+    real_runner = SubprocessRunner(default_timeout_seconds=10.0)
+    res_no_stdin = real_runner.run(
+        command=[sys.executable, str(eof_script)],
+        cwd=ws_dir,
+    )
+    assert res_no_stdin.exit_code == 0
+    assert "read 0 bytes" in res_no_stdin.stdout
+
+    eof_adapter = AgyCliAdapter(
+        workspace_manager=ws_mgr,
+        runner=real_runner,
+        cli_command=[sys.executable, str(eof_script)],
+    )
+    res_with_stdin = eof_adapter.implement_or_fix(ws_dir, plan, attempt=1)
+    assert res_with_stdin.files_written == ["src/app.js"]
+
+    # Timeout errors from Runner must redact secret tokens in CommandTimeoutError
+    timeout_runner = FakeRunner(
+        results=[
+            CommandTimeoutError(
+                f"Command timed out after 300.0s with token={secret_tok}"
+            )
+        ]
+    )
+    timeout_adapter = AgyCliAdapter(
+        workspace_manager=ws_mgr,
+        runner=timeout_runner,
+        cli_command=("agy",),
+        secrets=(secret_tok,),
+    )
+    with pytest.raises(CommandTimeoutError) as exc_info:
+        timeout_adapter.implement_or_fix(ws_dir, plan, attempt=1)
+    assert secret_tok not in str(exc_info.value)
+    assert "timed out" in str(exc_info.value).lower()
+
 
 
 

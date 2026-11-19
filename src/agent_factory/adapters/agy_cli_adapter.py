@@ -21,7 +21,7 @@ from agent_factory.ports.code_agent import (
     CodeAgentResult,
     QuotaExhaustedError,
 )
-from agent_factory.ports.runner import CommandResult, Runner
+from agent_factory.ports.runner import CommandResult, CommandTimeoutError, Runner
 from agent_factory.secrets import redact_secrets
 from agent_factory.workspace import SandboxViolationError, WorkspaceManager
 
@@ -100,6 +100,7 @@ _LANG_PREFIXES: frozenset[str] = frozenset(
     }
 )
 _MAX_CLI_PROMPT_CHARS = 12000
+DEFAULT_AGY_CLI_TIMEOUT_SECONDS = 300.0
 
 
 def _looks_like_file_path(token: str) -> bool:
@@ -243,7 +244,7 @@ class AgyCliAdapter(CodeAgent):
         workspace_manager: WorkspaceManager,
         runner: Runner | None = None,
         cli_command: Sequence[str] = ("agy",),
-        timeout_seconds: float = 60.0,
+        timeout_seconds: float = DEFAULT_AGY_CLI_TIMEOUT_SECONDS,
         allowed_cli_env_keys: Sequence[str] = ("AGY_HOME", "AGY_CONFIG_DIR"),
         default_retry_after_seconds: float = 5.0,
         model: str | None = None,
@@ -465,23 +466,27 @@ class AgyCliAdapter(CodeAgent):
             )
             cmd = self._build_cli_command(ws_path, effective_prompt, mode_arg, active_model)
             try:
-                res = self.runner.run(
-                    command=cmd,
-                    cwd=ws_path,
-                    timeout_seconds=self.timeout_seconds,
-                    env=clean_env,
-                    input=payload_str,
-                )
-            except TypeError as te:
-                if "input" in str(te):
+                try:
                     res = self.runner.run(
                         command=cmd,
                         cwd=ws_path,
                         timeout_seconds=self.timeout_seconds,
                         env=clean_env,
+                        input=payload_str,
                     )
-                else:
-                    raise
+                except TypeError as te:
+                    if "input" in str(te):
+                        res = self.runner.run(
+                            command=cmd,
+                            cwd=ws_path,
+                            timeout_seconds=self.timeout_seconds,
+                            env=clean_env,
+                        )
+                    else:
+                        raise
+            except CommandTimeoutError as exc:
+                clean_timeout = redact_secrets(str(exc), extra_secrets=self.secrets)
+                raise CommandTimeoutError(clean_timeout) from None
 
             combined_output = f"{res.stdout}\n{res.stderr}".strip()
             if res.exit_code == 0:

@@ -1,11 +1,13 @@
 """Local build worker, job queue, and write-test-fix loop (Section 7 Phase 2, INV-09, INV-13, INV-15, INV-17)."""
 
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
+from agent_factory.adapters.model_resolver import ACTIVITY_MESSAGES
 from agent_factory.domain.events import EventType, create_event
 from agent_factory.domain.models import BuildReport, Plan, validate_project_id
 from agent_factory.domain.states import IllegalTransition, ProjectState
@@ -134,6 +136,20 @@ class BuildWorker:
         usage = getter()
         raw_model = usage.get("model") if isinstance(usage, dict) else None
         return self._redact(str(raw_model)) if raw_model else None
+
+    def _report_activity(
+        self,
+        activity_summary: str,
+        *,
+        agents_count: int = 1,
+        stage: str | None = None,
+    ) -> None:
+        resolver = getattr(self.code_agent, "model_resolver", None) or getattr(
+            self.orchestrator.llm, "model_resolver", None
+        )
+        recorder = getattr(resolver, "record_activity", None) if resolver is not None else None
+        if callable(recorder):
+            recorder(activity_summary, agents_count=agents_count, stage=stage)
 
     def _fail_job(
         self,
@@ -273,6 +289,12 @@ class BuildWorker:
                     emit_event=False,
                 )
 
+            self._report_activity(
+                ACTIVITY_MESSAGES["BUILDING_TESTS"],
+                agents_count=1,
+                stage="BUILDING",
+            )
+            gen_t0 = time.monotonic()
             try:
                 gen_result = self.code_agent.generate_tests(ws_dir, job.plan.acceptance_tests)
             except QuotaExhaustedError as err:
@@ -288,24 +310,28 @@ class BuildWorker:
                 job.report = report
                 return report
             except (CodeAgentError, CommandTimeoutError) as err:
+                gen_duration = round(max(0.0, time.monotonic() - gen_t0), 3)
                 # Fatal code agent error: record the invocation in CircuitBreaker and AGENT_INVOKED before failing
                 self.orchestrator.record_state_call(
                     project_id,
                     ProjectState.BUILDING,
                     model=self._active_code_agent_model(),
                     agent="generate_tests",
+                    duration_seconds=gen_duration,
                 )
                 job.invocations_used += 1
                 return self._fail_job(
                     project_id, job, err, failed_state=ProjectState.BUILDING
                 )
 
+            gen_duration = round(max(0.0, time.monotonic() - gen_t0), 3)
             # Successful test generation: record call in CircuitBreaker and AGENT_INVOKED
             status = self.orchestrator.record_state_call(
                 project_id,
                 ProjectState.BUILDING,
                 model=getattr(gen_result, "model", None) or self._active_code_agent_model(),
                 agent="generate_tests",
+                duration_seconds=gen_duration,
             )
             job.invocations_used += 1
 
@@ -360,6 +386,12 @@ class BuildWorker:
 
             # Code agent writes / fixes code
             attempt_num = job.invocations_used + 1
+            self._report_activity(
+                ACTIVITY_MESSAGES["BUILDING_CODE"],
+                agents_count=1,
+                stage="BUILDING",
+            )
+            impl_t0 = time.monotonic()
             try:
                 impl_result = self.code_agent.implement_or_fix(
                     ws_dir,
@@ -380,24 +412,28 @@ class BuildWorker:
                 job.report = report
                 return report
             except (CodeAgentError, CommandTimeoutError) as err:
+                impl_duration = round(max(0.0, time.monotonic() - impl_t0), 3)
                 # Fatal code agent error: record the invocation in CircuitBreaker and AGENT_INVOKED before failing
                 self.orchestrator.record_state_call(
                     project_id,
                     ProjectState.BUILDING,
                     model=self._active_code_agent_model(),
                     agent="implement_or_fix",
+                    duration_seconds=impl_duration,
                 )
                 job.invocations_used += 1
                 return self._fail_job(
                     project_id, job, err, failed_state=ProjectState.BUILDING
                 )
 
+            impl_duration = round(max(0.0, time.monotonic() - impl_t0), 3)
             # Record successful agent invocation
             status = self.orchestrator.record_state_call(
                 project_id,
                 ProjectState.BUILDING,
                 model=getattr(impl_result, "model", None) or self._active_code_agent_model(),
                 agent="implement_or_fix",
+                duration_seconds=impl_duration,
             )
             job.invocations_used += 1
 
@@ -418,6 +454,12 @@ class BuildWorker:
                 continue
 
             # Run local tests
+            self._report_activity(
+                ACTIVITY_MESSAGES["VERIFYING"],
+                agents_count=1,
+                stage="VERIFYING",
+            )
+            verify_t0 = time.monotonic()
             try:
                 runner_result = self.runner.run(
                     command=["pytest", "-q"],
@@ -429,6 +471,7 @@ class BuildWorker:
                     project_id, job, err, failed_state=ProjectState.BUILDING
                 )
 
+            local_test_duration = round(max(0.0, time.monotonic() - verify_t0), 3)
             # Update test results
             if runner_result.test_results:
                 job.test_results = dict(runner_result.test_results)
@@ -439,7 +482,12 @@ class BuildWorker:
                     create_event(
                         project_id=project_id,
                         event_type=EventType.TESTS_UPDATED,
-                        payload={"passed": passed, "failed": failed, "total": total},
+                        payload={
+                            "passed": passed,
+                            "failed": failed,
+                            "total": total,
+                            "duration_seconds": local_test_duration,
+                        },
                         at=self.orchestrator._now(),
                     )
                 )
@@ -489,6 +537,7 @@ class BuildWorker:
                 )
 
             job.ci_rounds_used += 1
+            ci_duration = round(max(0.0, time.monotonic() - verify_t0), 3)
             clean_ci_summary = self._redact(ci_result.summary)
             self.orchestrator.store.append(
                 create_event(
@@ -497,12 +546,19 @@ class BuildWorker:
                     payload={
                         "ci_rounds": job.ci_rounds_used,
                         "summary": clean_ci_summary,
+                        "duration_seconds": ci_duration,
                     },
                     at=self.orchestrator._now(),
                 )
             )
 
             if ci_result.passed:
+                self._report_activity(
+                    ACTIVITY_MESSAGES["PUBLISHING"],
+                    agents_count=1,
+                    stage="PUBLISHING",
+                )
+                pub_t0 = time.monotonic()
                 try:
                     repo_url, deploy_url = self.vcs.merge_and_deploy(
                         project_id, branch="work"
@@ -512,11 +568,16 @@ class BuildWorker:
                         project_id, job, err, failed_state=ProjectState.VERIFYING
                     )
 
+                pub_duration = round(max(0.0, time.monotonic() - pub_t0), 3)
                 self.orchestrator.store.append(
                     create_event(
                         project_id=project_id,
                         event_type=EventType.PROJECT_DELIVERED,
-                        payload={"repo_url": repo_url, "deploy_url": deploy_url},
+                        payload={
+                            "repo_url": repo_url,
+                            "deploy_url": deploy_url,
+                            "duration_seconds": pub_duration,
+                        },
                         at=self.orchestrator._now(),
                     )
                 )

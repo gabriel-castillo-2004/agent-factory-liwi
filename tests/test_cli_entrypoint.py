@@ -20,6 +20,7 @@ from typing import Any, Self
 
 import pytest
 
+from agent_factory.adapters.agy_cli_adapter import AgyCliAdapter
 from agent_factory.adapters.fake_llm import FakeLLM
 from agent_factory.adapters.fake_telegram import FakeTelegramClient
 from agent_factory.adapters.github_vcs_adapter import GitHubVCSAdapter
@@ -1034,3 +1035,56 @@ def test_load_dotenv_into_environ_positive_and_negative(
     # 7. Non-existent file does not raise OSError
     missing_env = tmp_path / "does_not_exist.env"
     load_dotenv_into_environ(missing_env)
+
+
+def test_cli_config_agy_cli_timeout_seconds_default_and_override(tmp_path: Path) -> None:
+    """build_runtime defaults AgyCliAdapter timeout to 300.0s, accepts AGY_CLI_TIMEOUT_SECONDS, and redacts errors on invalid values."""
+    models_toml = tmp_path / "models.toml"
+    models_toml.write_text('[models]\nfast = "f"\nstrong = "s"\n', encoding="utf-8")
+    limits_toml = tmp_path / "limits.toml"
+    limits_toml.write_text(
+        "INTERVIEW = 6\nDEBATE = 6\nMEDIATION = 3\nBUILDING = 15\nci_rounds = 3\n",
+        encoding="utf-8",
+    )
+
+    base_env: dict[str, str] = {
+        "TELEGRAM_BOT_TOKEN": "TOK_SECRET_TIMEOUT_TEST",
+        "ALLOWED_CHAT_IDS": "1001",
+        "ALLOWED_USER_IDS": "2001",
+        "LLM_PROVIDER": "agy",
+        "AGENT_FACTORY_DB_PATH": str(tmp_path / "timeout_default.db"),
+        "AGENT_FACTORY_WORKSPACES_DIR": str(tmp_path / "ws_default"),
+        "AGENT_FACTORY_REGISTRY_REPO": str(tmp_path / "origin.git"),
+        "AGENT_FACTORY_MODELS_CONFIG": str(models_toml),
+        "AGENT_FACTORY_LIMITS_CONFIG": str(limits_toml),
+    }
+
+    cfg_default = load_cli_config(base_env)
+    assert cfg_default.agy_cli_timeout_seconds == 300.0
+    rt_default = build_runtime(cfg_default)
+    try:
+        assert isinstance(rt_default.code_agent, AgyCliAdapter)
+        assert rt_default.code_agent.timeout_seconds == 300.0
+    finally:
+        rt_default.store.close()
+
+    override_env = dict(base_env)
+    override_env["AGENT_FACTORY_DB_PATH"] = str(tmp_path / "timeout_override.db")
+    override_env["AGENT_FACTORY_WORKSPACES_DIR"] = str(tmp_path / "ws_override")
+    override_env["AGY_CLI_TIMEOUT_SECONDS"] = "420"
+    cfg_override = load_cli_config(override_env)
+    assert cfg_override.agy_cli_timeout_seconds == 420.0
+    rt_override = build_runtime(cfg_override)
+    try:
+        assert isinstance(rt_override.code_agent, AgyCliAdapter)
+        assert rt_override.code_agent.timeout_seconds == 420.0
+    finally:
+        rt_override.store.close()
+
+    for bad_val in ("0", "-5", "nan", "not_a_number"):
+        bad_env = dict(base_env)
+        bad_env["AGY_CLI_TIMEOUT_SECONDS"] = bad_val
+        with pytest.raises(CliConfigError) as exc_info:
+            load_cli_config(bad_env)
+        assert "TOK_SECRET_TIMEOUT_TEST" not in str(exc_info.value)
+

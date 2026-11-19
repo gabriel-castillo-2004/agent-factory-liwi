@@ -81,29 +81,51 @@ class DashboardController:
         self._active_projects: set[str] = set()
         self._threads: list[threading.Thread] = []
 
-    def _get_active_model_info(self, running: bool) -> tuple[str | None, str | None]:
-        """Return (active_model, active_stage) when running is True and ModelResolver tracks usage."""
+    def _get_live_status_info(self, running: bool) -> dict[str, Any]:
+        """Return live active model, stage, activity summary, agent count, and start time when running."""
+        empty: dict[str, Any] = {
+            "active_model": None,
+            "active_stage": None,
+            "activity_summary": None,
+            "agents_count": None,
+            "step_started_at": None,
+        }
         if not running or self.model_resolver is None:
-            return None, None
-        getter = getattr(self.model_resolver, "get_active_usage", None)
-        if not callable(getter):
-            return None, None
-        usage = getter()
-        if not isinstance(usage, dict):
-            return None, None
-        raw_model = usage.get("model")
-        raw_stage = usage.get("stage")
-        model = (
-            redact_secrets(str(raw_model), extra_secrets=self.secrets_to_redact)
-            if raw_model
-            else None
-        )
-        stage = (
-            redact_secrets(str(raw_stage), extra_secrets=self.secrets_to_redact)
-            if raw_stage
-            else None
-        )
-        return model, stage
+            return empty
+
+        live: dict[str, Any] = {}
+        live_fn = getattr(self.model_resolver, "get_live_status", None)
+        if callable(live_fn):
+            res = live_fn()
+            if isinstance(res, dict):
+                live = res
+        else:
+            usage_fn = getattr(self.model_resolver, "get_active_usage", None)
+            if callable(usage_fn):
+                res = usage_fn()
+                if isinstance(res, dict):
+                    live.update(res)
+            act_fn = getattr(self.model_resolver, "get_active_activity", None)
+            if callable(act_fn):
+                res = act_fn()
+                if isinstance(res, dict):
+                    live.update(res)
+
+        if not live:
+            return empty
+
+        def _scrub_opt(val: Any) -> str | None:
+            return redact_secrets(str(val), extra_secrets=self.secrets_to_redact) if val else None
+
+        raw_count = live.get("agents_count")
+        agents_count = int(raw_count) if isinstance(raw_count, (int, float)) and raw_count > 0 else None
+        return {
+            "active_model": _scrub_opt(live.get("model")),
+            "active_stage": _scrub_opt(live.get("stage")),
+            "activity_summary": _scrub_opt(live.get("activity_summary")),
+            "agents_count": agents_count,
+            "step_started_at": _scrub_opt(live.get("step_started_at")),
+        }
 
     def is_busy(self, project_id: str) -> bool:
         """Return True if a background task is currently executing for project_id."""
@@ -154,6 +176,11 @@ class DashboardController:
                 finally:
                     with self._lock:
                         self._active_projects.discard(project_id)
+                        no_active = not self._active_projects
+                    if no_active and self.model_resolver is not None:
+                        clear_fn = getattr(self.model_resolver, "clear_active_activity", None)
+                        if callable(clear_fn):
+                            clear_fn()
 
             t = threading.Thread(
                 target=_runner,
@@ -212,14 +239,17 @@ class DashboardController:
         last_error = self._extract_last_error(status, events)
         last_event_at = events[-1].at.isoformat() if events else None
         running = self.is_running(project_id)
-        active_model, active_stage = self._get_active_model_info(running)
+        live_info = self._get_live_status_info(running)
         raw = status.model_dump(mode="json")
         raw["last_error"] = last_error
         raw["has_plan"] = has_plan
         raw["busy"] = running
         raw["is_running"] = running
-        raw["active_model"] = active_model
-        raw["active_stage"] = active_stage
+        raw["active_model"] = live_info["active_model"]
+        raw["active_stage"] = live_info["active_stage"]
+        raw["activity_summary"] = live_info["activity_summary"]
+        raw["agents_count"] = live_info["agents_count"]
+        raw["step_started_at"] = live_info["step_started_at"]
         raw["last_event_at"] = last_event_at
         return _scrub_value(raw, self.secrets_to_redact)
 
@@ -239,7 +269,7 @@ class DashboardController:
                 )
             except (ValueError, IllegalTransition) as exc:
                 running = self.is_running(pid)
-                active_model, active_stage = self._get_active_model_info(running)
+                live_info = self._get_live_status_info(running)
                 summaries.append(
                     {
                         "project_id": pid,
@@ -255,8 +285,11 @@ class DashboardController:
                         "has_plan": False,
                         "busy": running,
                         "is_running": running,
-                        "active_model": active_model,
-                        "active_stage": active_stage,
+                        "active_model": live_info["active_model"],
+                        "active_stage": live_info["active_stage"],
+                        "activity_summary": live_info["activity_summary"],
+                        "agents_count": live_info["agents_count"],
+                        "step_started_at": live_info["step_started_at"],
                         "last_event_at": None,
                     }
                 )
@@ -293,6 +326,9 @@ class DashboardController:
             "is_running": summary["is_running"],
             "active_model": summary["active_model"],
             "active_stage": summary["active_stage"],
+            "activity_summary": summary["activity_summary"],
+            "agents_count": summary["agents_count"],
+            "step_started_at": summary["step_started_at"],
             "last_event_at": summary["last_event_at"],
             "spec": _scrub_value(spec.model_dump(mode="json"), self.secrets_to_redact),
             "plan": _scrub_value(plan.model_dump(mode="json"), self.secrets_to_redact)
@@ -1162,6 +1198,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       font-size: 0.78rem;
       color: var(--muted);
     }
+    .duration-pill {
+      display: inline-flex;
+      align-items: center;
+      font-size: 0.74rem;
+      font-weight: 500;
+      padding: 1px 8px;
+      border-radius: 999px;
+      background: var(--surface-alt);
+      color: var(--muted);
+      border: 1px solid var(--border);
+    }
+    .timeline-next {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin: 2px 0 4px 0;
+    }
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
     .toast { font-size: 0.85rem; color: var(--accent); }
@@ -1511,19 +1563,87 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       return '';
     }
 
+    function friendlyStateName(code) {
+      const names = {
+        'CREATED': 'Inicio del proyecto',
+        'IDLE': 'En espera',
+        'INTERVIEW': 'Entrevista inicial',
+        'DEBATE': 'Evaluación técnica',
+        'MEDIATION': 'Diseño del plan',
+        'WAITING_APPROVAL': 'Revisión y aprobación del plan',
+        'BUILDING': 'Construcción de la aplicación',
+        'VERIFYING': 'Pruebas y verificación',
+        'DELIVERED': 'Proyecto terminado y entregado',
+        'COMPLETED': 'Proyecto terminado',
+        'FAILED': 'Detenido por error',
+      };
+      return names[code] || String(code || '');
+    }
+
+    function formatDurationHuman(totalSeconds, subSecondLabel) {
+      if (typeof totalSeconds !== 'number' || !isFinite(totalSeconds) || totalSeconds < 0) {
+        return '';
+      }
+      if (totalSeconds < 1) {
+        return subSecondLabel || '< 1s';
+      }
+      const rounded = Math.round(totalSeconds);
+      if (rounded < 60) {
+        return rounded + 's';
+      }
+      let mins = Math.floor(rounded / 60);
+      const secs = rounded % 60;
+      if (mins < 60) {
+        return secs > 0 ? (mins + ' min ' + secs + 's') : (mins + ' min');
+      }
+      const hours = Math.floor(mins / 60);
+      mins = mins % 60;
+      return mins > 0 ? (hours + ' h ' + mins + ' min') : (hours + ' h');
+    }
+
+    function formatElapsedSince(startedIso) {
+      if (!startedIso) return '';
+      const ms = Date.parse(startedIso);
+      if (!isFinite(ms)) return '';
+      const elapsedSecs = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+      return formatDurationHuman(elapsedSecs, '0s') || '0s';
+    }
+
+    function updateLiveTimers() {
+      document.querySelectorAll('.live-step-timer[data-started-at]').forEach((el) => {
+        const startedAt = el.getAttribute('data-started-at');
+        const formatted = formatElapsedSince(startedAt);
+        if (formatted) {
+          el.textContent = 'Tiempo en este paso: ' + formatted;
+        }
+      });
+    }
+
     function buildGuidanceBanner(st, events) {
       const isRunning = Boolean(st.is_running || st.busy);
       if (isRunning) {
+        const descText = st.activity_summary
+          ? escapeHtml(st.activity_summary)
+          : 'Los agentes están avanzando en esta etapa. Esta pantalla se actualiza sola cada 5 segundos.';
+        const agentsCount = Number(st.agents_count || 1);
+        const agentsText = agentsCount === 2
+          ? '2 agentes colaborando'
+          : (agentsCount > 1 ? (agentsCount + ' agentes colaborando') : '1 agente trabajando');
+        const agentsPill = '<span class="model-pill">' + escapeHtml(agentsText) + '</span>';
         const modelPill = st.active_model
-          ? '<div class="model-usage-row"><span class="model-pill">Modelo en uso: ' + escapeHtml(st.active_model) + '</span></div>'
+          ? '<span class="model-pill">Modelo: ' + escapeHtml(st.active_model) + '</span>'
+          : '';
+        const elapsedText = st.step_started_at ? formatElapsedSince(st.step_started_at) : '';
+        const timerPill = st.step_started_at
+          ? '<span class="model-pill live-step-timer" data-started-at="' + escapeHtml(st.step_started_at) + '">Tiempo en este paso: ' + escapeHtml(elapsedText || '0s') + '</span>'
           : '';
         return '<div class="guidance-banner banner-info">' +
           '<div class="banner-content">' +
             '<div class="banner-icon"><span class="working-spinner" aria-hidden="true"></span></div>' +
             '<div class="banner-body">' +
               '<div class="banner-title">Trabajando automáticamente</div>' +
-              '<div class="banner-desc">Los agentes están avanzando en esta etapa. Esta pantalla se actualiza sola cada 5 segundos.</div>' +
-              modelPill +
+              '<div class="banner-desc">' + descText + '</div>' +
+              '<div class="model-usage-row">' + agentsPill + modelPill + timerPill + '</div>' +
             '</div>' +
           '</div>' +
         '</div>';
@@ -1679,10 +1799,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const isRunning = Boolean(st.is_running || st.busy || (state.detail && state.detail.is_running));
       const activeModel = st.active_model || (state.detail && state.detail.active_model) || null;
       const activeStage = st.active_stage || (state.detail && state.detail.active_stage) || null;
+      const activitySummary = st.activity_summary || (state.detail && state.detail.activity_summary) || null;
+      const agentsCount = st.agents_count || (state.detail && state.detail.agents_count) || null;
+      const stepStartedAt = st.step_started_at || (state.detail && state.detail.step_started_at) || null;
       const statusForBanner = Object.assign({}, st, {
         is_running: isRunning,
         active_model: activeModel,
         active_stage: activeStage,
+        activity_summary: activitySummary,
+        agents_count: agentsCount,
+        step_started_at: stepStartedAt,
       });
       const questions = extractLatestQuestions(events);
       const inact = st.state === 'INTERVIEW' && !isRunning ? formatInactivityNote(st.last_event_at) : '';
@@ -1692,6 +1818,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         isRunning,
         activeModel,
         activeStage,
+        activitySummary,
+        agentsCount,
+        stepStartedAt,
         st.last_event_at,
         st.last_error,
         questions,
@@ -1749,6 +1878,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             }
           });
         }
+      } else {
+        updateLiveTimers();
       }
 
       // Secondary action (Delete)
@@ -1823,7 +1954,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (!events.length) {
         document.getElementById('tab-events').innerHTML = '<div class="empty-box">No hay eventos registrados aún.</div>';
       } else {
-        document.getElementById('tab-events').innerHTML = '<div class="timeline">' + events.slice().reverse().map((ev) => {
+        const enrichedEvents = events.map((ev, idx) => {
+          const nextEv = (idx + 1 < events.length) ? events[idx + 1] : null;
+          let durSecs = null;
+          if (ev.payload && typeof ev.payload.duration_seconds === 'number' && isFinite(ev.payload.duration_seconds)) {
+            durSecs = ev.payload.duration_seconds;
+          } else if (nextEv && ev.at && nextEv.at) {
+            const diffSecs = (Date.parse(nextEv.at) - Date.parse(ev.at)) / 1000;
+            if (isFinite(diffSecs) && diffSecs >= 0) {
+              durSecs = diffSecs;
+            }
+          }
+          const durationText = durSecs !== null ? formatDurationHuman(durSecs, '< 1s') : '';
+          let nextText = '';
+          if (ev.payload && ev.payload.to) {
+            nextText = 'Avanzó a: ' + friendlyStateName(ev.payload.to);
+          } else if (nextEv && nextEv.type === 'STATE_TRANSITIONED' && nextEv.payload && nextEv.payload.to) {
+            nextText = 'Avanzó a: ' + friendlyStateName(nextEv.payload.to);
+          } else if (nextEv && nextEv.type) {
+            nextText = 'Siguiente paso: ' + eventLabel(nextEv.type);
+          }
+          return { ev, durationText, nextText };
+        });
+
+        document.getElementById('tab-events').innerHTML = '<div class="timeline">' + enrichedEvents.slice().reverse().map((item) => {
+          const ev = item.ev;
           const isErr = ev.type === 'PHASE_ERROR' || ev.type === 'PROJECT_FAILED';
           const isSuccess = ev.type === 'PROJECT_DELIVERED' || ev.type === 'PROJECT_COMPLETED';
           let dotClass = 'info';
@@ -1839,15 +1994,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const modelPill = payloadModel
             ? '<span class="model-pill">' + escapeHtml(payloadModel) + '</span>'
             : '';
+          const durPill = item.durationText
+            ? '<span class="duration-pill">Tardó ' + escapeHtml(item.durationText) + '</span>'
+            : '';
+          const nextLine = item.nextText
+            ? '<div class="timeline-next">' + escapeHtml(item.nextText) + '</div>'
+            : '';
           return '<div class="timeline-item">' +
             '<div class="timeline-dot ' + dotClass + '"></div>' +
             '<div class="timeline-header">' +
               '<span class="timeline-title-group">' +
                 '<span class="timeline-type">' + escapeHtml(label) + '</span>' +
                 modelPill +
+                durPill +
               '</span>' +
               '<span class="timeline-time" title="' + escapeHtml(rawDate) + '">' + friendlyDate + '</span>' +
             '</div>' +
+            nextLine +
             (hasPayload ? '<details class="tech-details" style="margin-top:4px;"><summary>Ver datos técnicos</summary><pre style="margin:4px 0 0 0;">' + escapeHtml(JSON.stringify(ev.payload, null, 2)) + '</pre></details>' : '') +
           '</div>';
         }).join('') + '</div>';
@@ -1993,6 +2156,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       });
     })();
 
+    setInterval(updateLiveTimers, 1000);
     setInterval(() => {
       loadProjects();
     }, 5000);

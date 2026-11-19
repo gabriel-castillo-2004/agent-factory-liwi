@@ -27,6 +27,16 @@ def _resolve_command(
     return cmd_list
 
 
+def _close_pipes(proc: subprocess.Popen[str]) -> None:
+    """Close subprocess stdio pipes cleanly after completion or timeout."""
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
 class SubprocessRunner(Runner):
     """Multiplatform command runner with timeout and full child process-tree termination."""
 
@@ -64,7 +74,7 @@ class SubprocessRunner(Runner):
             proc = subprocess.Popen(
                 cmd_list,
                 cwd=str(cwd_path),
-                stdin=subprocess.PIPE if input_str is not None else None,
+                stdin=subprocess.PIPE if input_str is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -90,6 +100,7 @@ class SubprocessRunner(Runner):
                     proc.wait(timeout=2.0)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+                _close_pipes(proc)
                 raise CommandTimeoutError(
                     f"Command '{cmd_list}' timed out after {timeout} seconds"
                 ) from exc
@@ -98,7 +109,7 @@ class SubprocessRunner(Runner):
             proc = subprocess.Popen(
                 cmd_list,
                 cwd=str(cwd_path),
-                stdin=subprocess.PIPE if input_str is not None else None,
+                stdin=subprocess.PIPE if input_str is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -124,6 +135,7 @@ class SubprocessRunner(Runner):
                     proc.wait(timeout=2.0)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+                _close_pipes(proc)
                 raise CommandTimeoutError(
                     f"Command '{cmd_list}' timed out after {timeout} seconds"
                 ) from exc

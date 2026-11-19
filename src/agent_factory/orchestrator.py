@@ -1,6 +1,7 @@
 """State machine orchestrator, approval gate, and circuit breaker (INV-05, INV-17)."""
 
 import threading
+import time
 import tomllib
 from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
@@ -8,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from agent_factory.adapters.model_resolver import ACTIVITY_MESSAGES
 from agent_factory.adapters.system_clock import SystemClock
 from agent_factory.agents.interviewer import Interviewer
 from agent_factory.agents.mediator import (
@@ -169,6 +171,18 @@ class Orchestrator:
     def _now(self) -> datetime:
         return self.clock.now() if self.clock else datetime.now(UTC)
 
+    def _report_activity(
+        self,
+        activity_summary: str,
+        *,
+        agents_count: int = 1,
+        stage: str | None = None,
+    ) -> None:
+        resolver = getattr(self.llm, "model_resolver", None)
+        recorder = getattr(resolver, "record_activity", None) if resolver is not None else None
+        if callable(recorder):
+            recorder(activity_summary, agents_count=agents_count, stage=stage)
+
     def _get_spec(self, project_id: str) -> Spec:
         events = self.store.get_events(project_id)
         spec: Spec | None = None
@@ -302,7 +316,13 @@ class Orchestrator:
                     agent="circuit_breaker",
                 )
 
+            interview_t0 = time.monotonic()
             try:
+                self._report_activity(
+                    ACTIVITY_MESSAGES["INTERVIEW"],
+                    agents_count=1,
+                    stage="INTERVIEW",
+                )
                 interviewer_payload: dict[str, Any] = {
                     "agent": "interviewer",
                     "incoming_event_id": event_id,
@@ -340,6 +360,7 @@ class Orchestrator:
                     agent="interviewer",
                 )
 
+            interview_duration = round(max(0.0, time.monotonic() - interview_t0), 3)
             self.store.append(
                 create_event(
                     project_id=project_id,
@@ -349,6 +370,7 @@ class Orchestrator:
                         "questions": round_result.questions,
                         "is_complete": round_result.is_complete,
                         "terminated_by_limit": round_result.terminated_by_limit,
+                        "duration_seconds": interview_duration,
                     },
                     at=self._now(),
                 )
@@ -413,11 +435,35 @@ class Orchestrator:
                     )
                 )
 
+            debate_t0 = time.monotonic()
+            mediation_t0: float | None = None
+            if resuming_mediation:
+                mediation_t0 = time.monotonic()
+                self._report_activity(
+                    ACTIVITY_MESSAGES["MEDIATION"],
+                    agents_count=1,
+                    stage="MEDIATION",
+                )
+            else:
+                self._report_activity(
+                    ACTIVITY_MESSAGES["DEBATE"],
+                    agents_count=2,
+                    stage="DEBATE",
+                )
+
             def _on_llm_call(state: ProjectState) -> None:
                 self.circuit_breaker.record_call(project_id, state)
 
             def _on_transition(from_state: ProjectState, to_state: ProjectState) -> None:
+                nonlocal mediation_t0
                 validate_transition(from_state, to_state)
+                if to_state == ProjectState.MEDIATION:
+                    mediation_t0 = time.monotonic()
+                    self._report_activity(
+                        ACTIVITY_MESSAGES["MEDIATION"],
+                        agents_count=1,
+                        stage="MEDIATION",
+                    )
                 self.store.append(
                     create_event(
                         project_id=project_id,
@@ -431,11 +477,15 @@ class Orchestrator:
                 proposal: PragmatistProposal,
                 critique: StructuralistCritique,
             ) -> None:
+                debate_duration = round(max(0.0, time.monotonic() - debate_t0), 3)
                 self.store.append(
                     create_event(
                         project_id=project_id,
                         event_type=EventType.PRAGMATIST_PROPOSED,
-                        payload={"proposal": proposal.model_dump(mode="json")},
+                        payload={
+                            "proposal": proposal.model_dump(mode="json"),
+                            "duration_seconds": debate_duration,
+                        },
                         at=self._now(),
                     )
                 )
@@ -443,7 +493,10 @@ class Orchestrator:
                     create_event(
                         project_id=project_id,
                         event_type=EventType.STRUCTURALIST_CRITIQUED,
-                        payload={"critique": critique.model_dump(mode="json")},
+                        payload={
+                            "critique": critique.model_dump(mode="json"),
+                            "duration_seconds": debate_duration,
+                        },
                         at=self._now(),
                     )
                 )
@@ -531,6 +584,10 @@ class Orchestrator:
                 )
 
             assert plan is not None
+            mediation_duration = round(
+                max(0.0, time.monotonic() - (mediation_t0 if mediation_t0 is not None else debate_t0)),
+                3,
+            )
             plan_hash = plan.compute_hash()
             validate_transition(ProjectState.MEDIATION, ProjectState.WAITING_APPROVAL)
             self.store.append(
@@ -541,6 +598,7 @@ class Orchestrator:
                         "plan": plan.model_dump(mode="json"),
                         "plan_hash": plan_hash,
                         "total_tests": len(plan.acceptance_tests),
+                        "duration_seconds": mediation_duration,
                         "to": ProjectState.WAITING_APPROVAL,
                     },
                     at=self._now(),
@@ -746,6 +804,7 @@ class Orchestrator:
         *,
         model: str | None = None,
         agent: str | None = None,
+        duration_seconds: float | None = None,
     ) -> ProjectStatus:
         """Record a call in the given state or transition to FAILED if budget exceeded (INV-17)."""
         validate_project_id(project_id)
@@ -763,6 +822,8 @@ class Orchestrator:
                     payload["agent"] = agent
                 if model:
                     payload["model"] = model
+                if duration_seconds is not None:
+                    payload["duration_seconds"] = round(max(0.0, float(duration_seconds)), 3)
                 self.store.append(
                     create_event(
                         project_id=project_id,

@@ -289,6 +289,7 @@ class CliConfig(BaseModel):
     llm_api_key: str = ""
     llm_provider: str = "auto"
     llm_fallback_to_agy: bool = True
+    agy_cli_timeout_seconds: float = 300.0
     dashboard_port: int = 8000
 
 
@@ -479,6 +480,26 @@ def load_cli_config(env: Mapping[str, str] | None = None) -> CliConfig:
         err_fb.__context__ = None
         raise err_fb
 
+    agy_cli_timeout_seconds = 300.0
+    err_agy_timeout: CliConfigError | None = None
+    try:
+        raw_agy_timeout = effective.get("AGY_CLI_TIMEOUT_SECONDS", "300.0").strip() or "300.0"
+        agy_cli_timeout_seconds = float(raw_agy_timeout)
+        if not math.isfinite(agy_cli_timeout_seconds) or agy_cli_timeout_seconds <= 0:
+            err_agy_timeout = CliConfigError(
+                "AGY_CLI_TIMEOUT_SECONDS must be a finite positive number"
+            )
+    except ValueError as exc:
+        clean_err = redact_secrets(
+            f"Invalid AGY_CLI_TIMEOUT_SECONDS: {exc}",
+            extra_secrets=(token,) if token else (),
+        )
+        err_agy_timeout = CliConfigError(clean_err)
+    if err_agy_timeout is not None:
+        err_agy_timeout.__cause__ = None
+        err_agy_timeout.__context__ = None
+        raise err_agy_timeout
+
     dashboard_port = 8000
     err_port: CliConfigError | None = None
     try:
@@ -517,6 +538,7 @@ def load_cli_config(env: Mapping[str, str] | None = None) -> CliConfig:
         llm_api_key=llm_api_key,
         llm_provider=raw_provider,
         llm_fallback_to_agy=llm_fallback_to_agy,
+        agy_cli_timeout_seconds=agy_cli_timeout_seconds,
         dashboard_port=dashboard_port,
     )
 
@@ -625,6 +647,7 @@ def build_runtime(
             effective_llm = AgyLLMAdapter(
                 runner=effective_runner,
                 cwd=config.workspaces_dir,
+                timeout_seconds=config.agy_cli_timeout_seconds,
                 secrets=active_secrets,
                 models_config_path=config.models_config_path,
                 model_resolver=shared_model_resolver,
@@ -643,6 +666,7 @@ def build_runtime(
                 agy_fallback = AgyLLMAdapter(
                     runner=effective_runner,
                     cwd=config.workspaces_dir,
+                    timeout_seconds=config.agy_cli_timeout_seconds,
                     secrets=active_secrets,
                     models_config_path=config.models_config_path,
                     model_resolver=shared_model_resolver,
@@ -701,6 +725,7 @@ def build_runtime(
             else AgyCliAdapter(
                 workspace_manager=workspace_manager,
                 runner=effective_runner,
+                timeout_seconds=config.agy_cli_timeout_seconds,
                 model=building_model,
                 model_resolver=shared_model_resolver,
                 secrets=active_secrets,
