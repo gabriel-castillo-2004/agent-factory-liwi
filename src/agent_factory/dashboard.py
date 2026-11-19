@@ -1214,6 +1214,112 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       color: var(--muted);
       margin: 2px 0 4px 0;
     }
+    .phase-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 4px 0;
+    }
+    .phase-card {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface);
+      transition: all 0.15s ease;
+    }
+    .phase-card.phase-active {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.25);
+    }
+    .phase-card.phase-error {
+      border-color: var(--err);
+    }
+    .phase-card.phase-pending {
+      opacity: 0.55;
+      background: var(--surface-alt);
+    }
+    .phase-summary {
+      list-style: none;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      padding: 11px 14px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .phase-summary::-webkit-details-marker { display: none; }
+    .phase-card.phase-pending .phase-summary {
+      cursor: default;
+    }
+    .phase-summary-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+    .phase-circle {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.78rem;
+      font-weight: 700;
+      flex-shrink: 0;
+      border: 1.5px solid var(--border);
+      color: var(--muted);
+      background: var(--surface-alt);
+    }
+    .phase-completed .phase-circle {
+      background: var(--ok);
+      border-color: var(--ok);
+      color: #ffffff;
+    }
+    .phase-active .phase-circle {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #ffffff;
+    }
+    .phase-error .phase-circle {
+      background: var(--err);
+      border-color: var(--err);
+      color: #ffffff;
+    }
+    .phase-title {
+      font-weight: 600;
+      font-size: 0.94rem;
+      color: var(--text);
+    }
+    .phase-meta-badge {
+      font-size: 0.76rem;
+      font-weight: 500;
+      padding: 2px 9px;
+      border-radius: 999px;
+      background: var(--surface-alt);
+      color: var(--muted);
+      border: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .phase-completed .phase-meta-badge {
+      background: var(--ok-bg);
+      color: var(--ok);
+      border-color: rgba(34, 197, 94, 0.3);
+    }
+    .phase-active .phase-meta-badge {
+      background: var(--info-bg);
+      color: var(--accent);
+      border-color: rgba(56, 189, 248, 0.35);
+    }
+    .phase-error .phase-meta-badge {
+      background: var(--err-bg);
+      color: var(--err);
+      border-color: rgba(239, 68, 68, 0.35);
+    }
+    .phase-steps {
+      border-top: 1px solid var(--border);
+      padding: 12px 14px 12px 18px;
+    }
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
     .toast { font-size: 0.85rem; color: var(--accent); }
@@ -1359,8 +1465,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       replyDrafts: {},
       adjustDrafts: {},
       adjustOpen: {},
+      phaseOpen: {},
       lastBannerSignature: null,
     };
+    let statusNoteTimer = null;
 
     function escapeHtml(text) {
       return String(text ?? '')
@@ -1371,27 +1479,67 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .replace(/'/g, '&#39;');
     }
 
-    function stepInfo(st) {
+    function stateToPhaseNum(code) {
+      switch (code) {
+        case 'CREATED':
+        case 'IDLE':
+        case 'INTERVIEW':
+          return 1;
+        case 'DEBATE':
+        case 'MEDIATION':
+          return 2;
+        case 'WAITING_APPROVAL':
+          return 3;
+        case 'BUILDING':
+        case 'VERIFYING':
+          return 4;
+        case 'DELIVERED':
+        case 'COMPLETED':
+          return 5;
+        default:
+          return 1;
+      }
+    }
+
+    function findFailedPhaseNum(events) {
+      if (!Array.isArray(events)) return 1;
+      for (let i = events.length - 1; i >= 0; i--) {
+        const ev = events[i];
+        const pl = ev && ev.payload ? ev.payload : {};
+        if (ev.type === 'PHASE_ERROR' && pl.state) {
+          return stateToPhaseNum(pl.state);
+        }
+        if (ev.type === 'PROJECT_FAILED' && pl.failed_from) {
+          return stateToPhaseNum(pl.failed_from);
+        }
+      }
+      return 1;
+    }
+
+    function stepInfo(st, events) {
       switch (st) {
         case 'INTERVIEW':
         case 'CREATED':
-          return { step: 'Paso 1: Definiendo detalles', cls: 'badge-info' };
+        case 'IDLE':
+          return { stage: 1, cardStep: 'Etapa 1 de 5', step: 'Etapa 1 de 5 · Definiendo detalles', cls: 'badge-info' };
         case 'DEBATE':
         case 'MEDIATION':
-          return { step: 'Paso 2: Preparando el plan', cls: 'badge-info' };
+          return { stage: 2, cardStep: 'Etapa 2 de 5', step: 'Etapa 2 de 5 · Diseñando la solución', cls: 'badge-info' };
         case 'WAITING_APPROVAL':
-          return { step: 'Paso 3: Listo para aprobar', cls: 'badge-warn' };
+          return { stage: 3, cardStep: 'Etapa 3 de 5', step: 'Etapa 3 de 5 · Esperando aprobación', cls: 'badge-warn' };
         case 'BUILDING':
         case 'VERIFYING':
-          return { step: 'Paso 4: Construyendo...', cls: 'badge-info' };
+          return { stage: 4, cardStep: 'Etapa 4 de 5', step: 'Etapa 4 de 5 · Construyendo y probando', cls: 'badge-info' };
         case 'DELIVERED':
         case 'COMPLETED':
-          return { step: '¡Terminado!', cls: 'badge-ok' };
+          return { stage: 5, cardStep: '¡Terminado!', step: 'Etapa 5 de 5 · ¡Terminado!', cls: 'badge-ok' };
         case 'FAILED':
-        case 'ERROR':
-          return { step: 'Necesita atención', cls: 'badge-err' };
+        case 'ERROR': {
+          const fNum = findFailedPhaseNum(events);
+          return { stage: fNum, cardStep: 'Necesita atención', step: 'Etapa ' + fNum + ' de 5 · Necesita atención', cls: 'badge-err' };
+        }
         default:
-          return { step: st || 'Iniciando', cls: 'badge-info' };
+          return { stage: 1, cardStep: st || 'Iniciando', step: 'Etapa 1 de 5 · ' + (st || 'Iniciando'), cls: 'badge-info' };
       }
     }
 
@@ -1419,7 +1567,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
 
     function setNote(msg) {
-      document.getElementById('status-note').textContent = msg || '';
+      const el = document.getElementById('status-note');
+      if (!el) return;
+      if (statusNoteTimer) {
+        clearTimeout(statusNoteTimer);
+        statusNoteTimer = null;
+      }
+      el.textContent = msg || '';
+      if (msg) {
+        statusNoteTimer = setTimeout(() => {
+          el.textContent = '';
+          statusNoteTimer = null;
+        }, 4000);
+      }
     }
 
     function applyTheme(theme) {
@@ -1496,7 +1656,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         return '<div class="project-card ' + selected + '" data-id="' + escapeHtml(p.project_id) + '">' +
           '<div class="card-header">' +
             '<div class="card-title">' + title + statusTag + '</div>' +
-            '<span class="badge ' + badgeCls + '">' + escapeHtml(info.step) + '</span>' +
+            '<span class="badge ' + badgeCls + '">' + escapeHtml(info.cardStep || info.step) + '</span>' +
           '</div>' +
           '<div class="progress-track"><div class="progress-fill" style="width:' + pct + '%"></div></div>' +
           timeHtml +
@@ -1533,6 +1693,133 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         'REGISTRY_PUBLISH_FAILED': 'Error al publicar registro',
       };
       return labels[type] || type;
+    }
+
+    function friendlyEventAction(ev) {
+      const pl = ev && ev.payload ? ev.payload : {};
+      switch (ev.type) {
+        case 'PROJECT_CREATED':
+          return 'Proyecto creado e iniciado';
+        case 'INTERVIEW_ROUND':
+          return 'Preguntas y respuestas de requisitos';
+        case 'SPEC_UPDATED':
+          return 'Especificación del proyecto guardada';
+        case 'PRAGMATIST_PROPOSED':
+          return 'Propuesta del especialista';
+        case 'STRUCTURALIST_CRITIQUED':
+          return 'Crítica de estructura';
+        case 'PLAN_CREATED':
+          return 'Plan técnico unificado';
+        case 'APPROVAL_RECORDED':
+          return 'Plan aprobado por ti';
+        case 'ADJUSTMENT_REQUESTED':
+          return 'Ajuste solicitado al plan';
+        case 'AGENT_INVOKED':
+          if (pl.agent === 'interviewer') return 'Analizando idea y preparando preguntas';
+          if (pl.agent === 'generate_tests') return 'Creando pruebas automáticas';
+          if (pl.agent === 'implement_or_fix') return 'Escribiendo código';
+          if (pl.state === 'VERIFYING') return 'Verificando funcionamiento';
+          if (pl.state === 'DEBATE') return 'Evaluación de especialistas';
+          if (pl.state === 'MEDIATION') return 'Diseñando plan técnico';
+          return 'Trabajando en la construcción';
+        case 'TESTS_UPDATED':
+          return (pl.total !== undefined)
+            ? ('Verificando funcionamiento (' + (pl.passed || 0) + '/' + pl.total + ' pruebas)')
+            : 'Verificando funcionamiento';
+        case 'CI_ROUND_COMPLETED':
+          return 'Verificando funcionamiento en CI';
+        case 'PROJECT_RETRIED':
+          return 'Reintento iniciado';
+        case 'PHASE_ERROR':
+          return 'Error en la etapa';
+        case 'PROJECT_FAILED':
+          return 'Detenido por error';
+        case 'PROJECT_DELIVERED':
+        case 'PROJECT_COMPLETED':
+        case 'COMPLETED':
+          return '¡Proyecto entregado con éxito!';
+        case 'REGISTRY_PUBLISH_FAILED':
+          return 'Aviso al publicar registro';
+        case 'STATE_TRANSITIONED':
+          return pl.to ? ('Avanzó a ' + friendlyStateName(pl.to)) : 'Cambio de etapa';
+        default:
+          return eventLabel(ev.type);
+      }
+    }
+
+    function phaseNumForEvent(ev) {
+      const pl = ev && ev.payload ? ev.payload : {};
+      switch (ev.type) {
+        case 'PROJECT_CREATED':
+        case 'INTERVIEW_ROUND':
+        case 'SPEC_UPDATED':
+          return 1;
+        case 'PRAGMATIST_PROPOSED':
+        case 'STRUCTURALIST_CRITIQUED':
+        case 'PLAN_CREATED':
+          return 2;
+        case 'APPROVAL_RECORDED':
+        case 'ADJUSTMENT_REQUESTED':
+          return 3;
+        case 'TESTS_UPDATED':
+        case 'CI_ROUND_COMPLETED':
+        case 'PROJECT_RETRIED':
+          return 4;
+        case 'PROJECT_DELIVERED':
+        case 'PROJECT_COMPLETED':
+        case 'COMPLETED':
+        case 'REGISTRY_PUBLISH_FAILED':
+          return 5;
+        case 'AGENT_INVOKED':
+          if (pl.agent === 'interviewer' || pl.state === 'INTERVIEW') return 1;
+          if (pl.state === 'DEBATE' || pl.state === 'MEDIATION') return 2;
+          if (pl.state === 'DELIVERED') return 5;
+          return 4;
+        case 'STATE_TRANSITIONED':
+          if (pl.from === 'WAITING_APPROVAL' && pl.to === 'INTERVIEW') return 3;
+          if (pl.to === 'DEBATE' || pl.to === 'MEDIATION' || pl.to === 'WAITING_APPROVAL') return 2;
+          if (pl.to === 'BUILDING' || pl.to === 'VERIFYING') return 4;
+          if (pl.to === 'DELIVERED' || pl.to === 'COMPLETED') return 5;
+          return 1;
+        case 'PHASE_ERROR':
+          return pl.state ? stateToPhaseNum(pl.state) : 4;
+        case 'PROJECT_FAILED':
+          return pl.failed_from ? stateToPhaseNum(pl.failed_from) : 4;
+        default:
+          return 1;
+      }
+    }
+
+    function computePhaseDuration(phaseNum, phaseItems, allItems) {
+      if (!phaseItems.length) return '';
+      if (phaseNum === 3) {
+        const approvalItem = phaseItems.find((it) => it.ev.type === 'APPROVAL_RECORDED');
+        const planItem = allItems.find((it) => it.ev.type === 'PLAN_CREATED');
+        if (approvalItem && planItem && approvalItem.ev.at && planItem.ev.at) {
+          const span = (Date.parse(approvalItem.ev.at) - Date.parse(planItem.ev.at)) / 1000;
+          if (isFinite(span) && span >= 0) {
+            return formatDurationHuman(span, '< 1s');
+          }
+        }
+      }
+      const firstAt = phaseItems[0].ev.at ? Date.parse(phaseItems[0].ev.at) : NaN;
+      const lastAt = phaseItems[phaseItems.length - 1].ev.at ? Date.parse(phaseItems[phaseItems.length - 1].ev.at) : NaN;
+      if (isFinite(firstAt) && isFinite(lastAt) && lastAt > firstAt) {
+        return formatDurationHuman((lastAt - firstAt) / 1000, '< 1s');
+      }
+      let sum = 0;
+      let sawDur = false;
+      let sawPragDur = false;
+      phaseItems.forEach((it) => {
+        const pl = it.ev.payload || {};
+        if (typeof pl.duration_seconds === 'number' && isFinite(pl.duration_seconds)) {
+          if (it.ev.type === 'STRUCTURALIST_CRITIQUED' && sawPragDur) return;
+          if (it.ev.type === 'PRAGMATIST_PROPOSED') sawPragDur = true;
+          sum += Math.max(0, pl.duration_seconds);
+          sawDur = true;
+        }
+      });
+      return sawDur ? formatDurationHuman(sum, '< 1s') : '< 1s';
     }
 
     function extractLatestQuestions(events) {
@@ -1780,12 +2067,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       const st = state.detail.status;
       const events = state.detail.events || [];
-      const info = stepInfo(st.state);
+      const info = stepInfo(st.state, events);
       const titleText = st.name || st.objective || st.project_id;
       document.getElementById('detail-title').textContent = titleText;
 
       const badge = document.getElementById('detail-badge');
-      badge.textContent = info.step + ' (' + (st.progress_pct || 0) + '%)';
+      badge.textContent = info.step;
       badge.className = 'badge ' + info.cls;
       document.getElementById('detail-progress').style.width = Number(st.progress_pct || 0) + '%';
       const timeBox = document.getElementById('detail-time');
@@ -1950,71 +2237,128 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           '<h4 style="margin:14px 0 8px 0;">Pruebas de aceptación (' + (plan.acceptance_tests || []).length + ')</h4><ul style="padding-left:20px; font-size:0.92rem;">' + testsHtml + '</ul>';
       }
 
-      // Events tab ("Historial")
-      if (!events.length) {
-        document.getElementById('tab-events').innerHTML = '<div class="empty-box">No hay eventos registrados aún.</div>';
-      } else {
-        const enrichedEvents = events.map((ev, idx) => {
-          const nextEv = (idx + 1 < events.length) ? events[idx + 1] : null;
-          let durSecs = null;
-          if (ev.payload && typeof ev.payload.duration_seconds === 'number' && isFinite(ev.payload.duration_seconds)) {
-            durSecs = ev.payload.duration_seconds;
-          } else if (nextEv && ev.at && nextEv.at) {
-            const diffSecs = (Date.parse(nextEv.at) - Date.parse(ev.at)) / 1000;
-            if (isFinite(diffSecs) && diffSecs >= 0) {
-              durSecs = diffSecs;
-            }
-          }
-          const durationText = durSecs !== null ? formatDurationHuman(durSecs, '< 1s') : '';
-          let nextText = '';
-          if (ev.payload && ev.payload.to) {
-            nextText = 'Avanzó a: ' + friendlyStateName(ev.payload.to);
-          } else if (nextEv && nextEv.type === 'STATE_TRANSITIONED' && nextEv.payload && nextEv.payload.to) {
-            nextText = 'Avanzó a: ' + friendlyStateName(nextEv.payload.to);
-          } else if (nextEv && nextEv.type) {
-            nextText = 'Siguiente paso: ' + eventLabel(nextEv.type);
-          }
-          return { ev, durationText, nextText };
-        });
+      // Events tab ("Historial" grouped into 5 clear lifecycle phases)
+      const LIFECYCLE_PHASES = [
+        { num: 1, id: 'idea', title: '1. Idea y requisitos' },
+        { num: 2, id: 'design', title: '2. Diseño de la solución' },
+        { num: 3, id: 'approval', title: '3. Aprobación del plan' },
+        { num: 4, id: 'build', title: '4. Construcción y pruebas' },
+        { num: 5, id: 'delivery', title: '5. Entrega final' },
+      ];
 
-        document.getElementById('tab-events').innerHTML = '<div class="timeline">' + enrichedEvents.slice().reverse().map((item) => {
-          const ev = item.ev;
-          const isErr = ev.type === 'PHASE_ERROR' || ev.type === 'PROJECT_FAILED';
-          const isSuccess = ev.type === 'PROJECT_DELIVERED' || ev.type === 'PROJECT_COMPLETED';
-          let dotClass = 'info';
-          if (isErr) dotClass = 'err';
-          else if (isSuccess) dotClass = 'ok';
-          const rawDate = ev.at ? String(ev.at) : '';
-          const friendlyDate = rawDate ? escapeHtml(formatFriendlyTime(rawDate)) : '';
-          const hasPayload = ev.payload && Object.keys(ev.payload).length > 0;
-          const label = eventLabel(ev.type);
-          const payloadModel = (ev.type === 'AGENT_INVOKED' && ev.payload && ev.payload.model)
-            ? String(ev.payload.model)
-            : '';
-          const modelPill = payloadModel
-            ? '<span class="model-pill">' + escapeHtml(payloadModel) + '</span>'
-            : '';
-          const durPill = item.durationText
-            ? '<span class="duration-pill">Tardó ' + escapeHtml(item.durationText) + '</span>'
-            : '';
-          const nextLine = item.nextText
-            ? '<div class="timeline-next">' + escapeHtml(item.nextText) + '</div>'
-            : '';
-          return '<div class="timeline-item">' +
-            '<div class="timeline-dot ' + dotClass + '"></div>' +
-            '<div class="timeline-header">' +
-              '<span class="timeline-title-group">' +
-                '<span class="timeline-type">' + escapeHtml(label) + '</span>' +
-                modelPill +
-                durPill +
+      const enriched = events.map((ev, idx) => {
+        const nextEv = (idx + 1 < events.length) ? events[idx + 1] : null;
+        let durSecs = null;
+        if (ev.payload && typeof ev.payload.duration_seconds === 'number' && isFinite(ev.payload.duration_seconds)) {
+          durSecs = ev.payload.duration_seconds;
+        } else if (nextEv && ev.at && nextEv.at) {
+          const diffSecs = (Date.parse(nextEv.at) - Date.parse(ev.at)) / 1000;
+          if (isFinite(diffSecs) && diffSecs >= 0) {
+            durSecs = diffSecs;
+          }
+        }
+        return {
+          ev,
+          phaseNum: phaseNumForEvent(ev),
+          durationText: durSecs !== null ? formatDurationHuman(durSecs, '< 1s') : '',
+        };
+      });
+
+      const isDelivered = st.state === 'DELIVERED' || st.state === 'COMPLETED';
+      const isFailed = st.state === 'FAILED' || st.state === 'ERROR';
+      const activePhaseNum = isDelivered ? 6 : info.stage;
+
+      const eventsEl = document.getElementById('tab-events');
+      eventsEl.innerHTML = '<div class="phase-list">' + LIFECYCLE_PHASES.map((ph) => {
+        const phaseItems = enriched.filter((it) => it.phaseNum === ph.num);
+        let phaseStatus = 'pending';
+        if (isDelivered) {
+          phaseStatus = 'completed';
+        } else if (isFailed) {
+          if (ph.num < activePhaseNum) phaseStatus = 'completed';
+          else if (ph.num === activePhaseNum) phaseStatus = 'error';
+          else phaseStatus = 'pending';
+        } else {
+          if (ph.num < activePhaseNum) phaseStatus = 'completed';
+          else if (ph.num === activePhaseNum) phaseStatus = 'active';
+          else phaseStatus = 'pending';
+        }
+
+        if (phaseStatus === 'pending') {
+          return '<div class="phase-card phase-pending">' +
+            '<div class="phase-summary">' +
+              '<span class="phase-summary-left">' +
+                '<span class="phase-circle">' + ph.num + '</span>' +
+                '<span class="phase-title">' + escapeHtml(ph.title) + '</span>' +
               '</span>' +
-              '<span class="timeline-time" title="' + escapeHtml(rawDate) + '">' + friendlyDate + '</span>' +
+              '<span class="phase-meta-badge">Pendiente</span>' +
             '</div>' +
-            nextLine +
-            (hasPayload ? '<details class="tech-details" style="margin-top:4px;"><summary>Ver datos técnicos</summary><pre style="margin:4px 0 0 0;">' + escapeHtml(JSON.stringify(ev.payload, null, 2)) + '</pre></details>' : '') +
           '</div>';
-        }).join('') + '</div>';
-      }
+        }
+
+        let badgeLabel = 'En curso';
+        let circleHtml = String(ph.num);
+        if (phaseStatus === 'completed') {
+          const durStr = computePhaseDuration(ph.num, phaseItems, enriched);
+          badgeLabel = durStr ? ('Completado en ' + durStr) : 'Completado';
+          circleHtml = '✓';
+        } else if (phaseStatus === 'error') {
+          badgeLabel = 'Requiere atención';
+          circleHtml = '!';
+        }
+
+        const stateKey = st.project_id + ':' + ph.id;
+        const defaultOpen = (phaseStatus === 'active' || phaseStatus === 'error');
+        const isOpen = (stateKey in state.phaseOpen) ? state.phaseOpen[stateKey] : defaultOpen;
+        const openAttr = isOpen ? ' open' : '';
+
+        const stepsHtml = phaseItems.length
+          ? '<div class="timeline">' + phaseItems.map((item) => {
+              const ev = item.ev;
+              const isErr = ev.type === 'PHASE_ERROR' || ev.type === 'PROJECT_FAILED';
+              const isSuccess = ev.type === 'PROJECT_DELIVERED' || ev.type === 'PROJECT_COMPLETED' || ev.type === 'COMPLETED';
+              let dotClass = 'info';
+              if (isErr) dotClass = 'err';
+              else if (isSuccess) dotClass = 'ok';
+              const rawDate = ev.at ? String(ev.at) : '';
+              const friendlyDate = rawDate ? escapeHtml(formatFriendlyTime(rawDate)) : '';
+              const hasPayload = ev.payload && Object.keys(ev.payload).length > 0;
+              const actionTitle = friendlyEventAction(ev);
+              const payloadModel = (ev.payload && ev.payload.model) ? String(ev.payload.model) : '';
+              const modelPill = payloadModel ? '<span class="model-pill">' + escapeHtml(payloadModel) + '</span>' : '';
+              const durPill = item.durationText ? '<span class="duration-pill">Tardó ' + escapeHtml(item.durationText) + '</span>' : '';
+              return '<div class="timeline-item">' +
+                '<div class="timeline-dot ' + dotClass + '"></div>' +
+                '<div class="timeline-header">' +
+                  '<span class="timeline-title-group">' +
+                    '<span class="timeline-type">' + escapeHtml(actionTitle) + '</span>' +
+                    modelPill +
+                    durPill +
+                  '</span>' +
+                  '<span class="timeline-time" title="' + escapeHtml(rawDate) + '">' + friendlyDate + '</span>' +
+                '</div>' +
+                (hasPayload ? '<details class="tech-details" style="margin-top:4px;"><summary>Ver datos técnicos</summary><pre style="margin:4px 0 0 0;">' + escapeHtml(JSON.stringify(ev.payload, null, 2)) + '</pre></details>' : '') +
+              '</div>';
+            }).join('') + '</div>'
+          : '<div class="muted" style="font-size:0.86rem;">En progreso en esta fase...</div>';
+
+        return '<details class="phase-card phase-' + phaseStatus + '" data-phase-key="' + escapeHtml(stateKey) + '"' + openAttr + '>' +
+          '<summary class="phase-summary">' +
+            '<span class="phase-summary-left">' +
+              '<span class="phase-circle">' + circleHtml + '</span>' +
+              '<span class="phase-title">' + escapeHtml(ph.title) + '</span>' +
+            '</span>' +
+            '<span class="phase-meta-badge">' + escapeHtml(badgeLabel) + '</span>' +
+          '</summary>' +
+          '<div class="phase-steps">' + stepsHtml + '</div>' +
+        '</details>';
+      }).join('') + '</div>';
+
+      eventsEl.querySelectorAll('details.phase-card[data-phase-key]').forEach((det) => {
+        det.addEventListener('toggle', () => {
+          state.phaseOpen[det.getAttribute('data-phase-key')] = det.open;
+        });
+      });
 
       renderTabs();
     }

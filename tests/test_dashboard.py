@@ -1096,10 +1096,32 @@ def test_dashboard_exposes_active_model_while_running_and_renders_history_model(
         assert "1 agente trabajando" in running_block
         assert "2 agentes colaborando" in running_block
         assert "live-step-timer" in running_block
-        assert "ev.type === 'AGENT_INVOKED'" in html
         assert "model-pill" in html
         assert "Tardó " in html
-        assert "Avanzó a:" in html
+
+        # 5-phase grouped timeline, states, readable actions, Etapa X de 5 badge, and 4s toast auto-hide
+        for expected_phase in (
+            "1. Idea y requisitos",
+            "2. Diseño de la solución",
+            "3. Aprobación del plan",
+            "4. Construcción y pruebas",
+            "5. Entrega final",
+            "Pendiente",
+            "Completado en ",
+            "opacity: 0.55",
+            "✓",
+            "Creando pruebas automáticas",
+            "Escribiendo código",
+            "Verificando funcionamiento",
+            "Propuesta del especialista",
+            "Crítica de estructura",
+            "Etapa ",
+            " de 5",
+            "4000",
+        ):
+            assert expected_phase in html
+        assert "Siguiente paso:" not in html
+        assert "progress_pct || 0) + '%)'" not in html
 
         # Trigger live background run -> Orchestrator + AgyLLMAdapter record activity and active_model right before runner
         code, res = _http_json(
