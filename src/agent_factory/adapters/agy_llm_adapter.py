@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -11,10 +12,17 @@ from typing import Any, NoReturn
 from pydantic import BaseModel
 
 from agent_factory.adapters.agy_cli_adapter import build_sanitized_cli_env
+from agent_factory.adapters.model_resolver import (
+    ModelResolver,
+    is_retryable_model_or_quota_error,
+    read_configured_model_for_stage,
+)
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.ports.llm import LLM, InvalidLLMResponseError, LLMError
 from agent_factory.ports.runner import CommandResult, CommandTimeoutError, Runner
 from agent_factory.secrets import redact_secrets
+
+logger = logging.getLogger(__name__)
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\r?\n?(.*?)\r?\n?```", re.DOTALL | re.IGNORECASE)
 
@@ -160,6 +168,9 @@ class AgyLLMAdapter:
         timeout_seconds: float = 60.0,
         allowed_cli_env_keys: Sequence[str] = ("AGY_HOME", "AGY_CONFIG_DIR"),
         secrets: Sequence[str] = (),
+        model: str | None = None,
+        models_config_path: Path | None = None,
+        model_resolver: ModelResolver | None = None,
     ) -> None:
         self.runner: Runner = (
             runner
@@ -171,6 +182,20 @@ class AgyLLMAdapter:
         self.timeout_seconds = timeout_seconds
         self.allowed_cli_env_keys: tuple[str, ...] = tuple(allowed_cli_env_keys)
         self.secrets: tuple[str, ...] = tuple(secrets)
+        self.model = model
+        self.models_config_path = models_config_path
+        self.model_resolver: ModelResolver = (
+            model_resolver
+            if model_resolver is not None
+            else ModelResolver(
+                runner=self.runner,
+                cli_command=self.cli_command,
+                cwd=self.cwd,
+                allowed_cli_env_keys=self.allowed_cli_env_keys,
+                models_config_path=models_config_path,
+                secrets=self.secrets,
+            )
+        )
 
     def build_clean_env(
         self,
@@ -178,6 +203,37 @@ class AgyLLMAdapter:
     ) -> dict[str, str]:
         """Construct a sanitized environment stripping host secrets (INV-19)."""
         return build_sanitized_cli_env(self.allowed_cli_env_keys, host_env=host_env)
+
+    @staticmethod
+    def _infer_stage(
+        messages: list[dict[str, str]],
+        schema: type[BaseModel] | dict[str, Any] | None,
+    ) -> str:
+        if schema is not None:
+            schema_name = getattr(schema, "__name__", str(schema))
+            if "Plan" in schema_name:
+                return "MEDIATION"
+            if "Pragmatist" in schema_name or "Structuralist" in schema_name:
+                return "DEBATE"
+            if "Interview" in schema_name:
+                return "INTERVIEW"
+
+        for msg in messages:
+            content_low = str(msg.get("content", "")).lower()
+            if "mediator" in content_low or "mediation" in content_low:
+                return "MEDIATION"
+            if "pragmatist" in content_low or "structuralist" in content_low:
+                return "DEBATE"
+            if "interviewer" in content_low:
+                return "INTERVIEW"
+        return "INTERVIEW"
+
+    def _configured_model_for_stage(self, stage: str) -> str | None:
+        if self.model is not None:
+            cleaned = self.model.strip()
+            if cleaned and cleaned.upper() != "CONFIGURE_ME":
+                return cleaned
+        return read_configured_model_for_stage(self.models_config_path, stage)
 
     def _raise_error(self, message: str, *, invalid_response: bool = False) -> NoReturn:
         clean_msg = redact_secrets(message, extra_secrets=self.secrets)
@@ -221,42 +277,77 @@ class AgyLLMAdapter:
         messages: list[dict[str, str]],
         schema: type[BaseModel] | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Invoke `agy` CLI with combined prompt and return parsed JSON dict (INV-02, INV-18)."""
+        """Invoke `agy` CLI with combined prompt and bounded model fallback retries (INV-02, INV-18)."""
         prompt = _build_combined_prompt(messages, schema=schema)
-        command = list(self.cli_command) + ["-p", prompt]
+        stage = self._infer_stage(messages, schema)
+        configured_model = self._configured_model_for_stage(stage)
+        active_model = self.model_resolver.resolve_model_for_role(stage, configured_model)
         clean_env = self.build_clean_env()
 
-        res: CommandResult | None = None
-        run_error: str | None = None
-        try:
-            res = self.runner.run(
-                command=command,
-                cwd=self.cwd,
-                timeout_seconds=self.timeout_seconds,
-                env=clean_env,
-            )
-        except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
-            run_error = f"agy CLI execution failed: {exc}"
+        tried_models: set[str] = set()
+        max_attempts = 3
 
-        if run_error is not None:
-            self._raise_error(run_error)
+        for attempt_idx in range(1, max_attempts + 1):
+            command = list(self.cli_command) + ["-p", prompt]
+            if active_model:
+                command.extend(["--model", active_model])
 
-        assert res is not None
-        if res.timed_out:
+            res: CommandResult | None = None
+            run_error: str | None = None
+            try:
+                res = self.runner.run(
+                    command=command,
+                    cwd=self.cwd,
+                    timeout_seconds=self.timeout_seconds,
+                    env=clean_env,
+                )
+            except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
+                run_error = f"agy CLI execution failed: {exc}"
+
+            if run_error is not None:
+                self._raise_error(run_error)
+
+            assert res is not None
+            if res.timed_out:
+                detail = (res.stderr or res.stdout).strip()
+                self._raise_error(
+                    f"agy CLI timed out: {detail}" if detail else "agy CLI timed out"
+                )
+
+            if res.exit_code == 0:
+                return self._parse_json_dict(res.stdout)
+
+            combined_output = f"{res.stdout}\n{res.stderr}".strip()
             detail = (res.stderr or res.stdout).strip()
-            self._raise_error(
-                f"agy CLI timed out: {detail}" if detail else "agy CLI timed out"
-            )
+            if (
+                is_retryable_model_or_quota_error(res.exit_code, combined_output)
+                and attempt_idx < max_attempts
+            ):
+                tried_models.add((active_model or "").lower())
+                candidate = self.model_resolver.next_fallback_model(
+                    stage,
+                    active_model,
+                    error_output=combined_output,
+                )
+                while candidate is not None and candidate.lower() in tried_models:
+                    candidate = self.model_resolver.next_fallback_model(stage, candidate)
+                if candidate is not None:
+                    logger.warning(
+                        "AgyLLMAdapter retrying stage %s with fallback model %r (after %r failed)",
+                        stage,
+                        redact_secrets(candidate, extra_secrets=self.secrets),
+                        redact_secrets(str(active_model or "<default>"), extra_secrets=self.secrets),
+                    )
+                    active_model = candidate
+                    continue
 
-        if res.exit_code != 0:
-            detail = (res.stderr or res.stdout).strip()
             self._raise_error(
                 f"agy CLI exited with code {res.exit_code}: {detail}"
                 if detail
                 else f"agy CLI exited with code {res.exit_code}"
             )
 
-        return self._parse_json_dict(res.stdout)
+        self._raise_error("agy CLI exhausted all model retry attempts")
 
 
 class FallbackLLMAdapter:

@@ -1,6 +1,7 @@
 """Tests for AgyCliAdapter and end-to-end offline integration with TemplateScaffold and BuildWorker (A2b-3, A2b-4, A2b-5, A2b-6, INV-06, INV-09, INV-13, INV-18, INV-19, INV-23)."""
 
 import json
+import logging
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,6 +14,7 @@ from agent_factory.adapters.fake_llm import FakeLLM
 from agent_factory.adapters.fake_runner import FakeRunner
 from agent_factory.adapters.fake_vcs import FakeVCS
 from agent_factory.adapters.memory_store import MemoryEventStore
+from agent_factory.adapters.model_resolver import ModelResolver
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.builder import BuildWorker, JobState, LocalJobQueue
 from agent_factory.domain.events import EventType
@@ -914,5 +916,101 @@ def test_agy_cli_adapter_command_has_no_payload_and_uses_stdin(tmp_path: Path) -
     assert payload_impl["mode"] == "implement_or_fix"
     assert "plan" in payload_impl
     assert payload_impl["failure_output"] == "AssertionError: 1 != 0"
+
+
+def test_agy_cli_adapter_resolves_and_retries_fallback_models_on_invalid_selection_and_quota(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Resolve and retry fallback models on invalid selection and quota errors up to 3 attempts."""
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+    ws_dir = ws_mgr.create_workspace("proj-model-fallback")
+    plan = _sample_static_web_plan()
+    dummy_secret = "DUMMY_TEST_SECRET_VALUE_999"
+
+    available_output = (
+        'error: invalid model selection (--model "gemini-2.5-pro" --effort ""): '
+        "model gemini-2.5-pro is not recognized as a known model or custom model in settings\n\n"
+        "Available models:\n"
+        "  - Gemini 3.5 Pro\n"
+        "  - Gemini 4 Neon (High)\n"
+        "  - Gemini 4 Argon (High)\n"
+        "  - Claude Sonnet 4.5\n"
+        "  - Gemini 3.8 Flash (High)\n"
+        f"leaked_debug={dummy_secret}\n"
+    )
+
+    # Phase 1: implement_or_fix fails on configured "gemini-2.5-pro", parses Available models:,
+    # retries on strongest preference "Gemini 4 Neon (High)" and succeeds.
+    runner = FakeRunner(
+        results=[
+            CommandResult(exit_code=1, stdout="", stderr=available_output),
+            CommandResult(
+                exit_code=0,
+                stdout=json.dumps(
+                    {"files_written": ["index.html"], "summary": "Implemented with fallback"}
+                ),
+            ),
+            # Phase 2: generate_tests starts proactively on cached "Gemini 4 Neon (High)",
+            # hits quota (exit_code=1 / 429), retries on "Gemini 4 Argon (High)" and succeeds.
+            CommandResult(
+                exit_code=1,
+                stdout="",
+                stderr=f"429 rate limit exceeded quota exhausted token={dummy_secret}",
+            ),
+            CommandResult(
+                exit_code=0,
+                stdout=json.dumps(
+                    {"files_written": ["tests/test_app.py"], "summary": "Generated tests"}
+                ),
+            ),
+            # Phase 3: exhausting 3 distinct models stops at attempt 3 and raises.
+            CommandResult(exit_code=1, stdout="", stderr="429 quota exceeded on model 1"),
+            CommandResult(exit_code=1, stdout="", stderr="429 quota exceeded on model 2"),
+            CommandResult(exit_code=1, stdout="", stderr="429 quota exceeded on model 3"),
+        ]
+    )
+
+    resolver = ModelResolver(
+        runner=runner,
+        cli_command=("agy",),
+        auto_probe=False,
+        secrets=(dummy_secret,),
+    )
+    adapter = AgyCliAdapter(
+        workspace_manager=ws_mgr,
+        runner=runner,
+        cli_command=("agy",),
+        model="gemini-2.5-pro",
+        model_resolver=resolver,
+        secrets=(dummy_secret,),
+    )
+
+    with caplog.at_level(logging.INFO):
+        res_impl = adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=1)
+        assert res_impl.files_written == ["index.html"]
+        assert res_impl.summary == "Implemented with fallback"
+
+        assert len(runner.calls) == 2
+        assert "gemini-2.5-pro" in runner.calls[0]["command"]
+        assert "Gemini 4 Neon (High)" in runner.calls[1]["command"]
+
+        # Resolver now has cached models; generate_tests uses "Gemini 4 Neon (High)" proactively
+        # then falls back to "Gemini 4 Argon (High)" on quota error.
+        res_tests = adapter.generate_tests(ws_dir, plan.acceptance_tests)
+        assert res_tests.files_written == ["tests/test_app.py"]
+        assert len(runner.calls) == 4
+        assert "Gemini 4 Neon (High)" in runner.calls[2]["command"]
+        assert "Gemini 4 Argon (High)" in runner.calls[3]["command"]
+
+        # Exhausting 3 distinct models caps retries at 3 calls and raises QuotaExhaustedError / CodeAgentError
+        calls_before_exhaust = len(runner.calls)
+        with pytest.raises((QuotaExhaustedError, CodeAgentError)):
+            adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=2)
+        assert len(runner.calls) - calls_before_exhaust == 3
+
+    # Verify secrets were never written into logs
+    assert dummy_secret not in caplog.text
+
 
 

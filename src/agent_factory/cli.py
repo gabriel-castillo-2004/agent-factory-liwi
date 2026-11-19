@@ -20,6 +20,10 @@ from agent_factory.adapters.agy_cli_adapter import AgyCliAdapter
 from agent_factory.adapters.agy_llm_adapter import AgyLLMAdapter, FallbackLLMAdapter
 from agent_factory.adapters.git_registry_publisher import GitRegistryPublisher
 from agent_factory.adapters.github_vcs_adapter import GitHubVCSAdapter
+from agent_factory.adapters.model_resolver import (
+    ModelResolver,
+    read_configured_model_for_stage,
+)
 from agent_factory.adapters.sqlite_store import SqliteEventStore
 from agent_factory.adapters.static_deploy_publisher import StaticDeployPublisher
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
@@ -305,6 +309,7 @@ class RuntimeBundle(BaseModel):
     build_worker: BuildWorker
     telegram_client: TelegramClient
     bot_service: TelegramBotService
+    model_resolver: ModelResolver | None = None
 
 
 def _parse_id_whitelist(raw: str | None, var_name: str, secret_token: str = "") -> frozenset[int]:
@@ -583,6 +588,7 @@ def build_runtime(
     registry_publisher: RegistryPublisher | None = None,
     code_agent: CodeAgent | None = None,
     clock: Clock | None = None,
+    model_resolver: ModelResolver | None = None,
 ) -> RuntimeBundle:
     """Assemble SqliteEventStore, adapters, Orchestrator, BuildWorker, and TelegramBotService."""
     if not config.limits_config_path.is_file():
@@ -596,6 +602,16 @@ def build_runtime(
 
     effective_transport = transport if transport is not None else UrllibHttpTransport()
     effective_runner = runner if runner is not None else SubprocessRunner()
+    shared_model_resolver = (
+        model_resolver
+        if model_resolver is not None
+        else ModelResolver(
+            runner=effective_runner,
+            cwd=config.workspaces_dir,
+            models_config_path=config.models_config_path,
+            secrets=active_secrets,
+        )
+    )
 
     if llm is not None:
         effective_llm = llm
@@ -610,6 +626,8 @@ def build_runtime(
                 runner=effective_runner,
                 cwd=config.workspaces_dir,
                 secrets=active_secrets,
+                models_config_path=config.models_config_path,
+                model_resolver=shared_model_resolver,
             )
         else:
             if not config.llm_api_key:
@@ -626,6 +644,8 @@ def build_runtime(
                     runner=effective_runner,
                     cwd=config.workspaces_dir,
                     secrets=active_secrets,
+                    models_config_path=config.models_config_path,
+                    model_resolver=shared_model_resolver,
                 )
                 effective_llm = FallbackLLMAdapter(primary=primary_llm, fallback=agy_fallback)
             else:
@@ -670,15 +690,10 @@ def build_runtime(
             templates_root=config.templates_root,
         )
 
-        building_model: str | None = None
-        if config.models_config_path.is_file():
-            try:
-                with config.models_config_path.open("rb") as f:
-                    m_data = tomllib.load(f)
-                if isinstance(m_data, dict):
-                    building_model = m_data.get("BUILDING") or m_data.get("models", {}).get("strong")
-            except (OSError, tomllib.TOMLDecodeError):
-                building_model = None
+        building_model = read_configured_model_for_stage(
+            config.models_config_path,
+            "BUILDING",
+        )
 
         effective_code_agent = (
             code_agent
@@ -687,6 +702,8 @@ def build_runtime(
                 workspace_manager=workspace_manager,
                 runner=effective_runner,
                 model=building_model,
+                model_resolver=shared_model_resolver,
+                secrets=active_secrets,
             )
         )
 
@@ -766,6 +783,7 @@ def build_runtime(
             build_worker=build_worker,
             telegram_client=effective_tg_client,
             bot_service=bot_service,
+            model_resolver=shared_model_resolver,
         )
     except Exception:
         store.close()

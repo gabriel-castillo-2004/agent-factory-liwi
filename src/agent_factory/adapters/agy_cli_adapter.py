@@ -1,12 +1,18 @@
 """Real CLI code agent adapter for local execution inside workspaces/<project_id>/ (INV-06, INV-09, INV-18, INV-19, ADR-002)."""
 
 import json
+import logging
 import os
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from agent_factory.adapters.model_resolver import (
+    ModelResolver,
+    is_model_selection_error,
+    is_quota_error,
+)
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.domain.models import AcceptanceTest, Plan
 from agent_factory.ports.code_agent import (
@@ -15,8 +21,11 @@ from agent_factory.ports.code_agent import (
     CodeAgentResult,
     QuotaExhaustedError,
 )
-from agent_factory.ports.runner import Runner
+from agent_factory.ports.runner import CommandResult, Runner
+from agent_factory.secrets import redact_secrets
 from agent_factory.workspace import SandboxViolationError, WorkspaceManager
+
+logger = logging.getLogger(__name__)
 
 ALLOWED_SYSTEM_ENV_VARS: frozenset[str] = frozenset(
     {
@@ -79,6 +88,8 @@ class AgyCliAdapter(CodeAgent):
         allowed_cli_env_keys: Sequence[str] = ("AGY_HOME", "AGY_CONFIG_DIR"),
         default_retry_after_seconds: float = 5.0,
         model: str | None = None,
+        model_resolver: ModelResolver | None = None,
+        secrets: Sequence[str] = (),
     ) -> None:
         self.workspace_manager = workspace_manager
         self.runner: Runner = (
@@ -91,6 +102,17 @@ class AgyCliAdapter(CodeAgent):
         self.allowed_cli_env_keys: frozenset[str] = frozenset(allowed_cli_env_keys)
         self.default_retry_after_seconds = default_retry_after_seconds
         self.model = model
+        self.secrets: tuple[str, ...] = tuple(secrets)
+        self.model_resolver: ModelResolver = (
+            model_resolver
+            if model_resolver is not None
+            else ModelResolver(
+                runner=self.runner,
+                cli_command=self.cli_command,
+                allowed_cli_env_keys=tuple(allowed_cli_env_keys),
+                secrets=self.secrets,
+            )
+        )
 
     def validate_workspace_cwd(self, workspace_dir: Path) -> Path:
         """Verify workspace_dir is a valid isolated workspace directory under workspace_manager.base_dir (INV-18, INV-22)."""
@@ -162,6 +184,27 @@ class AgyCliAdapter(CodeAgent):
             "plan": plan.model_dump(mode="json"),
         }
 
+    def _build_cli_command(
+        self,
+        ws_path: Path,
+        prompt: str,
+        mode_arg: str,
+        active_model: str | None,
+    ) -> list[str]:
+        is_real_agy = Path(self.cli_command[0]).stem.lower() == "agy"
+        cmd = list(self.cli_command) + [
+            "-p",
+            prompt,
+            "--add-dir",
+            str(ws_path),
+            "--dangerously-skip-permissions",
+        ]
+        if active_model:
+            cmd.extend(["--model", active_model])
+        if not is_real_agy:
+            cmd.extend(["--mode", mode_arg])
+        return cmd
+
     def _run_cli(
         self,
         ws_path: Path,
@@ -173,71 +216,71 @@ class AgyCliAdapter(CodeAgent):
                 "Generate acceptance tests according to the payload provided via stdin. "
                 "Respond with a JSON object containing files_written and summary."
             )
+            stage = "BUILDING"
         else:
             prompt = (
                 "Implement or fix code in workspace according to the plan and failure output provided via stdin. "
                 "Respond with a JSON object containing files_written and summary."
             )
-
-        is_real_agy = Path(self.cli_command[0]).stem.lower() == "agy"
-        cmd = list(self.cli_command) + [
-            "-p",
-            prompt,
-            "--add-dir",
-            str(ws_path),
-            "--dangerously-skip-permissions",
-        ]
-        if self.model:
-            cmd.extend(["--model", self.model])
-        if not is_real_agy:
-            cmd.extend(["--mode", mode_arg])
+            stage = "BUILDING"
 
         payload_str = json.dumps(payload, ensure_ascii=False)
         clean_env = self.build_clean_env()
-        try:
-            res = self.runner.run(
-                command=cmd,
-                cwd=ws_path,
-                timeout_seconds=self.timeout_seconds,
-                env=clean_env,
-                input=payload_str,
-            )
-        except TypeError as te:
-            if "input" in str(te):
+        active_model = self.model_resolver.resolve_model_for_role(stage, self.model)
+        tried_models: set[str] = set()
+        max_attempts = 3
+        res: CommandResult | None = None
+
+        for attempt_idx in range(1, max_attempts + 1):
+            cmd = self._build_cli_command(ws_path, prompt, mode_arg, active_model)
+            try:
                 res = self.runner.run(
                     command=cmd,
                     cwd=ws_path,
                     timeout_seconds=self.timeout_seconds,
                     env=clean_env,
+                    input=payload_str,
                 )
-            else:
-                raise
-
-        combined_output = f"{res.stdout}\n{res.stderr}".strip()
-
-        # Handle non-zero exit codes (quota exhaustion or fatal agent failures)
-        if res.exit_code != 0:
-            lowered = combined_output.lower()
-            quota_phrases = (
-                "too many requests",
-                "quota exhausted",
-                "quota exceeded",
-                "rate limit",
-                "rate_limit",
-                "resource_exhausted",
-                "insufficient quota",
-            )
-            is_quota = (
-                res.exit_code in {42, 429}
-                or any(phrase in lowered for phrase in quota_phrases)
-                or bool(
-                    re.search(
-                        r"\b(?:http|status|error|code)\s*[:=]?\s*429\b",
-                        combined_output,
-                        re.IGNORECASE,
+            except TypeError as te:
+                if "input" in str(te):
+                    res = self.runner.run(
+                        command=cmd,
+                        cwd=ws_path,
+                        timeout_seconds=self.timeout_seconds,
+                        env=clean_env,
                     )
+                else:
+                    raise
+
+            combined_output = f"{res.stdout}\n{res.stderr}".strip()
+            if res.exit_code == 0:
+                break
+
+            is_quota = is_quota_error(res.exit_code, combined_output)
+            is_model_err = is_model_selection_error(combined_output)
+
+            if (is_quota or is_model_err) and attempt_idx < max_attempts:
+                tried_models.add((active_model or "").lower())
+                candidate = self.model_resolver.next_fallback_model(
+                    stage,
+                    active_model,
+                    error_output=combined_output,
                 )
-            )
+                while candidate is not None and candidate.lower() in tried_models:
+                    candidate = self.model_resolver.next_fallback_model(stage, candidate)
+                if candidate is not None:
+                    logger.warning(
+                        "AgyCliAdapter (%s) switching model from %r to fallback %r (attempt %d/%d)",
+                        mode_arg,
+                        redact_secrets(
+                            str(active_model or "<default>"), extra_secrets=self.secrets
+                        ),
+                        redact_secrets(candidate, extra_secrets=self.secrets),
+                        attempt_idx,
+                        max_attempts,
+                    )
+                    active_model = candidate
+                    continue
 
             if is_quota:
                 retry_match = re.search(
@@ -249,13 +292,19 @@ class AgyCliAdapter(CodeAgent):
                     else self.default_retry_after_seconds
                 )
                 raise QuotaExhaustedError(
-                    message=combined_output or "CLI quota exhausted",
+                    message=redact_secrets(combined_output, extra_secrets=self.secrets)
+                    or "CLI quota exhausted",
                     retry_after_seconds=retry_after,
                 )
 
             raise CodeAgentError(
-                f"CLI execution failed with exit code {res.exit_code}: {combined_output}"
+                redact_secrets(
+                    f"CLI execution failed with exit code {res.exit_code}: {combined_output}",
+                    extra_secrets=self.secrets,
+                )
             )
+
+        assert res is not None
 
         # Parse success output
         files_written: list[str] = []
