@@ -1398,6 +1398,42 @@ def test_agy_cli_adapter_excludes_pycache_and_bytecode_files_and_handles_binary_
     assert "err" in bin_out.stderr
 
 
+def test_agy_cli_adapter_implement_prompt_requires_reading_tests_without_modifying_them(
+    tmp_path: Path,
+) -> None:
+    """implement_or_fix prompt instructs the agent to read tests/ alongside pytest output before returning empty files_written, while strictly forbidding modifications to tests/ (INV-13)."""
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+    ws_dir = ws_mgr.create_workspace("proj-read-tests-prompt")
+    plan = _sample_static_web_plan()
+    runner = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=0,
+                stdout=json.dumps({"files_written": ["src/app.js"], "summary": "Aligned DOM"}),
+            )
+        ]
+    )
+    adapter = AgyCliAdapter(workspace_manager=ws_mgr, runner=runner, cli_command=("agy",))
+
+    res = adapter.implement_or_fix(
+        ws_dir,
+        plan,
+        failure_output="FAILED tests/test_app.py::test_start - AssertionError: missing #start-btn",
+        attempt=2,
+    )
+    assert res.files_written == ["src/app.js"]
+
+    cmd = runner.calls[0]["command"]
+    prompt_impl = cmd[cmd.index("-p") + 1]
+    lower_prompt = prompt_impl.lower()
+    assert "read" in lower_prompt and "tests/" in lower_prompt
+    assert "read-only" in lower_prompt
+    assert "assertions" in lower_prompt
+    assert "never" in lower_prompt and "modify" in lower_prompt and "tests/" in lower_prompt
+    assert "inv-13" in lower_prompt
+
+
+
 
 
 

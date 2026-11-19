@@ -197,12 +197,19 @@ class BuildWorker:
         exit_code = int(getattr(runner_result, "exit_code", 1))
         return exit_code, tuple(sorted(failing_tests)), normalized
 
+    def _bound_redacted(self, text: str, limit: int = 220) -> str:
+        """Normalize whitespace, redact secrets (INV-19), and truncate safely to limit chars."""
+        redacted = self._redact(" ".join(text.split()))
+        if len(redacted) > limit:
+            return redacted[: limit - 3].rstrip() + "..."
+        return redacted
+
     def _summarize_stagnation_cause(
         self,
         runner_result: object,
         failing_tests: Sequence[str],
     ) -> str:
-        """Build a concise plain-Spanish explanation of why repeated no-op rounds stalled."""
+        """Build a concise plain-Spanish explanation including the redacted primary pytest failure line."""
         raw_stdout = str(getattr(runner_result, "stdout", "") or "")
         raw_stderr = str(getattr(runner_result, "stderr", "") or "")
         combined = f"{raw_stderr}\n{raw_stdout}".strip()
@@ -211,31 +218,64 @@ class BuildWorker:
         if getattr(runner_result, "timed_out", False):
             return f"{prefix}: las pruebas excedieron el tiempo límite."
 
+        lines = [" ".join(raw.split()) for raw in combined.splitlines() if raw.strip()]
+        failed_line = next(
+            (ln for ln in lines if ln.startswith(("FAILED ", "ERROR "))),
+            "",
+        )
+        exc_line = next(
+            (
+                re.sub(r"^E\s+", "", ln).strip()
+                for ln in lines
+                if re.search(
+                    r"(AssertionError|ModuleNotFoundError|ImportError|SyntaxError|TypeError|NameError|RuntimeError|Error:|Exception:)",
+                    ln,
+                )
+            ),
+            "",
+        )
+
         mod_match = re.search(r"No module named ['\"]?([^'\"\r\n\s]+)['\"]?", combined)
         if mod_match:
             missing_mod = self._redact(mod_match.group(1))
-            return (
-                f"{prefix} mientras las pruebas siguen fallando: "
-                f"falta la librería externa '{missing_mod}' en el entorno local."
-            )
+            extra = f" - {self._bound_redacted(failed_line, 110)}" if failed_line else ""
+            raw_cause = f"falta la librería externa '{missing_mod}' (ModuleNotFoundError{extra})"
+            return f"{prefix} ({self._bound_redacted(raw_cause, 220)})."
 
         imp_match = re.search(r"ImportError:\s*([^\r\n]+)", combined)
         if imp_match:
-            imp_err = self._redact(imp_match.group(1).strip())[:100]
-            return f"{prefix} mientras las pruebas siguen fallando: error de importación ({imp_err})."
+            raw_imp = f"ImportError: {imp_match.group(1).strip()}"
+            if failed_line and imp_match.group(1).strip() not in failed_line:
+                raw_imp = f"{failed_line} - {raw_imp}"
+            return f"{prefix} ({self._bound_redacted(raw_imp, 220)})."
 
         detail = ""
-        for raw_line in combined.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            if re.search(r"(AssertionError|SyntaxError|TypeError|NameError|Error:|FAILED |^E\s+)", line):
-                detail = self._redact(" ".join(line.split()))[:110]
-                break
-        if not detail and failing_tests:
-            detail = "pruebas pendientes: " + ", ".join(failing_tests[:5])
+        if failed_line:
+            if " - " not in failed_line and exc_line and exc_line not in failed_line:
+                detail = f"{failed_line} - {exc_line}"
+            else:
+                detail = failed_line
+        elif exc_line:
+            detail = exc_line
+        else:
+            skip_or_summary = next(
+                (
+                    ln
+                    for ln in lines
+                    if ln.startswith("SKIPPED ")
+                    or re.search(r"\b\d+\s+(?:failed|skipped|errors?)\b", ln)
+                ),
+                "",
+            )
+            if skip_or_summary:
+                detail = skip_or_summary
+            elif failing_tests:
+                detail = "pruebas pendientes: " + ", ".join(failing_tests[:5])
+            elif lines:
+                detail = " ".join(lines[-2:])
+
         if detail:
-            return f"{prefix} mientras las pruebas siguen fallando ({detail})."
+            return f"{prefix} ({self._bound_redacted(detail, 220)})."
         return f"{prefix} porque las pruebas continúan fallando."
 
     def _save_round_checkpoint(

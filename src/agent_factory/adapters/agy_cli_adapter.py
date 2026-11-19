@@ -536,9 +536,10 @@ class AgyCliAdapter(CodeAgent):
                 f"Task: Implement or fix code directly on disk inside {ws_str} (attempt {payload.get('attempt', 1)}).\n"
                 f"Target files to create/update: {target_paths_str}\n"
                 "Requirements:\n"
-                "1. Create and edit those workspace files directly on the filesystem.\n"
-                "2. NEVER modify tests/, pyproject.toml, setup.cfg, conftest.py, or package.json.\n"
-                "3. Respond with a JSON object containing files_written and a short plain-text summary (no nested markdown or JSON; full payload also passed via stdin).\n"
+                "1. Before changing code or concluding no changes are needed, READ the test files under tests/ (strictly read-only) together with the pytest failure output to align your implementation with the exact selectors, DOM attributes, exports, and assertions expected.\n"
+                "2. Create and edit the target application files directly on the filesystem.\n"
+                "3. NEVER create, modify, or delete tests/, pyproject.toml, setup.cfg, conftest.py, or package.json (INV-13).\n"
+                "4. Respond with a JSON object containing files_written (only return [] after verifying every assertion in tests/ already holds) and a short plain-text summary (no nested markdown or JSON; full payload also passed via stdin).\n"
                 f"Plan summary: {plan.get('summary', '')}\n"
                 f"File specifications:\n{contracts_block}\n"
                 + (f"Latest failure output:\n{failure_tail}" if failure_tail else "")

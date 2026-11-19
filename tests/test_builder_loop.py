@@ -1402,5 +1402,91 @@ def test_build_worker_reuses_existing_tests_and_src_and_saves_round_checkpoint_p
     assert ckpt_data["tests_total"] == 2
 
 
+def test_build_worker_stagnation_summary_includes_specific_redacted_pytest_failure(
+    tmp_path: Path,
+) -> None:
+    """Early stagnation stop always extracts and redacts the primary pytest failure line (FAILED ... - Error) within ~220 chars."""
+    secret = "SECRET_STAG_777"
+    pid = "proj-stagnate-specific"
+    orchestrator, store = _create_approved_project(pid, num_tests=2, approve=True)
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_stag_spec")
+
+    long_tail_fail = (
+        "============================= test session starts ==============================\n"
+        "F.                                                                       [100%]\n"
+        "=================================== FAILURES ===================================\n"
+        "______________________________ test_start_button _______________________________\n"
+        "    def test_start_button():\n"
+        ">       assert '#start-btn' in html_text\n"
+        f"E       AssertionError: missing #start-btn token={secret} " + ("z" * 240) + "\n\n"
+        "tests/test_app.py:42: AssertionError\n"
+        "=========================== short test summary info ============================\n"
+        f"FAILED tests/test_app.py::test_start_button - AssertionError: missing #start-btn token={secret} "
+        + ("z" * 240)
+        + "\n1 failed, 1 passed in 0.25s\n"
+    )
+    runner = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=1,
+                stdout=long_tail_fail,
+                test_results={"AT-01": False, "AT-02": True},
+            ),
+            CommandResult(
+                exit_code=1,
+                stdout=long_tail_fail.replace("0.25s", "0.31s"),
+                test_results={"AT-01": False, "AT-02": True},
+            ),
+        ]
+    )
+    agent = FakeCodeAgent(
+        test_gen_steps=[{"tests/test_app.py": "def test_start_button(): assert False\n"}],
+        impl_steps=[{}, {}, {"src/never.js": "// skipped"}],
+    )
+    worker = BuildWorker(
+        orchestrator=orchestrator,
+        workspace_manager=ws_mgr,
+        code_agent=agent,
+        runner=runner,
+        vcs=FakeVCS(),
+        secrets_to_redact=(secret,),
+    )
+    report = worker.run_job(pid)
+
+    assert orchestrator.get_status(pid).state == ProjectState.FAILED
+    assert report.invocations == 3  # 1 gen_tests + 2 noop impl rounds
+    cause = report.failure_cause or ""
+    assert "sin cambios" in cause.lower()
+    assert "FAILED tests/test_app.py::test_start_button" in cause
+    assert "AssertionError" in cause
+    assert secret not in cause
+    assert "[REDACTED]" in cause
+    # Snippet portion inside parentheses bounded around ~220 chars
+    assert len(cause) <= 320
+    failed_ev = next(ev for ev in store.get_events(pid) if ev.type == EventType.PROJECT_FAILED)
+    assert "FAILED tests/test_app.py::test_start_button" in failed_ev.payload["reason"]
+    assert secret not in failed_ev.payload["reason"]
+
+    # Also verify _summarize_stagnation_cause handles E-only / skipped / unlabeled pytest output cleanly
+    no_dash_out = CommandResult(
+        exit_code=1,
+        stdout=(
+            "E       AssertionError: expected button\n"
+            "FAILED tests/test_ui.py::test_render\n"
+        ),
+    )
+    cause_2 = worker._summarize_stagnation_cause(no_dash_out, ["AT-01"])
+    assert "FAILED tests/test_ui.py::test_render" in cause_2
+    assert "AssertionError: expected button" in cause_2
+
+    skipped_out = CommandResult(
+        exit_code=0,
+        stdout="SKIPPED [4] tests\\test_app.py:83: Node.js is not available in PATH\n2 passed, 4 skipped in 0.15s\n",
+    )
+    cause_3 = worker._summarize_stagnation_cause(skipped_out, ["AT-01"])
+    assert "Node.js is not available in PATH" in cause_3
+
+
+
 
 
