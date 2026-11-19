@@ -1,5 +1,6 @@
 """State machine orchestrator, approval gate, and circuit breaker (INV-05, INV-17)."""
 
+import logging
 import threading
 import time
 import tomllib
@@ -37,6 +38,9 @@ from agent_factory.ports.llm import LLM, LLMError
 from agent_factory.ports.publisher import RegistryPublishError, StatusPublisher
 from agent_factory.ports.store import EventStore
 from agent_factory.secrets import redact_secrets
+from agent_factory.workspace import WorkspaceManager
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_STATE_LIMITS: dict[str, int] = {
     "INTERVIEW": 6,
@@ -145,6 +149,7 @@ class Orchestrator:
         circuit_breaker: CircuitBreaker | None = None,
         clock: Clock | None = None,
         valid_templates: AbstractSet[str] = VALID_TEMPLATES,
+        workspace_manager: WorkspaceManager | None = None,
     ) -> None:
         self.store = store
         self.llm = llm
@@ -155,6 +160,7 @@ class Orchestrator:
         )
         self.clock = clock if clock is not None else SystemClock()
         self.valid_templates = valid_templates
+        self.workspace_manager = workspace_manager
         self._lock = threading.RLock()
         self._project_locks: dict[str, threading.RLock] = {}
         self._specs: dict[str, Spec] = {}
@@ -675,8 +681,13 @@ class Orchestrator:
             )
             return self.get_status(project_id)
 
-    def retry_project(self, project_id: str) -> ProjectStatus:
-        """Reset failure counters for a FAILED or orphaned active project and return it to its recoverable active state."""
+    def retry_project(
+        self,
+        project_id: str,
+        *,
+        workspace_manager: WorkspaceManager | None = None,
+    ) -> ProjectStatus:
+        """Reset failure counters for a FAILED or orphaned active project, clean partial workspace, and return to recoverable state."""
         validate_project_id(project_id)
         with self._project_lock(project_id):
             events = self.store.get_events(project_id)
@@ -764,6 +775,23 @@ class Orchestrator:
                 self.circuit_breaker.reset(project_id, ProjectState.VERIFYING)
 
             validate_transition(current_status.state, target_state, allow_retry=True)
+
+            workspace_cleaned = False
+            effective_ws_mgr = (
+                workspace_manager if workspace_manager is not None else self.workspace_manager
+            )
+            if (
+                current_status.state != ProjectState.DELIVERED
+                and target_state != ProjectState.DELIVERED
+                and effective_ws_mgr is not None
+            ):
+                workspace_cleaned = effective_ws_mgr.remove_workspace(project_id)
+                if workspace_cleaned:
+                    logger.info(
+                        "Cleaned partial workspace before retrying non-delivered project %r",
+                        project_id,
+                    )
+
             self.store.append(
                 create_event(
                     project_id=project_id,
@@ -772,6 +800,7 @@ class Orchestrator:
                         "from": current_status.state.value,
                         "to": target_state.value,
                         "failed_from": last_active_state.value,
+                        "workspace_cleaned": workspace_cleaned,
                     },
                     at=self._now(),
                 )

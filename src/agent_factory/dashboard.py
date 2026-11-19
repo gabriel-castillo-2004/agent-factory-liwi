@@ -5,7 +5,6 @@ from __future__ import annotations
 import http.server
 import json
 import logging
-import shutil
 import threading
 import urllib.parse
 import uuid
@@ -630,8 +629,15 @@ class DashboardController:
             "background_started": background_started,
         }
 
+    def _resolve_workspace_manager(self) -> WorkspaceManager | None:
+        return (
+            self.workspace_manager
+            or getattr(self.build_worker, "workspace_manager", None)
+            or getattr(self.template_scaffold, "workspace_manager", None)
+        )
+
     def retry_project(self, project_id: str) -> dict[str, Any]:
-        """Retry a FAILED or paused project and resume DEBATE/MEDIATION pipeline in background if applicable."""
+        """Retry a FAILED or paused project, cleaning partial workspace, and resume pipeline if applicable."""
         validate_project_id(project_id)
         events = self.orchestrator.store.get_events(project_id)
         if not events:
@@ -643,8 +649,11 @@ class DashboardController:
                     f"Project '{project_id}' already has an active background operation"
                 )
             try:
-                updated = self.orchestrator.retry_project(project_id)
-            except (ValueError, IllegalTransition) as exc:
+                updated = self.orchestrator.retry_project(
+                    project_id,
+                    workspace_manager=self._resolve_workspace_manager(),
+                )
+            except (ValueError, IllegalTransition, SandboxViolationError) as exc:
                 raise ProjectConflictError(str(exc)) from exc
 
             if self.build_worker is not None and self.build_worker.queue is not None:
@@ -683,9 +692,10 @@ class DashboardController:
                 )
 
             had_events = bool(self.orchestrator.store.get_events(project_id))
+            ws_mgr = self._resolve_workspace_manager()
             ws_dir: Path | None = None
-            if self.workspace_manager is not None:
-                ws_dir = self.workspace_manager.get_workspace_dir(project_id)
+            if ws_mgr is not None:
+                ws_dir = ws_mgr.get_workspace_dir(project_id)
             had_workspace = ws_dir is not None and ws_dir.exists()
 
             if not had_events and not had_workspace:
@@ -705,8 +715,8 @@ class DashboardController:
                 for cid in stale_chats:
                     self.bot_service.active_project_by_chat.pop(cid, None)
 
-            if ws_dir is not None and ws_dir.exists():
-                shutil.rmtree(ws_dir)
+            if ws_mgr is not None and had_workspace:
+                ws_mgr.remove_workspace(project_id)
 
         return {"ok": True, "deleted": project_id}
 

@@ -700,18 +700,19 @@ def build_runtime(
             )
         )
 
+        workspace_manager = WorkspaceManager(base_dir=config.workspaces_dir)
+        template_scaffold = TemplateScaffold(
+            workspace_manager=workspace_manager,
+            templates_root=config.templates_root,
+        )
+
         orchestrator = Orchestrator(
             store=store,
             llm=effective_llm,
             clock=clock,
             circuit_breaker=circuit_breaker,
             publisher=effective_registry,
-        )
-
-        workspace_manager = WorkspaceManager(base_dir=config.workspaces_dir)
-        template_scaffold = TemplateScaffold(
             workspace_manager=workspace_manager,
-            templates_root=config.templates_root,
         )
 
         building_model = read_configured_model_for_stage(

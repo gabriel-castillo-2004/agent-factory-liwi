@@ -1,6 +1,10 @@
 """Isolated workspace sandbox and deterministic test-lock hash verification (INV-13, INV-18, INV-22)."""
 
 import hashlib
+import os
+import shutil
+import stat
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PureWindowsPath
 
@@ -65,6 +69,31 @@ class WorkspaceManager:
             for rel_path, content in template_files.items():
                 self.write_file(project_id, rel_path, content)
         return ws_dir
+
+    def remove_workspace(self, project_id: str) -> bool:
+        """Safely remove workspaces/<project_id>/ inside base_dir, clearing readonly .git files (INV-22)."""
+        ws_dir = self.get_workspace_dir(project_id)
+        raw_path = self.base_dir / project_id
+        if raw_path.is_symlink():
+            raise SandboxViolationError(
+                f"Refusing to remove symlinked workspace '{raw_path}' (INV-22)"
+            )
+        if not ws_dir.exists():
+            return False
+
+        def _handle_readonly(func: object, path: str, _exc: object) -> None:
+            try:
+                os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+            except OSError:
+                pass
+            if callable(func):
+                func(path)
+
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(ws_dir, onexc=_handle_readonly)
+        else:
+            shutil.rmtree(ws_dir, onerror=_handle_readonly)
+        return True
 
     def resolve_safe_path(self, project_id: str, relative_path: str | Path) -> Path:
         """Resolve relative_path inside workspaces/<project_id>/ and reject any traversal or symlink escape."""

@@ -2,6 +2,8 @@
 
 import http.client
 import json
+import os
+import stat
 import threading
 import urllib.error
 import urllib.request
@@ -37,7 +39,7 @@ from agent_factory.ports.runner import CommandResult
 from agent_factory.ports.vcs import CIRunResult
 from agent_factory.scaffold import DEFAULT_TEMPLATES_ROOT, TemplateScaffold
 from agent_factory.telegram_bot import TelegramBotConfig, TelegramBotService
-from agent_factory.workspace import WorkspaceManager
+from agent_factory.workspace import SandboxViolationError, WorkspaceManager
 
 
 def _spec_payload() -> dict[str, Any]:
@@ -1231,3 +1233,173 @@ def test_dashboard_exposes_active_model_while_running_and_renders_history_model(
         if thread.is_alive():
             thread.join(timeout=2.0)
         store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_retry_cleans_partial_workspace_safely_and_prevents_test_collision(
+    tmp_path: Path,
+) -> None:
+    """Retrying FAILED/BUILDING project safely cleans partial workspace/<id> (including readonly .git files), enforces INV-22, and allows clean rebuild without tests/ collision."""
+    store = SqliteEventStore(str(tmp_path / "retry_clean_ws.db"))
+    pid = "proj-partial-retry"
+    now = datetime(2026, 11, 19, 15, 0, tzinfo=UTC)
+
+    plan_obj = Plan(
+        summary="Retry Clean Plan",
+        rationale="Simple static site",
+        template_id="static-web",
+        files=[FileSpec(path="index.html", purpose="UI", contract="HTML5")],
+        acceptance_tests=[
+            AcceptanceTest(id="AT-01", description="Renders", type=AcceptanceTestType.UNIT)
+        ],
+        risks=[],
+        deployment_target="github-pages",
+    )
+    plan_hash = plan_obj.compute_hash()
+    plan_dict = plan_obj.model_dump(mode="json")
+
+    store.append(
+        create_event(
+            pid,
+            EventType.PROJECT_CREATED,
+            {"name": "Partial Retry", "objective": "App", "state": "INTERVIEW"},
+            at=now,
+        )
+    )
+    store.append(
+        create_event(
+            pid,
+            EventType.STATE_TRANSITIONED,
+            {"from": "INTERVIEW", "to": "DEBATE"},
+            at=now,
+        )
+    )
+    store.append(
+        create_event(
+            pid,
+            EventType.STATE_TRANSITIONED,
+            {"from": "DEBATE", "to": "MEDIATION"},
+            at=now,
+        )
+    )
+    store.append(
+        create_event(
+            pid,
+            EventType.PLAN_CREATED,
+            {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"},
+            at=now,
+        )
+    )
+    store.append(
+        create_event(
+            pid,
+            EventType.APPROVAL_RECORDED,
+            {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"},
+            at=now,
+        )
+    )
+    store.append(
+        create_event(
+            pid,
+            EventType.PROJECT_FAILED,
+            {"failed_from": "BUILDING", "reason": "BuildWorker timed out"},
+            at=now,
+        )
+    )
+
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+    scaffold = TemplateScaffold(workspace_manager=ws_mgr, templates_root=DEFAULT_TEMPLATES_ROOT)
+    # Materialize partial workspace WITH existing tests/ file AND readonly .git pack object
+    partial_ws = scaffold.scaffold(pid, "static-web")
+    partial_test = partial_ws / "tests" / "test_stale.py"
+    partial_test.parent.mkdir(parents=True, exist_ok=True)
+    partial_test.write_text("def test_stale(): assert False\n", encoding="utf-8")
+    git_obj = partial_ws / ".git" / "objects" / "ab" / "123456"
+    git_obj.parent.mkdir(parents=True, exist_ok=True)
+    git_obj.write_bytes(b"readonly-git-object")
+    os.chmod(git_obj, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+
+    # Confirm TemplateScaffold still rejects non-empty tests/ directly (INV-13 intact)
+    with pytest.raises(SandboxViolationError, match="already contains files in tests/"):
+        scaffold.scaffold(pid, "static-web")
+
+    outside_dir = tmp_path / "outside_untouched"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    outside_file = outside_dir / "keep.txt"
+    outside_file.write_text("must stay", encoding="utf-8")
+
+    # INV-22 traversal guard on WorkspaceManager.remove_workspace
+    with pytest.raises(SandboxViolationError):
+        ws_mgr.remove_workspace("../outside_untouched")
+    assert outside_file.read_text(encoding="utf-8") == "must stay"
+
+    orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
+    worker = BuildWorker(
+        orchestrator=orch,
+        workspace_manager=ws_mgr,
+        code_agent=FakeCodeAgent(
+            test_gen_steps=[{"tests/test_app.py": "def test_at_01(): assert True\n"}],
+            impl_steps=[{"index.html": "<!DOCTYPE html><html><body><h1>OK</h1></body></html>\n"}],
+        ),
+        runner=FakeRunner(
+            results=[CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True})]
+        ),
+        vcs=FakeVCS(),
+    )
+
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        build_worker=worker,
+        template_scaffold=scaffold,
+        workspace_manager=ws_mgr,
+    )
+    try:
+        # 1. Traversal via HTTP POST /retry is rejected with 400 and leaves outside files intact
+        bad_code, _ = _http_json(
+            f"{base_url}/api/projects/%2E%2E%2Foutside_untouched/retry",
+            method="POST",
+        )
+        assert bad_code == 400
+        assert outside_file.read_text(encoding="utf-8") == "must stay"
+
+        # 2. Retry FAILED project cleans partial workspace (incl. readonly .git) and enters WAITING_APPROVAL
+        ret_code, ret_res = _http_json(f"{base_url}/api/projects/{pid}/retry", method="POST")
+        assert ret_code == 200
+        assert ret_res["status"]["state"] == "WAITING_APPROVAL"
+        assert not partial_ws.exists()
+
+        _, retried_detail = _http_json(f"{base_url}/api/projects/{pid}")
+        retried_ev = next(
+            ev for ev in reversed(retried_detail["events"]) if ev["type"] == EventType.PROJECT_RETRIED
+        )
+        assert retried_ev["payload"]["workspace_cleaned"] is True
+
+        # 3. Approving after retry scaffolds cleanly and finishes in DELIVERED without tests/ collision
+        app_code, app_res = _http_json(f"{base_url}/api/projects/{pid}/approve", method="POST")
+        assert app_code == 200
+        assert app_res["background_started"] is True
+        assert server.controller.wait_for_idle(timeout=5.0) is True
+
+        _, delivered_detail = _http_json(f"{base_url}/api/projects/{pid}")
+        assert delivered_detail["status"]["state"] == "DELIVERED"
+        assert delivered_detail["status"]["progress_pct"] == 100
+        delivered_ws = ws_mgr.get_workspace_dir(pid)
+        assert delivered_ws.is_dir()
+
+        # 4. Retry on DELIVERED project returns 409 Conflict and NEVER removes delivered workspace
+        fin_ret_code, _ = _http_json(f"{base_url}/api/projects/{pid}/retry", method="POST")
+        assert fin_ret_code == 409
+        assert delivered_ws.is_dir()
+    finally:
+        # Make git file writable before pytest cleanup if test failed halfway
+        if git_obj.exists():
+            os.chmod(git_obj, stat.S_IWRITE | stat.S_IREAD)
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
