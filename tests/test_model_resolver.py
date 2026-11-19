@@ -34,6 +34,23 @@ REAL_AGY_INVALID_MODEL_STDERR = (
     'Use --model "<name>" to specify a model.\n'
 )
 
+REAL_AGY_FULL_MODELS_STDERR = (
+    'error: invalid model selection (--model "gemini-2.5-pro" --effort ""): '
+    "model gemini-2.5-pro is not recognized as a known model or custom model in settings\n\n"
+    "Available models:\n"
+    "  - Gemini 4 Neon (High)\n"
+    "  - Gemini 4 Argon (High)\n"
+    "  - Claude Sonnet 4.5\n"
+    "  - Gemini 4 Hydrogen (Low)\n"
+    "  - Gemini 4 Hydrogen (Medium)\n"
+    "  - Gemini 4 Hydrogen (High)\n"
+    "  - Gemini 3.8 Flash (Low)\n"
+    "  - Gemini 3.8 Flash (Medium)\n"
+    "  - Gemini 3.8 Flash (High)\n"
+    "  - Gemini 3.5 Pro\n\n"
+    'Use --model "<name>" to specify a model.\n'
+)
+
 
 def test_parse_available_models_extracts_real_agy_error_formats_and_handles_empty() -> None:
     """parse_available_models extracts model names under Available models: across bullet, plain, and inline formats."""
@@ -137,7 +154,7 @@ def test_model_resolver_role_preferences_and_models_toml_overrides(tmp_path: Pat
     assert read_configured_model_for_stage(models_toml, "INTERVIEW") == "gemini-2.5-flash"
 
     runner = FakeRunner(
-        results=[CommandResult(exit_code=1, stdout="", stderr=REAL_AGY_INVALID_MODEL_STDERR)]
+        results=[CommandResult(exit_code=1, stdout="", stderr=REAL_AGY_FULL_MODELS_STDERR)]
     )
     resolver = ModelResolver(
         runner=runner,
@@ -146,27 +163,66 @@ def test_model_resolver_role_preferences_and_models_toml_overrides(tmp_path: Pat
         auto_probe=True,
     )
 
-    # Unavailable configured model "gemini-2.5-pro" resolves to Neon (High) for strong stages
-    assert resolver.resolve_model_for_role("BUILDING", "gemini-2.5-pro") == "Gemini 4 Neon (High)"
-    assert resolver.resolve_model_for_role("MEDIATION", "gemini-2.5-pro") == "Gemini 4 Neon (High)"
-    assert resolver.resolve_model_for_role("DEBATE", "gemini-2.5-flash") == "Gemini 4 Neon (High)"
+    # Initial usage tracking starts empty before invocation
+    empty_usage = resolver.get_active_usage()
+    assert empty_usage == {"model": None, "stage": None, "updated_at": None}
 
-    # Fast stage ("INTERVIEW") prioritizes Gemini 3.8 Flash
-    assert (
-        resolver.resolve_model_for_role("INTERVIEW", "gemini-2.5-flash")
-        == "Gemini 3.8 Flash (High)"
-    )
+    # Unavailable legacy "gemini-2.5-pro"/"gemini-2.5-flash" falls directly onto credit-efficient Hydrogen for strong stages
+    assert resolver.resolve_model_for_role("BUILDING", "gemini-2.5-pro") == "Gemini 4 Hydrogen (Medium)"
+    assert resolver.resolve_model_for_role("MEDIATION", "gemini-2.5-pro") == "Gemini 4 Hydrogen (Medium)"
+    assert resolver.resolve_model_for_role("DEBATE", "gemini-2.5-flash") == "Gemini 4 Hydrogen (Medium)"
+
+    # Fast stages ("INTERVIEW", "IDLE") prioritize latest Flash Low -> Medium -> High, then Hydrogen (Low)
+    assert resolver.resolve_model_for_role("INTERVIEW", "gemini-2.5-flash") == "Gemini 3.8 Flash (Low)"
+    assert resolver.resolve_model_for_role("IDLE", "gemini-2.5-flash") == "Gemini 3.8 Flash (Low)"
+
+    # Fast fallback order: 3.8 Flash (Low) -> 3.8 Flash (Medium) -> 3.8 Flash (High) -> 4 Hydrogen (Low)
+    fast_fb1 = resolver.next_fallback_model("INTERVIEW", "Gemini 3.8 Flash (Low)")
+    assert fast_fb1 == "Gemini 3.8 Flash (Medium)"
+    fast_fb2 = resolver.next_fallback_model("INTERVIEW", "Gemini 3.8 Flash (Medium)")
+    assert fast_fb2 == "Gemini 3.8 Flash (High)"
+    fast_fb3 = resolver.next_fallback_model("INTERVIEW", "Gemini 3.8 Flash (High)")
+    assert fast_fb3 == "Gemini 4 Hydrogen (Low)"
+    resolver.clear_failed_models()
 
     # Exact or case-insensitive match in discovered models is preserved
     assert resolver.resolve_model_for_role("BUILDING", "claude sonnet 4.5") == "Claude Sonnet 4.5"
 
-    # Next fallback walks remaining strong preferences in order until exhausted
-    fb1 = resolver.next_fallback_model("BUILDING", "Gemini 4 Neon (High)")
-    assert fb1 == "Gemini 4 Argon (High)"
-    fb2 = resolver.next_fallback_model("BUILDING", "Gemini 4 Argon (High)")
-    assert fb2 == "Claude Sonnet 4.5"
-    fb3 = resolver.next_fallback_model("BUILDING", "Claude Sonnet 4.5")
+    # Strong fallback walks credit-efficient Hydrogen Medium -> High -> Low -> 3.8 Flash High -> Medium
+    fb1 = resolver.next_fallback_model("BUILDING", "Gemini 4 Hydrogen (Medium)")
+    assert fb1 == "Gemini 4 Hydrogen (High)"
+    fb2 = resolver.next_fallback_model("BUILDING", "Gemini 4 Hydrogen (High)")
+    assert fb2 == "Gemini 4 Hydrogen (Low)"
+    fb3 = resolver.next_fallback_model("BUILDING", "Gemini 4 Hydrogen (Low)")
     assert fb3 == "Gemini 3.8 Flash (High)"
+    fb4 = resolver.next_fallback_model("BUILDING", "Gemini 3.8 Flash (High)")
+    assert fb4 == "Gemini 3.8 Flash (Medium)"
+
+    # Higher-version Flash (e.g. Gemini 4.0 Flash) is prioritized automatically on fast stages
+    future_runner = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=1,
+                stdout="",
+                stderr=(
+                    "Available models:\n"
+                    "  - Gemini 3.8 Flash (Low)\n"
+                    "  - Gemini 4.0 Flash (Medium)\n"
+                    "  - Gemini 4.0 Flash (Low)\n"
+                    "  - Gemini 4 Hydrogen (Low)\n"
+                ),
+            )
+        ]
+    )
+    future_resolver = ModelResolver(runner=future_runner, auto_probe=True)
+    assert future_resolver.resolve_model_for_role("INTERVIEW", "gemini-2.5-flash") == "Gemini 4.0 Flash (Low)"
+
+    # Active usage recording tracks model, normalized stage, and ISO timestamp
+    recorded = future_resolver.record_active_usage("Gemini 4.0 Flash (Low)", "interview")
+    assert recorded["model"] == "Gemini 4.0 Flash (Low)"
+    assert recorded["stage"] == "INTERVIEW"
+    assert isinstance(recorded["updated_at"], str) and "T" in recorded["updated_at"]
+    assert future_resolver.get_active_usage() == recorded
 
     # Custom preference list in models.toml [fallbacks] is honored
     custom_toml = tmp_path / "custom_models.toml"
@@ -187,12 +243,13 @@ def test_model_resolver_role_preferences_and_models_toml_overrides(tmp_path: Pat
 
 
 def test_model_resolver_thread_safety() -> None:
-    """ModelResolver handles concurrent lookups and failure markings safely under RLock."""
+    """ModelResolver handles concurrent lookups, failure markings, and active usage updates safely under RLock."""
     runner = FakeRunner(
-        results=[CommandResult(exit_code=1, stdout="", stderr=REAL_AGY_INVALID_MODEL_STDERR)]
+        results=[CommandResult(exit_code=1, stdout="", stderr=REAL_AGY_FULL_MODELS_STDERR)]
     )
     resolver = ModelResolver(runner=runner, auto_probe=True)
     results: list[str | None] = []
+    usages: list[dict[str, str | None]] = []
     errors: list[Exception] = []
     lock = threading.Lock()
 
@@ -200,8 +257,11 @@ def test_model_resolver_thread_safety() -> None:
         try:
             stage = "BUILDING" if idx % 2 == 0 else "INTERVIEW"
             chosen = resolver.resolve_model_for_role(stage, "gemini-2.5-pro")
+            resolver.record_active_usage(chosen, stage)
+            snapshot = resolver.get_active_usage()
             with lock:
                 results.append(chosen)
+                usages.append(snapshot)
         except Exception as exc:  # noqa: BLE001
             with lock:
                 errors.append(exc)
@@ -215,6 +275,7 @@ def test_model_resolver_thread_safety() -> None:
     assert errors == []
     assert len(results) == 12
     assert all(r is not None for r in results)
+    assert all(u["model"] is not None and u["stage"] in {"BUILDING", "INTERVIEW"} for u in usages)
     assert len(runner.calls) == 1
 
 
@@ -222,7 +283,7 @@ def test_agy_llm_adapter_retries_on_invalid_model_and_shares_resolver_in_cli(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """AgyLLMAdapter substitutes failed model on invalid model selection, logs without secrets, retries up to 3 attempts, and shares ModelResolver with AgyCliAdapter in build_runtime."""
+    """AgyLLMAdapter substitutes failed model on invalid model selection, records active usage, logs without secrets, retries up to 3 attempts, and shares ModelResolver with AgyCliAdapter in build_runtime."""
     secret_val = "SECRET_MODEL_LOG_GUARD_9911"
     models_toml = tmp_path / "models.toml"
     models_toml.write_text(
@@ -235,7 +296,7 @@ def test_agy_llm_adapter_retries_on_invalid_model_and_shares_resolver_in_cli(
     limits_toml = tmp_path / "limits.toml"
     limits_toml.write_text("INTERVIEW = 6\nDEBATE = 6\nMEDIATION = 3\nBUILDING = 15\nci_rounds = 3\n", encoding="utf-8")
 
-    # 1. Runtime invalid model selection on MEDIATION -> retries with Neon (High) -> succeeds
+    # 1. Runtime invalid model selection on MEDIATION -> retries with Gemini 4 Hydrogen (High) -> succeeds
     plan_json = json.dumps(
         {
             "summary": "App",
@@ -264,7 +325,7 @@ def test_agy_llm_adapter_retries_on_invalid_model_and_shares_resolver_in_cli(
         secrets=(secret_val,),
     )
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.INFO):
         out = adapter.complete(
             [{"role": "system", "content": "You are Mediator."}],
             schema=Plan,
@@ -274,16 +335,20 @@ def test_agy_llm_adapter_retries_on_invalid_model_and_shares_resolver_in_cli(
     assert len(runner.calls) == 2
     assert "--model" in runner.calls[0]["command"]
     assert "gemini-2.5-pro" in runner.calls[0]["command"]
-    assert "Gemini 4 Neon (High)" in runner.calls[1]["command"]
+    assert "Gemini 4 Hydrogen (High)" in runner.calls[1]["command"]
+    usage = adapter.model_resolver.get_active_usage()
+    assert usage["model"] == "Gemini 4 Hydrogen (High)"
+    assert usage["stage"] == "MEDIATION"
+    assert usage["updated_at"] is not None
     assert secret_val not in caplog.text
-    assert "Gemini 4 Neon (High)" in caplog.text
+    assert "Gemini 4 Hydrogen (High)" in caplog.text
 
     # 2. Exhausting 3 distinct model attempts raises LLMError after max 3 calls
     exhaust_runner = FakeRunner(
         results=[
-            CommandResult(exit_code=1, stderr=REAL_AGY_INVALID_MODEL_STDERR),
-            CommandResult(exit_code=429, stderr="Quota exhausted on Gemini 4 Neon (High)"),
-            CommandResult(exit_code=429, stderr="Quota exhausted on Gemini 4 Argon (High)"),
+            CommandResult(exit_code=1, stderr=REAL_AGY_FULL_MODELS_STDERR),
+            CommandResult(exit_code=429, stderr="Quota exhausted on Gemini 4 Hydrogen (Medium)"),
+            CommandResult(exit_code=429, stderr="Quota exhausted on Gemini 4 Hydrogen (High)"),
             CommandResult(exit_code=0, stdout='{"should": "not be reached"}'),
         ]
     )
@@ -295,6 +360,8 @@ def test_agy_llm_adapter_retries_on_invalid_model_and_shares_resolver_in_cli(
     with pytest.raises(LLMError):
         exhaust_adapter.complete([{"role": "system", "content": "Mediator"}], schema=Plan)
     assert len(exhaust_runner.calls) == 3
+    assert "Gemini 4 Hydrogen (Medium)" in exhaust_runner.calls[1]["command"]
+    assert "Gemini 4 Hydrogen (High)" in exhaust_runner.calls[2]["command"]
 
     # 3. cli.build_runtime shares the exact same ModelResolver between AgyLLMAdapter and AgyCliAdapter
     for provider in ("agy", "auto"):

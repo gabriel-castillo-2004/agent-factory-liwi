@@ -884,6 +884,7 @@ def main(
                 template_scaffold=runtime.template_scaffold,
                 workspace_manager=runtime.workspace_manager,
                 bot_service=runtime.bot_service,
+                model_resolver=runtime.model_resolver,
                 secrets_to_redact=active_secrets,
             )
             print(f"Dashboard local disponible en {dashboard_url}", flush=True)

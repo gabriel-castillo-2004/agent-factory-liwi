@@ -303,11 +303,18 @@ class Orchestrator:
                 )
 
             try:
+                interviewer_payload: dict[str, Any] = {
+                    "agent": "interviewer",
+                    "incoming_event_id": event_id,
+                }
+                interviewer_model = self._resolve_llm_model_hint("INTERVIEW")
+                if interviewer_model:
+                    interviewer_payload["model"] = interviewer_model
                 self.store.append(
                     create_event(
                         project_id=project_id,
                         event_type=EventType.AGENT_INVOKED,
-                        payload={"agent": "interviewer", "incoming_event_id": event_id},
+                        payload=interviewer_payload,
                         at=self._now(),
                     )
                 )
@@ -723,10 +730,22 @@ class Orchestrator:
             self.circuit_breaker.reset(project_id)
             return self.store.delete_project(project_id)
 
+    def _resolve_llm_model_hint(self, stage: str) -> str | None:
+        """Resolve configured/discovered model hint when LLM exposes a ModelResolver."""
+        cfg_fn = getattr(self.llm, "_configured_model_for_stage", None)
+        resolver = getattr(self.llm, "model_resolver", None)
+        if not callable(cfg_fn) or resolver is None:
+            return None
+        configured = cfg_fn(stage)
+        return resolver.resolve_model_for_role(stage, configured)
+
     def record_state_call(
         self,
         project_id: str,
         state: ProjectState,
+        *,
+        model: str | None = None,
+        agent: str | None = None,
     ) -> ProjectStatus:
         """Record a call in the given state or transition to FAILED if budget exceeded (INV-17)."""
         validate_project_id(project_id)
@@ -739,11 +758,16 @@ class Orchestrator:
                 raise IllegalTransition(ProjectState.FAILED, state)
             try:
                 self.circuit_breaker.record_call(project_id, state)
+                payload: dict[str, Any] = {"state": state.value}
+                if agent:
+                    payload["agent"] = agent
+                if model:
+                    payload["model"] = model
                 self.store.append(
                     create_event(
                         project_id=project_id,
                         event_type=EventType.AGENT_INVOKED,
-                        payload={"state": state.value},
+                        payload=payload,
                         at=self._now(),
                     )
                 )

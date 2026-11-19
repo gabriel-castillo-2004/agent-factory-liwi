@@ -288,6 +288,14 @@ class AgyLLMAdapter:
         max_attempts = 3
 
         for attempt_idx in range(1, max_attempts + 1):
+            self.model_resolver.record_active_usage(active_model, stage)
+            logger.info(
+                "AgyLLMAdapter invoking stage %s with model %r (attempt %d/%d)",
+                stage,
+                redact_secrets(str(active_model or "<default>"), extra_secrets=self.secrets),
+                attempt_idx,
+                max_attempts,
+            )
             command = list(self.cli_command) + ["-p", prompt]
             if active_model:
                 command.extend(["--model", active_model])
@@ -361,6 +369,13 @@ class FallbackLLMAdapter:
     def transport(self) -> Any:
         """Expose primary HTTP transport when available."""
         return getattr(self.primary, "transport", None)
+
+    @property
+    def model_resolver(self) -> Any:
+        """Expose primary or fallback ModelResolver when available."""
+        return getattr(self.fallback, "model_resolver", None) or getattr(
+            self.primary, "model_resolver", None
+        )
 
     def complete(
         self,

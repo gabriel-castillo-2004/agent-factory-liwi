@@ -12,11 +12,13 @@ from typing import Any
 import pytest
 
 from agent_factory import cli
+from agent_factory.adapters.agy_llm_adapter import AgyLLMAdapter
 from agent_factory.adapters.fake_code_agent import FakeCodeAgent
 from agent_factory.adapters.fake_llm import FakeLLM
 from agent_factory.adapters.fake_runner import FakeRunner
 from agent_factory.adapters.fake_telegram import FakeTelegramClient
 from agent_factory.adapters.fake_vcs import FakeVCS
+from agent_factory.adapters.model_resolver import ModelResolver
 from agent_factory.adapters.sqlite_store import SqliteEventStore
 from agent_factory.adapters.telegram_client import TelegramHttpClient
 from agent_factory.builder import BuildWorker, LocalJobQueue
@@ -1004,6 +1006,141 @@ def test_dashboard_create_project_interview_message_and_plan_adjustment(tmp_path
         assert conf_msg_code == 409
     finally:
         round1_release.set()
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_exposes_active_model_while_running_and_renders_history_model(
+    tmp_path: Path,
+) -> None:
+    """Expose active_model and active_stage when is_running is true, update live in UI banner, and render model alongside Agente invocado."""
+    store = SqliteEventStore(str(tmp_path / "live_model.db"))
+
+    started_evt = threading.Event()
+    release_evt = threading.Event()
+
+    class _SlowAgyRunner(FakeRunner):
+        def run(self, **kwargs: Any) -> CommandResult:
+            started_evt.set()
+            assert release_evt.wait(timeout=5.0) is True
+            return super().run(**kwargs)
+
+    probe_stderr = (
+        "Available models:\n"
+        "  - Gemini 4 Neon (High)\n"
+        "  - Gemini 4 Hydrogen (Medium)\n"
+        "  - Gemini 3.8 Flash (Low)\n"
+        "  - Gemini 3.8 Flash (High)\n"
+    )
+    runner = _SlowAgyRunner(
+        results=[
+            CommandResult(exit_code=0, stdout=json.dumps(_spec_payload())),
+            CommandResult(exit_code=0, stdout=json.dumps(_pragmatist_payload())),
+            CommandResult(exit_code=0, stdout=json.dumps(_structuralist_payload())),
+            CommandResult(exit_code=0, stdout=json.dumps(_plan_payload("Plan Modelo Vivo"))),
+        ]
+    )
+    resolver = ModelResolver(runner=runner, auto_probe=False)
+    resolver._discovered_models = [
+        "Gemini 4 Neon (High)",
+        "Gemini 4 Hydrogen (Medium)",
+        "Gemini 3.8 Flash (Low)",
+        "Gemini 3.8 Flash (High)",
+    ]
+    assert probe_stderr
+
+    llm = AgyLLMAdapter(
+        runner=runner,
+        cwd=tmp_path,
+        model="gemini-2.5-pro",
+        model_resolver=resolver,
+    )
+    orch = Orchestrator(store=store, llm=llm)
+
+    # Idle project with pre-existing AGENT_INVOKED carrying a model in payload
+    orch.create_project("proj-idle-hist", "Proyecto Inactivo", "Objetivo inactivo")
+    store.append(
+        create_event(
+            "proj-idle-hist",
+            EventType.AGENT_INVOKED,
+            {"state": "BUILDING", "model": "Gemini 4 Hydrogen (Medium)"},
+            at=datetime(2026, 11, 19, 10, 0, tzinfo=UTC),
+        )
+    )
+
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        model_resolver=resolver,
+    )
+    try:
+        # HTML checks for running-banner model pill and history model badge
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            html = html_resp.read().decode("utf-8")
+
+        fn_start = html.index("function buildGuidanceBanner(")
+        fn_end = html.index("function renderDetail()", fn_start)
+        running_block = html[fn_start:fn_end].split("if (st.state === 'INTERVIEW')", 1)[0]
+        assert "Modelo en uso:" in running_block
+        assert "active_model" in running_block
+        assert "ev.type === 'AGENT_INVOKED'" in html
+        assert "model-pill" in html
+
+        # Trigger live background run -> AgyLLMAdapter records active_model right before runner
+        code, res = _http_json(
+            f"{base_url}/api/projects",
+            method="POST",
+            body={"prompt": "Sitio de prueba modelo"},
+        )
+        assert code == 200
+        pid = res["project_id"]
+        assert started_evt.wait(timeout=5.0) is True
+
+        # Wait briefly until runner call triggers record_active_usage -> API reflects active_model
+        _, proj_list = _http_json(f"{base_url}/api/projects")
+        by_id = {p["project_id"]: p for p in proj_list["projects"]}
+        assert by_id[pid]["is_running"] is True
+        assert by_id[pid]["active_model"] == "Gemini 3.8 Flash (Low)"
+        assert by_id[pid]["active_stage"] == "INTERVIEW"
+        assert by_id["proj-idle-hist"]["is_running"] is False
+        assert by_id["proj-idle-hist"]["active_model"] is None
+        assert by_id["proj-idle-hist"]["active_stage"] is None
+
+        _, detail = _http_json(f"{base_url}/api/projects/{pid}")
+        assert detail["is_running"] is True
+        assert detail["active_model"] == "Gemini 3.8 Flash (Low)"
+        assert detail["active_stage"] == "INTERVIEW"
+        assert detail["status"]["active_model"] == "Gemini 3.8 Flash (Low)"
+
+        # Live fallback update while still running is reflected immediately in API
+        resolver.record_active_usage("Gemini 4 Hydrogen (Medium)", "BUILDING")
+        _, updated_detail = _http_json(f"{base_url}/api/projects/{pid}")
+        assert updated_detail["active_model"] == "Gemini 4 Hydrogen (Medium)"
+        assert updated_detail["active_stage"] == "BUILDING"
+
+        release_evt.set()
+        assert server.controller.wait_for_idle(timeout=5.0) is True
+
+        # Once stopped (is_running == False), active_model and active_stage become None
+        _, stopped_detail = _http_json(f"{base_url}/api/projects/{pid}")
+        assert stopped_detail["is_running"] is False
+        assert stopped_detail["active_model"] is None
+        assert stopped_detail["active_stage"] is None
+
+        # Idle project retains model metadata inside AGENT_INVOKED history payload
+        _, hist_detail = _http_json(f"{base_url}/api/projects/proj-idle-hist")
+        invoked_ev = next(
+            ev for ev in hist_detail["events"] if ev["type"] == EventType.AGENT_INVOKED
+        )
+        assert invoked_ev["payload"]["model"] == "Gemini 4 Hydrogen (Medium)"
+    finally:
+        release_evt.set()
         server.shutdown()
         server.server_close()
         server.controller.wait_for_idle(timeout=5.0)

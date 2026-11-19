@@ -125,6 +125,16 @@ class BuildWorker:
         """Scrub configured secrets and credential patterns from diagnostic strings."""
         return redact_secrets(text, extra_secrets=self.secrets_to_redact)
 
+    def _active_code_agent_model(self) -> str | None:
+        """Return the active model recorded by the code agent's ModelResolver, if available."""
+        resolver = getattr(self.code_agent, "model_resolver", None)
+        getter = getattr(resolver, "get_active_usage", None) if resolver is not None else None
+        if not callable(getter):
+            return None
+        usage = getter()
+        raw_model = usage.get("model") if isinstance(usage, dict) else None
+        return self._redact(str(raw_model)) if raw_model else None
+
     def _fail_job(
         self,
         project_id: str,
@@ -264,7 +274,7 @@ class BuildWorker:
                 )
 
             try:
-                self.code_agent.generate_tests(ws_dir, job.plan.acceptance_tests)
+                gen_result = self.code_agent.generate_tests(ws_dir, job.plan.acceptance_tests)
             except QuotaExhaustedError as err:
                 job.state = JobState.PAUSED_QUOTA
                 job.pause_count += 1
@@ -279,7 +289,12 @@ class BuildWorker:
                 return report
             except (CodeAgentError, CommandTimeoutError) as err:
                 # Fatal code agent error: record the invocation in CircuitBreaker and AGENT_INVOKED before failing
-                self.orchestrator.record_state_call(project_id, ProjectState.BUILDING)
+                self.orchestrator.record_state_call(
+                    project_id,
+                    ProjectState.BUILDING,
+                    model=self._active_code_agent_model(),
+                    agent="generate_tests",
+                )
                 job.invocations_used += 1
                 return self._fail_job(
                     project_id, job, err, failed_state=ProjectState.BUILDING
@@ -287,7 +302,10 @@ class BuildWorker:
 
             # Successful test generation: record call in CircuitBreaker and AGENT_INVOKED
             status = self.orchestrator.record_state_call(
-                project_id, ProjectState.BUILDING
+                project_id,
+                ProjectState.BUILDING,
+                model=getattr(gen_result, "model", None) or self._active_code_agent_model(),
+                agent="generate_tests",
             )
             job.invocations_used += 1
 
@@ -343,7 +361,7 @@ class BuildWorker:
             # Code agent writes / fixes code
             attempt_num = job.invocations_used + 1
             try:
-                self.code_agent.implement_or_fix(
+                impl_result = self.code_agent.implement_or_fix(
                     ws_dir,
                     job.plan,
                     failure_output=job.last_failure_output,
@@ -363,7 +381,12 @@ class BuildWorker:
                 return report
             except (CodeAgentError, CommandTimeoutError) as err:
                 # Fatal code agent error: record the invocation in CircuitBreaker and AGENT_INVOKED before failing
-                self.orchestrator.record_state_call(project_id, ProjectState.BUILDING)
+                self.orchestrator.record_state_call(
+                    project_id,
+                    ProjectState.BUILDING,
+                    model=self._active_code_agent_model(),
+                    agent="implement_or_fix",
+                )
                 job.invocations_used += 1
                 return self._fail_job(
                     project_id, job, err, failed_state=ProjectState.BUILDING
@@ -371,7 +394,10 @@ class BuildWorker:
 
             # Record successful agent invocation
             status = self.orchestrator.record_state_call(
-                project_id, ProjectState.BUILDING
+                project_id,
+                ProjectState.BUILDING,
+                model=getattr(impl_result, "model", None) or self._active_code_agent_model(),
+                agent="implement_or_fix",
             )
             job.invocations_used += 1
 

@@ -7,6 +7,7 @@ import re
 import threading
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 from agent_factory.ports.runner import CommandTimeoutError, Runner
@@ -41,17 +42,21 @@ _STRONG_STAGES: frozenset[str] = frozenset(
 
 DEFAULT_STAGE_PREFERENCES: dict[str, tuple[str, ...]] = {
     "strong": (
-        "Neon (High)",
-        "Argon (High)",
-        "Claude Sonnet",
+        "Gemini 4 Hydrogen (Medium)",
+        "Gemini 4 Hydrogen (High)",
+        "Gemini 4 Hydrogen (Low)",
         "Gemini 3.8 Flash (High)",
+        "Gemini 3.8 Flash (Medium)",
     ),
     "fast": (
-        "Gemini 3.8 Flash",
-        "Hydrogen",
-        "Argon",
+        "Gemini 3.8 Flash (Low)",
+        "Gemini 3.8 Flash (Medium)",
+        "Gemini 3.8 Flash (High)",
+        "Gemini 4 Hydrogen (Low)",
     ),
 }
+
+_VERSION_NUM_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+)*)\b")
 
 _MODEL_ERROR_PHRASES: tuple[str, ...] = (
     "invalid model selection",
@@ -227,11 +232,34 @@ def _load_preferences_from_toml(models_config_path: Path | None) -> dict[str, tu
     return prefs
 
 
-def _pick_preferred_model(
+def _parse_flash_version(candidate: str) -> tuple[int, ...] | None:
+    """Extract numeric version tuple (normalized to >=2 parts) from a Flash model name."""
+    match = _VERSION_NUM_RE.search(candidate)
+    if match is None:
+        return None
+    parts = [int(p) for p in match.group(1).split(".") if p.isdigit()]
+    if not parts:
+        return None
+    if len(parts) == 1:
+        parts.append(0)
+    return tuple(parts)
+
+
+def _effort_rank(candidate_lower: str) -> int:
+    if "(low)" in candidate_lower or re.search(r"\blow\b", candidate_lower):
+        return 0
+    if "(medium)" in candidate_lower or re.search(r"\bmedium\b", candidate_lower):
+        return 1
+    if "(high)" in candidate_lower or re.search(r"\bhigh\b", candidate_lower):
+        return 2
+    return 3
+
+
+def _find_preferred_match(
     preferences: Sequence[str],
     available: Sequence[str],
-) -> str:
-    """Select the highest-priority model matching preference hints, or the first available model."""
+) -> str | None:
+    """Return the first candidate in available matching preferences in priority order, or None."""
     for pattern in preferences:
         pat_low = pattern.strip().lower()
         if not pat_low:
@@ -245,7 +273,50 @@ def _pick_preferred_model(
                 cand_low = candidate.lower()
                 if all(tok in cand_low for tok in tokens):
                     return candidate
-    return available[0]
+    return None
+
+
+def _pick_preferred_model(
+    preferences: Sequence[str],
+    available: Sequence[str],
+) -> str:
+    """Select the highest-priority model matching preference hints, or the first available model."""
+    matched = _find_preferred_match(preferences, available)
+    return matched if matched is not None else available[0]
+
+
+def _pick_fast_default_model(available: Sequence[str]) -> str:
+    """Prioritize newest Flash (>=3.8: Low -> Medium -> High), then Hydrogen Low."""
+    flash_candidates: list[tuple[tuple[int, ...], int, int, str]] = []
+    for idx, candidate in enumerate(available):
+        low = candidate.lower()
+        if "flash" not in low:
+            continue
+        ver = _parse_flash_version(candidate)
+        if ver is not None and ver < (3, 8):
+            continue
+        # Higher version first; unversioned Flash sits below versioned >=3.8
+        rank_ver = ver if ver is not None else (0, 0)
+        flash_candidates.append((rank_ver, -_effort_rank(low), -idx, candidate))
+
+    if flash_candidates:
+        flash_candidates.sort(reverse=True)
+        return flash_candidates[0][3]
+
+    matched = _find_preferred_match(
+        ("Gemini 4 Hydrogen (Low)", "Hydrogen", "Flash"),
+        available,
+    )
+    return matched if matched is not None else available[0]
+
+
+def _pick_strong_default_model(available: Sequence[str]) -> str:
+    """Prioritize Hydrogen Medium/High/Low, then Gemini 3.8 Flash High/Medium."""
+    matched = _find_preferred_match(DEFAULT_STAGE_PREFERENCES["strong"], available)
+    if matched is not None:
+        return matched
+    fallback_efficient = _find_preferred_match(("Hydrogen", "Flash"), available)
+    return fallback_efficient if fallback_efficient is not None else available[0]
 
 
 class ModelResolver:
@@ -299,6 +370,37 @@ class ModelResolver:
 
         self._discovered_models: list[str] | None = None
         self._failed_models: set[str] = set()
+        self._active_usage: dict[str, str | None] = {
+            "model": None,
+            "stage": None,
+            "updated_at": None,
+        }
+
+    def record_active_usage(
+        self,
+        model_name: str | None,
+        role_or_stage: str,
+    ) -> dict[str, str | None]:
+        """Record active or most recently used model and stage cleanly under lock."""
+        clean_model: str | None = None
+        if model_name is not None:
+            trimmed = str(model_name).strip()
+            if trimmed:
+                clean_model = redact_secrets(trimmed, extra_secrets=self.secrets)
+        clean_stage = str(role_or_stage or "").strip().upper() or None
+        usage: dict[str, str | None] = {
+            "model": clean_model,
+            "stage": clean_stage,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        with self._lock:
+            self._active_usage = usage
+            return dict(self._active_usage)
+
+    def get_active_usage(self) -> dict[str, str | None]:
+        """Return a thread-safe snapshot of the last recorded active model usage."""
+        with self._lock:
+            return dict(self._active_usage)
 
     def _build_clean_env(self) -> dict[str, str]:
         if self._env_builder is not None:
@@ -307,14 +409,20 @@ class ModelResolver:
 
         return build_sanitized_cli_env(self.allowed_cli_env_keys)
 
-    def _preferences_for_stage(self, role_or_stage: str) -> tuple[str, ...]:
+    def _select_preferred_model(
+        self,
+        role_or_stage: str,
+        available: Sequence[str],
+    ) -> str:
         stage_upper = (role_or_stage or "").strip().upper()
         if stage_upper in self._custom_preferences:
-            return self._custom_preferences[stage_upper]
+            return _pick_preferred_model(self._custom_preferences[stage_upper], available)
         tier = "STRONG" if stage_upper in _STRONG_STAGES else "FAST"
         if tier in self._custom_preferences:
-            return self._custom_preferences[tier]
-        return DEFAULT_STAGE_PREFERENCES[tier.lower()]
+            return _pick_preferred_model(self._custom_preferences[tier], available)
+        if tier == "STRONG":
+            return _pick_strong_default_model(available)
+        return _pick_fast_default_model(available)
 
     def discover_available_models(self, force_refresh: bool = False) -> list[str]:
         """Probe `agy` CLI and cache available models listed under `Available models:`."""
@@ -406,8 +514,7 @@ class ModelResolver:
                         )
                         return candidate
 
-            prefs = self._preferences_for_stage(role_or_stage)
-            selected = _pick_preferred_model(prefs, available)
+            selected = self._select_preferred_model(role_or_stage, available)
             if configured is not None:
                 logger.warning(
                     "Configured model %r for stage %s is unavailable; using fallback model %r",
@@ -474,8 +581,7 @@ class ModelResolver:
                 )
                 return None
 
-            prefs = self._preferences_for_stage(role_or_stage)
-            selected = _pick_preferred_model(prefs, available)
+            selected = self._select_preferred_model(role_or_stage, available)
             logger.warning(
                 "Substituted failed model %r with fallback model %r for stage %s",
                 redact_secrets(str(failed_model or "<default>"), extra_secrets=self.secrets),

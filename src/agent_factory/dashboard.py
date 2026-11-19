@@ -62,6 +62,7 @@ class DashboardController:
         template_scaffold: TemplateScaffold | None = None,
         workspace_manager: WorkspaceManager | None = None,
         bot_service: TelegramBotService | None = None,
+        model_resolver: Any = None,
         secrets_to_redact: Sequence[str] = (),
     ) -> None:
         self.orchestrator = orchestrator
@@ -69,10 +70,40 @@ class DashboardController:
         self.template_scaffold = template_scaffold
         self.workspace_manager = workspace_manager
         self.bot_service = bot_service
+        if model_resolver is not None:
+            self.model_resolver = model_resolver
+        else:
+            self.model_resolver = getattr(orchestrator.llm, "model_resolver", None) or getattr(
+                getattr(build_worker, "code_agent", None), "model_resolver", None
+            )
         self.secrets_to_redact: tuple[str, ...] = tuple(secrets_to_redact)
         self._lock = threading.RLock()
         self._active_projects: set[str] = set()
         self._threads: list[threading.Thread] = []
+
+    def _get_active_model_info(self, running: bool) -> tuple[str | None, str | None]:
+        """Return (active_model, active_stage) when running is True and ModelResolver tracks usage."""
+        if not running or self.model_resolver is None:
+            return None, None
+        getter = getattr(self.model_resolver, "get_active_usage", None)
+        if not callable(getter):
+            return None, None
+        usage = getter()
+        if not isinstance(usage, dict):
+            return None, None
+        raw_model = usage.get("model")
+        raw_stage = usage.get("stage")
+        model = (
+            redact_secrets(str(raw_model), extra_secrets=self.secrets_to_redact)
+            if raw_model
+            else None
+        )
+        stage = (
+            redact_secrets(str(raw_stage), extra_secrets=self.secrets_to_redact)
+            if raw_stage
+            else None
+        )
+        return model, stage
 
     def is_busy(self, project_id: str) -> bool:
         """Return True if a background task is currently executing for project_id."""
@@ -181,11 +212,14 @@ class DashboardController:
         last_error = self._extract_last_error(status, events)
         last_event_at = events[-1].at.isoformat() if events else None
         running = self.is_running(project_id)
+        active_model, active_stage = self._get_active_model_info(running)
         raw = status.model_dump(mode="json")
         raw["last_error"] = last_error
         raw["has_plan"] = has_plan
         raw["busy"] = running
         raw["is_running"] = running
+        raw["active_model"] = active_model
+        raw["active_stage"] = active_stage
         raw["last_event_at"] = last_event_at
         return _scrub_value(raw, self.secrets_to_redact)
 
@@ -205,6 +239,7 @@ class DashboardController:
                 )
             except (ValueError, IllegalTransition) as exc:
                 running = self.is_running(pid)
+                active_model, active_stage = self._get_active_model_info(running)
                 summaries.append(
                     {
                         "project_id": pid,
@@ -220,6 +255,8 @@ class DashboardController:
                         "has_plan": False,
                         "busy": running,
                         "is_running": running,
+                        "active_model": active_model,
+                        "active_stage": active_stage,
                         "last_event_at": None,
                     }
                 )
@@ -253,7 +290,9 @@ class DashboardController:
         return {
             "project_id": project_id,
             "status": summary,
-            "is_running": self.is_running(project_id),
+            "is_running": summary["is_running"],
+            "active_model": summary["active_model"],
+            "active_stage": summary["active_stage"],
             "last_event_at": summary["last_event_at"],
             "spec": _scrub_value(spec.model_dump(mode="json"), self.secrets_to_redact),
             "plan": _scrub_value(plan.model_dump(mode="json"), self.secrets_to_redact)
@@ -842,6 +881,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       color: var(--muted);
       margin-left: 4px;
     }
+    .model-usage-row {
+      margin-top: 8px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }
+    .model-pill {
+      display: inline-flex;
+      align-items: center;
+      font-size: 0.76rem;
+      font-weight: 500;
+      padding: 2px 9px;
+      border-radius: 999px;
+      background: var(--surface);
+      color: var(--muted);
+      border: 1px solid var(--border);
+    }
     .badge {
       font-size: 0.75rem;
       font-weight: 600;
@@ -1090,6 +1147,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       align-items: center;
       gap: 8px;
       margin-bottom: 4px;
+    }
+    .timeline-title-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
     }
     .timeline-type {
       font-weight: 600;
@@ -1451,12 +1514,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     function buildGuidanceBanner(st, events) {
       const isRunning = Boolean(st.is_running || st.busy);
       if (isRunning) {
+        const modelPill = st.active_model
+          ? '<div class="model-usage-row"><span class="model-pill">Modelo en uso: ' + escapeHtml(st.active_model) + '</span></div>'
+          : '';
         return '<div class="guidance-banner banner-info">' +
           '<div class="banner-content">' +
             '<div class="banner-icon"><span class="working-spinner" aria-hidden="true"></span></div>' +
             '<div class="banner-body">' +
               '<div class="banner-title">Trabajando automáticamente</div>' +
               '<div class="banner-desc">Los agentes están avanzando en esta etapa. Esta pantalla se actualiza sola cada 5 segundos.</div>' +
+              modelPill +
             '</div>' +
           '</div>' +
         '</div>';
@@ -1610,13 +1677,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       // Contextual guidance banner (only rebuild when signature changes so active drafts stay intact)
       const isRunning = Boolean(st.is_running || st.busy || (state.detail && state.detail.is_running));
-      const statusForBanner = Object.assign({}, st, { is_running: isRunning });
+      const activeModel = st.active_model || (state.detail && state.detail.active_model) || null;
+      const activeStage = st.active_stage || (state.detail && state.detail.active_stage) || null;
+      const statusForBanner = Object.assign({}, st, {
+        is_running: isRunning,
+        active_model: activeModel,
+        active_stage: activeStage,
+      });
       const questions = extractLatestQuestions(events);
       const inact = st.state === 'INTERVIEW' && !isRunning ? formatInactivityNote(st.last_event_at) : '';
       const bannerSig = JSON.stringify([
         st.project_id,
         st.state,
         isRunning,
+        activeModel,
+        activeStage,
         st.last_event_at,
         st.last_error,
         questions,
@@ -1758,10 +1833,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const friendlyDate = rawDate ? escapeHtml(formatFriendlyTime(rawDate)) : '';
           const hasPayload = ev.payload && Object.keys(ev.payload).length > 0;
           const label = eventLabel(ev.type);
+          const payloadModel = (ev.type === 'AGENT_INVOKED' && ev.payload && ev.payload.model)
+            ? String(ev.payload.model)
+            : '';
+          const modelPill = payloadModel
+            ? '<span class="model-pill">' + escapeHtml(payloadModel) + '</span>'
+            : '';
           return '<div class="timeline-item">' +
             '<div class="timeline-dot ' + dotClass + '"></div>' +
             '<div class="timeline-header">' +
-              '<span class="timeline-type">' + escapeHtml(label) + '</span>' +
+              '<span class="timeline-title-group">' +
+                '<span class="timeline-type">' + escapeHtml(label) + '</span>' +
+                modelPill +
+              '</span>' +
               '<span class="timeline-time" title="' + escapeHtml(rawDate) + '">' + friendlyDate + '</span>' +
             '</div>' +
             (hasPayload ? '<details class="tech-details" style="margin-top:4px;"><summary>Ver datos técnicos</summary><pre style="margin:4px 0 0 0;">' + escapeHtml(JSON.stringify(ev.payload, null, 2)) + '</pre></details>' : '') +
@@ -2133,6 +2217,7 @@ def start_dashboard_server(
     template_scaffold: TemplateScaffold | None = None,
     workspace_manager: WorkspaceManager | None = None,
     bot_service: TelegramBotService | None = None,
+    model_resolver: Any = None,
     secrets_to_redact: Sequence[str] = (),
 ) -> tuple[DashboardHTTPServer, threading.Thread, str]:
     """Create and start DashboardHTTPServer on 127.0.0.1:<port> in a daemon thread."""
@@ -2142,6 +2227,7 @@ def start_dashboard_server(
         template_scaffold=template_scaffold,
         workspace_manager=workspace_manager,
         bot_service=bot_service,
+        model_resolver=model_resolver,
         secrets_to_redact=secrets_to_redact,
     )
     server = DashboardHTTPServer((LOOPBACK_HOST, port), controller)

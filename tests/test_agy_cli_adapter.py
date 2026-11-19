@@ -936,12 +936,14 @@ def test_agy_cli_adapter_resolves_and_retries_fallback_models_on_invalid_selecti
         "  - Gemini 4 Neon (High)\n"
         "  - Gemini 4 Argon (High)\n"
         "  - Claude Sonnet 4.5\n"
+        "  - Gemini 4 Hydrogen (Medium)\n"
+        "  - Gemini 4 Hydrogen (High)\n"
         "  - Gemini 3.8 Flash (High)\n"
         f"leaked_debug={dummy_secret}\n"
     )
 
     # Phase 1: implement_or_fix fails on configured "gemini-2.5-pro", parses Available models:,
-    # retries on strongest preference "Gemini 4 Neon (High)" and succeeds.
+    # retries on credit-efficient heavy preference "Gemini 4 Hydrogen (Medium)" and succeeds.
     runner = FakeRunner(
         results=[
             CommandResult(exit_code=1, stdout="", stderr=available_output),
@@ -951,8 +953,8 @@ def test_agy_cli_adapter_resolves_and_retries_fallback_models_on_invalid_selecti
                     {"files_written": ["index.html"], "summary": "Implemented with fallback"}
                 ),
             ),
-            # Phase 2: generate_tests starts proactively on cached "Gemini 4 Neon (High)",
-            # hits quota (exit_code=1 / 429), retries on "Gemini 4 Argon (High)" and succeeds.
+            # Phase 2: generate_tests starts proactively on cached "Gemini 4 Hydrogen (Medium)",
+            # hits quota (exit_code=1 / 429), retries on "Gemini 4 Hydrogen (High)" and succeeds.
             CommandResult(
                 exit_code=1,
                 stdout="",
@@ -990,18 +992,23 @@ def test_agy_cli_adapter_resolves_and_retries_fallback_models_on_invalid_selecti
         res_impl = adapter.implement_or_fix(ws_dir, plan, failure_output="", attempt=1)
         assert res_impl.files_written == ["index.html"]
         assert res_impl.summary == "Implemented with fallback"
+        assert res_impl.model == "Gemini 4 Hydrogen (Medium)"
+        assert resolver.get_active_usage()["model"] == "Gemini 4 Hydrogen (Medium)"
+        assert resolver.get_active_usage()["stage"] == "BUILDING"
 
         assert len(runner.calls) == 2
         assert "gemini-2.5-pro" in runner.calls[0]["command"]
-        assert "Gemini 4 Neon (High)" in runner.calls[1]["command"]
+        assert "Gemini 4 Hydrogen (Medium)" in runner.calls[1]["command"]
 
-        # Resolver now has cached models; generate_tests uses "Gemini 4 Neon (High)" proactively
-        # then falls back to "Gemini 4 Argon (High)" on quota error.
+        # Resolver now has cached models; generate_tests uses "Gemini 4 Hydrogen (Medium)" proactively
+        # then falls back to "Gemini 4 Hydrogen (High)" on quota error.
         res_tests = adapter.generate_tests(ws_dir, plan.acceptance_tests)
         assert res_tests.files_written == ["tests/test_app.py"]
+        assert res_tests.model == "Gemini 4 Hydrogen (High)"
+        assert resolver.get_active_usage()["model"] == "Gemini 4 Hydrogen (High)"
         assert len(runner.calls) == 4
-        assert "Gemini 4 Neon (High)" in runner.calls[2]["command"]
-        assert "Gemini 4 Argon (High)" in runner.calls[3]["command"]
+        assert "Gemini 4 Hydrogen (Medium)" in runner.calls[2]["command"]
+        assert "Gemini 4 Hydrogen (High)" in runner.calls[3]["command"]
 
         # Exhausting 3 distinct models caps retries at 3 calls and raises QuotaExhaustedError / CodeAgentError
         calls_before_exhaust = len(runner.calls)
@@ -1011,6 +1018,8 @@ def test_agy_cli_adapter_resolves_and_retries_fallback_models_on_invalid_selecti
 
     # Verify secrets were never written into logs
     assert dummy_secret not in caplog.text
+    assert "Gemini 4 Hydrogen (Medium)" in caplog.text
+    assert "Gemini 4 Hydrogen (High)" in caplog.text
 
 
 

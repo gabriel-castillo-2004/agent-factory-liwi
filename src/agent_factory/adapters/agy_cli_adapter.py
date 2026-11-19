@@ -232,6 +232,15 @@ class AgyCliAdapter(CodeAgent):
         res: CommandResult | None = None
 
         for attempt_idx in range(1, max_attempts + 1):
+            self.model_resolver.record_active_usage(active_model, stage)
+            logger.info(
+                "AgyCliAdapter (%s) invoking stage %s with model %r (attempt %d/%d)",
+                mode_arg,
+                stage,
+                redact_secrets(str(active_model or "<default>"), extra_secrets=self.secrets),
+                attempt_idx,
+                max_attempts,
+            )
             cmd = self._build_cli_command(ws_path, prompt, mode_arg, active_model)
             try:
                 res = self.runner.run(
@@ -333,7 +342,16 @@ class AgyCliAdapter(CodeAgent):
             except (json.JSONDecodeError, ValueError, TypeError):
                 summary = output_text
 
-        return CodeAgentResult(files_written=files_written, summary=summary)
+        resolved_model = (
+            redact_secrets(active_model, extra_secrets=self.secrets)
+            if active_model
+            else None
+        )
+        return CodeAgentResult(
+            files_written=files_written,
+            summary=summary,
+            model=resolved_model,
+        )
 
     def generate_tests(
         self,

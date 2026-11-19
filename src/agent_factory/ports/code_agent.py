@@ -30,6 +30,7 @@ class CodeAgentResult(BaseModel):
 
     files_written: list[str] = Field(default_factory=list)
     summary: str = ""
+    model: str | None = None
 
 
 @runtime_checkable
