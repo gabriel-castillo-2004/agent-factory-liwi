@@ -5,7 +5,7 @@ import logging
 import os
 import re
 from collections.abc import Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from agent_factory.adapters.model_resolver import (
@@ -76,6 +76,165 @@ def build_sanitized_cli_env(
     return clean_env
 
 
+_FENCED_BLOCK_RE = re.compile(r"```([^\r\n`]*)\r?\n(.*?)\r?\n?```", re.DOTALL)
+_ATTR_PATH_RE = re.compile(
+    r"""(?:file|path|title)\s*=\s*(?:["'`]([^"'`]+)["'`]|(\S+))""",
+    re.IGNORECASE,
+)
+_LANG_PREFIXES: frozenset[str] = frozenset(
+    {
+        "python",
+        "py",
+        "javascript",
+        "js",
+        "typescript",
+        "ts",
+        "bash",
+        "sh",
+        "json",
+        "html",
+        "css",
+        "text",
+        "txt",
+        "plaintext",
+    }
+)
+_MAX_CLI_PROMPT_CHARS = 12000
+
+
+def _looks_like_file_path(token: str) -> bool:
+    cleaned = token.strip().strip("`\"',:")
+    if not cleaned:
+        return False
+    if "/" in cleaned or "\\" in cleaned or ".." in cleaned:
+        return True
+    if re.match(r"^[A-Za-z]:", cleaned):
+        return True
+    return bool(re.search(r"\.[A-Za-z0-9]{1,8}$", cleaned))
+
+
+def _extract_path_from_fence(info: str, body: str) -> str | None:
+    stripped_info = info.strip()
+    if stripped_info:
+        attr_match = _ATTR_PATH_RE.search(stripped_info)
+        if attr_match:
+            val = attr_match.group(1) or attr_match.group(2) or ""
+            return val.strip().strip("`\"',:")
+
+        # Handle `python:tests/test_app.py` without breaking Windows `C:\...`
+        if ":" in stripped_info and not re.match(r"^[A-Za-z]:", stripped_info):
+            prefix, rest = stripped_info.split(":", 1)
+            if prefix.strip().lower() in _LANG_PREFIXES and _looks_like_file_path(rest):
+                return rest.strip().strip("`\"',:")
+
+        parts = stripped_info.split(None, 1)
+        if parts[0].strip().lower() in _LANG_PREFIXES:
+            if len(parts) > 1 and _looks_like_file_path(parts[1]):
+                return parts[1].strip().strip("`\"',:")
+        elif _looks_like_file_path(stripped_info):
+            return stripped_info.strip("`\"',:")
+
+    first_lines = body.splitlines()[:1]
+    if first_lines:
+        line0 = first_lines[0].strip()
+        for comment_prefix in ("# file:", "#file:", "// file:", "//file:", "#", "//"):
+            if line0.lower().startswith(comment_prefix):
+                candidate = line0[len(comment_prefix) :].strip().strip("`\"',:")
+                if _looks_like_file_path(candidate) and (
+                    "/" in candidate or "\\" in candidate or ".." in candidate or candidate.startswith("tests")
+                ):
+                    return candidate
+                break
+    return None
+
+
+def _resolve_safe_test_path(ws_path: Path, raw_path: str) -> Path | None:
+    """Validate candidate path stays strictly inside <ws_path>/tests/ (INV-22)."""
+    cleaned = raw_path.strip().strip("`\"'")
+    if not cleaned or "\x00" in cleaned:
+        raise SandboxViolationError(f"Invalid extracted test file path: {raw_path!r}")
+
+    norm = cleaned.replace("\\", "/").removeprefix("./")
+
+    if re.match(r"^[A-Za-z]:", norm) or norm.startswith("/"):
+        raise SandboxViolationError(
+            f"Absolute path outside workspace tests/ rejected (INV-22): {raw_path!r}"
+        )
+
+    parts = PurePosixPath(norm).parts
+    if any(part == ".." for part in parts):
+        raise SandboxViolationError(
+            f"Path traversal outside workspace tests/ rejected (INV-22): {raw_path!r}"
+        )
+
+    if not parts or parts[0] != "tests" or len(parts) < 2:
+        # Non-traversal paths outside tests/ (e.g. src/ notes) are never written in generate_tests
+        return None
+
+    tests_root = (ws_path / "tests").resolve()
+    target = (ws_path / PurePosixPath(*parts)).resolve()
+    if not target.is_relative_to(tests_root) or target == tests_root:
+        raise SandboxViolationError(
+            f"Resolved path '{target}' escapes '{tests_root}' (INV-22)"
+        )
+    return target
+
+
+def _extract_and_write_test_files(ws_path: Path, output_text: str) -> list[str]:
+    """Extract labeled test code blocks from CLI output and write safely under workspace/tests/."""
+    if not output_text or not output_text.strip():
+        return []
+
+    texts_to_scan = [output_text]
+    try:
+        parsed = json.loads(output_text.strip())
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict) and isinstance(parsed.get("summary"), str):
+        texts_to_scan.append(parsed["summary"])
+
+    written_paths: list[str] = []
+    seen_targets: set[Path] = set()
+    for text in texts_to_scan:
+        for info, body in _FENCED_BLOCK_RE.findall(text):
+            raw_path = _extract_path_from_fence(info, body)
+            if raw_path is None:
+                continue
+            target = _resolve_safe_test_path(ws_path, raw_path)
+            if target is None:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            content = body if body.endswith("\n") else f"{body}\n"
+            target.write_text(content, encoding="utf-8")
+            if target not in seen_targets:
+                seen_targets.add(target)
+                written_paths.append(target.relative_to(ws_path).as_posix())
+    return written_paths
+
+
+def _list_workspace_test_files(ws_path: Path) -> set[str]:
+    tests_dir = ws_path / "tests"
+    if not tests_dir.is_dir():
+        return set()
+    return {
+        p.relative_to(ws_path).as_posix()
+        for p in tests_dir.rglob("*")
+        if p.is_file()
+    }
+
+
+def _merge_unique_paths(*groups: Sequence[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for grp in groups:
+        for item in grp:
+            norm = str(item).strip().replace("\\", "/")
+            if norm and norm not in seen:
+                seen.add(norm)
+                merged.append(norm)
+    return merged
+
+
 class AgyCliAdapter(CodeAgent):
     """Executes the local CLI code agent inside an isolated workspace with a clean environment."""
 
@@ -90,6 +249,7 @@ class AgyCliAdapter(CodeAgent):
         model: str | None = None,
         model_resolver: ModelResolver | None = None,
         secrets: Sequence[str] = (),
+        retry_if_no_tests_written: bool | None = None,
     ) -> None:
         self.workspace_manager = workspace_manager
         self.runner: Runner = (
@@ -103,6 +263,10 @@ class AgyCliAdapter(CodeAgent):
         self.default_retry_after_seconds = default_retry_after_seconds
         self.model = model
         self.secrets: tuple[str, ...] = tuple(secrets)
+        if retry_if_no_tests_written is None:
+            self.retry_if_no_tests_written = self.runner.__class__.__name__ != "FakeRunner"
+        else:
+            self.retry_if_no_tests_written = retry_if_no_tests_written
         self.model_resolver: ModelResolver = (
             model_resolver
             if model_resolver is not None
@@ -201,28 +365,86 @@ class AgyCliAdapter(CodeAgent):
         ]
         if active_model:
             cmd.extend(["--model", active_model])
-        if not is_real_agy:
-            cmd.extend(["--mode", mode_arg])
+        cmd.extend(["--mode", "auto" if is_real_agy else mode_arg])
         return cmd
 
-    def _run_cli(
+    def _build_prompt(
         self,
         ws_path: Path,
         mode_arg: str,
         payload: dict[str, Any],
-    ) -> CodeAgentResult:
+        *,
+        extra_instruction: str = "",
+    ) -> str:
+        ws_str = str(ws_path)
         if mode_arg == "generate-tests":
+            tests_list = payload.get("acceptance_tests") or []
+            tests_lines = [
+                f"- {t.get('id', 'AT')}: [{t.get('type', 'unit')}] {t.get('description', '')}"
+                for t in tests_list
+                if isinstance(t, dict)
+            ]
+            tests_block = "\n".join(tests_lines)
             prompt = (
-                "Generate acceptance tests according to the payload provided via stdin. "
-                "Respond with a JSON object containing files_written and summary."
+                f"Workspace directory (cwd): {ws_str}\n"
+                "Task: Generate real, executable acceptance tests inside the workspace directory.\n"
+                "Requirements:\n"
+                "1. Write test file(s) directly to the workspace filesystem under tests/ (for example tests/test_app.py).\n"
+                "2. Do NOT read or create files under src/.\n"
+                "3. Respond with a JSON object containing files_written (e.g. [\"tests/test_app.py\"]) and summary.\n"
+                "4. If direct file tool writes are unavailable, output each file inside a fenced code block labeled with its relative path (e.g. ```python tests/test_app.py).\n"
+                f"Acceptance tests (also passed via stdin JSON):\n{tests_block}"
             )
-            stage = "BUILDING"
         else:
+            plan = payload.get("plan") or {}
+            plan_files = plan.get("files") or []
+            file_paths = [
+                str(f.get("path", "")).strip()
+                for f in plan_files
+                if isinstance(f, dict) and str(f.get("path", "")).strip()
+            ]
+            target_paths_str = ", ".join(file_paths) if file_paths else "(see plan files)"
+            failure_tail = str(payload.get("failure_output") or "")[-4000:]
+            contracts_lines = [
+                f"- {f.get('path')}: {f.get('purpose', '')} | Contract: {f.get('contract', '')}"
+                for f in plan_files
+                if isinstance(f, dict) and f.get("path")
+            ]
+            contracts_block = "\n".join(contracts_lines)
             prompt = (
-                "Implement or fix code in workspace according to the plan and failure output provided via stdin. "
-                "Respond with a JSON object containing files_written and summary."
+                f"Workspace directory (cwd): {ws_str}\n"
+                f"Task: Implement or fix code directly on disk inside {ws_str} (attempt {payload.get('attempt', 1)}).\n"
+                f"Target files to create/update: {target_paths_str}\n"
+                "Requirements:\n"
+                "1. Create and edit those workspace files directly on the filesystem.\n"
+                "2. NEVER modify tests/, pyproject.toml, setup.cfg, conftest.py, or package.json.\n"
+                "3. Respond with a JSON object containing files_written and summary (full payload also passed via stdin).\n"
+                f"Plan summary: {plan.get('summary', '')}\n"
+                f"File specifications:\n{contracts_block}\n"
+                + (f"Latest failure output:\n{failure_tail}" if failure_tail else "")
             )
-            stage = "BUILDING"
+
+        if extra_instruction:
+            prompt = f"{prompt}\n\nIMPORTANT RETRY INSTRUCTION:\n{extra_instruction}"
+
+        if len(prompt) > _MAX_CLI_PROMPT_CHARS:
+            prompt = prompt[: _MAX_CLI_PROMPT_CHARS - 24] + "\n...[truncated; see stdin]"
+        return prompt
+
+    def _run_cli_with_output(
+        self,
+        ws_path: Path,
+        mode_arg: str,
+        payload: dict[str, Any],
+        *,
+        prompt: str | None = None,
+    ) -> tuple[CodeAgentResult, str]:
+        stage = "BUILDING"
+        effective_prompt = (
+            prompt
+            if prompt is not None
+            else self._build_prompt(ws_path, mode_arg, payload)
+        )
 
         payload_str = json.dumps(payload, ensure_ascii=False)
         clean_env = self.build_clean_env()
@@ -241,7 +463,7 @@ class AgyCliAdapter(CodeAgent):
                 attempt_idx,
                 max_attempts,
             )
-            cmd = self._build_cli_command(ws_path, prompt, mode_arg, active_model)
+            cmd = self._build_cli_command(ws_path, effective_prompt, mode_arg, active_model)
             try:
                 res = self.runner.run(
                     command=cmd,
@@ -347,11 +569,34 @@ class AgyCliAdapter(CodeAgent):
             if active_model
             else None
         )
-        return CodeAgentResult(
+        result = CodeAgentResult(
             files_written=files_written,
             summary=summary,
             model=resolved_model,
         )
+        return result, res.stdout
+
+    def _run_cli(
+        self,
+        ws_path: Path,
+        mode_arg: str,
+        payload: dict[str, Any],
+    ) -> CodeAgentResult:
+        result, _ = self._run_cli_with_output(ws_path, mode_arg, payload)
+        return result
+
+    @staticmethod
+    def _collect_or_extract_test_files(
+        ws_path: Path,
+        before_files: set[str],
+        raw_stdout: str,
+    ) -> tuple[list[str], list[str]]:
+        new_files = sorted(_list_workspace_test_files(ws_path) - before_files)
+        extracted: list[str] = []
+        if not new_files:
+            extracted = _extract_and_write_test_files(ws_path, raw_stdout)
+            new_files = sorted(_list_workspace_test_files(ws_path) - before_files)
+        return new_files, extracted
 
     def generate_tests(
         self,
@@ -361,7 +606,46 @@ class AgyCliAdapter(CodeAgent):
         """Execute CLI in generate-tests mode inside workspace_dir using only acceptance_tests (INV-13, A2b-4)."""
         ws_path = self.validate_workspace_cwd(workspace_dir)
         payload = self.build_test_generation_payload(ws_path, acceptance_tests)
-        return self._run_cli(ws_path, "generate-tests", payload)
+        before_files = _list_workspace_test_files(ws_path)
+
+        result, raw_stdout = self._run_cli_with_output(ws_path, "generate-tests", payload)
+        new_files, extracted = self._collect_or_extract_test_files(
+            ws_path, before_files, raw_stdout
+        )
+
+        if not _list_workspace_test_files(ws_path) and self.retry_if_no_tests_written:
+            logger.warning(
+                "AgyCliAdapter (generate-tests) produced zero files in tests/; retrying explicitly"
+            )
+            retry_prompt = self._build_prompt(
+                ws_path,
+                "generate-tests",
+                payload,
+                extra_instruction=(
+                    f"No files were created inside '{ws_path / 'tests'}' on the previous call. "
+                    "You MUST write real executable test file(s) directly inside tests/ (e.g. tests/test_app.py) "
+                    "now, or output fenced code blocks labeled ```python tests/test_app.py."
+                ),
+            )
+            retry_payload = dict(payload)
+            retry_payload["retry_reason"] = "zero_test_files_created_in_tests"
+            result, retry_stdout = self._run_cli_with_output(
+                ws_path,
+                "generate-tests",
+                retry_payload,
+                prompt=retry_prompt,
+            )
+            new_files, extracted = self._collect_or_extract_test_files(
+                ws_path, before_files, retry_stdout
+            )
+
+        if new_files or extracted:
+            result = result.model_copy(
+                update={
+                    "files_written": _merge_unique_paths(result.files_written, new_files, extracted)
+                }
+            )
+        return result
 
     def implement_or_fix(
         self,

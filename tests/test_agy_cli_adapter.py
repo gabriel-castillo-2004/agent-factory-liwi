@@ -1022,4 +1022,160 @@ def test_agy_cli_adapter_resolves_and_retries_fallback_models_on_invalid_selecti
     assert "Gemini 4 Hydrogen (High)" in caplog.text
 
 
+def test_agy_cli_adapter_passes_auto_mode_and_explicit_workspace_file_prompts(
+    tmp_path: Path,
+) -> None:
+    """Real `agy` command includes `--mode auto`, `--dangerously-skip-permissions`, workspace paths, and explicit file instructions in `-p`."""
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+    ws_dir = ws_mgr.create_workspace("proj-auto-mode")
+    plan = _sample_static_web_plan()
+
+    runner = FakeRunner()
+    adapter = AgyCliAdapter(
+        workspace_manager=ws_mgr,
+        runner=runner,
+        cli_command=("agy",),
+        model="Gemini 4 Hydrogen (Medium)",
+    )
+
+    adapter.generate_tests(ws_dir, plan.acceptance_tests)
+    cmd_gen = runner.calls[0]["command"]
+    assert "--mode" in cmd_gen
+    assert cmd_gen[cmd_gen.index("--mode") + 1] == "auto"
+    assert "--dangerously-skip-permissions" in cmd_gen
+    prompt_gen = cmd_gen[cmd_gen.index("-p") + 1]
+    assert str(ws_dir.resolve()) in prompt_gen
+    assert "tests/test_app.py" in prompt_gen
+    assert "AT-01" in prompt_gen
+    assert "Pure ES module in src/app.js" not in prompt_gen
+
+    adapter.implement_or_fix(ws_dir, plan, failure_output="AT-01 failed", attempt=1)
+    cmd_impl = runner.calls[1]["command"]
+    assert "--mode" in cmd_impl
+    assert cmd_impl[cmd_impl.index("--mode") + 1] == "auto"
+    prompt_impl = cmd_impl[cmd_impl.index("-p") + 1]
+    assert str(ws_dir.resolve()) in prompt_impl
+    assert "src/app.js" in prompt_impl
+
+
+def test_agy_cli_adapter_extracts_test_blocks_retries_zero_tests_and_enforces_inv13_inv22(
+    tmp_path: Path,
+) -> None:
+    """Verify fallback extraction from stdout blocks into workspace/tests, explicit retry on empty test output, strict INV-13 preservation, and INV-22 traversal rejection."""
+    # A. Fallback extraction from fenced code blocks in CLI stdout (single call, no retry needed)
+    ws_mgr_a = WorkspaceManager(base_dir=tmp_path / "ws_extract")
+    ws_dir_a = ws_mgr_a.create_workspace("proj-extract-blocks")
+    plan = _sample_static_web_plan()
+
+    markdown_stdout = (
+        "Here are the acceptance tests:\n\n"
+        "```python tests/test_pomodoro.py\n"
+        "def test_at_01_pomodoro():\n"
+        "    assert 25 * 60 == 1500\n"
+        "```\n\n"
+        "```python:tests/sub/test_extra.py\n"
+        "def test_at_02_extra():\n"
+        "    assert True\n"
+        "```\n"
+    )
+    runner_extract = FakeRunner(results=[CommandResult(exit_code=0, stdout=markdown_stdout)])
+    adapter_extract = AgyCliAdapter(
+        workspace_manager=ws_mgr_a,
+        runner=runner_extract,
+        cli_command=("agy",),
+        retry_if_no_tests_written=True,
+    )
+    res_extract = adapter_extract.generate_tests(ws_dir_a, plan.acceptance_tests)
+    assert len(runner_extract.calls) == 1
+    pomodoro_file = ws_dir_a / "tests" / "test_pomodoro.py"
+    extra_file = ws_dir_a / "tests" / "sub" / "test_extra.py"
+    assert pomodoro_file.is_file()
+    assert "def test_at_01_pomodoro():" in pomodoro_file.read_text(encoding="utf-8")
+    assert extra_file.is_file()
+    assert "def test_at_02_extra():" in extra_file.read_text(encoding="utf-8")
+    assert "tests/test_pomodoro.py" in res_extract.files_written
+    assert "tests/sub/test_extra.py" in res_extract.files_written
+
+    # B. Explicit retry succeeds when CLI writes nothing on attempt 1 and creates tests/ on attempt 2
+    ws_mgr_b = WorkspaceManager(base_dir=tmp_path / "ws_retry")
+    ws_dir_b = ws_mgr_b.create_workspace("proj-retry-tests")
+    retry_script = tmp_path / "retry_tests_cli.py"
+    retry_script.write_text(
+        "import json, pathlib, sys\n"
+        "ws = pathlib.Path.cwd()\n"
+        "marker = ws / '.first_run_seen'\n"
+        "if not marker.exists():\n"
+        "    marker.write_text('1', encoding='utf-8')\n"
+        "    print(json.dumps({'files_written': [], 'summary': 'forgot to write'}))\n"
+        "else:\n"
+        "    tdir = ws / 'tests'\n"
+        "    tdir.mkdir(parents=True, exist_ok=True)\n"
+        "    (tdir / 'test_app.py').write_text('def test_retry_ok(): assert True\\n', encoding='utf-8')\n"
+        "    print(json.dumps({'files_written': ['tests/test_app.py'], 'summary': 'written on retry'}))\n",
+        encoding="utf-8",
+    )
+    adapter_retry = AgyCliAdapter(
+        workspace_manager=ws_mgr_b,
+        runner=SubprocessRunner(default_timeout_seconds=10.0),
+        cli_command=[sys.executable, str(retry_script)],
+    )
+    res_retry = adapter_retry.generate_tests(ws_dir_b, plan.acceptance_tests)
+    assert (ws_dir_b / "tests" / "test_app.py").is_file()
+    assert "tests/test_app.py" in res_retry.files_written
+
+    # C. Preserves INV-13 failure in BuildWorker if both initial attempt and retry write zero tests
+    project_empty = "proj-inv13-empty"
+    orch_c, _ = _approved_static_web_orchestrator(project_empty)
+    ws_mgr_c = WorkspaceManager(base_dir=tmp_path / "ws_inv13")
+    TemplateScaffold(workspace_manager=ws_mgr_c, templates_root=DEFAULT_TEMPLATES_ROOT).scaffold(
+        project_id=project_empty,
+        template_id="static-web",
+    )
+    empty_script = tmp_path / "empty_tests_cli.py"
+    empty_script.write_text(
+        "import json\n"
+        "print(json.dumps({'files_written': [], 'summary': 'no tests written'}))\n",
+        encoding="utf-8",
+    )
+    adapter_empty = AgyCliAdapter(
+        workspace_manager=ws_mgr_c,
+        runner=SubprocessRunner(default_timeout_seconds=10.0),
+        cli_command=[sys.executable, str(empty_script)],
+    )
+    worker_c = BuildWorker(
+        orchestrator=orch_c,
+        workspace_manager=ws_mgr_c,
+        code_agent=adapter_empty,
+        runner=FakeRunner(),
+        vcs=FakeVCS(),
+    )
+    report_c = worker_c.run_job(project_id=project_empty)
+    assert orch_c.get_status(project_empty).state == ProjectState.FAILED
+    assert report_c.failure_cause is not None
+    assert "INV-13" in report_c.failure_cause
+    assert report_c.invocations == 1
+
+    # D. Rejects path traversal outside workspace/tests (INV-22)
+    ws_mgr_d = WorkspaceManager(base_dir=tmp_path / "ws_traversal")
+    ws_dir_d = ws_mgr_d.create_workspace("proj-traversal-guard")
+    outside_target = tmp_path / "escaped_test.py"
+    for bad_label in (
+        "../escaped_test.py",
+        "tests/../../escaped_test.py",
+        str(outside_target.resolve()),
+    ):
+        mal_stdout = f"```python {bad_label}\ndef test_evil(): pass\n```\n"
+        mal_runner = FakeRunner(results=[CommandResult(exit_code=0, stdout=mal_stdout)])
+        mal_adapter = AgyCliAdapter(
+            workspace_manager=ws_mgr_d,
+            runner=mal_runner,
+            cli_command=("agy",),
+            retry_if_no_tests_written=False,
+        )
+        with pytest.raises(SandboxViolationError):
+            mal_adapter.generate_tests(ws_dir_d, plan.acceptance_tests)
+        assert not outside_target.exists()
+
+
+
 
