@@ -28,6 +28,25 @@ def is_python_cache_path(path: str | Path) -> bool:
     lower = norm.lower()
     return any(lower.endswith(ext) for ext in _BYTECODE_SUFFIXES)
 
+
+def workspace_nonempty_test_files(workspace_dir: Path) -> list[str]:
+    """Return sorted workspace-relative paths of non-empty test files excluding bytecode/caches."""
+    ws = Path(workspace_dir).resolve()
+    tests_dir = ws / "tests"
+    if not tests_dir.is_dir():
+        return []
+    found: list[str] = []
+    for file_path in tests_dir.rglob("*"):
+        if not file_path.is_file():
+            continue
+        rel_posix = file_path.relative_to(ws).as_posix()
+        if is_python_cache_path(rel_posix):
+            continue
+        if file_path.stat().st_size > 0:
+            found.append(rel_posix)
+    found.sort()
+    return found
+
 RUNNER_CONFIG_FILENAMES: tuple[str, ...] = (
     "pyproject.toml",
     "pytest.ini",

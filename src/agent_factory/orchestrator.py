@@ -686,8 +686,9 @@ class Orchestrator:
         project_id: str,
         *,
         workspace_manager: WorkspaceManager | None = None,
+        clean_workspace: bool = False,
     ) -> ProjectStatus:
-        """Reset failure counters for a FAILED or orphaned active project, clean partial workspace, and return to recoverable state."""
+        """Reset failure counters for a FAILED or orphaned active project, optionally clean workspace, and return to recoverable state."""
         validate_project_id(project_id)
         with self._project_lock(project_id):
             events = self.store.get_events(project_id)
@@ -781,7 +782,8 @@ class Orchestrator:
                 workspace_manager if workspace_manager is not None else self.workspace_manager
             )
             if (
-                current_status.state != ProjectState.DELIVERED
+                clean_workspace
+                and current_status.state != ProjectState.DELIVERED
                 and target_state != ProjectState.DELIVERED
                 and effective_ws_mgr is not None
             ):

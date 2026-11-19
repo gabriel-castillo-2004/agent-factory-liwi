@@ -1301,4 +1301,106 @@ def test_build_worker_handles_binary_pyc_and_binary_assets_in_tests_without_unic
     assert verify_and_restore_test_lock(ws_dir, snap) is True
 
 
+def test_build_worker_reuses_existing_tests_and_src_and_saves_round_checkpoint_preserving_inv13(
+    tmp_path: Path,
+) -> None:
+    """Incremental resume: BuildWorker reuses existing non-empty tests/ and prior src/, skips generate_tests, preserves INV-13 lock, and persists round checkpoints."""
+    pid = "proj-incremental-resume"
+    orchestrator, store = _create_approved_project(pid, num_tests=2, approve=True)
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_incr")
+    ws_dir = ws_mgr.create_workspace(
+        pid,
+        template_files={"pyproject.toml": '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'},
+    )
+    existing_test = "def test_at_01(): assert True\ndef test_at_02(): assert True\n"
+    (ws_dir / "tests").mkdir(parents=True, exist_ok=True)
+    (ws_dir / "tests" / "test_app.py").write_text(existing_test, encoding="utf-8")
+    (ws_dir / "tests" / "__pycache__").mkdir(parents=True, exist_ok=True)
+    (ws_dir / "tests" / "__pycache__" / "test_app.cpython-312-pytest-9.2.0.pyc").write_bytes(
+        b"\xcb\x0d\x0d\x0a\x00\x00"
+    )
+    (ws_dir / "src").mkdir(parents=True, exist_ok=True)
+    (ws_dir / "src" / "app.py").write_text("STEP = 1\n", encoding="utf-8")
+
+    # Also prove empty 0-byte file alone does not qualify if no real test exists
+    pid_zero = "proj-zero-byte-test"
+    orch_z, _ = _create_approved_project(pid_zero, num_tests=2, approve=True)
+    ws_z = ws_mgr.create_workspace(pid_zero)
+    (ws_z / "tests").mkdir(parents=True, exist_ok=True)
+    (ws_z / "tests" / "empty.py").write_bytes(b"")
+    worker_z = BuildWorker(
+        orchestrator=orch_z,
+        workspace_manager=ws_mgr,
+        code_agent=FakeCodeAgent(
+            test_gen_steps=[{"tests/test_fresh.py": "def test_ok(): pass\n"}],
+            impl_steps=[{"src/app.py": "OK = True\n"}],
+        ),
+        runner=FakeRunner(
+            results=[CommandResult(exit_code=0, stdout="2 passed", test_results={"AT-01": True, "AT-02": True})]
+        ),
+        vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
+    )
+    worker_z.run_job(pid_zero)
+    assert len(worker_z.code_agent.test_gen_calls) == 1  # type: ignore[attr-defined]
+
+    observed_prior_src: list[str] = []
+
+    def _round1_tamper(ws: Path, _p, _f, _a):
+        observed_prior_src.append((ws / "src" / "app.py").read_text(encoding="utf-8"))
+        # Attempt to weaken existing reused test -> must be reverted by INV-13 lock
+        (ws / "tests" / "test_app.py").write_text("def test_weak(): pass\n", encoding="utf-8")
+        from agent_factory.ports.code_agent import CodeAgentResult
+
+        return CodeAgentResult(files_written=["tests/test_app.py"], summary="Tried tampering")
+
+    def _round2_finish(ws: Path, _p, _f, _a):
+        prev = (ws / "src" / "app.py").read_text(encoding="utf-8")
+        (ws / "src" / "app.py").write_text(prev + "STEP = 2\n", encoding="utf-8")
+        from agent_factory.ports.code_agent import CodeAgentResult
+
+        return CodeAgentResult(files_written=["src/app.py"], summary="Continued from prior src")
+
+    agent = FakeCodeAgent(
+        test_gen_steps=[{"tests/should_never_run.py": "def test_bad(): pass\n"}],
+        impl_steps=[_round1_tamper, _round2_finish],
+    )
+    runner = FakeRunner(
+        results=[
+            CommandResult(exit_code=0, stdout="2 passed", test_results={"AT-01": True, "AT-02": True}),
+        ]
+    )
+    worker = BuildWorker(
+        orchestrator=orchestrator,
+        workspace_manager=ws_mgr,
+        code_agent=agent,
+        runner=runner,
+        vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
+    )
+
+    report = worker.run_job(pid)
+    assert orchestrator.get_status(pid).state == ProjectState.DELIVERED
+    assert report.failure_cause is None
+    assert len(agent.test_gen_calls) == 0
+    assert not (ws_dir / "tests" / "should_never_run.py").exists()
+    assert observed_prior_src == ["STEP = 1\n"]
+    assert "STEP = 1\nSTEP = 2\n" in (ws_dir / "src" / "app.py").read_text(encoding="utf-8")
+    assert (ws_dir / "tests" / "test_app.py").read_text(encoding="utf-8") == existing_test
+
+    ev_types = [ev.type for ev in store.get_events(pid)]
+    assert EventType.TESTS_REUSED in ev_types
+    reused_ev = next(ev for ev in store.get_events(pid) if ev.type == EventType.TESTS_REUSED)
+    assert reused_ev.payload["files"] == ["tests/test_app.py"]
+
+    ckpt_file = ws_dir / ".agent-factory" / "checkpoint.json"
+    assert ckpt_file.is_file()
+    import json as _json
+
+    ckpt_data = _json.loads(ckpt_file.read_text(encoding="utf-8"))
+    assert ckpt_data["round"] == 2
+    assert ckpt_data["files_written"] == ["src/app.py"]
+    assert ckpt_data["tests_passed"] == 2
+    assert ckpt_data["tests_total"] == 2
+
+
+
 

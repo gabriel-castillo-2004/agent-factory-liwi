@@ -1372,8 +1372,12 @@ def test_dashboard_retry_cleans_partial_workspace_safely_and_prevents_test_colli
         assert bad_code == 400
         assert outside_file.read_text(encoding="utf-8") == "must stay"
 
-        # 2. Retry FAILED project cleans partial workspace (incl. readonly .git) and enters WAITING_APPROVAL
-        ret_code, ret_res = _http_json(f"{base_url}/api/projects/{pid}/retry", method="POST")
+        # 2. Explicit clean_workspace=True cleans partial workspace (incl. readonly .git) and enters WAITING_APPROVAL
+        ret_code, ret_res = _http_json(
+            f"{base_url}/api/projects/{pid}/retry",
+            method="POST",
+            body={"clean_workspace": True},
+        )
         assert ret_code == 200
         assert ret_res["status"]["state"] == "WAITING_APPROVAL"
         assert not partial_ws.exists()
@@ -1622,6 +1626,110 @@ def test_dashboard_phases_abc_rounds_file_chips_prior_attempts_and_tech_mode(
         assert "sanitizeDisplaySummary" in html_body
         assert "Falló la verificación de pruebas" in html_body
         assert "ModuleNotFoundError" in html_body
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_incremental_retry_preserves_workspace_and_supports_clean_rebuild(
+    tmp_path: Path,
+) -> None:
+    """Default retry (clean_workspace=False) preserves tests/ and prior src/, reuses existing tests without calling generate_tests, and Dashboard offers 'Reconstruir desde cero'."""
+    store = SqliteEventStore(str(tmp_path / "incr_retry.db"))
+    pid = "proj-incr-dash"
+    now = datetime(2026, 11, 19, 17, 15, tzinfo=UTC)
+    plan_dict = _plan_payload("Incremental App")
+    plan_obj = Plan.model_validate(plan_dict)
+    plan_hash = plan_obj.compute_hash()
+
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "Incr", "objective": "App", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.PROJECT_FAILED, {"failed_from": "BUILDING", "reason": "Timeout midway"}, at=now),
+    ):
+        store.append(ev)
+
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_incr_dash")
+    scaffold = TemplateScaffold(workspace_manager=ws_mgr, templates_root=DEFAULT_TEMPLATES_ROOT)
+    ws_dir = scaffold.scaffold(pid, "static-web")
+    existing_test = "def test_at_01(): assert True\n"
+    (ws_dir / "tests").mkdir(parents=True, exist_ok=True)
+    (ws_dir / "tests" / "test_app.py").write_text(existing_test, encoding="utf-8")
+    (ws_dir / "src").mkdir(parents=True, exist_ok=True)
+    (ws_dir / "src" / "app.js").write_text("// partial progress\n", encoding="utf-8")
+
+    seen_prior_js: list[str] = []
+
+    def _resume_impl(ws: Path, _p, _f, _a):
+        seen_prior_js.append((ws / "src" / "app.js").read_text(encoding="utf-8"))
+        (ws / "src" / "app.js").write_text("// completed after resume\n", encoding="utf-8")
+        from agent_factory.ports.code_agent import CodeAgentResult
+
+        return CodeAgentResult(files_written=["src/app.js"], summary="Resumed cleanly")
+
+    code_agent = FakeCodeAgent(
+        test_gen_steps=[{"tests/should_not_run.py": "def test_no(): pass\n"}],
+        impl_steps=[_resume_impl],
+    )
+    orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
+    worker = BuildWorker(
+        orchestrator=orch,
+        workspace_manager=ws_mgr,
+        code_agent=code_agent,
+        runner=FakeRunner(
+            results=[CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True})]
+        ),
+        vcs=FakeVCS(),
+    )
+
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        build_worker=worker,
+        template_scaffold=scaffold,
+        workspace_manager=ws_mgr,
+    )
+    try:
+        # 1. HTML contains secondary clean rebuild button and client sends clean_workspace flag
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as resp:
+            html = resp.read().decode("utf-8")
+        assert "Reconstruir desde cero" in html
+        assert "clean_workspace" in html
+        assert "retry-clean" in html
+
+        # 2. Default POST /retry (no body -> clean_workspace=False) preserves tests/ and src/
+        ret_code, ret_res = _http_json(f"{base_url}/api/projects/{pid}/retry", method="POST")
+        assert ret_code == 200
+        assert ret_res["status"]["state"] == "WAITING_APPROVAL"
+        assert (ws_dir / "tests" / "test_app.py").read_text(encoding="utf-8") == existing_test
+        assert (ws_dir / "src" / "app.js").read_text(encoding="utf-8") == "// partial progress\n"
+
+        _, retried_detail = _http_json(f"{base_url}/api/projects/{pid}")
+        retried_ev = next(
+            ev for ev in reversed(retried_detail["events"]) if ev["type"] == EventType.PROJECT_RETRIED
+        )
+        assert retried_ev["payload"]["workspace_cleaned"] is False
+
+        # 3. Approve -> resumes incrementally without failing scaffold or calling generate_tests
+        app_code, app_res = _http_json(f"{base_url}/api/projects/{pid}/approve", method="POST")
+        assert app_code == 200
+        assert app_res["background_started"] is True
+        assert server.controller.wait_for_idle(timeout=5.0) is True
+
+        _, final_detail = _http_json(f"{base_url}/api/projects/{pid}")
+        assert final_detail["status"]["state"] == "DELIVERED"
+        assert len(code_agent.test_gen_calls) == 0
+        assert seen_prior_js == ["// partial progress\n"]
+        assert any(ev["type"] == EventType.TESTS_REUSED for ev in final_detail["events"])
     finally:
         server.shutdown()
         server.server_close()

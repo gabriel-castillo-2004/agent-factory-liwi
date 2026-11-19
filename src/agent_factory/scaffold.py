@@ -5,7 +5,11 @@ from pathlib import Path, PureWindowsPath
 
 from pydantic import BaseModel, Field
 
-from agent_factory.workspace import SandboxViolationError, WorkspaceManager
+from agent_factory.workspace import (
+    SandboxViolationError,
+    WorkspaceManager,
+    workspace_nonempty_test_files,
+)
 
 DEFAULT_TEMPLATES_ROOT: Path = Path(__file__).resolve().parents[2] / "templates"
 
@@ -177,12 +181,14 @@ class TemplateScaffold:
         self,
         project_id: str,
         template_id: str = "static-web",
+        *,
+        allow_existing: bool = False,
     ) -> Path:
         """Copy validated template files into workspaces/<project_id>/ via WorkspaceManager."""
         ws_dir = self.workspace_manager.get_workspace_dir(project_id)
         inspection = self.inspect_template(template_id)
 
-        # Check destination workspace src/ for symlink escape or existing files (F2B-06)
+        # Check destination workspace src/ and tests/ for symlink escapes (INV-22)
         src_dir = ws_dir / "src"
         if src_dir.is_symlink() or (
             src_dir.exists() and not src_dir.resolve().is_relative_to(ws_dir)
@@ -190,12 +196,6 @@ class TemplateScaffold:
             raise SandboxViolationError(
                 f"Destination workspace '{project_id}' src/ is an escaping link: {src_dir}"
             )
-        if src_dir.is_dir() and any(p.is_file() for p in src_dir.rglob("*")):
-            raise SandboxViolationError(
-                f"Destination workspace '{project_id}' already contains files in src/"
-            )
-
-        # Check destination workspace tests/ for symlink escape or existing files (F2B-06)
         tests_dir = ws_dir / "tests"
         if tests_dir.is_symlink() or (
             tests_dir.exists() and not tests_dir.resolve().is_relative_to(ws_dir)
@@ -203,7 +203,28 @@ class TemplateScaffold:
             raise SandboxViolationError(
                 f"Destination workspace '{project_id}' tests/ is an escaping link: {tests_dir}"
             )
-        if tests_dir.is_dir() and any(p.is_file() for p in tests_dir.rglob("*")):
+
+        reused_tests = workspace_nonempty_test_files(ws_dir) if allow_existing else []
+        has_src_files = src_dir.is_dir() and any(p.is_file() for p in src_dir.rglob("*"))
+        has_tests_files = tests_dir.is_dir() and any(p.is_file() for p in tests_dir.rglob("*"))
+
+        if allow_existing and reused_tests:
+            ws_dir.mkdir(parents=True, exist_ok=True)
+            tpl_dir = self._resolve_template_dir(template_id)
+            for rel_file in inspection.files:
+                dest_file = self.workspace_manager.resolve_safe_path(project_id, rel_file)
+                if not dest_file.exists():
+                    content = (tpl_dir / rel_file).read_text(encoding="utf-8")
+                    self.workspace_manager.write_file(project_id, rel_file, content)
+            (ws_dir / "src").mkdir(parents=True, exist_ok=True)
+            return ws_dir
+
+        # Enforce empty src/ and empty tests/ when not resuming an existing tested workspace (F2B-06, INV-13)
+        if has_src_files:
+            raise SandboxViolationError(
+                f"Destination workspace '{project_id}' already contains files in src/"
+            )
+        if has_tests_files:
             raise SandboxViolationError(
                 f"Destination workspace '{project_id}' already contains files in tests/"
             )

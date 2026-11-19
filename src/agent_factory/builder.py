@@ -1,10 +1,12 @@
 """Local build worker, job queue, and write-test-fix loop (Section 7 Phase 2, INV-09, INV-13, INV-15, INV-17)."""
 
+import json
 import re
 import threading
 import time
 from collections.abc import Mapping, Sequence
 from enum import StrEnum
+from pathlib import Path
 
 from pydantic import BaseModel, Field
 
@@ -27,6 +29,7 @@ from agent_factory.workspace import (
     compute_test_lock,
     is_python_cache_path,
     verify_and_restore_test_lock,
+    workspace_nonempty_test_files,
 )
 
 
@@ -235,6 +238,47 @@ class BuildWorker:
             return f"{prefix} mientras las pruebas siguen fallando ({detail})."
         return f"{prefix} porque las pruebas continúan fallando."
 
+    def _save_round_checkpoint(
+        self,
+        project_id: str,
+        snapshot: TestLockSnapshot,
+        build_round: int,
+        files_written: Sequence[str],
+        tests_passed: int,
+        tests_total: int,
+    ) -> None:
+        """Persist local round checkpoint metadata inside workspace root via WorkspaceManager (INV-19, INV-22)."""
+        payload = {
+            "project_id": project_id,
+            "round": int(build_round),
+            "files_written": [self._redact(str(p)) for p in files_written],
+            "tests_passed": int(tests_passed),
+            "tests_total": int(tests_total),
+            "tests_hash": snapshot.tests_hash,
+            "updated_at": self.orchestrator._now().isoformat(),
+        }
+        try:
+            self.workspace_manager.write_file(
+                project_id,
+                ".agent-factory/checkpoint.json",
+                json.dumps(payload, ensure_ascii=False, indent=2),
+            )
+        except OSError:
+            pass
+
+    @staticmethod
+    def _validate_workspace_links(ws_dir: Path) -> None:
+        """Ensure src/ and tests/ do not escape workspace root via symlinks/junctions (INV-22)."""
+        resolved_ws = ws_dir.resolve()
+        for sub in ("src", "tests"):
+            candidate = ws_dir / sub
+            if candidate.is_symlink() or (
+                candidate.exists() and not candidate.resolve().is_relative_to(resolved_ws)
+            ):
+                raise SandboxViolationError(
+                    f"Workspace subdirectory '{sub}' escapes '{resolved_ws}': {candidate}"
+                )
+
     def _report_activity(
         self,
         activity_summary: str,
@@ -360,129 +404,158 @@ class BuildWorker:
             ws_dir = self.workspace_manager.create_workspace(
                 project_id, template_files=template_files
             )
+            self._validate_workspace_links(ws_dir)
 
-            # Check existing workspace src directory for contamination on disk
-            src_dir = ws_dir / "src"
-            if src_dir.is_dir() and any(p.is_file() for p in src_dir.rglob("*")):
-                msg = (
-                    "Production code in src/ exists before test generation; potential test contamination (INV-13)"
+            # Reuse valid existing tests on incremental retry/resume while locking them (INV-13)
+            reused_test_files = workspace_nonempty_test_files(ws_dir)
+            if reused_test_files:
+                total_acceptance_tests = len(job.plan.acceptance_tests)
+                self._report_activity(
+                    "Reutilizando pruebas existentes...",
+                    agents_count=1,
+                    stage="BUILDING",
+                    detail=f"{len(reused_test_files)} archivo(s) de pruebas conservados",
+                    tests_passed=0,
+                    tests_total=total_acceptance_tests,
                 )
+                job.lock_snapshot = compute_test_lock(ws_dir)
                 self.orchestrator.store.append(
                     create_event(
                         project_id=project_id,
-                        event_type=EventType.PHASE_ERROR,
+                        event_type=EventType.TESTS_REUSED,
                         payload={
-                            "state": ProjectState.BUILDING.value,
-                            "agent": "build_worker",
-                            "error_type": "SandboxViolationError",
-                            "detail": self._redact(msg),
+                            "files": reused_test_files[:10],
+                            "tests_hash": job.lock_snapshot.tests_hash,
+                            "summary_short": (
+                                f"Se reutilizaron {len(reused_test_files)} archivo(s) de pruebas existentes"
+                            ),
                         },
                         at=self.orchestrator._now(),
                     )
                 )
-                raise SandboxViolationError(msg)
+            else:
+                # Check existing workspace src directory for contamination on disk
+                src_dir = ws_dir / "src"
+                if src_dir.is_dir() and any(p.is_file() for p in src_dir.rglob("*")):
+                    msg = (
+                        "Production code in src/ exists before test generation; potential test contamination (INV-13)"
+                    )
+                    self.orchestrator.store.append(
+                        create_event(
+                            project_id=project_id,
+                            event_type=EventType.PHASE_ERROR,
+                            payload={
+                                "state": ProjectState.BUILDING.value,
+                                "agent": "build_worker",
+                                "error_type": "SandboxViolationError",
+                                "detail": self._redact(msg),
+                            },
+                            at=self.orchestrator._now(),
+                        )
+                    )
+                    raise SandboxViolationError(msg)
 
-            # Check circuit breaker limit before invoking
-            building_limit = (
-                self.orchestrator.circuit_breaker.get_limit(ProjectState.BUILDING) or 15
-            )
-            calls = self.orchestrator.circuit_breaker.get_calls(
-                project_id, ProjectState.BUILDING
-            )
-            if calls >= building_limit:
-                status = self.orchestrator.record_state_call(
+                # Check circuit breaker limit before invoking
+                building_limit = (
+                    self.orchestrator.circuit_breaker.get_limit(ProjectState.BUILDING) or 15
+                )
+                calls = self.orchestrator.circuit_breaker.get_calls(
                     project_id, ProjectState.BUILDING
                 )
-                return self._fail_job(
-                    project_id,
-                    job,
-                    status.failure_reason
-                    or f"BUILDING invocation limit ({building_limit}) exceeded",
-                    emit_event=False,
-                )
+                if calls >= building_limit:
+                    status = self.orchestrator.record_state_call(
+                        project_id, ProjectState.BUILDING
+                    )
+                    return self._fail_job(
+                        project_id,
+                        job,
+                        status.failure_reason
+                        or f"BUILDING invocation limit ({building_limit}) exceeded",
+                        emit_event=False,
+                    )
 
-            total_acceptance_tests = len(job.plan.acceptance_tests)
-            self._report_activity(
-                ACTIVITY_MESSAGES["BUILDING_TESTS"],
-                agents_count=1,
-                stage="BUILDING",
-                detail=f"{total_acceptance_tests} criterios de aceptación",
-                tests_passed=0,
-                tests_total=total_acceptance_tests,
-            )
-            gen_t0 = time.monotonic()
-            try:
-                gen_result = self.code_agent.generate_tests(ws_dir, job.plan.acceptance_tests)
-            except QuotaExhaustedError as err:
-                job.state = JobState.PAUSED_QUOTA
-                job.pause_count += 1
-                self.clock.sleep(err.retry_after_seconds)
-                report = BuildReport(
-                    invocations=job.invocations_used,
-                    test_results=job.test_results,
-                    ci_rounds=job.ci_rounds_used,
-                    failure_cause=None,
+                total_acceptance_tests = len(job.plan.acceptance_tests)
+                self._report_activity(
+                    ACTIVITY_MESSAGES["BUILDING_TESTS"],
+                    agents_count=1,
+                    stage="BUILDING",
+                    detail=f"{total_acceptance_tests} criterios de aceptación",
+                    tests_passed=0,
+                    tests_total=total_acceptance_tests,
                 )
-                job.report = report
-                return report
-            except (CodeAgentError, CommandTimeoutError) as err:
+                gen_t0 = time.monotonic()
+                try:
+                    gen_result = self.code_agent.generate_tests(ws_dir, job.plan.acceptance_tests)
+                except QuotaExhaustedError as err:
+                    job.state = JobState.PAUSED_QUOTA
+                    job.pause_count += 1
+                    self.clock.sleep(err.retry_after_seconds)
+                    report = BuildReport(
+                        invocations=job.invocations_used,
+                        test_results=job.test_results,
+                        ci_rounds=job.ci_rounds_used,
+                        failure_cause=None,
+                    )
+                    job.report = report
+                    return report
+                except (CodeAgentError, CommandTimeoutError) as err:
+                    gen_duration = round(max(0.0, time.monotonic() - gen_t0), 3)
+                    # Fatal code agent error: record the invocation in CircuitBreaker and AGENT_INVOKED before failing
+                    self.orchestrator.record_state_call(
+                        project_id,
+                        ProjectState.BUILDING,
+                        model=self._active_code_agent_model(),
+                        agent="generate_tests",
+                        duration_seconds=gen_duration,
+                        summary_short=self._summarize_short(err),
+                        outcome="failed",
+                        extra_secrets=self.secrets_to_redact,
+                    )
+                    job.invocations_used += 1
+                    return self._fail_job(
+                        project_id, job, err, failed_state=ProjectState.BUILDING
+                    )
+
                 gen_duration = round(max(0.0, time.monotonic() - gen_t0), 3)
-                # Fatal code agent error: record the invocation in CircuitBreaker and AGENT_INVOKED before failing
-                self.orchestrator.record_state_call(
+                gen_files = self._sanitize_files_written(
+                    getattr(gen_result, "files_written", None), tests_only=True
+                )
+                gen_summary = self._summarize_short(getattr(gen_result, "summary", None))
+                # Successful test generation: record call in CircuitBreaker and AGENT_INVOKED
+                status = self.orchestrator.record_state_call(
                     project_id,
                     ProjectState.BUILDING,
-                    model=self._active_code_agent_model(),
+                    model=getattr(gen_result, "model", None) or self._active_code_agent_model(),
                     agent="generate_tests",
                     duration_seconds=gen_duration,
-                    summary_short=self._summarize_short(err),
-                    outcome="failed",
+                    files_written=gen_files,
+                    summary_short=gen_summary,
+                    outcome="ok",
                     extra_secrets=self.secrets_to_redact,
                 )
                 job.invocations_used += 1
-                return self._fail_job(
-                    project_id, job, err, failed_state=ProjectState.BUILDING
+
+                if status.state == ProjectState.FAILED:
+                    return self._fail_job(
+                        project_id,
+                        job,
+                        status.failure_reason or "Circuit breaker tripped",
+                        emit_event=False,
+                    )
+
+                tests_dir = ws_dir / "tests"
+                has_tests = tests_dir.is_dir() and any(
+                    p.is_file() and not is_python_cache_path(p.relative_to(ws_dir))
+                    for p in tests_dir.rglob("*")
                 )
+                if not has_tests:
+                    return self._fail_job(
+                        project_id,
+                        job,
+                        "Test generation produced zero test files in tests/ (INV-13)",
+                    )
 
-            gen_duration = round(max(0.0, time.monotonic() - gen_t0), 3)
-            gen_files = self._sanitize_files_written(
-                getattr(gen_result, "files_written", None), tests_only=True
-            )
-            gen_summary = self._summarize_short(getattr(gen_result, "summary", None))
-            # Successful test generation: record call in CircuitBreaker and AGENT_INVOKED
-            status = self.orchestrator.record_state_call(
-                project_id,
-                ProjectState.BUILDING,
-                model=getattr(gen_result, "model", None) or self._active_code_agent_model(),
-                agent="generate_tests",
-                duration_seconds=gen_duration,
-                files_written=gen_files,
-                summary_short=gen_summary,
-                outcome="ok",
-                extra_secrets=self.secrets_to_redact,
-            )
-            job.invocations_used += 1
-
-            if status.state == ProjectState.FAILED:
-                return self._fail_job(
-                    project_id,
-                    job,
-                    status.failure_reason or "Circuit breaker tripped",
-                    emit_event=False,
-                )
-
-            tests_dir = ws_dir / "tests"
-            has_tests = tests_dir.is_dir() and any(
-                p.is_file() and not is_python_cache_path(p.relative_to(ws_dir))
-                for p in tests_dir.rglob("*")
-            )
-            if not has_tests:
-                return self._fail_job(
-                    project_id,
-                    job,
-                    "Test generation produced zero test files in tests/ (INV-13)",
-                )
-
-            job.lock_snapshot = compute_test_lock(ws_dir)
+                job.lock_snapshot = compute_test_lock(ws_dir)
         else:
             ws_dir = self.workspace_manager.create_workspace(
                 project_id, template_files=None
@@ -700,6 +773,14 @@ class BuildWorker:
                 runner_result.exit_code == 0
                 and has_all_plan_tests
                 and all_reported_tests_passed
+            )
+            self._save_round_checkpoint(
+                project_id,
+                job.lock_snapshot,
+                build_round,
+                impl_files,
+                tests_passed_count,
+                tests_total_count,
             )
 
             if not local_tests_passed:

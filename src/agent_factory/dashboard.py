@@ -24,7 +24,11 @@ from agent_factory.ports.runner import CommandTimeoutError
 from agent_factory.scaffold import TemplateScaffold
 from agent_factory.secrets import redact_secrets
 from agent_factory.telegram_bot import TelegramBotService, _slugify
-from agent_factory.workspace import SandboxViolationError, WorkspaceManager
+from agent_factory.workspace import (
+    SandboxViolationError,
+    WorkspaceManager,
+    workspace_nonempty_test_files,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -389,7 +393,15 @@ class DashboardController:
                         if self.template_scaffold is not None:
                             plan = self.orchestrator.get_plan(project_id)
                             template_id = plan.template_id if plan else "static-web"
-                            self.template_scaffold.scaffold(project_id, template_id)
+                            ws_dir = self.template_scaffold.workspace_manager.get_workspace_dir(
+                                project_id
+                            )
+                            if workspace_nonempty_test_files(ws_dir):
+                                self.template_scaffold.scaffold(
+                                    project_id, template_id, allow_existing=True
+                                )
+                            else:
+                                self.template_scaffold.scaffold(project_id, template_id)
                         if self.build_worker is not None:
                             self.build_worker.enqueue_approved_project(project_id)
                             report = self.build_worker.run_job(project_id)
@@ -649,8 +661,13 @@ class DashboardController:
             or getattr(self.template_scaffold, "workspace_manager", None)
         )
 
-    def retry_project(self, project_id: str) -> dict[str, Any]:
-        """Retry a FAILED or paused project, cleaning partial workspace, and resume pipeline if applicable."""
+    def retry_project(
+        self,
+        project_id: str,
+        *,
+        clean_workspace: bool = False,
+    ) -> dict[str, Any]:
+        """Retry a FAILED or paused project (conserving workspace unless clean_workspace=True) and resume if applicable."""
         validate_project_id(project_id)
         events = self.orchestrator.store.get_events(project_id)
         if not events:
@@ -665,6 +682,7 @@ class DashboardController:
                 updated = self.orchestrator.retry_project(
                     project_id,
                     workspace_manager=self._resolve_workspace_manager(),
+                    clean_workspace=clean_workspace,
                 )
             except (ValueError, IllegalTransition, SandboxViolationError) as exc:
                 raise ProjectConflictError(str(exc)) from exc
@@ -1929,6 +1947,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         'STRUCTURALIST_CRITIQUED': 'Crítica de debate',
         'PLAN_CREATED': 'Plan generado',
         'APPROVAL_RECORDED': 'Aprobación del plan',
+        'TESTS_REUSED': 'Pruebas existentes reutilizadas',
         'TESTS_UPDATED': 'Pruebas actualizadas',
         'AGENT_INVOKED': 'Agente invocado',
         'CI_ROUND_COMPLETED': 'Verificación CI completada',
@@ -1968,6 +1987,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (pl.state === 'DEBATE') return 'Evaluación de especialistas';
           if (pl.state === 'MEDIATION') return 'Diseñando plan técnico';
           return 'Trabajando en la construcción';
+        case 'TESTS_REUSED':
+          return 'Se reutilizaron las pruebas automáticas existentes';
         case 'TESTS_UPDATED':
           return (pl.total !== undefined)
             ? ('Verificando funcionamiento (' + (pl.passed || 0) + '/' + pl.total + ' pruebas)')
@@ -1975,7 +1996,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         case 'CI_ROUND_COMPLETED':
           return 'Verificando funcionamiento en CI';
         case 'PROJECT_RETRIED':
-          return 'Reintento iniciado';
+          return pl.workspace_cleaned ? 'Reconstrucción desde cero iniciada' : 'Reintento iniciado';
         case 'PHASE_ERROR':
           return 'Error en la etapa';
         case 'PROJECT_FAILED':
@@ -2007,6 +2028,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         case 'APPROVAL_RECORDED':
         case 'ADJUSTMENT_REQUESTED':
           return 3;
+        case 'TESTS_REUSED':
         case 'TESTS_UPDATED':
         case 'CI_ROUND_COMPLETED':
           return 4;
@@ -2262,6 +2284,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           '</div>' +
           '<div class="banner-actions">' +
             '<button class="btn btn-warn" data-dact="retry">Reanudar proyecto</button>' +
+            '<button class="btn btn-subtle-danger btn-sm" data-dact="retry-clean">Reconstruir desde cero</button>' +
           '</div>' +
         '</div>';
       }
@@ -2282,6 +2305,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           '</div>' +
           '<div class="banner-actions">' +
             '<button class="btn btn-warn" data-dact="retry">Volver a intentar</button>' +
+            '<button class="btn btn-subtle-danger btn-sm" data-dact="retry-clean">Reconstruir desde cero</button>' +
           '</div>' +
         '</div>';
       }
@@ -3142,8 +3166,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/approve', { method: 'POST' });
           setNote('Construcción iniciada para ' + pid + '.');
         } else if (action === 'retry') {
-          await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/retry', { method: 'POST' });
+          await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/retry', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ clean_workspace: false }),
+          });
           setNote('Reintento iniciado para ' + pid + '.');
+        } else if (action === 'retry-clean') {
+          if (!window.confirm('¿Deseas borrar el workspace actual de "' + pid + '" y reconstruir desde cero?')) {
+            return;
+          }
+          await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/retry', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ clean_workspace: true }),
+          });
+          setNote('Reconstrucción desde cero iniciada para ' + pid + '.');
         }
         state.lastBannerSignature = null;
         await loadProjects();
@@ -3377,8 +3415,11 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._drain_body()
                 result = ctrl.approve_project(pid)
             elif action == "retry":
-                self._drain_body()
-                result = ctrl.retry_project(pid)
+                body = self._read_json_body()
+                raw_clean = body.get("clean_workspace", False)
+                if not isinstance(raw_clean, bool):
+                    raise TypeError("El campo 'clean_workspace' debe ser booleano.")
+                result = ctrl.retry_project(pid, clean_workspace=raw_clean)
             else:
                 body = self._read_json_body()
                 message = self._require_str_field(body, "message")
