@@ -23,7 +23,11 @@ from agent_factory.ports.code_agent import (
 )
 from agent_factory.ports.runner import CommandResult, CommandTimeoutError, Runner
 from agent_factory.secrets import redact_secrets
-from agent_factory.workspace import SandboxViolationError, WorkspaceManager
+from agent_factory.workspace import (
+    SandboxViolationError,
+    WorkspaceManager,
+    is_python_cache_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -332,7 +336,7 @@ def _list_workspace_test_files(ws_path: Path) -> set[str]:
     return {
         p.relative_to(ws_path).as_posix()
         for p in tests_dir.rglob("*")
-        if p.is_file()
+        if p.is_file() and not is_python_cache_path(p.relative_to(ws_path))
     }
 
 
@@ -739,12 +743,13 @@ class AgyCliAdapter(CodeAgent):
                 ws_path, before_files, retry_stdout
             )
 
-        if new_files or extracted:
-            result = result.model_copy(
-                update={
-                    "files_written": _merge_unique_paths(result.files_written, new_files, extracted)
-                }
-            )
+        merged_files = [
+            p
+            for p in _merge_unique_paths(result.files_written, new_files, extracted)
+            if not is_python_cache_path(p)
+        ]
+        if merged_files != list(result.files_written) or new_files or extracted:
+            result = result.model_copy(update={"files_written": merged_files})
         return result
 
     def implement_or_fix(

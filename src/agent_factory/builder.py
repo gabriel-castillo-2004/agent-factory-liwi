@@ -25,6 +25,7 @@ from agent_factory.workspace import (
     TestLockSnapshot,
     WorkspaceManager,
     compute_test_lock,
+    is_python_cache_path,
     verify_and_restore_test_lock,
 )
 
@@ -152,6 +153,8 @@ class BuildWorker:
         for raw_path in raw_files:
             norm = self._redact(str(raw_path).strip().replace("\\", "/")).lstrip("./")
             if not norm or ".." in norm.split("/"):
+                continue
+            if is_python_cache_path(norm):
                 continue
             if tests_only and not (norm == "tests" or norm.startswith("tests/")):
                 continue
@@ -469,7 +472,8 @@ class BuildWorker:
 
             tests_dir = ws_dir / "tests"
             has_tests = tests_dir.is_dir() and any(
-                p.is_file() for p in tests_dir.rglob("*")
+                p.is_file() and not is_python_cache_path(p.relative_to(ws_dir))
+                for p in tests_dir.rglob("*")
             )
             if not has_tests:
                 return self._fail_job(

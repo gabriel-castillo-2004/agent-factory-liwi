@@ -1217,3 +1217,88 @@ def test_build_worker_stops_early_after_two_consecutive_noop_rounds_with_identic
     assert worker_b._summarize_short(leaked) == "Solo resumen limpio"
 
 
+def test_build_worker_handles_binary_pyc_and_binary_assets_in_tests_without_unicode_error(
+    tmp_path: Path,
+) -> None:
+    """INV-13 test lock & files_written survive binary .pyc caches in tests/__pycache__ and protect arbitrary binary fixtures via raw bytes."""
+    from agent_factory.ports.code_agent import CodeAgentResult
+    from agent_factory.workspace import compute_test_lock, verify_and_restore_test_lock
+
+    pid = "proj-pyc-unicode-safe"
+    orchestrator, store = _create_approved_project(pid, num_tests=2, approve=True)
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_pyc")
+
+    pyc_rel = "tests/__pycache__/test_app.cpython-312-pytest-9.2.0.pyc"
+    pyc_bytes = b"\xcb\x0d\x0d\x0a\x00\x00\x00\x00binary-pyc-payload\xff\xfe"
+    fixture_rel = "tests/fixtures/sample.bin"
+    fixture_bytes = b"\xcb\x0d\x0d\x0a\x01\x02raw-binary-fixture\xff"
+
+    class _PycGeneratingAgent(FakeCodeAgent):
+        def generate_tests(self, workspace_dir, acceptance_tests):  # type: ignore[override]
+            tdir = workspace_dir / "tests"
+            (tdir / "__pycache__").mkdir(parents=True, exist_ok=True)
+            (tdir / "fixtures").mkdir(parents=True, exist_ok=True)
+            (tdir / "test_app.py").write_text(
+                "def test_at_01(): pass\ndef test_at_02(): pass\n", encoding="utf-8"
+            )
+            (workspace_dir / pyc_rel).write_bytes(pyc_bytes)
+            (workspace_dir / fixture_rel).write_bytes(fixture_bytes)
+            return CodeAgentResult(
+                files_written=["tests/test_app.py", pyc_rel, fixture_rel],
+                summary="Generated tests and ran pytest cache",
+                model="Gemini 4 Hydrogen (Medium)",
+            )
+
+    agent = _PycGeneratingAgent(
+        impl_steps=[
+            lambda ws, _p, _f, _a: (
+                # Also simulate pytest recreating newer .pyc bytes during run
+                (ws / "src").mkdir(parents=True, exist_ok=True),
+                (ws / "src" / "deck.ts").write_text("export const ok = true;\n", encoding="utf-8"),
+                (ws / pyc_rel).write_bytes(pyc_bytes + b"\x99\x88"),
+                CodeAgentResult(files_written=["src/deck.ts"], summary="Implemented app"),
+            )[-1],
+        ],
+    )
+    runner = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=0,
+                stdout="2 passed",
+                test_results={"AT-01": True, "AT-02": True},
+            )
+        ]
+    )
+    worker = BuildWorker(
+        orchestrator=orchestrator,
+        workspace_manager=ws_mgr,
+        code_agent=agent,
+        runner=runner,
+        vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
+    )
+    report = worker.run_job(
+        project_id=pid,
+        template_files={"pyproject.toml": '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'},
+    )
+
+    assert orchestrator.get_status(pid).state == ProjectState.DELIVERED
+    assert report.failure_cause is None
+
+    # verify generate_tests event filtered __pycache__/*.pyc cleanly
+    gen_ev = next(
+        ev
+        for ev in store.get_events(pid)
+        if ev.type == EventType.AGENT_INVOKED and ev.payload.get("agent") == "generate_tests"
+    )
+    assert gen_ev.payload["files_written"] == ["tests/test_app.py", fixture_rel]
+
+    # Verify raw-byte snapshot protects binary fixtures against tampering without UnicodeDecodeError
+    ws_dir = ws_mgr.get_workspace_dir(pid)
+    snap = compute_test_lock(ws_dir)
+    (ws_dir / fixture_rel).write_bytes(b"tampered-binary-bytes")
+    assert verify_and_restore_test_lock(ws_dir, snap) is False
+    assert (ws_dir / fixture_rel).read_bytes() == fixture_bytes
+    assert verify_and_restore_test_lock(ws_dir, snap) is True
+
+
+

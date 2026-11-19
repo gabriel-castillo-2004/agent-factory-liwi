@@ -1343,6 +1343,62 @@ def test_agy_cli_adapter_cleans_fenced_json_summary_and_enforces_stdlib_test_pro
     assert "standard library" in gen_prompt.lower()
 
 
+def test_agy_cli_adapter_excludes_pycache_and_bytecode_files_and_handles_binary_stdout(
+    tmp_path: Path,
+) -> None:
+    """generate_tests filters __pycache__/*.pyc/*.pyo from files_written, and SubprocessRunner handles invalid UTF-8 bytes safely."""
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+    ws_dir = ws_mgr.create_workspace("proj-pyc-filter")
+    plan = _sample_static_web_plan()
+
+    cli_script = tmp_path / "emit_pyc_and_tests.py"
+    cli_script.write_text(
+        "import json, pathlib, sys\n"
+        "ws = pathlib.Path.cwd()\n"
+        "tdir = ws / 'tests'\n"
+        "cache = tdir / '__pycache__'\n"
+        "cache.mkdir(parents=True, exist_ok=True)\n"
+        "(tdir / 'test_app.py').write_text('def test_at_01(): assert True\\n', encoding='utf-8')\n"
+        "(cache / 'test_app.cpython-312-pytest-9.2.0.pyc').write_bytes(b'\\xcb\\x0d\\x0d\\x0a\\x00\\x00\\xff')\n"
+        "(tdir / 'stale.pyo').write_bytes(b'\\xcb\\x0d\\x0d\\x0a')\n"
+        "sys.stdout.buffer.write(json.dumps({\n"
+        "    'files_written': [\n"
+        "        'tests/test_app.py',\n"
+        "        'tests/__pycache__/test_app.cpython-312-pytest-9.2.0.pyc',\n"
+        "        'tests/stale.pyo',\n"
+        "    ],\n"
+        "    'summary': 'Tests and cache created',\n"
+        "}).encode('utf-8'))\n",
+        encoding="utf-8",
+    )
+
+    real_runner = SubprocessRunner(default_timeout_seconds=10.0)
+    adapter = AgyCliAdapter(
+        workspace_manager=ws_mgr,
+        runner=real_runner,
+        cli_command=[sys.executable, str(cli_script)],
+    )
+
+    res = adapter.generate_tests(ws_dir, plan.acceptance_tests)
+    assert res.files_written == ["tests/test_app.py"]
+    assert res.summary == "Tests and cache created"
+
+    # Also verify SubprocessRunner decodes non-UTF8 bytes with replacement without UnicodeDecodeError
+    raw_bytes_script = tmp_path / "raw_bytes_out.py"
+    raw_bytes_script.write_text(
+        "import sys\n"
+        "sys.stdout.buffer.write(b'line ok \\xcb\\x0d\\xff end\\n')\n"
+        "sys.stderr.buffer.write(b'err \\xfe\\xff detail\\n')\n",
+        encoding="utf-8",
+    )
+    bin_out = real_runner.run(command=[sys.executable, str(raw_bytes_script)], cwd=ws_dir)
+    assert bin_out.exit_code == 0
+    assert "line ok" in bin_out.stdout
+    assert "\ufffd" in bin_out.stdout
+    assert "err" in bin_out.stderr
+
+
+
 
 
 
