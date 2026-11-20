@@ -2511,4 +2511,187 @@ def test_suggest_title_from_repo_filters_template_text_and_inspects_src_template
     assert "música" in desc_b.lower() or "youtube" in desc_b.lower() or "mp3" in desc_b.lower()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_rename_project_updates_github_repo_remote_and_status(
+    tmp_path: Path,
+) -> None:
+    """PATCH /api/projects/<id>/title renames GitHub repo via PATCH /repos/{owner}/{old_repo}, updates origin remote & projected repo_url/deploy_url while keeping project_id intact, tolerates 422, redacts secrets, and exposes UI checkbox."""
+    import subprocess
+    from collections.abc import Sequence
+    from types import SimpleNamespace
+
+    from agent_factory.adapters.github_vcs_adapter import GitHubVCSAdapter
+
+    pid = "quiero-una-app-larga"
+    gh_tok = "TEST_GH_RENAME_SECRET_456"
+    store = SqliteEventStore(str(tmp_path / "rename_gh.db"))
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_rename")
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / "index.html").write_text("<h1>App</h1>\n", encoding="utf-8")
+
+    # Initialize isolated git repo inside ws_dir pointing to old GitHub remote
+    subprocess.run(["git", "init", "-b", "main"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", f"https://github.com/gabriel-user/{pid}.git"],
+        cwd=ws_dir,
+        check=True,
+    )
+
+    now = datetime(2026, 11, 20, 13, 0, tzinfo=UTC)
+    store.append(
+        create_event(
+            pid,
+            EventType.PROJECT_CREATED,
+            {"name": "Quiero una app larga", "objective": "App larga", "state": "INTERVIEW"},
+            at=now,
+        )
+    )
+    store.append(create_event(pid, EventType.STATE_TRANSITIONED, {"to": "DEBATE"}, at=now))
+    store.append(create_event(pid, EventType.STATE_TRANSITIONED, {"to": "MEDIATION"}, at=now))
+    store.append(create_event(pid, EventType.PLAN_CREATED, {"plan_hash": "h1", "total_tests": 1}, at=now))
+    store.append(
+        create_event(
+            pid,
+            EventType.APPROVAL_RECORDED,
+            {"decision": "approved", "plan_hash": "h1", "to": "BUILDING"},
+            at=now,
+        )
+    )
+    store.append(create_event(pid, EventType.STATE_TRANSITIONED, {"to": "VERIFYING"}, at=now))
+    store.append(
+        create_event(
+            pid,
+            EventType.PROJECT_DELIVERED,
+            {
+                "repo_url": f"https://github.com/gabriel-user/{pid}",
+                "deploy_url": f"https://gabriel-user.github.io/{pid}",
+            },
+            at=now,
+        )
+    )
+
+    http_calls: list[tuple[str, str, Any, dict[str, str] | None]] = []
+    next_status = 200
+    next_body: str = json.dumps(
+        {
+            "name": "yt-music-dl-descargador",
+            "html_url": "https://github.com/gabriel-user/yt-music-dl-descargador",
+        }
+    )
+
+    class _FakeTransport:
+        def request_json(
+            self,
+            method: str,
+            url: str,
+            payload: Any = None,
+            timeout_seconds: float = 30.0,
+            headers: dict[str, str] | None = None,
+            extra_secrets: Sequence[str] = (),
+            raise_on_http_error: bool = False,
+        ) -> Any:
+            http_calls.append((method, url, payload, headers))
+            return SimpleNamespace(status_code=next_status, body=next_body)
+
+    vcs = GitHubVCSAdapter(
+        owner="gabriel-user",
+        github_token=gh_tok,
+        secrets=(gh_tok,),
+        http_transport=_FakeTransport(),
+    )
+    orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr, vcs=vcs)
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        workspace_manager=ws_mgr,
+        secrets_to_redact=(gh_tok,),
+    )
+    try:
+        # 1. GET / exposes discrete GitHub rename checkbox inside edit-title-form
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            html = html_resp.read().decode("utf-8")
+        assert "Renombrar también en GitHub" in html
+        assert "rename-github-checkbox" in html
+
+        # 2. PATCH /title with rename_github_repo=True calls PATCH /repos/gabriel-user/quiero-una-app-larga
+        code, res = _http_json(
+            f"{base_url}/api/projects/{pid}/title",
+            method="PATCH",
+            body={"title": "YT Music DL — Descargador!", "rename_github_repo": True},
+        )
+        assert code == 200
+        assert res["ok"] is True
+        assert res["project_id"] == pid
+        assert res["name"] == "YT Music DL — Descargador!"
+        assert res["status"]["project_id"] == pid
+        assert res["status"]["links"]["repo"] == "https://github.com/gabriel-user/yt-music-dl-descargador"
+        assert (
+            res["status"]["links"]["deploy"]
+            == "https://gabriel-user.github.io/yt-music-dl-descargador/"
+        )
+
+        assert len(http_calls) == 1
+        m, u, p, hdrs = http_calls[0]
+        assert m == "PATCH"
+        assert u == f"https://api.github.com/repos/gabriel-user/{pid}"
+        assert p == {"name": "yt-music-dl-descargador"}
+        assert hdrs is not None and hdrs["Authorization"] == f"Bearer {gh_tok}"
+
+        # Workspace git origin remote updated without embedding token
+        origin_url = subprocess.run(
+            ["git", "-C", str(ws_dir), "remote", "get-url", "origin"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert origin_url == "https://github.com/gabriel-user/yt-music-dl-descargador.git"
+        assert gh_tok not in origin_url
+
+        # Event-sourced detail replay keeps project_id & projects new URLs
+        _, detail = _http_json(f"{base_url}/api/projects/{pid}")
+        assert detail["project_id"] == pid
+        assert detail["status"]["name"] == "YT Music DL — Descargador!"
+        assert detail["status"]["links"]["repo"] == "https://github.com/gabriel-user/yt-music-dl-descargador"
+
+        # 3. rename_github_repo=False renames only title without calling GitHub API
+        code2, res2 = _http_json(
+            f"{base_url}/api/projects/{pid}/title",
+            method="PATCH",
+            body={"title": "Sólo Título Local", "rename_github_repo": False},
+        )
+        assert code2 == 200
+        assert res2["name"] == "Sólo Título Local"
+        assert len(http_calls) == 1
+        assert res2["status"]["links"]["repo"] == "https://github.com/gabriel-user/yt-music-dl-descargador"
+
+        # 4. Tolerates 422 when GitHub says repo already has that name; redacts secrets on real failure
+        next_status = 422
+        next_body = json.dumps({"message": "Repository already has that name"})
+        r_url, d_url = vcs.rename_repository(
+            "https://github.com/gabriel-user/yt-music-dl-descargador",
+            "Música & Café — Versión 2",
+        )
+        assert r_url == "https://github.com/gabriel-user/musica-cafe-version-2"
+        assert d_url == "https://gabriel-user.github.io/musica-cafe-version-2/"
+
+        next_status = 403
+        next_body = json.dumps({"message": f"Forbidden with token {gh_tok}"})
+        err_code, err_res = _http_json(
+            f"{base_url}/api/projects/{pid}/title",
+            method="PATCH",
+            body={"title": "Fallo Con Secreto", "rename_github_repo": True},
+        )
+        assert err_code == 409
+        assert gh_tok not in err_res["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+
 

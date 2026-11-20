@@ -5,7 +5,10 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shutil
+import unicodedata
+import urllib.parse
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -78,6 +81,28 @@ def _validate_owner(owner: str) -> str:
     ):
         raise ValueError(f"Invalid repository owner '{owner}'")
     return clean
+
+
+def _validate_repo_segment(repo: str) -> str:
+    """Validate GitHub repository name preventing path traversal or option injection."""
+    clean = repo.strip()
+    if (
+        not clean
+        or clean.startswith("-")
+        or any(ch.isspace() for ch in clean)
+        or any(bad in clean for bad in ("..", "/", "\\", "@", "?", "#", ":"))
+    ):
+        raise ValueError(f"Invalid repository name '{repo}'")
+    return clean
+
+
+def slugify_repo_name(title: str, max_len: int = 63) -> str:
+    """Convert arbitrary title text into a clean lowercase ASCII repository slug without double hyphens."""
+    normalized = unicodedata.normalize("NFKD", str(title or "")).encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-z0-9]+", "-", normalized.lower()).strip("-")
+    if len(slug) > max_len:
+        slug = slug[:max_len].strip("-")
+    return slug
 
 
 class GitHubVCSAdapter(VCS):
@@ -216,6 +241,8 @@ class GitHubVCSAdapter(VCS):
         transport = self._effective_http_transport()
         if transport is None:
             raise VcsError("GitHub HTTP transport is unavailable")
+        if hasattr(transport, "request_json"):
+            return self._github_request_with_transport(transport, method, path, payload)
         url = f"{self.api_base_url}/{path.lstrip('/')}"
         headers = {
             "Accept": "application/vnd.github+json",
@@ -228,17 +255,7 @@ class GitHubVCSAdapter(VCS):
         resp: Any = None
         err_detail: str | None = None
         try:
-            if hasattr(transport, "request_json"):
-                resp = transport.request_json(
-                    method,
-                    url,
-                    payload=payload,
-                    timeout_seconds=self.timeout_seconds,
-                    headers=headers,
-                    extra_secrets=self.secrets,
-                    raise_on_http_error=False,
-                )
-            elif method.upper() == "POST":
+            if method.upper() == "POST":
                 resp = transport.post_json(
                     url,
                     payload or {},
@@ -907,3 +924,143 @@ class GitHubVCSAdapter(VCS):
         else:
             deploy_url = f"{self.deploy_base_url}/{project_id}" if self.deploy_base_url else repo_url
         return (repo_url, deploy_url)
+
+    def _github_request_with_transport(
+        self,
+        transport: Any,
+        method: str,
+        path: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> tuple[int, str]:
+        """Execute a GitHub REST API call against an explicit transport with secret redaction."""
+        url = f"{self.api_base_url}/{path.lstrip('/')}"
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "agent-factory",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if self.github_token:
+            headers["Authorization"] = f"Bearer {self.github_token}"
+
+        resp: Any = None
+        err_detail: str | None = None
+        try:
+            resp = transport.request_json(
+                method,
+                url,
+                payload=payload,
+                timeout_seconds=self.timeout_seconds,
+                headers=headers,
+                extra_secrets=self.secrets,
+                raise_on_http_error=False,
+            )
+        except (TelegramTransportError, OSError, RuntimeError, ValueError) as exc:
+            err_detail = str(exc) or type(exc).__name__
+        if err_detail is not None:
+            self._raise_vcs_error("GitHub API request failed", err_detail)
+        assert resp is not None
+        return int(resp.status_code), str(resp.body or "")
+
+    def rename_repository(
+        self,
+        current_repo_url: str,
+        new_title: str,
+        workspace_dir: Path | None = None,
+    ) -> tuple[str, str | None]:
+        """Rename GitHub repository via PATCH /repos/{owner}/{old_repo}, update isolated origin remote, and return updated (repo_url, deploy_url)."""
+        raw_url = str(current_repo_url or "").strip()
+        if not raw_url:
+            return raw_url, None
+
+        parsed = urllib.parse.urlsplit(raw_url)
+        host = (parsed.hostname or "").lower()
+        repo_base_host = (urllib.parse.urlsplit(self.repo_base_url).hostname or "").lower()
+        if parsed.scheme.lower() not in ("http", "https") or host not in ("github.com", repo_base_host):
+            return raw_url, None
+
+        segments = [seg for seg in parsed.path.strip("/").split("/") if seg]
+        if len(segments) != 2:
+            return raw_url, None
+        owner = _validate_owner(segments[0])
+        old_repo = _validate_repo_segment(segments[1].removesuffix(".git"))
+
+        new_slug = slugify_repo_name(new_title)
+        if not new_slug:
+            raise ValueError("Cannot derive a valid repository slug from the new title")
+        new_slug = _validate_repo_segment(new_slug)
+
+        if not self.github_token:
+            return raw_url, None
+
+        final_slug = new_slug
+        if new_slug != old_repo:
+            transport = self._effective_http_transport()
+            if transport is None and not self._is_fake_runner():
+                from agent_factory.adapters.telegram_client import UrllibHttpTransport
+
+                transport = UrllibHttpTransport()
+            if transport is None:
+                raise VcsError("GitHub HTTP transport is unavailable to rename repository")
+
+            status_code, body = self._github_request_with_transport(
+                transport,
+                "PATCH",
+                f"/repos/{owner}/{old_repo}",
+                {"name": new_slug},
+            )
+            if status_code in (200, 201):
+                if body.strip():
+                    try:
+                        parsed_body = json.loads(body)
+                        if isinstance(parsed_body, dict) and parsed_body.get("name"):
+                            final_slug = _validate_repo_segment(str(parsed_body["name"]))
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+            elif status_code == 422 and "already exists on this account" not in body.lower():
+                final_slug = new_slug
+            else:
+                self._raise_vcs_error(
+                    f"GitHub repo rename failed (HTTP {status_code})",
+                    body or f"status {status_code}",
+                )
+
+        repo_base = self.repo_base_url.rstrip("/") if host == repo_base_host and self.repo_base_url else "https://github.com"
+        new_repo_url = f"{repo_base}/{owner}/{final_slug}"
+        if self.deploy_base_url and owner.lower() == self.owner.lower():
+            deploy_base = self.deploy_base_url.rstrip("/")
+        else:
+            deploy_base = f"https://{owner}.github.io"
+        new_deploy_url = f"{deploy_base}/{final_slug}/"
+
+        if workspace_dir is not None:
+            ws = Path(workspace_dir)
+            if ws.is_dir():
+                ws_resolved = ws.resolve()
+                git_entry = ws_resolved / ".git"
+                if git_entry.is_symlink():
+                    raise VcsError(f"Workspace .git must not be a symlink: {git_entry} (INV-22)")
+                if (git_entry / "HEAD").is_file():
+                    clean_env = self.build_clean_env()
+                    self._validate_workspace_git_toplevel(ws_resolved, env=clean_env)
+                    remote_git_url = f"{new_repo_url}.git"
+                    cur_origin = self.runner.run(
+                        ["git", "remote", "get-url", "origin"],
+                        cwd=ws_resolved,
+                        env=clean_env,
+                    )
+                    if cur_origin.exit_code == 0 and cur_origin.stdout.strip():
+                        self._run_git(
+                            ["remote", "set-url", "origin", remote_git_url],
+                            cwd=ws_resolved,
+                            env=clean_env,
+                            context="Git remote set-url failed",
+                        )
+                    else:
+                        self._run_git(
+                            ["remote", "add", "origin", remote_git_url],
+                            cwd=ws_resolved,
+                            env=clean_env,
+                            context="Git remote add failed",
+                        )
+
+        return (new_repo_url, new_deploy_url)

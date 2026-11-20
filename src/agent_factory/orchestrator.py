@@ -765,6 +765,7 @@ class Orchestrator:
         clock: Clock | None = None,
         valid_templates: AbstractSet[str] = VALID_TEMPLATES,
         workspace_manager: WorkspaceManager | None = None,
+        vcs: Any | None = None,
     ) -> None:
         self.store = store
         self.llm = llm
@@ -776,6 +777,7 @@ class Orchestrator:
         self.clock = clock if clock is not None else SystemClock()
         self.valid_templates = valid_templates
         self.workspace_manager = workspace_manager
+        self.vcs = vcs
         self._lock = threading.RLock()
         self._project_locks: dict[str, threading.RLock] = {}
         self._specs: dict[str, Spec] = {}
@@ -913,20 +915,56 @@ class Orchestrator:
                 self._specs[project_id] = Spec(objective=objective)
             return self.get_status(project_id)
 
-    def rename_project(self, project_id: str, title: str) -> ProjectStatus:
-        """Append PROJECT_RENAMED event validating and sanitizing the new title (INV-11)."""
+    def rename_project(
+        self,
+        project_id: str,
+        title: str,
+        *,
+        rename_github_repo: bool | None = None,
+        vcs: Any | None = None,
+    ) -> ProjectStatus:
+        """Append PROJECT_RENAMED event validating/sanitizing title and optionally renaming GitHub repository (INV-11)."""
         validate_project_id(project_id)
         clean_title = sanitize_project_title(title)
+        eff_vcs = vcs if vcs is not None else self.vcs
         with self._project_lock(project_id):
             events = self.store.get_events(project_id)
             if not events:
                 raise ValueError(f"Project '{project_id}' does not exist")
             current_status = self.get_status(project_id)
+            payload: dict[str, Any] = {
+                "name": clean_title,
+                "previous_name": current_status.name,
+            }
+
+            current_repo_url = (current_status.links.repo or "").strip()
+            has_github_repo = "github.com/" in current_repo_url.lower()
+            should_rename_repo = (
+                has_github_repo
+                if rename_github_repo is None
+                else (bool(rename_github_repo) and bool(current_repo_url))
+            )
+            if should_rename_repo and eff_vcs is not None and hasattr(eff_vcs, "rename_repository"):
+                ws_dir: Path | None = None
+                if self.workspace_manager is not None:
+                    cand_ws = self.workspace_manager.get_workspace_dir(project_id)
+                    if cand_ws.is_dir():
+                        ws_dir = cand_ws
+                new_repo_url, new_deploy_url = eff_vcs.rename_repository(
+                    current_repo_url,
+                    clean_title,
+                    workspace_dir=ws_dir,
+                )
+                if new_repo_url and new_repo_url != current_repo_url:
+                    payload["repo_url"] = new_repo_url
+                    if new_deploy_url and (current_status.links.deploy or "").strip():
+                        payload["deploy_url"] = new_deploy_url
+
             self.store.append(
                 create_event(
                     project_id=project_id,
                     event_type=EventType.PROJECT_RENAMED,
-                    payload={"name": clean_title, "previous_name": current_status.name},
+                    payload=payload,
                     at=self._now(),
                 )
             )

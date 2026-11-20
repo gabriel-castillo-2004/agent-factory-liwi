@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import atexit
 import hashlib
 import logging
@@ -424,33 +425,177 @@ def _is_pyproject_dependency_manifest(pyproject_path: Path) -> bool:
     return False
 
 
-def _find_python_dependency_manifests(ws_dir: Path) -> tuple[list[Path], Path | None]:
-    """Locate contained non-symlink requirements.txt (root or src/) and dependency pyproject.toml."""
-    req_files: list[Path] = []
-    for raw_req in (ws_dir / "requirements.txt", ws_dir / "src" / "requirements.txt"):
-        if raw_req.exists() or raw_req.is_symlink():
-            contained = _ensure_contained(raw_req, ws_dir)
-            if contained.is_file():
-                req_files.append(contained)
+_IMPORT_TO_PYPI_PACKAGE: dict[str, str] = {
+    "flask": "flask",
+    "yt_dlp": "yt-dlp",
+    "fastapi": "fastapi",
+    "uvicorn": "uvicorn",
+    "requests": "requests",
+    "bs4": "beautifulsoup4",
+    "pil": "pillow",
+    "PIL": "pillow",
+    "dotenv": "python-dotenv",
+    "yaml": "pyyaml",
+    "cv2": "opencv-python",
+    "sklearn": "scikit-learn",
+    "jwt": "pyjwt",
+    "Crypto": "pycryptodome",
+    "waitress": "waitress",
+    "werkzeug": "werkzeug",
+    "jinja2": "jinja2",
+    "pydantic": "pydantic",
+    "httpx": "httpx",
+    "aiohttp": "aiohttp",
+    "dateutil": "python-dateutil",
+}
 
-    pyproject_file: Path | None = None
-    raw_pyproj = ws_dir / "pyproject.toml"
-    if raw_pyproj.exists() or raw_pyproj.is_symlink():
-        contained_pyproj = _ensure_contained(raw_pyproj, ws_dir)
-        if contained_pyproj.is_file() and _is_pyproject_dependency_manifest(contained_pyproj):
-            pyproject_file = contained_pyproj
 
-    return req_files, pyproject_file
+def _norm_pypi_name(name: str) -> str:
+    """Normalize package names per PEP 503 for deduplication against manifests."""
+    return re.sub(r"[-_.]+", "-", name.strip()).lower()
 
 
-def _compute_deps_hash(ws_dir: Path, manifests: Sequence[Path]) -> str:
-    """Compute deterministic SHA-256 over workspace-relative manifest paths and bytes."""
+def _detect_workspace_third_party_packages(workspace_dir: Path) -> list[str]:
+    """Inspect workspace .py files via AST (excluding tests/venvs/caches) and return sorted PyPI package names."""
+    ws = Path(workspace_dir).resolve()
+    if not ws.is_dir():
+        return []
+
+    py_files = [
+        p
+        for p in _scan_workspace_files(ws, max_depth=3, suffix=".py")
+        if not (
+            p.name.lower().startswith("test_")
+            or p.name.lower().endswith("_test.py")
+            or p.name.lower() in {"conftest.py", "setup.py"}
+        )
+    ]
+    if not py_files:
+        return []
+
+    local_modules: set[str] = {"src"}
+    for py_path in py_files:
+        if py_path.stem != "__init__":
+            local_modules.add(py_path.stem)
+        rel_parts = py_path.relative_to(ws).parts
+        for part in rel_parts[:-1]:
+            local_modules.add(part)
+
+    stdlib_names = frozenset(sys.stdlib_module_names) | frozenset(sys.builtin_module_names) | {"__future__"}
+    discovered: set[str] = set()
+
+    for py_path in py_files:
+        try:
+            source = py_path.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(source, filename=str(py_path))
+        except (OSError, SyntaxError, ValueError):
+            continue
+
+        for node in ast.walk(tree):
+            top_names: list[str] = []
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".", 1)[0].strip()
+                    if top:
+                        top_names.append(top)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level and node.level > 0:
+                    continue
+                if node.module:
+                    top = node.module.split(".", 1)[0].strip()
+                    if top:
+                        top_names.append(top)
+
+            for top in top_names:
+                if top in stdlib_names or top in local_modules:
+                    continue
+                mapped = (
+                    _IMPORT_TO_PYPI_PACKAGE.get(top)
+                    or _IMPORT_TO_PYPI_PACKAGE.get(top.lower())
+                    or top.replace("_", "-").lower()
+                )
+                if mapped:
+                    discovered.add(mapped)
+
+    return sorted(discovered)
+
+
+def _extract_declared_manifest_packages(
+    req_files: Sequence[Path],
+    pyproject_files: Sequence[Path],
+) -> set[str]:
+    """Extract PEP-503 normalized package names already declared in requirements*.txt / pyproject.toml."""
+    declared: set[str] = set()
+    for req_file in req_files:
+        try:
+            lines = req_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for raw_line in lines:
+            line = raw_line.split("#", 1)[0].strip()
+            if not line or line.startswith("-"):
+                continue
+            pkg = re.split(r"[=<>!~;\[\s@]", line, maxsplit=1)[0].strip()
+            if pkg:
+                declared.add(_norm_pypi_name(pkg))
+
+    for pyproj in pyproject_files:
+        try:
+            data = tomllib.loads(pyproj.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        proj = data.get("project", {})
+        if isinstance(proj, dict):
+            deps = list(proj.get("dependencies", []) or [])
+            opt = proj.get("optional-dependencies", {})
+            if isinstance(opt, dict):
+                for vals in opt.values():
+                    if isinstance(vals, list):
+                        deps.extend(vals)
+            for item in deps:
+                pkg = re.split(r"[=<>!~;\[\s@]", str(item), maxsplit=1)[0].strip()
+                if pkg:
+                    declared.add(_norm_pypi_name(pkg))
+    return declared
+
+
+def _find_python_dependency_manifests(ws_dir: Path) -> tuple[list[Path], list[Path]]:
+    """Locate contained requirements*.txt and dependency pyproject.toml files up to depth 3."""
+    req_files: list[Path] = [
+        p
+        for p in _scan_workspace_files(ws_dir, max_depth=3, suffix=".txt")
+        if p.name.lower().startswith("requirements") and p.name.lower().endswith(".txt")
+    ]
+    req_files.sort(key=lambda p: p.relative_to(ws_dir).as_posix())
+
+    pyproject_files: list[Path] = [
+        p
+        for p in _scan_workspace_files(ws_dir, max_depth=3, filename="pyproject.toml")
+        if _is_pyproject_dependency_manifest(p)
+    ]
+    pyproject_files.sort(key=lambda p: (len(p.relative_to(ws_dir).parts), p.relative_to(ws_dir).as_posix()))
+
+    return req_files, pyproject_files
+
+
+def _compute_deps_hash(
+    ws_dir: Path,
+    manifests: Sequence[Path],
+    ast_packages: Sequence[str] = (),
+) -> str:
+    """Compute deterministic SHA-256 over manifests and sorted AST-detected packages."""
     hasher = hashlib.sha256()
     for manifest in sorted(manifests, key=lambda p: p.relative_to(ws_dir).as_posix()):
         rel = manifest.relative_to(ws_dir).as_posix().encode("utf-8")
         hasher.update(rel)
         hasher.update(b"\0")
         hasher.update(manifest.read_bytes())
+        hasher.update(b"\0")
+    if ast_packages:
+        hasher.update(b"__ast__\0")
+        hasher.update("\n".join(sorted(set(ast_packages))).encode("utf-8"))
         hasher.update(b"\0")
     return hasher.hexdigest()
 
@@ -596,14 +741,15 @@ class LocalAppRunner:
         install_deps: bool,
         dep_install_timeout: float,
     ) -> tuple[Path, Path | None]:
-        """Ensure per-workspace .venv and cached dependency install when manifests exist."""
-        req_files, pyproject_file = _find_python_dependency_manifests(ws_dir)
-        manifests: list[Path] = [*req_files, *([pyproject_file] if pyproject_file is not None else [])]
+        """Ensure per-workspace .venv and cached dependency install from manifests + AST imports."""
+        req_files, pyproject_files = _find_python_dependency_manifests(ws_dir)
+        manifests: list[Path] = [*req_files, *pyproject_files]
+        ast_packages = _detect_workspace_third_party_packages(ws_dir)
         raw_venv = ws_dir / ".venv"
         venv_dir = _ensure_contained(raw_venv, ws_dir)
         venv_py = _ensure_contained(_venv_python_path(venv_dir), ws_dir)
 
-        if not manifests:
+        if not manifests and not ast_packages:
             return Path(sys.executable), None
 
         if not install_deps:
@@ -615,7 +761,7 @@ class LocalAppRunner:
             dep_lock = self._dep_locks.setdefault(project_id, threading.Lock())
 
         with dep_lock:
-            target_hash = _compute_deps_hash(ws_dir, manifests)
+            target_hash = _compute_deps_hash(ws_dir, manifests, ast_packages=ast_packages)
             hash_file = _ensure_contained(venv_dir / ".deps_hash", ws_dir)
             if venv_py.is_file() and hash_file.is_file():
                 try:
@@ -660,13 +806,32 @@ class LocalAppRunner:
                     context=f"No se pudieron instalar dependencias desde '{rel_req}'",
                 )
 
-            if pyproject_file is not None and not req_files:
+            if pyproject_files and not req_files:
+                for pyproj in pyproject_files:
+                    pkg_target = (
+                        "."
+                        if pyproj.parent == ws_dir
+                        else pyproj.parent.relative_to(ws_dir).as_posix()
+                    )
+                    self._run_dep_command(
+                        [str(venv_py), "-m", "pip", "install", "-e", pkg_target],
+                        cwd=ws_dir,
+                        env=dep_env,
+                        timeout_seconds=dep_install_timeout,
+                        context="No se pudieron instalar dependencias desde 'pyproject.toml'",
+                    )
+
+            declared_norm = _extract_declared_manifest_packages(req_files, pyproject_files)
+            missing_ast_pkgs = [
+                pkg for pkg in ast_packages if _norm_pypi_name(pkg) not in declared_norm
+            ]
+            if missing_ast_pkgs:
                 self._run_dep_command(
-                    [str(venv_py), "-m", "pip", "install", "-e", "."],
+                    [str(venv_py), "-m", "pip", "install", *missing_ast_pkgs],
                     cwd=ws_dir,
                     env=dep_env,
                     timeout_seconds=dep_install_timeout,
-                    context="No se pudieron instalar dependencias desde 'pyproject.toml'",
+                    context="No se pudieron instalar dependencias detectadas por AST",
                 )
 
             hash_file.parent.mkdir(parents=True, exist_ok=True)
@@ -700,7 +865,7 @@ class LocalAppRunner:
         *,
         workspace_dir: Path | None = None,
         readiness_timeout: float = 8.0,
-        install_deps: bool = True,
+        install_deps: bool = False,
         dep_install_timeout: float = 180.0,
     ) -> LocalAppStatus:
         """Start project_id app on a free 127.0.0.1 port (8081..8199) and wait until HTTP socket is ready."""

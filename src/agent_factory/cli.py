@@ -766,6 +766,7 @@ def build_runtime(
                 deploy_publisher=deploy_publisher,
             )
         )
+        orchestrator.vcs = effective_vcs
 
         local_runner = LocalAppRunner(
             workspace_manager=workspace_manager,

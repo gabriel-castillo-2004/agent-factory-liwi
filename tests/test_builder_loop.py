@@ -2398,6 +2398,170 @@ def test_local_app_runner_isolated_venv_deps_hash_cache_and_git_exclude(
         runner_pyproj.stop_all()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_local_app_runner_ast_detects_missing_deps_without_requirements_txt(
+    tmp_path: Path,
+) -> None:
+    """When workspace lacks requirements.txt, _detect_workspace_third_party_packages discovers third-party imports via AST (filtering stdlib & local packages), installs them into .venv, caches .deps_hash, and discovers nested requirements*.txt up to depth 3."""
+    import json
+    import os
+    import subprocess
+    import urllib.request
+    from collections.abc import Sequence
+    from typing import Any
+
+    from agent_factory.runtime_runner import (
+        LocalAppRunner,
+        _detect_workspace_third_party_packages,
+        _find_python_dependency_manifests,
+    )
+
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_ast")
+    pid = "proj-ast-deps"
+    ws_dir = ws_mgr.create_workspace(pid)
+    pkg_dir = ws_dir / "src" / "yt_music_dl"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+    (pkg_dir / "helper.py").write_text(
+        "import json\nBANNER = 'YT Music DL AST ok'\n",
+        encoding="utf-8",
+    )
+    app_file = pkg_dir / "app.py"
+    app_file.write_text(
+        "import http.server\n"
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "import flask\n"
+        "import yt_dlp\n"
+        "from yt_music_dl.helper import BANNER\n"
+        "from . import helper\n\n"
+        "host = os.environ['HOST']\n"
+        "port = int(os.environ['PORT'])\n"
+        "class H(http.server.BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        payload = {\n"
+        "            'banner': BANNER,\n"
+        "            'prefix': sys.prefix,\n"
+        "            'flask_ok': flask.FLASK_MARK,\n"
+        "            'yt_ok': yt_dlp.YT_MARK,\n"
+        "        }\n"
+        "        body = json.dumps(payload).encode()\n"
+        "        self.send_response(200)\n"
+        "        self.send_header('Content-Type', 'application/json')\n"
+        "        self.send_header('Content-Length', str(len(body)))\n"
+        "        self.end_headers()\n"
+        "        self.wfile.write(body)\n"
+        "    def log_message(self, *args):\n"
+        "        pass\n"
+        "if __name__ == '__main__':\n"
+        "    http.server.ThreadingHTTPServer((host, port), H).serve_forever()\n",
+        encoding="utf-8",
+    )
+    # Ignored test imports must NOT appear as runtime third-party deps
+    (ws_dir / "tests").mkdir()
+    (ws_dir / "tests" / "test_ignore_me.py").write_text("import playwright\n", encoding="utf-8")
+
+    # 1. Verify AST detection & PyPI mapping cleanly
+    detected = _detect_workspace_third_party_packages(ws_dir)
+    assert detected == ["flask", "yt-dlp"]
+
+    # Check additional common import -> PyPI mappings
+    ws_map = tmp_path / "ws_map"
+    ws_map.mkdir()
+    (ws_map / "main.py").write_text(
+        "import fastapi, uvicorn, requests, yaml, cv2, dotenv\n"
+        "from bs4 import BeautifulSoup\n"
+        "from PIL import Image\n",
+        encoding="utf-8",
+    )
+    assert _detect_workspace_third_party_packages(ws_map) == [
+        "beautifulsoup4",
+        "fastapi",
+        "opencv-python",
+        "pillow",
+        "python-dotenv",
+        "pyyaml",
+        "requests",
+        "uvicorn",
+    ]
+
+    # 2. Verify nested requirements*.txt discovery up to depth 3
+    (ws_map / "nested").mkdir()
+    (ws_map / "nested" / "requirements-prod.txt").write_text("requests==2.32.0\n", encoding="utf-8")
+    reqs_map, _ = _find_python_dependency_manifests(ws_map)
+    assert [p.relative_to(ws_map).as_posix() for p in reqs_map] == [
+        "nested/requirements-prod.txt"
+    ]
+
+    # 3. LocalAppRunner.start installs AST-detected packages into .venv & caches .deps_hash
+    pip_cmds: list[list[str]] = []
+    real_run = subprocess.run
+
+    def _offline_ast_runner(cmd: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        cmd_list = [str(c) for c in cmd]
+        if len(cmd_list) >= 4 and cmd_list[1:3] == ["-m", "venv"]:
+            return real_run([cmd_list[0], "-m", "venv", "--without-pip", *cmd_list[3:]], **kwargs)
+        if "-m" in cmd_list and "pip" in cmd_list and "install" in cmd_list:
+            pip_cmds.append(cmd_list)
+            venv_py = Path(cmd_list[0])
+            venv_root = venv_py.parent.parent
+            site_dir = (
+                venv_root / "Lib" / "site-packages"
+                if os.name == "nt"
+                else next((venv_root / "lib").glob("python*/site-packages"))
+            )
+            site_dir.mkdir(parents=True, exist_ok=True)
+            (site_dir / "flask.py").write_text("FLASK_MARK = 'flask-installed'\n", encoding="utf-8")
+            (site_dir / "yt_dlp.py").write_text("YT_MARK = 'yt-dlp-installed'\n", encoding="utf-8")
+            return subprocess.CompletedProcess(cmd_list, 0, stdout="ok", stderr="")
+        return real_run(cmd_list, **kwargs)
+
+    runner = LocalAppRunner(workspace_manager=ws_mgr, dep_command_runner=_offline_ast_runner)
+    try:
+        st1 = runner.start(pid, install_deps=True)
+        assert st1.running is True
+        assert st1.app_type == "python_local"
+        assert len(pip_cmds) == 1
+        assert pip_cmds[0][-2:] == ["flask", "yt-dlp"]
+        assert (ws_dir / ".venv" / ".deps_hash").is_file()
+
+        with urllib.request.urlopen(st1.url, timeout=5.0) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        assert payload["banner"] == "YT Music DL AST ok"
+        assert payload["flask_ok"] == "flask-installed"
+        assert payload["yt_ok"] == "yt-dlp-installed"
+        assert Path(payload["prefix"]).resolve() == (ws_dir / ".venv").resolve()
+        runner.stop(pid)
+
+        # Cached on second start
+        st2 = runner.start(pid, install_deps=True)
+        assert st2.running is True
+        assert len(pip_cmds) == 1
+        runner.stop(pid)
+
+        # New import invalidates .deps_hash and re-invokes pip
+        app_file.write_text(
+            "import requests\n" + app_file.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        # Drop stub for requests inside _offline_ast_runner not needed at import unless installed:
+        req_stub_dir = (
+            ws_dir / ".venv" / "Lib" / "site-packages"
+            if os.name == "nt"
+            else next((ws_dir / ".venv" / "lib").glob("python*/site-packages"))
+        )
+        (req_stub_dir / "requests.py").write_text("", encoding="utf-8")
+        st3 = runner.start(pid, install_deps=True)
+        assert st3.running is True
+        assert len(pip_cmds) == 2
+        assert "requests" in pip_cmds[1]
+    finally:
+        runner.stop_all()
+
+
+
 
 
 

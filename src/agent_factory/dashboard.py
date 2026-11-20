@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from agent_factory.adapters.github_vcs_adapter import VcsError
 from agent_factory.builder import BuildWorker
 from agent_factory.domain.events import Event, EventType
 from agent_factory.domain.models import ApprovalEvent, ProjectStatus, validate_project_id
@@ -80,6 +81,7 @@ class DashboardController:
         model_resolver: Any = None,
         local_runner: LocalAppRunner | None = None,
         logos_dir: Path | None = None,
+        vcs: Any | None = None,
         secrets_to_redact: Sequence[str] = (),
     ) -> None:
         self.orchestrator = orchestrator
@@ -87,6 +89,11 @@ class DashboardController:
         self.template_scaffold = template_scaffold
         self.workspace_manager = workspace_manager
         self.bot_service = bot_service
+        self.vcs = (
+            vcs
+            if vcs is not None
+            else getattr(build_worker, "vcs", None) or getattr(orchestrator, "vcs", None)
+        )
         if model_resolver is not None:
             self.model_resolver = model_resolver
         else:
@@ -691,13 +698,28 @@ class DashboardController:
             "background_started": background_started,
         }
 
-    def rename_project(self, project_id: str, title: str) -> dict[str, Any]:
-        """Validate, sanitize, and persist a manual title rename via PROJECT_RENAMED (INV-11)."""
+    def rename_project(
+        self,
+        project_id: str,
+        title: str,
+        *,
+        rename_github_repo: bool | None = None,
+    ) -> dict[str, Any]:
+        """Validate, sanitize, persist PROJECT_RENAMED, and optionally rename GitHub repository (INV-11)."""
         validate_project_id(project_id)
         events = self.orchestrator.store.get_events(project_id)
         if not events:
             raise ProjectNotFoundError(f"Project '{project_id}' not found")
-        updated = self.orchestrator.rename_project(project_id, title)
+        try:
+            updated = self.orchestrator.rename_project(
+                project_id,
+                title,
+                rename_github_repo=rename_github_repo,
+                vcs=self.vcs,
+            )
+        except (VcsError, OSError) as exc:
+            clean_msg = redact_secrets(str(exc), extra_secrets=self.secrets_to_redact)
+            raise ProjectConflictError(clean_msg) from None
         summary = self._serialize_summary(
             project_id,
             updated,
@@ -708,6 +730,8 @@ class DashboardController:
             "ok": True,
             "project_id": project_id,
             "name": updated.name,
+            "repo_url": updated.links.repo,
+            "deploy_url": updated.links.deploy,
             "status": summary,
         }
 
@@ -1804,6 +1828,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       flex-wrap: wrap;
       margin-top: 6px;
     }
+    .rename-github-check {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 0.78rem;
+      color: var(--muted);
+      cursor: pointer;
+      user-select: none;
+    }
     .input-inline {
       flex: 1;
       min-width: 210px;
@@ -2063,6 +2096,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <form id="edit-title-form" class="edit-title-form" style="display:none">
               <input id="edit-title-input" class="input-field input-inline" type="text" maxlength="80" placeholder="Nombre del proyecto" required />
               <button id="suggest-title-btn" class="btn btn-sm" type="button" title="Analizar archivos del repositorio y sugerir título">✨ Sugerir analizando repo</button>
+              <label id="rename-github-wrap" class="rename-github-check" style="display:none">
+                <input id="rename-github-checkbox" type="checkbox" checked />
+                <span>Renombrar también en GitHub</span>
+              </label>
               <button id="save-title-btn" class="btn btn-primary btn-sm" type="submit">Guardar</button>
               <button id="cancel-title-btn" class="btn btn-sm" type="button">Cancelar</button>
             </form>
@@ -3763,6 +3800,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const form = document.getElementById('edit-title-form');
       const input = document.getElementById('edit-title-input');
       const suggestBtn = document.getElementById('suggest-title-btn');
+      const renameGithubWrap = document.getElementById('rename-github-wrap');
+      const renameGithubCheckbox = document.getElementById('rename-github-checkbox');
       const saveBtn = document.getElementById('save-title-btn');
       const cancelBtn = document.getElementById('cancel-title-btn');
       if (!editBtn || !form || !input || !saveBtn || !cancelBtn) return;
@@ -3778,6 +3817,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const st = state.detail.status;
         state.editingTitlePid = st.project_id;
         input.value = st.name || st.objective || st.project_id;
+        const repoUrl = (st.links && st.links.repo) || st.repo_url || '';
+        const hasRepo = Boolean(repoUrl && String(repoUrl).trim());
+        if (renameGithubWrap && renameGithubCheckbox) {
+          renameGithubWrap.style.display = hasRepo ? 'inline-flex' : 'none';
+          renameGithubCheckbox.checked = hasRepo;
+        }
         editBtn.style.display = 'none';
         form.style.display = 'flex';
         input.focus();
@@ -3822,16 +3867,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           setNote('Escribe un título válido para el proyecto.');
           return;
         }
+        const renameGithubRepo = Boolean(
+          renameGithubWrap &&
+          renameGithubCheckbox &&
+          renameGithubWrap.style.display !== 'none' &&
+          renameGithubCheckbox.checked
+        );
         saveBtn.disabled = true;
         try {
-          await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/title', {
+          const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/title', {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title }),
+            body: JSON.stringify({ title, rename_github_repo: renameGithubRepo }),
           });
           closeEditor();
           state.lastBannerSignature = null;
-          setNote('Título actualizado.');
+          setNote(
+            renameGithubRepo && res && res.repo_url
+              ? 'Título y repositorio en GitHub actualizados.'
+              : 'Título actualizado.'
+          );
           await loadProjects();
         } catch (err) {
           setNote('Error actualizando título: ' + err.message);
@@ -4254,7 +4309,14 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         try:
             body = self._read_json_body()
             title = self._require_str_field(body, "title")
-            result = ctrl.rename_project(pid, title)
+            raw_rename_repo = body.get("rename_github_repo")
+            if raw_rename_repo is not None and not isinstance(raw_rename_repo, bool):
+                raise ValueError("Field 'rename_github_repo' must be a boolean")
+            result = ctrl.rename_project(
+                pid,
+                title,
+                rename_github_repo=raw_rename_repo,
+            )
         except (ValueError, TypeError, SandboxViolationError) as exc:
             self._send_json(400, {"error": str(exc)})
             return
@@ -4302,6 +4364,7 @@ def start_dashboard_server(
     model_resolver: Any = None,
     local_runner: LocalAppRunner | None = None,
     logos_dir: Path | None = None,
+    vcs: Any | None = None,
     secrets_to_redact: Sequence[str] = (),
 ) -> tuple[DashboardHTTPServer, threading.Thread, str]:
     """Create and start DashboardHTTPServer on 127.0.0.1:<port> in a daemon thread."""
@@ -4314,6 +4377,7 @@ def start_dashboard_server(
         model_resolver=model_resolver,
         local_runner=local_runner,
         logos_dir=logos_dir,
+        vcs=vcs,
         secrets_to_redact=secrets_to_redact,
     )
     server = DashboardHTTPServer((LOOPBACK_HOST, port), controller)

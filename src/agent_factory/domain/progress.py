@@ -82,6 +82,11 @@ def project_status_from_events(project_id: str, events: Sequence[Event]) -> Proj
             new_name = str(payload.get("name", "")).strip()
             if new_name:
                 name = new_name
+            if "repo_url" in payload or "deploy_url" in payload:
+                links = ProjectLinks(
+                    repo=payload.get("repo_url", links.repo),
+                    deploy=payload.get("deploy_url", links.deploy),
+                )
 
         elif event.type == EventType.STATE_TRANSITIONED:
             next_state = ProjectState(payload["to"])
