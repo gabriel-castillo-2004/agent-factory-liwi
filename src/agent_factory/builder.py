@@ -54,8 +54,30 @@ _PYTEST_TIMEOUT_HDR_RE = re.compile(
 )
 
 
+_PYTEST_PROGRESS_LINE_RE = re.compile(
+    r"^(?:[.FsExX]+\s*\[\s*\d{1,3}%\s*\]|\.{2,})$"
+)
+_PYTEST_PROGRESS_EXTRACT_RE = re.compile(
+    r"^(?:[^\s:]+\.py\s+)?([.FsExX]+)(?:\s*\[\s*\d{1,3}%\s*\])?$"
+)
+_PYTEST_SUMMARY_LINE_RE = re.compile(
+    r"^(?:=+\s*)?(?:"
+    r"(?:\d+\s+(?:passed|failed|errors?|skipped|deselected|xfailed|xpassed|warnings?|reruns?)\s*(?:,\s*)?)+"
+    r"|\bno tests ran\b"
+    r")(?:\s+in\s+\d+(?:\.\d+)?s(?:\s*\([^)]*\))?)?(?:\s*=+)?$",
+    re.IGNORECASE,
+)
+_PYTEST_COUNT_TOKEN_RE = re.compile(
+    r"\b(\d+)\s+(passed|failed|errors?|skipped|xfailed)\b",
+    re.IGNORECASE,
+)
+_PYTEST_VERBOSE_NODE_RE = re.compile(
+    r"::\S+\s+(PASSED|FAILED|SKIPPED|ERROR|XFAIL)\b",
+)
+
+
 def _filter_pytest_diagnostic_lines(raw_text: str) -> list[str]:
-    """Strip ANSI codes, empty dividers, section titles, and pytest environment header lines."""
+    """Strip ANSI codes, dividers, section banners, progress dots, and pytest header lines."""
     ansi_free = re.sub(r"\x1b\[[0-9;]*m", "", raw_text)
     result: list[str] = []
     for raw in ansi_free.splitlines():
@@ -66,10 +88,77 @@ def _filter_pytest_diagnostic_lines(raw_text: str) -> list[str]:
             continue
         if _PYTEST_TIMEOUT_HDR_RE.match(ln):
             continue
+        if _PYTEST_PROGRESS_LINE_RE.match(ln):
+            continue
         if re.fullmatch(r"[=\-_~*\s]+", ln) or _PYTEST_SECTION_BANNER_RE.match(ln):
             continue
         result.append(ln)
     return result
+
+
+def _parse_pytest_counts(stdout: str, stderr: str) -> dict[str, int]:
+    """Extract passed/failed/skipped/errors/xfailed counts from pytest stdout/stderr."""
+    ansi_free = re.sub(r"\x1b\[[0-9;]*m", "", f"{stdout}\n{stderr}")
+    counts = {"passed": 0, "failed": 0, "skipped": 0, "errors": 0, "xfailed": 0}
+    lines = [" ".join(raw.split()) for raw in ansi_free.splitlines() if raw.strip()]
+
+    for ln in reversed(lines):
+        if _PYTEST_SUMMARY_LINE_RE.match(ln):
+            for num_str, kind in _PYTEST_COUNT_TOKEN_RE.findall(ln):
+                low = kind.lower()
+                key = "errors" if low.startswith("error") else low
+                counts[key] += int(num_str)
+            return counts
+
+    # Fallback 1: verbose per-test outcome lines (e.g. "tests/test_app.py::test_1 PASSED [ 50%]")
+    verbose_hits = _PYTEST_VERBOSE_NODE_RE.findall("\n".join(lines))
+    if verbose_hits:
+        mapping = {
+            "PASSED": "passed",
+            "FAILED": "failed",
+            "SKIPPED": "skipped",
+            "ERROR": "errors",
+            "XFAIL": "xfailed",
+        }
+        for outcome in verbose_hits:
+            counts[mapping[outcome]] += 1
+        return counts
+
+    # Fallback 2: quiet progress characters (e.g. "...... [100%]" or "tests/test_app.py ..F. [100%]")
+    for ln in lines:
+        prog_match = _PYTEST_PROGRESS_EXTRACT_RE.match(ln)
+        if not prog_match:
+            continue
+        for ch in prog_match.group(1):
+            if ch == ".":
+                counts["passed"] += 1
+            elif ch == "F":
+                counts["failed"] += 1
+            elif ch == "E":
+                counts["errors"] += 1
+            elif ch == "s":
+                counts["skipped"] += 1
+            elif ch in ("x", "X"):
+                counts["xfailed"] += 1
+    return counts
+
+
+def _extract_failing_nodeids(stdout: str, stderr: str) -> list[str]:
+    """Extract failing or skipped test identifiers from pytest stdout/stderr."""
+    ansi_free = re.sub(r"\x1b\[[0-9;]*m", "", f"{stdout}\n{stderr}")
+    found: list[str] = []
+    for raw in ansi_free.splitlines():
+        ln = " ".join(raw.split())
+        m = re.match(r"^(?:FAILED|ERROR)\s+([^\s]+)", ln)
+        if not m:
+            m = re.search(r"^([^\s]+::[^\s]+)\s+(?:FAILED|SKIPPED|ERROR|XFAIL)\b", ln)
+        if m:
+            ident = m.group(1).strip()
+            if ident and ident not in found:
+                found.append(ident)
+            if len(found) >= 10:
+                break
+    return found
 
 
 class JobState(StrEnum):
@@ -477,6 +566,8 @@ class BuildWorker:
                 agent="build_worker",
                 extra_secrets=self.secrets_to_redact,
             )
+        if failed_state != ProjectState.BUILDING or not job.last_failure_output:
+            job.last_failure_output = clean_reason
         job.state = JobState.FAILED
         report = BuildReport(
             invocations=job.invocations_used,
@@ -872,7 +963,11 @@ class BuildWorker:
             pytest_ini_path = self.workspace_manager.resolve_safe_path(project_id, "pytest.ini")
             pytest_cmd = [
                 "pytest",
-                "-q",
+                "-v",
+                "--tb=short",
+                "-ra",
+                "-o",
+                "addopts=",
                 *(["-c", str(pytest_ini_path)] if pytest_ini_path.is_file() else []),
                 f"--rootdir={ws_dir}",
             ]
@@ -890,7 +985,15 @@ class BuildWorker:
 
             local_test_duration = round(max(0.0, time.monotonic() - verify_t0), 3)
             required_test_ids = [at.id for at in job.plan.acceptance_tests]
-            # Update test results
+            parsed_counts = _parse_pytest_counts(runner_result.stdout, runner_result.stderr)
+            no_skipped_or_errors = (
+                parsed_counts["failed"] == 0
+                and parsed_counts["errors"] == 0
+                and parsed_counts["skipped"] == 0
+                and parsed_counts["xfailed"] == 0
+            )
+
+            # Update test results from structured runner output or parsed pytest summary/progress
             if runner_result.test_results:
                 job.test_results = dict(runner_result.test_results)
                 passed = sum(1 for v in runner_result.test_results.values() if v)
@@ -921,17 +1024,60 @@ class BuildWorker:
                         at=self.orchestrator._now(),
                     )
                 )
-            has_all_plan_tests = bool(runner_result.test_results) and all(
-                runner_result.test_results.get(tid) is True for tid in required_test_ids
-            )
-            all_reported_tests_passed = bool(runner_result.test_results) and all(
-                runner_result.test_results.values()
-            )
-            local_tests_passed = (
-                runner_result.exit_code == 0
-                and has_all_plan_tests
-                and all_reported_tests_passed
-            )
+                has_all_plan_tests = all(
+                    runner_result.test_results.get(tid) is True for tid in required_test_ids
+                )
+                all_reported_tests_passed = all(runner_result.test_results.values())
+                local_tests_passed = (
+                    runner_result.exit_code == 0
+                    and has_all_plan_tests
+                    and all_reported_tests_passed
+                    and no_skipped_or_errors
+                )
+            else:
+                passed = parsed_counts["passed"]
+                failed = (
+                    parsed_counts["failed"]
+                    + parsed_counts["errors"]
+                    + parsed_counts["skipped"]
+                    + parsed_counts["xfailed"]
+                )
+                total = passed + failed
+                local_tests_passed = (
+                    runner_result.exit_code == 0
+                    and passed > 0
+                    and no_skipped_or_errors
+                )
+                if total > 0:
+                    tests_passed_count = passed
+                    tests_total_count = total
+                    if local_tests_passed:
+                        job.test_results = (
+                            {tid: True for tid in required_test_ids}
+                            if required_test_ids
+                            else {f"test_{idx}": True for idx in range(1, passed + 1)}
+                        )
+                        failing_tests = []
+                    else:
+                        failing_tests = _extract_failing_nodeids(
+                            runner_result.stdout, runner_result.stderr
+                        )
+                    self.orchestrator.store.append(
+                        create_event(
+                            project_id=project_id,
+                            event_type=EventType.TESTS_UPDATED,
+                            payload={
+                                "passed": passed,
+                                "failed": failed,
+                                "total": total,
+                                "round": build_round,
+                                "duration_seconds": local_test_duration,
+                            },
+                            at=self.orchestrator._now(),
+                        )
+                    )
+                else:
+                    failing_tests = []
             self._save_round_checkpoint(
                 project_id,
                 job.lock_snapshot,
@@ -971,9 +1117,10 @@ class BuildWorker:
                     last_failure_sig = current_sig
                 continue
 
-            # Local tests passed! Reset stagnation tracking and transition to VERIFYING
+            # Local tests passed! Reset stagnation tracking, clear failure output, and transition to VERIFYING
             consecutive_noop_rounds = 0
             last_failure_sig = None
+            job.last_failure_output = ""
             self.orchestrator.store.append(
                 create_event(
                     project_id=project_id,
@@ -992,7 +1139,7 @@ class BuildWorker:
 
                 # Get CI result
                 ci_result = self.vcs.get_ci_result(project_id, branch="work")
-            except (OSError, RuntimeError, ValueError) as err:
+            except (CommandTimeoutError, OSError, RuntimeError, ValueError) as err:
                 return self._fail_job(
                     project_id, job, err, failed_state=ProjectState.VERIFYING
                 )
@@ -1029,7 +1176,7 @@ class BuildWorker:
                     repo_url, deploy_url = self.vcs.merge_and_deploy(
                         project_id, branch="work"
                     )
-                except (OSError, RuntimeError, ValueError) as err:
+                except (CommandTimeoutError, OSError, RuntimeError, ValueError) as err:
                     return self._fail_job(
                         project_id, job, err, failed_state=ProjectState.VERIFYING
                     )
@@ -1076,6 +1223,7 @@ class BuildWorker:
                         registry_warning = (
                             f"Registry publish failed (best-effort): {clean_reg_err}"
                         )
+                        job.last_failure_output = registry_warning
                         self.orchestrator.store.append(
                             create_event(
                                 project_id=project_id,
@@ -1116,7 +1264,8 @@ class BuildWorker:
                     at=self.orchestrator._now(),
                 )
             )
-            job.last_failure_output = clean_ci_summary
+            ci_failed_checks = ", ".join(self._redact(c) for c in ci_result.failed_checks)
+            job.last_failure_output = clean_ci_summary or ci_failed_checks or "CI checks failed"
 
     def run_next(
         self,

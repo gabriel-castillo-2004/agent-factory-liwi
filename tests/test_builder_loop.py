@@ -1559,7 +1559,6 @@ def test_build_worker_and_scaffold_isolate_pytest_inside_workspace_without_paren
     import sys
 
     from agent_factory.adapters.subprocess_runner import SubprocessRunner
-    from agent_factory.ports.runner import CommandResult as _CommandResult
     from agent_factory.scaffold import DEFAULT_TEMPLATES_ROOT, TemplateScaffold
 
     parent_repo = tmp_path / "agent_factory_parent"
@@ -1578,7 +1577,7 @@ def test_build_worker_and_scaffold_isolate_pytest_inside_workspace_without_paren
     # 1. TemplateScaffold.scaffold creates minimal pytest.ini without overwriting custom pytest.ini
     pid_scaffold = "proj-scaffold-ini"
     ws_scaffold = scaffold.scaffold(pid_scaffold, template_id="static-web")
-    expected_ini = "[pytest]\ntestpaths = tests\naddopts = -q\n"
+    expected_ini = "[pytest]\ntestpaths = tests\naddopts = -ra --tb=short\n"
     assert (ws_scaffold / "pytest.ini").is_file()
     assert (ws_scaffold / "pytest.ini").read_text(encoding="utf-8") == expected_ini
 
@@ -1599,14 +1598,7 @@ def test_build_worker_and_scaffold_isolate_pytest_inside_workspace_without_paren
             cmd_list = list(command)
             recorded_cmds.append(cmd_list)
             actual = [sys.executable, "-m", "pytest", *cmd_list[1:]] if cmd_list[0] == "pytest" else cmd_list
-            res = real_sub.run(actual, cwd=cwd, timeout_seconds=timeout_seconds, env=env, input=input)
-            return _CommandResult(
-                exit_code=res.exit_code,
-                stdout=res.stdout,
-                stderr=res.stderr,
-                timed_out=res.timed_out,
-                test_results={"AT-01": res.exit_code == 0, "AT-02": res.exit_code == 0},
-            )
+            return real_sub.run(actual, cwd=cwd, timeout_seconds=timeout_seconds, env=env, input=input)
 
     test_code = (
         "from pathlib import Path\n\n"
@@ -1643,6 +1635,9 @@ def test_build_worker_and_scaffold_isolate_pytest_inside_workspace_without_paren
     assert len(recorded_cmds) == 1
     cmd = recorded_cmds[0]
     assert cmd[0] == "pytest"
+    assert "-v" in cmd
+    assert "--tb=short" in cmd
+    assert "-ra" in cmd
     assert "-c" in cmd
     assert str((ws_dir / "pytest.ini").resolve()) in cmd
     assert f"--rootdir={ws_dir.resolve()}" in cmd
@@ -1741,19 +1736,160 @@ def test_build_worker_stagnation_ignores_pytest_headers_and_reports_real_failure
     assert "pruebas omitidas [SKIPPED]" in cause_skip
     assert "Node.js is not available in PATH" in cause_skip
 
-    # 5. Headers only -> never surfaces inifile/rootdir fallback
+    # 5. Headers and progress-dot lines only -> never surfaces inifile/rootdir or ...... [100%]
     hdr_only = CommandResult(
         exit_code=1,
         stdout=(
             "platform win32 -- Python 3.12.10\n"
             "inifile: C:\\repo\\pyproject.toml\n"
             "rootdir: C:\\repo\n"
+            "......                                                                   [100%]\n"
         ),
     )
     cause_hdr_only = worker._summarize_stagnation_cause(hdr_only, [])
     assert "inifile:" not in cause_hdr_only
     assert "rootdir:" not in cause_hdr_only
+    assert "[100%]" not in cause_hdr_only
+    assert "......" not in cause_hdr_only
     assert "continúan fallando" in cause_hdr_only
+
+
+def test_build_worker_passes_on_subprocess_pytest_summary_and_progress_dots_and_preserves_post_test_errors(
+    tmp_path: Path,
+) -> None:
+    """SubprocessRunner leaves CommandResult.test_results empty: BuildWorker must pass on exit_code=0 with passed>0 (including '...... [100%]' or '6 passed in 0.12s'), fail on skipped>0, and record real stage errors after pytest passes."""
+    # Case A: Quiet progress-dots output ("...... [100%]") with empty test_results converges to DELIVERED
+    pid_dots = "proj-dots-pass"
+    orch_a, store_a = _create_approved_project(pid_dots, num_tests=2, approve=True)
+    ws_mgr_a = WorkspaceManager(base_dir=tmp_path / "ws_dots")
+    agent_a = FakeCodeAgent(
+        test_gen_steps=[{"tests/test_app.py": "def test_ok(): pass\n"}],
+        impl_steps=[{"src/deck.ts": "export const ok = true;\n"}],
+    )
+    runner_a = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=0,
+                stdout="......                                                                   [100%]\n",
+                stderr="",
+                test_results={},
+            )
+        ]
+    )
+    worker_a = BuildWorker(
+        orchestrator=orch_a,
+        workspace_manager=ws_mgr_a,
+        code_agent=agent_a,
+        runner=runner_a,
+        vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
+    )
+    report_a = worker_a.run_job(pid_dots)
+    assert orch_a.get_status(pid_dots).state == ProjectState.DELIVERED
+    assert report_a.invocations == 2
+    assert report_a.test_results == {"AT-01": True, "AT-02": True}
+    assert len(agent_a.impl_calls) == 1
+    tests_ev_a = next(ev for ev in store_a.get_events(pid_dots) if ev.type == EventType.TESTS_UPDATED)
+    assert tests_ev_a.payload["passed"] == 6
+    assert tests_ev_a.payload["failed"] == 0
+    assert tests_ev_a.payload["total"] == 6
+
+    # Case B: Verbose explicit summary ("6 passed in 0.12s") with empty test_results converges to DELIVERED
+    pid_sum = "proj-summary-pass"
+    orch_b, _ = _create_approved_project(pid_sum, num_tests=2, approve=True)
+    ws_mgr_b = WorkspaceManager(base_dir=tmp_path / "ws_sum")
+    worker_b = BuildWorker(
+        orchestrator=orch_b,
+        workspace_manager=ws_mgr_b,
+        code_agent=FakeCodeAgent(
+            test_gen_steps=[{"tests/test_app.py": "def test_ok(): pass\n"}],
+            impl_steps=[{"src/deck.ts": "export const ok = true;\n"}],
+        ),
+        runner=FakeRunner(
+            results=[
+                CommandResult(
+                    exit_code=0,
+                    stdout=(
+                        "tests/test_app.py::test_1 PASSED [ 50%]\n"
+                        "tests/test_app.py::test_2 PASSED [100%]\n"
+                        "============================== 6 passed in 0.12s ==============================\n"
+                    ),
+                    test_results={},
+                )
+            ]
+        ),
+        vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
+    )
+    report_b = worker_b.run_job(pid_sum)
+    assert orch_b.get_status(pid_sum).state == ProjectState.DELIVERED
+    assert report_b.invocations == 2
+
+    # Case C: exit_code=0 with skipped > 0 (e.g. "2 passed, 4 skipped") still fails verification & triggers skipped stagnation
+    pid_skip = "proj-empty-results-skip"
+    orch_c, _ = _create_approved_project(pid_skip, num_tests=2, approve=True)
+    ws_mgr_c = WorkspaceManager(base_dir=tmp_path / "ws_skip_empty")
+    skip_out = (
+        "SKIPPED [4] tests/test_app.py:83: Node.js is not available in PATH\n"
+        "========================= 2 passed, 4 skipped in 0.10s =========================\n"
+    )
+    worker_c = BuildWorker(
+        orchestrator=orch_c,
+        workspace_manager=ws_mgr_c,
+        code_agent=FakeCodeAgent(
+            test_gen_steps=[{"tests/test_app.py": "def test_ok(): pass\n"}],
+            impl_steps=[{}, {}],
+        ),
+        runner=FakeRunner(
+            results=[
+                CommandResult(exit_code=0, stdout=skip_out, test_results={}),
+                CommandResult(exit_code=0, stdout=skip_out, test_results={}),
+            ]
+        ),
+        vcs=FakeVCS(),
+    )
+    report_c = worker_c.run_job(pid_skip)
+    assert orch_c.get_status(pid_skip).state == ProjectState.FAILED
+    assert report_c.failure_cause is not None
+    assert "pruebas omitidas [SKIPPED]" in report_c.failure_cause
+
+    # Case D: When pytest passes ("...... [100%]") and GitHub push fails afterward, error/last_failure_output record the GitHub error
+    pid_vcs = "proj-post-test-vcs-err"
+    orch_d, store_d = _create_approved_project(pid_vcs, num_tests=2, approve=True)
+    ws_mgr_d = WorkspaceManager(base_dir=tmp_path / "ws_vcs_err")
+    queue_d = LocalJobQueue()
+
+    class _FailingPushVCS(FakeVCS):
+        def push_branch(self, project_id: str, workspace_dir: Path, branch: str = "work") -> str:
+            raise RuntimeError("GitHub push rejected (403 remote permission denied)")
+
+    worker_d = BuildWorker(
+        orchestrator=orch_d,
+        workspace_manager=ws_mgr_d,
+        code_agent=FakeCodeAgent(
+            test_gen_steps=[{"tests/test_app.py": "def test_ok(): pass\n"}],
+            impl_steps=[{"src/deck.ts": "export const ok = true;\n"}],
+        ),
+        runner=FakeRunner(
+            results=[
+                CommandResult(
+                    exit_code=0,
+                    stdout="......                                                                   [100%]\n",
+                    test_results={},
+                )
+            ]
+        ),
+        vcs=_FailingPushVCS(),
+        queue=queue_d,
+    )
+    report_d = worker_d.run_job(pid_vcs)
+    assert orch_d.get_status(pid_vcs).state == ProjectState.FAILED
+    assert report_d.failure_cause == "GitHub push rejected (403 remote permission denied)"
+    job_d = queue_d.get_job(pid_vcs)
+    assert job_d is not None
+    assert job_d.last_failure_output == "GitHub push rejected (403 remote permission denied)"
+    assert "[100%]" not in job_d.last_failure_output
+    phase_err = next(ev for ev in store_d.get_events(pid_vcs) if ev.type == EventType.PHASE_ERROR)
+    assert "GitHub push rejected (403 remote permission denied)" in phase_err.payload["detail"]
+    assert phase_err.payload["state"] == ProjectState.VERIFYING.value
 
 
 

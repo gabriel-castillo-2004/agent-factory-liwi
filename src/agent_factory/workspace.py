@@ -60,7 +60,7 @@ RUNNER_CONFIG_FILENAMES: tuple[str, ...] = (
     "setup.cfg",
 )
 
-DEFAULT_WORKSPACE_PYTEST_INI: str = "[pytest]\ntestpaths = tests\naddopts = -q\n"
+DEFAULT_WORKSPACE_PYTEST_INI: str = "[pytest]\ntestpaths = tests\naddopts = -ra --tb=short\n"
 
 
 class SandboxViolationError(ValueError):
