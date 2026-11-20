@@ -2,10 +2,13 @@
 
 import base64
 import hashlib
+import html
 import os
+import re
 import shutil
 import stat
 import sys
+import unicodedata
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -317,3 +320,211 @@ def verify_and_restore_test_lock(
         file_path.write_bytes(base64.b64decode(b64_data))
 
     return False
+
+
+MAX_CUSTOM_LOGO_BYTES: int = 512 * 1024
+LOGO_MIME_BY_EXT: dict[str, str] = {
+    "svg": "image/svg+xml",
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "webp": "image/webp",
+}
+_SVG_DANGEROUS_TAG_RE = re.compile(
+    r"<\s*(?:script|foreignobject|iframe|object|embed)\b",
+    re.IGNORECASE,
+)
+_SVG_EVENT_HANDLER_RE = re.compile(
+    r"""(?:\s|/)on[a-z]+\s*=""",
+    re.IGNORECASE,
+)
+_SVG_DANGEROUS_URI_RE = re.compile(
+    r"""(?:javascript|vbscript)\s*:|data\s*:\s*text/html""",
+    re.IGNORECASE,
+)
+
+
+def _normalize_keywords(text: str) -> str:
+    norm = unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore").decode("ascii")
+    return norm.lower()
+
+
+def generate_project_logo_svg(title: str, objective: str = "") -> str:
+    """Generate a minimalist 64x64 high-contrast SVG logo tailored to project domain."""
+    combined = _normalize_keywords(f"{title} {objective}")
+    label = html.escape((title or "Proyecto")[:40].strip() or "Proyecto", quote=True)
+
+    if any(
+        kw in combined
+        for kw in (
+            "music",
+            "musica",
+            "cancion",
+            "song",
+            "audio",
+            "mp3",
+            "sound",
+            "playlist",
+            "radio",
+            "yt-dlp",
+            "reproductor",
+        )
+    ):
+        grad_a, grad_b = "#4f46e5", "#7c3aed"
+        glyph = (
+            '<path d="M27 42V22l17-4v18" fill="none" stroke="#ffffff" stroke-width="3.2" '
+            'stroke-linecap="round" stroke-linejoin="round"/>'
+            '<circle cx="23" cy="43" r="4.2" fill="#ffffff"/>'
+            '<circle cx="40" cy="39" r="4.2" fill="#ffffff"/>'
+            '<path d="M47 22c2.8 3.2 2.8 8.8 0 12" fill="none" stroke="#e0e7ff" '
+            'stroke-width="2.6" stroke-linecap="round"/>'
+        )
+    elif any(
+        kw in combined
+        for kw in (
+            "pomodoro",
+            "timer",
+            "temporizador",
+            "reloj",
+            "clock",
+            "cronometro",
+            "foco",
+            "focus",
+            "alarma",
+            "countdown",
+        )
+    ):
+        grad_a, grad_b = "#ea580c", "#f59e0b"
+        glyph = (
+            '<circle cx="32" cy="34" r="15" fill="none" stroke="#ffffff" stroke-width="3.2"/>'
+            '<path d="M27 14h10M32 34v-8M32 34l5.5 3.5" fill="none" stroke="#ffffff" '
+            'stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>'
+        )
+    elif any(
+        kw in combined
+        for kw in (
+            "nota",
+            "diario",
+            "journal",
+            "libro",
+            "book",
+            "blog",
+            "tarea",
+            "todo",
+            "checklist",
+            "presupuesto",
+            "gasto",
+            "markdown",
+        )
+    ):
+        grad_a, grad_b = "#059669", "#10b981"
+        glyph = (
+            '<rect x="19" y="16" width="26" height="32" rx="4" fill="none" stroke="#ffffff" stroke-width="3"/>'
+            '<path d="M25 25h14M25 32h14M25 39h9" fill="none" stroke="#ecfdf5" '
+            'stroke-width="2.8" stroke-linecap="round"/>'
+        )
+    else:
+        grad_a, grad_b = "#0284c7", "#0ea5e9"
+        glyph = (
+            '<rect x="16" y="17" width="32" height="30" rx="5" fill="none" stroke="#ffffff" stroke-width="3"/>'
+            '<path d="M23 28l5 4-5 4M32 36h8" fill="none" stroke="#f0f9ff" '
+            'stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>'
+        )
+
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" '
+        f'role="img" aria-label="{label}">'
+        "<defs>"
+        f'<linearGradient id="afg" x1="0" y1="0" x2="1" y2="1">'
+        f'<stop offset="0%" stop-color="{grad_a}"/>'
+        f'<stop offset="100%" stop-color="{grad_b}"/>'
+        "</linearGradient>"
+        "</defs>"
+        '<rect x="2" y="2" width="60" height="60" rx="16" fill="url(#afg)"/>'
+        f"{glyph}"
+        "</svg>\n"
+    )
+
+
+def validate_and_sanitize_logo_bytes(
+    data: bytes,
+    filename: str = "",
+) -> tuple[str, str, bytes]:
+    """Validate uploaded logo size (<=512KB), magic bytes, and SVG XSS safety."""
+    if not data:
+        raise ValueError("El archivo de logo está vacío.")
+    if len(data) > MAX_CUSTOM_LOGO_BYTES:
+        raise ValueError("El logo supera el límite máximo permitido de 512 KB.")
+
+    detected_ext: str | None = None
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        detected_ext = "png"
+    elif data.startswith(b"\xff\xd8\xff"):
+        detected_ext = "jpg"
+    elif len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        detected_ext = "webp"
+    else:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                "Formato de imagen no soportado; usa PNG, JPG, WebP o SVG."
+            ) from exc
+        stripped = text.lstrip()
+        low = stripped.lower()
+        if "<svg" in low[:2048] and ("</svg>" in low or "/>" in low):
+            if (
+                _SVG_DANGEROUS_TAG_RE.search(stripped)
+                or _SVG_EVENT_HANDLER_RE.search(stripped)
+                or _SVG_DANGEROUS_URI_RE.search(stripped)
+            ):
+                raise ValueError(
+                    "El SVG contiene scripts, manejadores o enlaces inseguros rechazados."
+                )
+            detected_ext = "svg"
+
+    if detected_ext is None:
+        raise ValueError("Archivo inválido: la firma del archivo no corresponde a SVG, PNG, JPG ni WebP.")
+
+    if filename:
+        raw_ext = Path(filename).suffix.lower().lstrip(".")
+        norm_ext = "jpg" if raw_ext == "jpeg" else raw_ext
+        if norm_ext and norm_ext in LOGO_MIME_BY_EXT and norm_ext != detected_ext:
+            raise ValueError(
+                f"La extensión '.{raw_ext}' no coincide con el contenido real ({detected_ext})."
+            )
+
+    return detected_ext, LOGO_MIME_BY_EXT[detected_ext], data
+
+
+def ensure_workspace_favicon(
+    workspace_dir: Path,
+    title: str,
+    objective: str = "",
+    *,
+    overwrite: bool = False,
+) -> Path | None:
+    """Write default minimalist favicon.svg into workspace root (and built static subdir) if absent."""
+    ws = Path(workspace_dir).resolve()
+    if not ws.is_dir():
+        return None
+    svg_content = generate_project_logo_svg(title, objective)
+    target_dirs = [ws]
+    for sub_name in ("src", "static", "public", "web"):
+        sub_dir = ws / sub_name
+        if sub_dir.is_dir() and (sub_dir / "index.html").is_file():
+            target_dirs.append(sub_dir)
+
+    primary_written: Path | None = None
+    for idx, tdir in enumerate(target_dirs):
+        fav_svg = tdir / "favicon.svg"
+        fav_ico = tdir / "favicon.ico"
+        if fav_svg.is_symlink() or fav_ico.is_symlink():
+            continue
+        if not overwrite and (fav_svg.exists() or fav_ico.exists()):
+            if idx == 0:
+                primary_written = fav_svg if fav_svg.exists() else fav_ico
+            continue
+        fav_svg.write_text(svg_content, encoding="utf-8")
+        if idx == 0:
+            primary_written = fav_svg
+    return primary_written

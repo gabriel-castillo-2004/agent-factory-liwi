@@ -45,14 +45,40 @@ _EXTERNAL_OR_SKIP_PREFIXES: tuple[str, ...] = (
     "javascript:",
     "#",
 )
-_PYTHON_ENTRYPOINTS: tuple[str, ...] = (
+_ROOT_PYTHON_NAMES: tuple[str, ...] = (
     "app.py",
     "main.py",
     "server.py",
-    "src/app.py",
-    "src/main.py",
-    "src/server.py",
+    "web.py",
+    "run.py",
+    "cli.py",
 )
+_PACKAGE_PYTHON_NAMES: tuple[str, ...] = (
+    "app.py",
+    "main.py",
+    "server.py",
+    "web.py",
+    "run.py",
+)
+_IGNORED_SCAN_DIRS: frozenset[str] = frozenset(
+    {
+        ".git",
+        "tests",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".agent-factory",
+        "node_modules",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+    }
+)
+_MAIN_GUARD_RE = re.compile(r"""if\s+__name__\s*==\s*["']__main__["']\s*:""")
+_WEB_SERVER_HINT_RE = re.compile(
+    r"\b(?:HTTPServer|ThreadingHTTPServer|Flask|FastAPI|uvicorn|Bottle|Tornado|http\.server)\b"
+)
+_STATIC_SUBDIR_NAMES: tuple[str, ...] = ("src", "static", "public", "web")
 _MAIN_EMPTY_RE = re.compile(r"<main[^>]*>\s*</main>", re.IGNORECASE)
 _SRC_APP_REF_RE = re.compile(r"""src\s*=\s*["']\./src/app\.js["']""", re.IGNORECASE)
 
@@ -67,6 +93,8 @@ class WorkspaceAppInfo(BaseModel):
     app_type: Literal["static", "python_local", "unknown"] = "unknown"
     serve_dir: Path | None = None
     entrypoint: Path | None = None
+    module_name: str | None = None
+    pythonpath: Path | None = None
 
 
 class LocalAppStatus(BaseModel):
@@ -136,63 +164,165 @@ def _is_template_index_html(html_path: Path, workspace_dir: Path) -> bool:
 
     if _SRC_APP_REF_RE.search(content) and not (workspace_dir / "src" / "app.js").is_file():
         return True
-    return (workspace_dir / "src" / "index.html").is_file()
+    for rel_sub in _STATIC_SUBDIR_NAMES:
+        if (workspace_dir / rel_sub / "index.html").is_file():
+            return True
+    return False
+
+
+def _scan_workspace_files(
+    ws: Path,
+    *,
+    max_depth: int = 3,
+    suffix: str | None = None,
+    filename: str | None = None,
+) -> list[Path]:
+    """Safely walk workspace_dir up to max_depth ignoring test/env/cache dirs (INV-22)."""
+    results: list[Path] = []
+    ws_resolved = ws.resolve()
+
+    def _walk(current: Path, depth: int) -> None:
+        try:
+            entries = sorted(current.iterdir(), key=lambda p: (not p.is_file(), p.name.lower()))
+        except OSError:
+            return
+        for entry in entries:
+            if entry.is_symlink():
+                _ensure_contained(entry, ws_resolved)
+            if entry.is_dir():
+                if entry.name in _IGNORED_SCAN_DIRS or entry.name.startswith("."):
+                    continue
+                if depth < max_depth:
+                    _ensure_contained(entry, ws_resolved)
+                    _walk(entry, depth + 1)
+            elif entry.is_file():
+                if filename is not None and entry.name != filename:
+                    continue
+                if suffix is not None and entry.suffix.lower() != suffix.lower():
+                    continue
+                results.append(_ensure_contained(entry, ws_resolved))
+
+    _walk(ws_resolved, 0)
+    return results
 
 
 def resolve_static_root(workspace_dir: Path) -> Path | None:
-    """Return built static directory containing index.html (preferring src/ over untouched template root)."""
+    """Return built static directory containing index.html across root/src/static/public/web or subdirs (depth<=3)."""
     ws = Path(workspace_dir).resolve()
     if not ws.is_dir():
         return None
 
     root_index = ws / "index.html"
-    src_dir = ws / "src"
-    src_index = src_dir / "index.html"
-
-    has_src_index = src_dir.exists() and _ensure_contained(src_dir, ws) and src_index.is_file()
-    if has_src_index:
-        _ensure_contained(src_index, ws)
-
     has_root_index = root_index.exists() and _ensure_contained(root_index, ws).is_file()
+    root_is_empty_template = has_root_index and _is_template_index_html(root_index, ws)
 
-    if has_src_index and (not has_root_index or _is_template_index_html(root_index, ws)):
-        return src_dir
+    subdir_candidates: list[Path] = []
+    for rel in _STATIC_SUBDIR_NAMES:
+        sub = ws / rel
+        sub_idx = sub / "index.html"
+        if sub.exists() and _ensure_contained(sub, ws).is_dir() and sub_idx.is_file():
+            _ensure_contained(sub_idx, ws)
+            subdir_candidates.append(sub.resolve())
+
+    if not subdir_candidates:
+        for idx_path in _scan_workspace_files(ws, max_depth=3, filename="index.html"):
+            if idx_path.parent != ws:
+                subdir_candidates.append(idx_path.parent)
+
+    if subdir_candidates and (not has_root_index or root_is_empty_template):
+        return subdir_candidates[0]
     if has_root_index:
         return ws
-    if has_src_index:
-        return src_dir
+    if subdir_candidates:
+        return subdir_candidates[0]
     return None
 
 
-def _find_python_entrypoint(ws: Path) -> Path | None:
-    """Locate a contained Python app entrypoint inside workspace_dir."""
-    for rel in _PYTHON_ENTRYPOINTS:
-        candidate = ws / rel
-        if candidate.exists() and _ensure_contained(candidate, ws).is_file():
-            return candidate
+def _is_non_test_python(py_file: Path) -> bool:
+    name = py_file.name.lower()
+    return not (
+        name.startswith("test_")
+        or name.endswith("_test.py")
+        or name in {"conftest.py", "setup.py", "__init__.py"}
+    )
 
+
+def _has_main_web_server(py_file: Path) -> bool:
+    try:
+        snippet = py_file.read_text(encoding="utf-8", errors="replace")[:16384]
+    except OSError:
+        return False
+    return bool(_MAIN_GUARD_RE.search(snippet) and _WEB_SERVER_HINT_RE.search(snippet))
+
+
+def _find_python_entrypoint(ws: Path) -> Path | None:
+    """Recursively locate a contained Python server entrypoint up to depth 3 ignoring tests/caches."""
+    for name in _ROOT_PYTHON_NAMES:
+        cand = ws / name
+        if cand.exists() and _ensure_contained(cand, ws).is_file():
+            return _ensure_contained(cand, ws)
+
+    priority_subpaths = [
+        *(f"src/{name}" for name in _ROOT_PYTHON_NAMES),
+        *(f"app/{name}" for name in _PACKAGE_PYTHON_NAMES),
+    ]
+    for rel in priority_subpaths:
+        cand = ws / rel
+        if cand.exists() and _ensure_contained(cand, ws).is_file():
+            return _ensure_contained(cand, ws)
+
+    scanned_py = _scan_workspace_files(ws, max_depth=3, suffix=".py")
+    # 1. Explicit package/subdir server names ordered by shallowest depth
+    pkg_matches = [
+        p
+        for p in scanned_py
+        if p.name in _PACKAGE_PYTHON_NAMES and _is_non_test_python(p)
+    ]
+    if pkg_matches:
+        pkg_matches.sort(key=lambda p: (len(p.relative_to(ws).parts), p.as_posix()))
+        return pkg_matches[0]
+
+    # 2. Any module with `if __name__ == "__main__":` + known web server framework/stdlib server
+    main_matches = [
+        p for p in scanned_py if _is_non_test_python(p) and _has_main_web_server(p)
+    ]
+    if main_matches:
+        main_matches.sort(key=lambda p: (len(p.relative_to(ws).parts), p.as_posix()))
+        return main_matches[0]
+
+    # 3. Fallback when requirements.txt exists: first executable .py in workspace
     req_file = ws / "requirements.txt"
     if req_file.exists() and _ensure_contained(req_file, ws).is_file():
-        for search_dir in (ws, ws / "src"):
-            if not search_dir.is_dir():
-                continue
-            for py_file in sorted(search_dir.glob("*.py")):
-                if py_file.name.startswith("test_") or py_file.name in {"conftest.py", "setup.py"}:
-                    continue
-                if _ensure_contained(py_file, ws).is_file():
-                    return py_file
+        non_test = [p for p in scanned_py if _is_non_test_python(p)]
+        if non_test:
+            non_test.sort(key=lambda p: (len(p.relative_to(ws).parts), p.as_posix()))
+            return non_test[0]
     return None
 
 
 def detect_workspace_app(workspace_dir: Path) -> WorkspaceAppInfo:
-    """Detect app_type ('static', 'python_local', or 'unknown') and serve directory inside workspace_dir."""
+    """Detect app_type ('static', 'python_local', or 'unknown'), entrypoint, and package module inside workspace_dir."""
     ws = Path(workspace_dir).resolve()
     if not ws.is_dir():
         return WorkspaceAppInfo(app_type="unknown")
 
     py_entry = _find_python_entrypoint(ws)
     if py_entry is not None:
-        return WorkspaceAppInfo(app_type="python_local", serve_dir=ws, entrypoint=py_entry)
+        module_name: str | None = None
+        pythonpath: Path | None = None
+        src_dir = (ws / "src").resolve()
+        if src_dir.is_dir() and py_entry.is_relative_to(src_dir):
+            rel_src = py_entry.relative_to(src_dir)
+            if len(rel_src.parts) >= 2 and (py_entry.parent / "__init__.py").is_file():
+                module_name = ".".join(rel_src.with_suffix("").parts)
+                pythonpath = src_dir
+        return WorkspaceAppInfo(
+            app_type="python_local",
+            serve_dir=ws,
+            entrypoint=py_entry,
+            module_name=module_name,
+            pythonpath=pythonpath,
+        )
 
     static_root = resolve_static_root(ws)
     if static_root is not None:
@@ -327,12 +457,23 @@ class LocalAppRunner:
             f"No free loopback ports available in {self.host}:{self.port_min}-{self.port_max}"
         )
 
-    def _build_env(self, *, port: int, app_type: str) -> dict[str, str]:
+    def _build_env(
+        self,
+        *,
+        port: int,
+        app_type: str,
+        pythonpath: Path | None = None,
+    ) -> dict[str, str]:
         clean = sanitize_subprocess_env()
         if app_type == "python_local":
             clean["PORT"] = str(port)
             clean["HOST"] = self.host
             clean["PYTHONUNBUFFERED"] = "1"
+            if pythonpath is not None:
+                existing_pp = clean.get("PYTHONPATH", "").strip()
+                clean["PYTHONPATH"] = (
+                    f"{pythonpath}{os.pathsep}{existing_pp}" if existing_pp else str(pythonpath)
+                )
         return clean
 
     def _redact(self, text: str) -> str:
@@ -390,11 +531,18 @@ class LocalAppRunner:
 
             port = self._allocate_free_port_locked()
             url = f"http://{self.host}:{port}"
-            sub_env = self._build_env(port=port, app_type=app_info.app_type)
+            sub_env = self._build_env(
+                port=port,
+                app_type=app_info.app_type,
+                pythonpath=app_info.pythonpath,
+            )
 
             if app_info.app_type == "static":
                 cmd = [sys.executable, "-m", "http.server", str(port), "--bind", self.host]
                 cwd = app_info.serve_dir
+            elif app_info.module_name:
+                cmd = [sys.executable, "-m", app_info.module_name]
+                cwd = ws_dir
             else:
                 assert app_info.entrypoint is not None
                 rel_entry = app_info.entrypoint.resolve().relative_to(ws_dir)
@@ -442,12 +590,13 @@ class LocalAppRunner:
             exit_code = proc.poll()
             if exit_code is not None:
                 if entry.stderr_thread is not None:
-                    entry.stderr_thread.join(timeout=0.5)
-                tail = " | ".join(entry.stderr_lines)
+                    entry.stderr_thread.join(timeout=1.0)
+                recent = list(entry.stderr_lines)[-8:]
+                tail = " | ".join(recent)
                 self.stop(project_id)
                 detail = self._redact(tail) if tail else f"exit code {exit_code}"
                 raise LocalAppError(
-                    f"Local app '{project_id}' exited prematurely ({detail})"
+                    f"La app local '{project_id}' se detuvo al iniciar (código {exit_code}): {detail}"
                 )
             try:
                 with socket.create_connection((self.host, port), timeout=0.2):

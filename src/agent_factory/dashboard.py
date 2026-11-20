@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import email.parser
+import email.policy
 import http.server
 import json
 import logging
@@ -30,8 +34,11 @@ from agent_factory.scaffold import TemplateScaffold
 from agent_factory.secrets import redact_secrets
 from agent_factory.telegram_bot import TelegramBotService, _slugify
 from agent_factory.workspace import (
+    LOGO_MIME_BY_EXT,
     SandboxViolationError,
     WorkspaceManager,
+    generate_project_logo_svg,
+    validate_and_sanitize_logo_bytes,
     workspace_nonempty_test_files,
 )
 
@@ -72,6 +79,7 @@ class DashboardController:
         bot_service: TelegramBotService | None = None,
         model_resolver: Any = None,
         local_runner: LocalAppRunner | None = None,
+        logos_dir: Path | None = None,
         secrets_to_redact: Sequence[str] = (),
     ) -> None:
         self.orchestrator = orchestrator
@@ -86,6 +94,20 @@ class DashboardController:
                 getattr(build_worker, "code_agent", None), "model_resolver", None
             )
         self.secrets_to_redact: tuple[str, ...] = tuple(secrets_to_redact)
+        if logos_dir is not None:
+            self.logos_dir = Path(logos_dir).resolve()
+        else:
+            db_path = getattr(orchestrator.store, "db_path", None)
+            if db_path and str(db_path) != ":memory:":
+                db_parent = Path(db_path).resolve().parent
+                repo_data_dir = Path("data").resolve()
+                self.logos_dir = (
+                    (repo_data_dir / "logos").resolve()
+                    if db_parent == repo_data_dir
+                    else (db_parent / "logos").resolve()
+                )
+            else:
+                self.logos_dir = Path("data/logos").resolve()
         effective_ws_mgr = self._resolve_workspace_manager() or getattr(
             orchestrator, "workspace_manager", None
         )
@@ -280,6 +302,34 @@ class DashboardController:
         except (SandboxViolationError, ValueError, OSError):
             return {"running": False, "url": None, "app_type": "unknown"}
 
+    def _find_custom_logo(self, project_id: str) -> tuple[Path, str] | None:
+        """Locate contained custom logo file for project_id in self.logos_dir (INV-22)."""
+        validate_project_id(project_id)
+        if not self.logos_dir.is_dir():
+            return None
+        for ext, mime in LOGO_MIME_BY_EXT.items():
+            cand = self.logos_dir / f"{project_id}.{ext}"
+            if cand.exists():
+                if cand.is_symlink():
+                    raise SandboxViolationError(f"Logo symlink rejected: {cand}")
+                resolved = cand.resolve()
+                if not resolved.is_relative_to(self.logos_dir):
+                    raise SandboxViolationError(f"Logo path escapes logos_dir: {resolved}")
+                if resolved.is_file():
+                    return resolved, mime
+        return None
+
+    def _logo_url_for(self, project_id: str) -> str:
+        base = f"/api/projects/{project_id}/logo"
+        try:
+            custom = self._find_custom_logo(project_id)
+            if custom is not None:
+                ver = custom[0].stat().st_mtime_ns // 1_000_000
+                return f"{base}?v={ver}"
+        except (SandboxViolationError, OSError, ValueError):
+            pass
+        return base
+
     def _serialize_summary(
         self,
         project_id: str,
@@ -298,6 +348,7 @@ class DashboardController:
         raw["busy"] = running
         raw["is_running"] = running
         raw["local_app"] = self._local_app_payload(project_id)
+        raw["logo_url"] = self._logo_url_for(project_id)
         raw.update(live_info)
         raw["last_event_at"] = last_event_at
         return _scrub_value(raw, self.secrets_to_redact)
@@ -335,6 +386,7 @@ class DashboardController:
                         "busy": running,
                         "is_running": running,
                         "local_app": {"running": False, "url": None, "app_type": "unknown"},
+                        "logo_url": f"/api/projects/{pid}/logo",
                         **live_info,
                         "last_event_at": None,
                     }
@@ -371,6 +423,7 @@ class DashboardController:
             "status": summary,
             "is_running": summary["is_running"],
             "local_app": summary["local_app"],
+            "logo_url": summary["logo_url"],
             "active_model": summary["active_model"],
             "active_stage": summary["active_stage"],
             "activity_summary": summary["activity_summary"],
@@ -656,6 +709,113 @@ class DashboardController:
             "project_id": project_id,
             "name": updated.name,
             "status": summary,
+        }
+
+    def suggest_project_title(self, project_id: str) -> dict[str, Any]:
+        """Inspect project workspace repo files and return 'Nombre - Descripción breve' suggestion."""
+        validate_project_id(project_id)
+        events = self.orchestrator.store.get_events(project_id)
+        if not events:
+            raise ProjectNotFoundError(f"Project '{project_id}' not found")
+        ws_mgr = self._resolve_workspace_manager() or getattr(
+            self.orchestrator, "workspace_manager", None
+        )
+        ws_dir: Path | None = None
+        if ws_mgr is not None:
+            candidate = ws_mgr.get_workspace_dir(project_id)
+            if candidate.is_dir():
+                ws_dir = candidate
+        suggested = self.orchestrator.suggest_title(
+            project_id,
+            workspace_dir=ws_dir,
+            extra_secrets=self.secrets_to_redact,
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "suggested_title": suggested,
+        }
+
+    def get_project_logo(self, project_id: str) -> tuple[str, bytes]:
+        """Return custom logo bytes+mime from logos_dir or auto-generated 64x64 domain SVG."""
+        validate_project_id(project_id)
+        events = self.orchestrator.store.get_events(project_id)
+        ws_mgr = self._resolve_workspace_manager() or getattr(
+            self.orchestrator, "workspace_manager", None
+        )
+        has_ws = ws_mgr is not None and ws_mgr.get_workspace_dir(project_id).is_dir()
+        if not events and not has_ws:
+            raise ProjectNotFoundError(f"Project '{project_id}' not found")
+
+        custom = self._find_custom_logo(project_id)
+        if custom is not None:
+            logo_path, mime = custom
+            return mime, logo_path.read_bytes()
+
+        title = project_id
+        objective = ""
+        if events:
+            try:
+                status = self.orchestrator.get_status(project_id)
+                title = status.name or project_id
+                objective = status.objective
+            except IllegalTransition:
+                first_pl = events[0].payload or {}
+                title = str(first_pl.get("name") or project_id)
+                objective = str(first_pl.get("objective") or "")
+        svg = generate_project_logo_svg(title, objective)
+        return "image/svg+xml; charset=utf-8", svg.encode("utf-8")
+
+    def upload_project_logo(
+        self,
+        project_id: str,
+        raw_bytes: bytes,
+        filename: str = "",
+    ) -> dict[str, Any]:
+        """Validate/sanitize uploaded SVG/PNG/JPG/WebP logo <=512KB, save under logos_dir, and copy into workspace."""
+        validate_project_id(project_id)
+        events = self.orchestrator.store.get_events(project_id)
+        ws_mgr = self._resolve_workspace_manager() or getattr(
+            self.orchestrator, "workspace_manager", None
+        )
+        ws_dir: Path | None = None
+        if ws_mgr is not None:
+            cand = ws_mgr.get_workspace_dir(project_id)
+            if cand.is_dir():
+                ws_dir = cand
+        if not events and ws_dir is None:
+            raise ProjectNotFoundError(f"Project '{project_id}' not found")
+
+        ext, mime, clean_bytes = validate_and_sanitize_logo_bytes(
+            raw_bytes, filename=filename
+        )
+        self.logos_dir.mkdir(parents=True, exist_ok=True)
+        for old_ext in LOGO_MIME_BY_EXT:
+            old_file = self.logos_dir / f"{project_id}.{old_ext}"
+            if old_ext != ext and old_file.is_file() and not old_file.is_symlink():
+                old_file.unlink()
+        target_path = (self.logos_dir / f"{project_id}.{ext}").resolve()
+        if not target_path.is_relative_to(self.logos_dir):
+            raise SandboxViolationError(f"Logo destination escapes logos_dir: {target_path}")
+        target_path.write_bytes(clean_bytes)
+
+        if ws_dir is not None and not ws_dir.is_symlink():
+            fav_target = ws_dir / f"favicon.{ext}"
+            if not fav_target.is_symlink():
+                fav_target.write_bytes(clean_bytes)
+            if ext == "svg":
+                for sub_name in ("src", "static", "public", "web"):
+                    sub_dir = ws_dir / sub_name
+                    if sub_dir.is_dir() and (sub_dir / "index.html").is_file():
+                        sub_fav = sub_dir / "favicon.svg"
+                        if not sub_fav.is_symlink():
+                            sub_fav.write_bytes(clean_bytes)
+
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "logo_url": self._logo_url_for(project_id),
+            "mime_type": mime,
         }
 
     def start_local_app(self, project_id: str) -> dict[str, Any]:
@@ -965,6 +1125,12 @@ class DashboardController:
 
             if ws_mgr is not None and had_workspace:
                 ws_mgr.remove_workspace(project_id)
+
+            if self.logos_dir.is_dir():
+                for ext in LOGO_MIME_BY_EXT:
+                    logo_f = self.logos_dir / f"{project_id}.{ext}"
+                    if logo_f.is_file() and not logo_f.is_symlink():
+                        logo_f.unlink()
 
         return {"ok": True, "deleted": project_id}
 
@@ -1587,8 +1753,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .title-row {
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 10px;
       flex-wrap: wrap;
+    }
+    .card-title-wrap {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+      flex: 1;
+    }
+    .card-logo {
+      width: 30px;
+      height: 30px;
+      border-radius: 8px;
+      object-fit: cover;
+      flex-shrink: 0;
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
+    }
+    .detail-logo {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      object-fit: cover;
+      flex-shrink: 0;
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
     }
     .btn-icon {
       border: 1px solid transparent;
@@ -1863,11 +2054,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="detail-header">
           <div class="detail-titles">
             <div class="title-row">
+              <img id="detail-logo-img" class="detail-logo" src="" alt="Logo del proyecto" style="display:none" />
               <h2 id="detail-title" class="detail-title"></h2>
               <button id="edit-title-btn" class="btn-icon" type="button" title="Editar título" aria-label="Editar título">✏️</button>
+              <button id="change-logo-btn" class="btn btn-sm" type="button" title="Subir logo propio">Cambiar logo</button>
+              <input id="logo-file-input" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" style="display:none" />
             </div>
             <form id="edit-title-form" class="edit-title-form" style="display:none">
               <input id="edit-title-input" class="input-field input-inline" type="text" maxlength="80" placeholder="Nombre del proyecto" required />
+              <button id="suggest-title-btn" class="btn btn-sm" type="button" title="Analizar archivos del repositorio y sugerir título">✨ Sugerir analizando repo</button>
               <button id="save-title-btn" class="btn btn-primary btn-sm" type="submit">Guardar</button>
               <button id="cancel-title-btn" class="btn btn-sm" type="button">Cancelar</button>
             </form>
@@ -2199,9 +2394,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const timeHtml = p.last_event_at
           ? '<div class="muted" style="font-size:0.75rem; margin-top:4px; text-align:right;" title="' + escapeHtml(p.last_event_at) + '">' + escapeHtml(formatFriendlyTime(p.last_event_at)) + '</div>'
           : '';
+        const logoUrl = escapeHtml(p.logo_url || ('/api/projects/' + encodeURIComponent(p.project_id) + '/logo'));
         return '<div class="project-card ' + selected + '" data-id="' + escapeHtml(p.project_id) + '">' +
           '<div class="card-header">' +
-            '<div class="card-title">' + title + statusTag + '</div>' +
+            '<div class="card-title-wrap">' +
+              '<img class="card-logo" src="' + logoUrl + '" alt="" />' +
+              '<div class="card-title">' + title + statusTag + '</div>' +
+            '</div>' +
             '<span class="badge ' + badgeCls + '">' + escapeHtml(info.cardStep || info.step) + '</span>' +
           '</div>' +
           renderStageSegments(info.stage, segMode) +
@@ -3044,6 +3243,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const info = stepInfo(st.state, events);
       const titleText = st.name || st.objective || st.project_id;
       document.getElementById('detail-title').textContent = titleText;
+      const detailLogoEl = document.getElementById('detail-logo-img');
+      if (detailLogoEl) {
+        const nextLogoSrc = st.logo_url || ('/api/projects/' + encodeURIComponent(st.project_id) + '/logo');
+        if (detailLogoEl.getAttribute('src') !== nextLogoSrc) {
+          detailLogoEl.setAttribute('src', nextLogoSrc);
+        }
+        detailLogoEl.style.display = 'block';
+      }
       if (state.editingTitlePid && state.editingTitlePid !== st.project_id) {
         const editForm = document.getElementById('edit-title-form');
         const editBtn = document.getElementById('edit-title-btn');
@@ -3555,6 +3762,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const editBtn = document.getElementById('edit-title-btn');
       const form = document.getElementById('edit-title-form');
       const input = document.getElementById('edit-title-input');
+      const suggestBtn = document.getElementById('suggest-title-btn');
       const saveBtn = document.getElementById('save-title-btn');
       const cancelBtn = document.getElementById('cancel-title-btn');
       if (!editBtn || !form || !input || !saveBtn || !cancelBtn) return;
@@ -3577,6 +3785,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       });
 
       cancelBtn.addEventListener('click', closeEditor);
+      if (suggestBtn) {
+        suggestBtn.addEventListener('click', async () => {
+          const pid = state.editingTitlePid || (state.detail && state.detail.project_id);
+          if (!pid) return;
+          suggestBtn.disabled = true;
+          try {
+            const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/suggest-title', {
+              method: 'POST',
+            });
+            if (res && res.suggested_title) {
+              input.value = res.suggested_title;
+              input.focus();
+              input.select();
+              setNote('Sugerencia generada analizando el repo. Puedes editarla o guardar.');
+            }
+          } catch (err) {
+            setNote('Error sugiriendo título: ' + err.message);
+          } finally {
+            suggestBtn.disabled = false;
+          }
+        });
+      }
       input.addEventListener('keydown', (ev) => {
         if (ev.key === 'Escape') {
           ev.preventDefault();
@@ -3608,6 +3838,50 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         } finally {
           saveBtn.disabled = false;
         }
+      });
+    })();
+
+    (function initLogoUpload() {
+      const btn = document.getElementById('change-logo-btn');
+      const fileInput = document.getElementById('logo-file-input');
+      if (!btn || !fileInput) return;
+
+      btn.addEventListener('click', () => {
+        if (!state.detail || !state.detail.project_id) return;
+        fileInput.value = '';
+        fileInput.click();
+      });
+
+      fileInput.addEventListener('change', () => {
+        const pid = state.detail && state.detail.project_id;
+        const file = fileInput.files && fileInput.files[0];
+        if (!pid || !file) return;
+        if (file.size > 512 * 1024) {
+          setNote('El archivo de logo supera el máximo de 512 KB.');
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = async () => {
+          try {
+            const result = String(reader.result || '');
+            const b64Idx = result.indexOf('base64,');
+            const b64 = b64Idx >= 0 ? result.slice(b64Idx + 7) : result;
+            const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/logo', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ filename: file.name || 'logo.png', data_base64: b64 }),
+            });
+            if (res && res.logo_url) {
+              const detailLogo = document.getElementById('detail-logo-img');
+              if (detailLogo) detailLogo.setAttribute('src', res.logo_url);
+            }
+            setNote('Logo actualizado.');
+            await loadProjects();
+          } catch (err) {
+            setNote('Error subiendo logo: ' + err.message);
+          }
+        };
+        reader.readAsDataURL(file);
       });
     })();
 
@@ -3727,6 +4001,64 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_bytes(self, status_code: int, content_type: str, body: bytes) -> None:
+        self.send_response(status_code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _extract_uploaded_logo_payload(self) -> tuple[bytes, str]:
+        raw_len = self.headers.get("Content-Length")
+        if not raw_len:
+            raise ValueError("Cuerpo vacío al subir logo.")
+        try:
+            length = int(raw_len)
+        except ValueError as exc:
+            raise ValueError("Invalid Content-Length header") from exc
+        if length <= 0:
+            raise ValueError("Cuerpo vacío al subir logo.")
+        if length > 2 * 1024 * 1024:
+            raise ValueError("El tamaño de la petición supera el máximo permitido (512 KB imagen).")
+
+        content_type = str(self.headers.get("Content-Type", "")).strip()
+        if "multipart/form-data" in content_type.lower():
+            raw_bytes = self.rfile.read(length)
+            msg = email.parser.BytesParser(policy=email.policy.default).parsebytes(
+                f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("latin-1")
+                + raw_bytes
+            )
+            if msg.is_multipart():
+                for part in msg.iter_parts():
+                    fn = part.get_filename()
+                    disp = str(part.get("Content-Disposition", ""))
+                    if fn or "filename=" in disp or part.get_content_maintype() == "image":
+                        payload = part.get_payload(decode=True) or b""
+                        return payload, str(fn or "")
+            raise ValueError("No se encontró archivo de imagen válido en multipart/form-data.")
+
+        raw_bytes = self.rfile.read(length)
+        try:
+            parsed = json.loads(raw_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Invalid JSON request body") from exc
+        if not isinstance(parsed, dict):
+            raise TypeError("JSON request body must be an object")
+
+        raw_b64 = parsed.get("data_base64")
+        if not isinstance(raw_b64, str) or not raw_b64.strip():
+            raise ValueError("El campo 'data_base64' es obligatorio.")
+        b64_clean = raw_b64.strip()
+        if "base64," in b64_clean[:64]:
+            b64_clean = b64_clean.split("base64,", 1)[1].strip()
+        try:
+            decoded = base64.b64decode(b64_clean, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("Codificación base64 inválida para el logo.") from exc
+        filename = str(parsed.get("filename") or "").strip()
+        return decoded, filename
+
     def _drain_body(self) -> None:
         raw_len = self.headers.get("Content-Length")
         if raw_len:
@@ -3790,6 +4122,8 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             "stop",
             "modify",
             "title",
+            "suggest-title",
+            "logo",
         }:
             return urllib.parse.unquote(parts[0]), parts[1]
         # Reject multi-segment or path-traversal attempts (e.g., ../etc) as invalid project_id
@@ -3808,6 +4142,18 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         pid, action = self._parse_project_route()
+        if pid is not None and action == "logo":
+            try:
+                mime, data = ctrl.get_project_logo(pid)
+            except (ValueError, SandboxViolationError) as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            except ProjectNotFoundError as exc:
+                self._send_json(404, {"error": str(exc)})
+                return
+            self._send_bytes(200, mime, data)
+            return
+
         if pid is not None and action is None:
             try:
                 detail = ctrl.get_project_detail(pid)
@@ -3841,7 +4187,16 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         pid, action = self._parse_project_route()
-        if pid is None or action not in {"approve", "retry", "message", "start", "stop", "modify"}:
+        if pid is None or action not in {
+            "approve",
+            "retry",
+            "message",
+            "start",
+            "stop",
+            "modify",
+            "suggest-title",
+            "logo",
+        }:
             self._drain_body()
             self._send_json(404, {"error": "Endpoint not found"})
             return
@@ -3866,11 +4221,17 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
                 body = self._read_json_body()
                 instructions = self._require_str_field(body, "instructions")
                 result = ctrl.modify_project(pid, instructions)
+            elif action == "suggest-title":
+                self._drain_body()
+                result = ctrl.suggest_project_title(pid)
+            elif action == "logo":
+                raw_logo, filename = self._extract_uploaded_logo_payload()
+                result = ctrl.upload_project_logo(pid, raw_logo, filename=filename)
             else:
                 body = self._read_json_body()
                 message = self._require_str_field(body, "message")
                 result = ctrl.send_message(pid, message)
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError, SandboxViolationError) as exc:
             self._send_json(400, {"error": str(exc)})
             return
         except ProjectNotFoundError as exc:
@@ -3894,7 +4255,7 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             body = self._read_json_body()
             title = self._require_str_field(body, "title")
             result = ctrl.rename_project(pid, title)
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError, SandboxViolationError) as exc:
             self._send_json(400, {"error": str(exc)})
             return
         except ProjectNotFoundError as exc:
@@ -3940,6 +4301,7 @@ def start_dashboard_server(
     bot_service: TelegramBotService | None = None,
     model_resolver: Any = None,
     local_runner: LocalAppRunner | None = None,
+    logos_dir: Path | None = None,
     secrets_to_redact: Sequence[str] = (),
 ) -> tuple[DashboardHTTPServer, threading.Thread, str]:
     """Create and start DashboardHTTPServer on 127.0.0.1:<port> in a daemon thread."""
@@ -3951,6 +4313,7 @@ def start_dashboard_server(
         bot_service=bot_service,
         model_resolver=model_resolver,
         local_runner=local_runner,
+        logos_dir=logos_dir,
         secrets_to_redact=secrets_to_redact,
     )
     server = DashboardHTTPServer((LOOPBACK_HOST, port), controller)

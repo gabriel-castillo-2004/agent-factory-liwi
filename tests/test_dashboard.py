@@ -2158,3 +2158,255 @@ def test_dashboard_post_delivery_modify_workflow_preserves_workspace_and_updates
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_suggest_title_analyzes_repo_and_ui_hook(tmp_path: Path) -> None:
+    """POST /api/projects/<id>/suggest-title inspects real workspace files, emits creative 'Nombre - Descripción' <=65 chars, redacts secrets (INV-19), and wires UI button."""
+    store = SqliteEventStore(str(tmp_path / "suggest_title.db"))
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_suggest")
+    pid = "musica-repo-test"
+    now = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
+    secret_tok = "TEST_SUGGEST_SECRET_777"
+
+    store.append(
+        create_event(
+            pid,
+            EventType.PROJECT_CREATED,
+            {
+                "name": "Aplicación de música",
+                "objective": "App local para descargar y escuchar canciones favoritas",
+                "state": "INTERVIEW",
+            },
+            at=now,
+        )
+    )
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / "README.md").write_text(
+        "# Musiquita\n\nApp web para descargar y escuchar música sin anuncios.\n",
+        encoding="utf-8",
+    )
+    (ws_dir / "src").mkdir()
+    (ws_dir / "src" / "app.py").write_text(
+        f'"""Musiquita server token={secret_tok}."""\nfrom http.server import ThreadingHTTPServer\n',
+        encoding="utf-8",
+    )
+
+    orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        workspace_manager=ws_mgr,
+        secrets_to_redact=(secret_tok,),
+    )
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            html = html_resp.read().decode("utf-8")
+        assert "Sugerir analizando repo" in html
+        assert "/suggest-title" in html
+
+        assert _http_json(f"{base_url}/api/projects/no-existe-sug/suggest-title", method="POST")[0] == 404
+        assert _http_json(f"{base_url}/api/projects/Bad%20ID!/suggest-title", method="POST")[0] == 400
+
+        code, res = _http_json(f"{base_url}/api/projects/{pid}/suggest-title", method="POST")
+        assert code == 200
+        assert res["ok"] is True
+        suggested = res["suggested_title"]
+        assert " - " in suggested
+        short_name, short_desc = suggested.split(" - ", 1)
+        assert len(short_name.strip()) >= 2
+        assert len(short_desc.strip()) >= 5
+        assert len(suggested) <= 65
+        assert "Musiquita" in short_name
+        assert secret_tok not in suggested
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_logo_auto_svg_and_custom_upload_sanitization(tmp_path: Path) -> None:
+    """GET /logo serves auto-generated domain-adapted 64x64 SVG by default; POST /logo validates magic bytes/size <=512KB, blocks SVG XSS (<script>, onload=, javascript:), persists valid SVG/PNG in logos_dir & workspace, and UI exposes Cambiar logo."""
+    import base64
+
+    store = SqliteEventStore(str(tmp_path / "logos_dash.db"))
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_logos")
+    logos_dir = tmp_path / "custom_logos"
+    now = datetime(2026, 11, 20, 12, 5, tzinfo=UTC)
+
+    pid_music = "logo-musica"
+    store.append(
+        create_event(
+            pid_music,
+            EventType.PROJECT_CREATED,
+            {
+                "name": "Musiquita - Reproductor de audio",
+                "objective": "Escuchar música MP3 y gestionar playlists",
+                "state": "INTERVIEW",
+            },
+            at=now,
+        )
+    )
+    ws_music = ws_mgr.create_workspace(pid_music)
+    (ws_music / "index.html").write_text("<h1>Hola</h1>\n", encoding="utf-8")
+
+    pid_timer = "logo-timer"
+    store.append(
+        create_event(
+            pid_timer,
+            EventType.PROJECT_CREATED,
+            {
+                "name": "Pomodoro Foco",
+                "objective": "Temporizador de intervalos de estudio",
+                "state": "INTERVIEW",
+            },
+            at=now,
+        )
+    )
+
+    orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        workspace_manager=ws_mgr,
+        logos_dir=logos_dir,
+    )
+    try:
+        # 1. UI exposes logo thumbnail hooks + Cambiar logo uploader
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            html = html_resp.read().decode("utf-8")
+        assert "Cambiar logo" in html
+        assert "logo-file-input" in html
+        assert "/logo" in html
+
+        # 2. Default GET /logo returns clean 64x64 domain-adapted SVG (distinct per domain)
+        with urllib.request.urlopen(f"{base_url}/api/projects/{pid_music}/logo", timeout=5.0) as r1:
+            assert r1.status == 200
+            assert "image/svg+xml" in r1.headers.get("Content-Type", "")
+            svg_music = r1.read().decode("utf-8")
+        assert "<svg" in svg_music
+        assert 'viewBox="0 0 64 64"' in svg_music
+        assert "<script" not in svg_music.lower()
+
+        with urllib.request.urlopen(f"{base_url}/api/projects/{pid_timer}/logo", timeout=5.0) as r2:
+            assert r2.status == 200
+            svg_timer = r2.read().decode("utf-8")
+        assert "<svg" in svg_timer
+        assert svg_music != svg_timer
+
+        # 3. Security validations on POST /logo
+        for bad_svg in (
+            b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
+            b'<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"><circle r="10"/></svg>',
+            b'<svg xmlns="http://www.w3.org/2000/svg"><a href="javascript:alert(1)">x</a></svg>',
+        ):
+            bad_code, _ = _http_json(
+                f"{base_url}/api/projects/{pid_music}/logo",
+                method="POST",
+                body={
+                    "filename": "evil.svg",
+                    "data_base64": base64.b64encode(bad_svg).decode("ascii"),
+                },
+            )
+            assert bad_code == 400
+
+        # Reject oversized payload > 512 KB
+        too_big = b"\x89PNG\r\n\x1a\n" + (b"0" * (512 * 1024 + 1))
+        big_code, _ = _http_json(
+            f"{base_url}/api/projects/{pid_music}/logo",
+            method="POST",
+            body={
+                "filename": "big.png",
+                "data_base64": base64.b64encode(too_big).decode("ascii"),
+            },
+        )
+        assert big_code == 400
+
+        # Reject spoofed magic header
+        fake_code, _ = _http_json(
+            f"{base_url}/api/projects/{pid_music}/logo",
+            method="POST",
+            body={
+                "filename": "fake.png",
+                "data_base64": base64.b64encode(b"NOT_A_PNG_FILE").decode("ascii"),
+            },
+        )
+        assert fake_code == 400
+
+        # 4. Upload valid clean SVG -> saved in logos_dir and copied as workspace favicon.svg
+        clean_svg = b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><circle cx="32" cy="32" r="24" fill="#38bdf8"/></svg>'
+        up_svg_code, up_svg_res = _http_json(
+            f"{base_url}/api/projects/{pid_music}/logo",
+            method="POST",
+            body={
+                "filename": "brand.svg",
+                "data_base64": base64.b64encode(clean_svg).decode("ascii"),
+            },
+        )
+        assert up_svg_code == 200
+        assert up_svg_res["ok"] is True
+        assert (logos_dir / f"{pid_music}.svg").read_bytes() == clean_svg
+        assert (ws_music / "favicon.svg").read_bytes() == clean_svg
+
+        # 5. Upload valid PNG -> replaces old SVG custom logo, served with image/png & copied to workspace
+        valid_png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
+        up_png_code, _ = _http_json(
+            f"{base_url}/api/projects/{pid_music}/logo",
+            method="POST",
+            body={
+                "filename": "icon.png",
+                "data_base64": base64.b64encode(valid_png).decode("ascii"),
+            },
+        )
+        assert up_png_code == 200
+        assert not (logos_dir / f"{pid_music}.svg").exists()
+        assert (logos_dir / f"{pid_music}.png").read_bytes() == valid_png
+        assert (ws_music / "favicon.png").read_bytes() == valid_png
+
+        with urllib.request.urlopen(f"{base_url}/api/projects/{pid_music}/logo", timeout=5.0) as r_png:
+            assert r_png.status == 200
+            assert r_png.headers.get("Content-Type", "").startswith("image/png")
+            assert r_png.read() == valid_png
+
+        # 6. Upload valid WebP via multipart/form-data -> accepted and served with image/webp
+        valid_webp = b"RIFF\x14\x00\x00\x00WEBPVP8 \x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        boundary = "----AgentFactoryBoundary987"
+        mp_body = (
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="logo"; filename="custom.webp"\r\n'
+                f"Content-Type: image/webp\r\n\r\n"
+            ).encode()
+            + valid_webp
+            + f"\r\n--{boundary}--\r\n".encode()
+        )
+        mp_req = urllib.request.Request(
+            f"{base_url}/api/projects/{pid_music}/logo",
+            data=mp_body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(mp_req, timeout=5.0) as mp_resp:
+            assert mp_resp.status == 200
+            mp_json = json.loads(mp_resp.read().decode("utf-8"))
+        assert mp_json["mime_type"] == "image/webp"
+        assert (logos_dir / f"{pid_music}.webp").read_bytes() == valid_webp
+        assert not (logos_dir / f"{pid_music}.png").exists()
+
+        # Summary list/detail expose logo_url
+        _, list_data = _http_json(f"{base_url}/api/projects")
+        music_item = next(p for p in list_data["projects"] if p["project_id"] == pid_music)
+        assert music_item["logo_url"].startswith(f"/api/projects/{pid_music}/logo")
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+

@@ -1976,6 +1976,173 @@ def test_build_worker_http_smoke_test_detects_missing_404_asset_and_recovers_aft
         local_runner.stop_all()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_local_app_runner_deep_detects_nested_python_package_module_and_static_subdirs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """detect_workspace_app finds nested package servers (src/<pkg>/server.py -> python -m <pkg>.server with PYTHONPATH=src), __main__ web files outside tests/, public/index.html, and reports redacted startup stderr cleanly."""
+    import json
+    import urllib.request
+
+    from agent_factory.runtime_runner import LocalAppError, LocalAppRunner, detect_workspace_app
+
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_deep")
+
+    # 1. Nested Python package src/mi_app/server.py even with empty root template index.html
+    pid_pkg = "proj-nested-pkg"
+    ws_pkg = ws_mgr.create_workspace(pid_pkg)
+    (ws_pkg / "index.html").write_text(
+        "<!DOCTYPE html><html><head><title>Static Web App</title></head>"
+        "<body><main id='app'></main><script type='module' src='./src/app.js'></script></body></html>\n",
+        encoding="utf-8",
+    )
+    (ws_pkg / "tests").mkdir()
+    (ws_pkg / "tests" / "test_server.py").write_text(
+        "if __name__ == '__main__':\n    from http.server import HTTPServer\n",
+        encoding="utf-8",
+    )
+    pkg_dir = ws_pkg / "src" / "mi_app"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+    (pkg_dir / "helper.py").write_text("GREETING = 'Hola desde mi_app'\n", encoding="utf-8")
+    (pkg_dir / "server.py").write_text(
+        "import http.server, json, os\n"
+        "from mi_app.helper import GREETING\n"
+        "host = os.environ['HOST']\n"
+        "port = int(os.environ['PORT'])\n"
+        "class H(http.server.BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        body = json.dumps({'msg': GREETING}).encode()\n"
+        "        self.send_response(200)\n"
+        "        self.send_header('Content-Type', 'application/json')\n"
+        "        self.send_header('Content-Length', str(len(body)))\n"
+        "        self.end_headers()\n"
+        "        self.wfile.write(body)\n"
+        "    def log_message(self, *args):\n"
+        "        pass\n"
+        "if __name__ == '__main__':\n"
+        "    http.server.ThreadingHTTPServer((host, port), H).serve_forever()\n",
+        encoding="utf-8",
+    )
+
+    info_pkg = detect_workspace_app(ws_pkg)
+    assert info_pkg.app_type == "python_local"
+    assert info_pkg.entrypoint is not None
+    assert info_pkg.entrypoint.resolve() == (pkg_dir / "server.py").resolve()
+    assert info_pkg.module_name == "mi_app.server"
+
+    runner = LocalAppRunner(workspace_manager=ws_mgr)
+    try:
+        st = runner.start(pid_pkg)
+        assert st.running is True
+        assert st.app_type == "python_local"
+        assert st.url is not None
+        with urllib.request.urlopen(st.url, timeout=5.0) as resp:
+            assert resp.status == 200
+            data = json.loads(resp.read().decode("utf-8"))
+        assert data == {"msg": "Hola desde mi_app"}
+    finally:
+        runner.stop_all()
+
+    # 2. __main__ server file in custom subdir (ignoring tests/ & .venv/)
+    pid_main = "proj-deep-main"
+    ws_main = ws_mgr.create_workspace(pid_main)
+    (ws_main / "tests").mkdir()
+    (ws_main / "tests" / "test_fake.py").write_text(
+        "from http.server import HTTPServer\nif __name__ == '__main__': pass\n", encoding="utf-8"
+    )
+    (ws_main / "web_app").mkdir()
+    (ws_main / "web_app" / "portal.py").write_text(
+        "from http.server import ThreadingHTTPServer\nif __name__ == '__main__':\n    pass\n",
+        encoding="utf-8",
+    )
+    info_main = detect_workspace_app(ws_main)
+    assert info_main.app_type == "python_local"
+    assert info_main.entrypoint == (ws_main / "web_app" / "portal.py").resolve()
+
+    # 3. Deep static index.html in public/ overriding untouched template root
+    pid_pub = "proj-public-static"
+    ws_pub = ws_mgr.create_workspace(pid_pub)
+    (ws_pub / "index.html").write_text(
+        "<html><head><title>Static Web App</title></head>"
+        "<body><main id='app'></main><script type='module' src='./src/app.js'></script></body></html>\n",
+        encoding="utf-8",
+    )
+    (ws_pub / "public").mkdir()
+    (ws_pub / "public" / "index.html").write_text("<h1>Public App</h1>\n", encoding="utf-8")
+    info_pub = detect_workspace_app(ws_pub)
+    assert info_pub.app_type == "static"
+    assert info_pub.serve_dir == (ws_pub / "public").resolve()
+
+    # 4. Immediate Python startup crash captures redacted stderr cleanly
+    secret_val = "TEST_ERR_SECRET_445"
+    monkeypatch.setenv("GITHUB_TOKEN", secret_val)
+    pid_crash = "proj-py-crash"
+    ws_crash = ws_mgr.create_workspace(pid_crash)
+    (ws_crash / "app.py").write_text(
+        f"import sys\nsys.stderr.write('secret={secret_val}\\n')\nimport missing_yt_dlp_mod\n",
+        encoding="utf-8",
+    )
+    runner_err = LocalAppRunner(workspace_manager=ws_mgr, secrets_to_redact=(secret_val,))
+    with pytest.raises(LocalAppError) as crash_err:
+        runner_err.start(pid_crash)
+    err_str = str(crash_err.value)
+    assert "missing_yt_dlp_mod" in err_str
+    assert secret_val not in err_str
+
+
+def test_build_worker_writes_favicon_svg_without_overwriting_existing_one(
+    tmp_path: Path,
+) -> None:
+    """BuildWorker writes auto-generated favicon.svg if missing before push, and preserves any custom favicon already in workspace."""
+    # Case A: Missing favicon -> generated automatically with music icon SVG
+    pid_a = "proj-auto-fav"
+    orch_a, _ = _create_approved_project(pid_a, num_tests=1, approve=True)
+    ws_mgr_a = WorkspaceManager(base_dir=tmp_path / "ws_fav_a")
+    worker_a = BuildWorker(
+        orchestrator=orch_a,
+        workspace_manager=ws_mgr_a,
+        code_agent=FakeCodeAgent(
+            test_gen_steps=[{"tests/test_app.py": "def test_ok(): assert True\n"}],
+            impl_steps=[{"index.html": "<h1>Musiquita</h1>\n"}],
+        ),
+        runner=FakeRunner(
+            results=[CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True})]
+        ),
+        vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
+    )
+    worker_a.run_job(pid_a)
+    assert orch_a.get_status(pid_a).state == ProjectState.DELIVERED
+    fav_a = ws_mgr_a.get_workspace_dir(pid_a) / "favicon.svg"
+    assert fav_a.is_file()
+    fav_txt = fav_a.read_text(encoding="utf-8")
+    assert "<svg" in fav_txt
+    assert 'viewBox="0 0 64 64"' in fav_txt
+    assert "<script" not in fav_txt.lower()
+
+    # Case B: Existing custom favicon.svg -> preserved untouched
+    pid_b = "proj-keep-fav"
+    orch_b, _ = _create_approved_project(pid_b, num_tests=1, approve=True)
+    ws_mgr_b = WorkspaceManager(base_dir=tmp_path / "ws_fav_b")
+    custom_fav = '<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>\n'
+    worker_b = BuildWorker(
+        orchestrator=orch_b,
+        workspace_manager=ws_mgr_b,
+        code_agent=FakeCodeAgent(
+            test_gen_steps=[{"tests/test_app.py": "def test_ok(): assert True\n"}],
+            impl_steps=[{"index.html": "<h1>App</h1>\n", "favicon.svg": custom_fav}],
+        ),
+        runner=FakeRunner(
+            results=[CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True})]
+        ),
+        vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
+    )
+    worker_b.run_job(pid_b)
+    assert (ws_mgr_b.get_workspace_dir(pid_b) / "favicon.svg").read_text(encoding="utf-8") == custom_fav
+
+
 
 
 

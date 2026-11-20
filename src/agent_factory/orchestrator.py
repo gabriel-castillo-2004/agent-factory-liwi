@@ -1,5 +1,6 @@
 """State machine orchestrator, approval gate, and circuit breaker (INV-05, INV-17)."""
 
+import json
 import logging
 import re
 import threading
@@ -126,6 +127,294 @@ def synthesize_project_title(prompt: str, max_len: int = 55) -> str:
     if candidate and candidate[0].islower():
         candidate = candidate[0].upper() + candidate[1:]
     return candidate[:max_len]
+
+
+_REPO_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_REPO_H1_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.IGNORECASE | re.DOTALL)
+_REPO_META_DESC_RE = re.compile(
+    r"""<meta[^>]+name=["']description["'][^>]+content=["'](.*?)["']""",
+    re.IGNORECASE | re.DOTALL,
+)
+_PY_DOCSTRING_RE = re.compile(r'^\s*(?:"""(.*?)"""|\'\'\'(.*?)\'\'\')', re.DOTALL)
+_GENERIC_APP_TITLES: frozenset[str] = frozenset(
+    {
+        "static web app",
+        "agent factory",
+        "agent-factory-app",
+        "app",
+        "web app",
+        "index",
+        "document",
+        "home",
+        "proyecto",
+        "nuevo proyecto",
+    }
+)
+
+
+def _read_contained_text_snippet(
+    file_path: Path,
+    workspace_dir: Path,
+    *,
+    max_bytes: int = 8192,
+    extra_secrets: Sequence[str] = (),
+) -> str:
+    """Safely read up to max_bytes UTF-8 from file_path strictly inside workspace_dir (INV-19, INV-22)."""
+    ws_resolved = workspace_dir.resolve()
+    if not file_path.exists() or file_path.is_symlink():
+        return ""
+    resolved = file_path.resolve()
+    if resolved != ws_resolved and not resolved.is_relative_to(ws_resolved):
+        return ""
+    if not resolved.is_file():
+        return ""
+    try:
+        raw = resolved.read_bytes()[:max_bytes].decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    return redact_secrets(raw, extra_secrets=extra_secrets)
+
+
+def _clean_short_brand(raw_name: str, max_len: int = 22) -> str:
+    """Extract a crisp 1-2 word friendly brand name without separator dashes."""
+    cleaned = _CTRL_CHARS_RE.sub(" ", str(raw_name or "")).replace(" - ", " ")
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = " ".join(cleaned.split()).strip(" .,:;-_#*`\"'")
+    if not cleaned or cleaned.lower() in _GENERIC_APP_TITLES:
+        return ""
+    cleaned = _LEADING_FILLER_RE.sub("", cleaned).strip(" .,:;-_#*`\"'")
+    words = [w.strip(",.:;()[]") for w in cleaned.split() if w.strip(",.:;()[]")]
+    picked: list[str] = []
+    for word in words[:3]:
+        trial = " ".join([*picked, word])
+        if len(trial) > max_len:
+            break
+        picked.append(word)
+        if len(picked) == 2:
+            break
+    out = " ".join(picked) if picked else (words[0][:max_len] if words else "")
+    if out and out[0].islower():
+        out = out[0].upper() + out[1:]
+    return out
+
+
+def suggest_title_from_repo(
+    workspace_dir: Path | None,
+    *,
+    current_name: str = "",
+    objective: str = "",
+    plan_summary: str = "",
+    extra_secrets: Sequence[str] = (),
+    max_len: int = 65,
+) -> str:
+    """Analyze workspace files, objective, and plan to suggest 'Nombre - Descripción breve' <= 65 chars (INV-19)."""
+    readme_heading = ""
+    readme_desc = ""
+    html_title = ""
+    html_desc = ""
+    pkg_name = ""
+    pkg_desc = ""
+    py_doc = ""
+    py_combined = ""
+
+    if workspace_dir is not None and workspace_dir.is_dir():
+        ws = workspace_dir.resolve()
+        for readme_name in ("README.md", "README.txt", "readme.md"):
+            txt = _read_contained_text_snippet(
+                ws / readme_name, ws, extra_secrets=extra_secrets
+            )
+            if not txt:
+                continue
+            for line in txt.splitlines():
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith("#") and not readme_heading:
+                    readme_heading = stripped.lstrip("#").strip()
+                elif not stripped.startswith(("#", "!", "[", "```")) and not readme_desc:
+                    readme_desc = stripped
+                if readme_heading and readme_desc:
+                    break
+            break
+
+        pkg_txt = _read_contained_text_snippet(
+            ws / "package.json", ws, extra_secrets=extra_secrets
+        )
+        if pkg_txt:
+            try:
+                pkg = json.loads(pkg_txt)
+                if isinstance(pkg, dict):
+                    raw_pn = str(pkg.get("name", "")).strip()
+                    if raw_pn and raw_pn.lower() not in _GENERIC_APP_TITLES:
+                        pkg_name = raw_pn.replace("-", " ").replace("_", " ").strip()
+                    pkg_desc = str(pkg.get("description", "")).strip()
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        for html_rel in (
+            "src/index.html",
+            "public/index.html",
+            "web/index.html",
+            "static/index.html",
+            "index.html",
+        ):
+            html_txt = _read_contained_text_snippet(
+                ws / html_rel, ws, extra_secrets=extra_secrets
+            )
+            if not html_txt:
+                continue
+            m_t = _REPO_TITLE_RE.search(html_txt)
+            if m_t:
+                t_val = " ".join(m_t.group(1).split()).strip()
+                if t_val and t_val.lower() not in _GENERIC_APP_TITLES and not html_title:
+                    html_title = t_val
+            m_h1 = _REPO_H1_RE.search(html_txt)
+            if m_h1:
+                h_val = " ".join(re.sub(r"<[^>]+>", " ", m_h1.group(1)).split()).strip()
+                if h_val and h_val.lower() not in _GENERIC_APP_TITLES and not html_title:
+                    html_title = h_val
+            m_desc = _REPO_META_DESC_RE.search(html_txt)
+            if m_desc and not html_desc:
+                html_desc = " ".join(m_desc.group(1).split()).strip()
+            if html_title:
+                break
+
+        py_snippets: list[str] = []
+        skip_dirs = {".git", "tests", "__pycache__", ".venv", "venv", "node_modules"}
+        for py_path in sorted(ws.rglob("*.py")):
+            rel_parts = py_path.relative_to(ws).parts
+            if len(rel_parts) > 3 or any(part in skip_dirs for part in rel_parts):
+                continue
+            if py_path.name.startswith("test_") or py_path.name == "conftest.py":
+                continue
+            py_txt = _read_contained_text_snippet(
+                py_path, ws, max_bytes=4096, extra_secrets=extra_secrets
+            )
+            if not py_txt:
+                continue
+            py_snippets.append(py_txt)
+            if not py_doc:
+                m_doc = _PY_DOCSTRING_RE.match(py_txt)
+                if m_doc:
+                    raw_doc = (m_doc.group(1) or m_doc.group(2) or "").strip()
+                    first_doc_line = raw_doc.splitlines()[0].strip() if raw_doc else ""
+                    if first_doc_line and first_doc_line.lower() not in _GENERIC_APP_TITLES:
+                        py_doc = first_doc_line
+            if len(py_snippets) >= 6:
+                break
+        py_combined = "\n".join(py_snippets).lower()
+
+    # 1. Pick short creative brand name
+    brand = ""
+    for candidate_name in (readme_heading, html_title, pkg_name, current_name):
+        brand = _clean_short_brand(candidate_name)
+        if brand:
+            break
+
+    context_all = " ".join(
+        part
+        for part in (
+            readme_heading,
+            readme_desc,
+            html_title,
+            html_desc,
+            pkg_desc,
+            py_doc,
+            objective,
+            plan_summary,
+            current_name,
+        )
+        if part
+    )
+    low_ctx = f"{context_all.lower()} {py_combined}"
+    if not brand:
+        if any(w in low_ctx for w in ("music", "músic", "cancion", "canción", "audio", "mp3", "yt_dlp", "yt-dlp")):
+            brand = "Musiquita"
+        elif any(w in low_ctx for w in ("pomodoro", "temporizador", "timer")):
+            brand = "Pomodoro"
+        elif any(w in low_ctx for w in ("nota", "diario", "journal", "markdown")):
+            brand = "Bitácora"
+        elif any(w in low_ctx for w in ("gasto", "presupuesto", "finanza")):
+            brand = "Finanzas"
+        else:
+            brand = _clean_short_brand(synthesize_project_title(objective or "MiApp", max_len=20)) or "MiApp"
+
+    # 2. Pick concise friendly description from repo evidence -> objective -> domain cues
+    desc_source = ""
+    for cand_desc in (readme_desc, html_desc, pkg_desc, objective, plan_summary, py_doc):
+        clean_cand = _CTRL_CHARS_RE.sub(" ", str(cand_desc or "")).strip()
+        if not clean_cand or clean_cand.lower() in _GENERIC_APP_TITLES:
+            continue
+        desc_source = clean_cand
+        break
+
+    if not desc_source:
+        if "yt_dlp" in low_ctx or "yt-dlp" in low_ctx or "music" in low_ctx or "músic" in low_ctx:
+            desc_source = "App para descargar y escuchar música"
+        elif "pomodoro" in low_ctx or "temporizador" in low_ctx:
+            desc_source = "Temporizador minimalista para enfocarse"
+        else:
+            desc_source = "Aplicación web interactiva local"
+
+    desc = redact_secrets(desc_source, extra_secrets=extra_secrets)
+    desc = " ".join(desc.split()).strip(" .,-:;")
+    desc = _LEADING_FILLER_RE.sub("", desc).strip(" .,-:;")
+    # Strip duplicated leading brand from description
+    if brand and desc.lower().startswith(brand.lower() + " "):
+        trimmed = desc[len(brand) :].strip(" .,-:;")
+        if len(trimmed) >= 6:
+            desc = trimmed
+    if not desc:
+        desc = "Aplicación lista para usar"
+    if desc[0].islower():
+        desc = desc[0].upper() + desc[1:]
+
+    sep = " - "
+    max_desc_len = max(8, max_len - len(brand) - len(sep))
+    if len(desc) > max_desc_len:
+        for clause_sep in (". ", "; ", ", "):
+            idx = desc.find(clause_sep, 12)
+            if 10 <= idx <= max_desc_len:
+                desc = desc[:idx].strip(" .,-:;")
+                break
+    if len(desc) > max_desc_len:
+        words = desc.split()
+        acc: list[str] = []
+        for w in words:
+            trial = " ".join([*acc, w])
+            if len(trial) > max_desc_len:
+                break
+            acc.append(w)
+        desc = " ".join(acc).strip(" .,-:;") if acc else desc[:max_desc_len].strip()
+        tail_words = desc.split()
+        if len(tail_words) >= 3 and tail_words[-1].lower() in {
+            "de",
+            "del",
+            "la",
+            "el",
+            "en",
+            "con",
+            "sin",
+            "para",
+            "por",
+            "a",
+            "y",
+            "e",
+            "o",
+            "the",
+            "for",
+            "with",
+            "of",
+            "to",
+            "and",
+        }:
+            desc = " ".join(tail_words[:-1]).strip(" .,-:;")
+
+    combined = f"{brand}{sep}{desc}"
+    redacted = redact_secrets(combined, extra_secrets=extra_secrets)
+    if len(redacted) > max_len:
+        redacted = redacted[:max_len].rstrip(" .,-:;")
+    return redacted
 
 
 class ApprovalError(Exception):
@@ -392,6 +681,33 @@ class Orchestrator:
                 )
             )
             return self.get_status(project_id)
+
+    def suggest_title(
+        self,
+        project_id: str,
+        *,
+        workspace_dir: Path | None = None,
+        extra_secrets: Sequence[str] = (),
+    ) -> str:
+        """Analyze workspace repo files, objective, and plan to suggest 'Nombre - Descripción breve'."""
+        validate_project_id(project_id)
+        events = self.store.get_events(project_id)
+        if not events:
+            raise ValueError(f"Project '{project_id}' does not exist")
+        status = self.get_status(project_id)
+        plan = self.get_plan(project_id)
+        eff_ws = workspace_dir
+        if eff_ws is None and self.workspace_manager is not None:
+            candidate_ws = self.workspace_manager.get_workspace_dir(project_id)
+            if candidate_ws.is_dir():
+                eff_ws = candidate_ws
+        return suggest_title_from_repo(
+            eff_ws,
+            current_name=status.name,
+            objective=status.objective,
+            plan_summary=plan.summary if plan is not None else "",
+            extra_secrets=extra_secrets,
+        )
 
     def modify_project(self, project_id: str, instructions: str) -> ProjectStatus:
         """Transition a DELIVERED project legally via CHANGE_REQUEST to BUILDING preserving workspace (INV-04, INV-05)."""

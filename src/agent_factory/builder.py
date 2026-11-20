@@ -35,6 +35,7 @@ from agent_factory.workspace import (
     TestLockSnapshot,
     WorkspaceManager,
     compute_test_lock,
+    ensure_workspace_favicon,
     ensure_workspace_pytest_ini,
     is_python_cache_path,
     verify_and_restore_test_lock,
@@ -1248,6 +1249,14 @@ class BuildWorker:
                     consecutive_noop_rounds = 0
                     last_failure_sig = current_sig
                 continue
+
+            # Ensure clean favicon.svg exists before smoke check / publishing (prevents 404 in browser console)
+            cur_meta = self.orchestrator.get_status(project_id)
+            ensure_workspace_favicon(
+                ws_dir,
+                cur_meta.name or project_id,
+                cur_meta.objective or job.plan.summary,
+            )
 
             # Local HTTP Smoke Test before promoting to VERIFYING
             if (
