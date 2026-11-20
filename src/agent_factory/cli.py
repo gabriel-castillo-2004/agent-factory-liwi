@@ -44,6 +44,7 @@ from agent_factory.ports.publisher import RegistryPublisher
 from agent_factory.ports.runner import Runner
 from agent_factory.ports.store import EventStore
 from agent_factory.ports.vcs import VCS
+from agent_factory.runtime_runner import LocalAppRunner
 from agent_factory.scaffold import TemplateScaffold
 from agent_factory.secrets import redact_secrets
 from agent_factory.telegram_bot import TelegramBotConfig, TelegramBotService
@@ -311,6 +312,7 @@ class RuntimeBundle(BaseModel):
     telegram_client: TelegramClient
     bot_service: TelegramBotService
     model_resolver: ModelResolver | None = None
+    local_runner: LocalAppRunner | None = None
 
 
 def _parse_id_whitelist(raw: str | None, var_name: str, secret_token: str = "") -> frozenset[int]:
@@ -765,6 +767,11 @@ def build_runtime(
             )
         )
 
+        local_runner = LocalAppRunner(
+            workspace_manager=workspace_manager,
+            secrets_to_redact=active_secrets,
+        )
+
         build_worker = BuildWorker(
             orchestrator=orchestrator,
             workspace_manager=workspace_manager,
@@ -774,6 +781,9 @@ def build_runtime(
             registry_publisher=effective_registry,
             clock=clock,
             secrets_to_redact=active_secrets,
+            local_app_runner=(
+                local_runner if isinstance(effective_runner, SubprocessRunner) else None
+            ),
         )
 
         effective_tg_client = (
@@ -815,6 +825,7 @@ def build_runtime(
             telegram_client=effective_tg_client,
             bot_service=bot_service,
             model_resolver=shared_model_resolver,
+            local_runner=local_runner,
         )
     except Exception:
         store.close()
@@ -916,6 +927,7 @@ def main(
                 workspace_manager=runtime.workspace_manager,
                 bot_service=runtime.bot_service,
                 model_resolver=runtime.model_resolver,
+                local_runner=runtime.local_runner,
                 secrets_to_redact=active_secrets,
             )
             print(f"Dashboard local disponible en {dashboard_url}", flush=True)
@@ -927,6 +939,8 @@ def main(
             max_backoff_seconds=config.backoff_max_seconds,
         )
     finally:
+        if runtime.local_runner is not None:
+            runtime.local_runner.stop_all()
         if dashboard_server is not None:
             dashboard_server.shutdown()
             dashboard_server.server_close()

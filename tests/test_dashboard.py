@@ -1739,3 +1739,422 @@ def test_dashboard_incremental_retry_preserves_workspace_and_supports_clean_rebu
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_smart_title_generation_and_manual_rename_endpoint(tmp_path: Path) -> None:
+    """create_project synthesizes clean <=55-char titles and clean slugs, preserves existing SQLite titles (INV-11), and PATCH /title validates, sanitizes, and renames projects."""
+    store = SqliteEventStore(str(tmp_path / "smart_title.db"))
+    now = datetime(2026, 11, 20, 10, 0, tzinfo=UTC)
+
+    # Pre-existing project in SQLite MUST remain untouched (INV-11)
+    legacy_pid = "legacy-old-proj"
+    legacy_name = "Nombre legacy muy largo guardado antes en SQLite sin alteraciones automáticas"
+    store.append(
+        create_event(
+            legacy_pid,
+            EventType.PROJECT_CREATED,
+            {"name": legacy_name, "objective": "Legacy prompt", "state": "INTERVIEW"},
+            at=now,
+        )
+    )
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "spec": {
+                    "objective": "Gestor de gastos diarios",
+                    "users": ["Gabriel"],
+                    "features": ["Registro"],
+                    "business_rules": ["Montos positivos"],
+                    "edge_cases": ["Campo vacío"],
+                    "constraints": ["Web estática"],
+                    "success_criteria": ["0 errores"],
+                    "assumptions": [],
+                },
+                "questions": ["¿Quieres categorías personalizadas?"],
+            }
+        ]
+    )
+    orch = Orchestrator(store=store, llm=llm)
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        # Existing project stays unchanged
+        _, list_before = _http_json(f"{base_url}/api/projects")
+        legacy_entry = next(p for p in list_before["projects"] if p["project_id"] == legacy_pid)
+        assert legacy_entry["name"] == legacy_name
+
+        # New project synthesizes short <=55 title without filler prefix & clean slug
+        verbose_prompt = (
+            "Quiero una aplicación web para gestionar gastos diarios del hogar "
+            "con gráficas mensuales y exportación de reportes en CSV"
+        )
+        c_code, c_res = _http_json(
+            f"{base_url}/api/projects",
+            method="POST",
+            body={"prompt": verbose_prompt},
+        )
+        assert c_code == 200
+        pid = c_res["project_id"]
+        short_name = c_res["status"]["name"]
+        assert 5 <= len(short_name) <= 55
+        assert "quiero" not in short_name.lower()
+        assert not pid.startswith("quiero-una-aplicacion")
+        assert c_res["status"]["objective"] == verbose_prompt
+        assert server.controller.wait_for_idle(timeout=5.0) is True
+
+        # Validation guards on PATCH /api/projects/<id>/title
+        bad_empty, _ = _http_json(
+            f"{base_url}/api/projects/{pid}/title",
+            method="PATCH",
+            body={"title": "   "},
+        )
+        assert bad_empty == 400
+        bad_long, _ = _http_json(
+            f"{base_url}/api/projects/{pid}/title",
+            method="PATCH",
+            body={"title": "X" * 81},
+        )
+        assert bad_long == 400
+        missing_code, _ = _http_json(
+            f"{base_url}/api/projects/no-existe-tit/title",
+            method="PATCH",
+            body={"title": "Nuevo título"},
+        )
+        assert missing_code == 404
+
+        # Valid rename persists via PROJECT_RENAMED event while preserving project_id & objective
+        ren_code, ren_res = _http_json(
+            f"{base_url}/api/projects/{pid}/title",
+            method="PATCH",
+            body={"title": "  Control de\x00 Gastos <2026>  "},
+        )
+        assert ren_code == 200
+        assert ren_res["status"]["name"] == "Control de Gastos 2026"
+        assert ren_res["project_id"] == pid
+
+        _, detail_after = _http_json(f"{base_url}/api/projects/{pid}")
+        assert detail_after["status"]["name"] == "Control de Gastos 2026"
+        assert detail_after["status"]["objective"] == verbose_prompt
+        assert any(ev["type"] == EventType.PROJECT_RENAMED for ev in detail_after["events"])
+
+        # UI contains inline title editor hook & PATCH endpoint
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            html = html_resp.read().decode("utf-8")
+        assert "edit-title-btn" in html
+        assert "/title" in html
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_local_app_runner_start_stop_for_static_and_python_apps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LocalAppRunner detects static (preferring built src/ over empty template root) and python_local (PORT/HOST, clean env), exposes local_app state and /start+/stop endpoints, and releases ports cleanly."""
+    from agent_factory.runtime_runner import LocalAppRunner, detect_workspace_app
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "TEST_LEAK_GUARD_SECRET_888")
+
+    store = SqliteEventStore(str(tmp_path / "local_runner.db"))
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_local")
+    now = datetime(2026, 11, 20, 10, 30, tzinfo=UTC)
+
+    def _seed_delivered(pid: str, name: str, deploy_url: str | None) -> None:
+        pdict = _plan_payload(name)
+        phash = Plan.model_validate(pdict).compute_hash()
+        for ev in (
+            create_event(pid, EventType.PROJECT_CREATED, {"name": name, "objective": name, "state": "INTERVIEW"}, at=now),
+            create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+            create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+            create_event(pid, EventType.PLAN_CREATED, {"plan": pdict, "plan_hash": phash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+            create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": phash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+            create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+            create_event(pid, EventType.PROJECT_DELIVERED, {"repo_url": f"https://github.com/acme/{pid}", "deploy_url": deploy_url}, at=now),
+        ):
+            store.append(ev)
+
+    # 1. Static app whose root index.html is empty template and built app lives in src/
+    pid_static = "app-static-src"
+    _seed_delivered(pid_static, "App Estática", f"https://acme.github.io/{pid_static}")
+    ws_static = ws_mgr.create_workspace(pid_static)
+    (ws_static / "index.html").write_text(
+        '<!DOCTYPE html>\n<html lang="es">\n  <head>\n    <title>Static Web App</title>\n'
+        '    <link rel="stylesheet" href="./styles.css" />\n  </head>\n'
+        '  <body>\n    <main id="app" aria-live="polite"></main>\n'
+        '    <script type="module" src="./src/app.js"></script>\n  </body>\n</html>\n',
+        encoding="utf-8",
+    )
+    (ws_static / "src").mkdir(parents=True)
+    (ws_static / "src" / "index.html").write_text(
+        "<!doctype html><html><body><h1>Real Built Static App</h1><script src='./app.js'></script></body></html>\n",
+        encoding="utf-8",
+    )
+    (ws_static / "src" / "app.js").write_text("console.log('ok');\n", encoding="utf-8")
+
+    # 2. Local Python server app with app.py using PORT and HOST from clean subprocess env
+    pid_py = "app-python-srv"
+    _seed_delivered(pid_py, "Backend Local Python", "")
+    ws_py = ws_mgr.create_workspace(pid_py)
+    (ws_py / "app.py").write_text(
+        "import http.server, json, os\n"
+        "host = os.environ['HOST']\n"
+        "port = int(os.environ['PORT'])\n"
+        "class H(http.server.BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        body = json.dumps({'ok': True, 'has_tg': 'TELEGRAM_BOT_TOKEN' in os.environ}).encode()\n"
+        "        self.send_response(200)\n"
+        "        self.send_header('Content-Type', 'application/json')\n"
+        "        self.send_header('Content-Length', str(len(body)))\n"
+        "        self.end_headers()\n"
+        "        self.wfile.write(body)\n"
+        "    def log_message(self, *args):\n"
+        "        pass\n"
+        "http.server.ThreadingHTTPServer((host, port), H).serve_forever()\n",
+        encoding="utf-8",
+    )
+
+    static_info = detect_workspace_app(ws_static)
+    assert static_info.app_type == "static"
+    assert static_info.serve_dir is not None
+    assert static_info.serve_dir.resolve() == (ws_static / "src").resolve()
+
+    py_info = detect_workspace_app(ws_py)
+    assert py_info.app_type == "python_local"
+
+    local_runner = LocalAppRunner(workspace_manager=ws_mgr)
+    orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        workspace_manager=ws_mgr,
+        local_runner=local_runner,
+    )
+    try:
+        # UI exposes local controls & conditional GitHub Pages button
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            html = html_resp.read().decode("utf-8")
+        for marker in ("Encender en local", "Apagar", "Abrir app en local", "local_app"):
+            assert marker in html
+
+        # GET /api/projects exposes local_app state initially stopped
+        _, list_res = _http_json(f"{base_url}/api/projects")
+        st_entry = next(p for p in list_res["projects"] if p["project_id"] == pid_static)
+        assert st_entry["local_app"] == {"running": False, "url": None, "app_type": "static"}
+        py_entry = next(p for p in list_res["projects"] if p["project_id"] == pid_py)
+        assert py_entry["local_app"] == {"running": False, "url": None, "app_type": "python_local"}
+
+        # Start static app -> serves real src/index.html on 127.0.0.1:8081..8199
+        s_code, s_res = _http_json(f"{base_url}/api/projects/{pid_static}/start", method="POST")
+        assert s_code == 200
+        static_url = s_res["local_app"]["url"]
+        assert s_res["local_app"]["running"] is True
+        assert s_res["local_app"]["app_type"] == "static"
+        assert static_url.startswith("http://127.0.0.1:")
+        port_s = int(static_url.rsplit(":", 1)[1])
+        assert 8081 <= port_s <= 8199
+
+        with urllib.request.urlopen(static_url, timeout=5.0) as app_resp:
+            assert app_resp.status == 200
+            body_html = app_resp.read().decode("utf-8")
+        assert "Real Built Static App" in body_html
+        assert "Static Web App" not in body_html
+
+        # Start python_local app -> receives PORT/HOST and clean env without TELEGRAM_BOT_TOKEN
+        p_code, p_res = _http_json(f"{base_url}/api/projects/{pid_py}/start", method="POST")
+        assert p_code == 200
+        py_url = p_res["local_app"]["url"]
+        assert p_res["local_app"]["running"] is True
+        assert p_res["local_app"]["app_type"] == "python_local"
+        assert py_url != static_url
+
+        _, py_json = _http_json(py_url)
+        assert py_json["ok"] is True
+        assert py_json["has_tg"] is False
+
+        # Detail endpoint reflects running local_app
+        _, py_detail = _http_json(f"{base_url}/api/projects/{pid_py}")
+        assert py_detail["local_app"]["running"] is True
+        assert py_detail["status"]["local_app"]["url"] == py_url
+
+        # Stop both apps and verify ports are released
+        stop_s_code, stop_s = _http_json(f"{base_url}/api/projects/{pid_static}/stop", method="POST")
+        assert stop_s_code == 200
+        assert stop_s["local_app"]["running"] is False
+        assert stop_s["local_app"]["url"] is None
+        with pytest.raises((urllib.error.URLError, OSError)):
+            urllib.request.urlopen(static_url, timeout=1.0)
+
+        stop_p_code, stop_p = _http_json(f"{base_url}/api/projects/{pid_py}/stop", method="POST")
+        assert stop_p_code == 200
+        assert stop_p["local_app"]["running"] is False
+        with pytest.raises((urllib.error.URLError, OSError)):
+            urllib.request.urlopen(py_url, timeout=1.0)
+    finally:
+        local_runner.stop_all()
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_post_delivery_modify_workflow_preserves_workspace_and_updates_project(
+    tmp_path: Path,
+) -> None:
+    """POST /api/projects/<id>/modify transitions DELIVERED -> CHANGE_REQUEST -> BUILDING, preserves existing workspace, extends tests before sealing INV-13 lock, runs Smoke Test, pushes updates, and delivers cleanly."""
+    from agent_factory.runtime_runner import LocalAppRunner
+
+    store = SqliteEventStore(str(tmp_path / "modify_post.db"))
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_mod")
+    pid = "proj-post-modify"
+    now = datetime(2026, 11, 20, 11, 0, tzinfo=UTC)
+    plan_dict = _plan_payload("Post-Delivery App v1")
+    plan_hash = Plan.model_validate(plan_dict).compute_hash()
+
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "App Notas", "objective": "App de notas rápida", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+        create_event(pid, EventType.PROJECT_DELIVERED, {"repo_url": f"https://github.com/acme/{pid}", "deploy_url": f"https://acme.github.io/{pid}"}, at=now),
+    ):
+        store.append(ev)
+
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / "index.html").write_text(
+        "<!doctype html><html><body><h1>Notas</h1><script src='./app.js'></script></body></html>\n",
+        encoding="utf-8",
+    )
+    (ws_dir / "app.js").write_text("window.appReady = true;\n", encoding="utf-8")
+    (ws_dir / "custom-user-keep.txt").write_text("preserve-me\n", encoding="utf-8")
+    (ws_dir / "tests").mkdir(parents=True)
+    (ws_dir / "tests" / "test_app.py").write_text("def test_at_01(): assert True\n", encoding="utf-8")
+
+    # Another non-delivered project to assert 409 state guard
+    store.append(
+        create_event(
+            "proj-not-delivered",
+            EventType.PROJECT_CREATED,
+            {"name": "En Entrevista", "objective": "Obj", "state": "INTERVIEW"},
+            at=now,
+        )
+    )
+
+    seen_modify_prompts: list[str] = []
+
+    def _mod_test_step(ws: Path, _tests: Any) -> Any:
+        # Existing workspace artifacts must still exist during test extension
+        assert (ws / "custom-user-keep.txt").is_file()
+        (ws / "tests" / "test_modify_theme.py").write_text(
+            "def test_theme_toggle(): assert 'theme-toggle' in (Path if False else open('index.html', encoding='utf-8').read())\n",
+            encoding="utf-8",
+        )
+        from agent_factory.ports.code_agent import CodeAgentResult
+
+        return CodeAgentResult(
+            files_written=["tests/test_modify_theme.py"],
+            summary="Added modification test",
+        )
+
+    def _mod_impl_step(ws: Path, plan_obj: Any, failure_out: str, _attempt: int) -> Any:
+        seen_modify_prompts.append(f"{plan_obj.summary}\n{failure_out}")
+        assert (ws / "custom-user-keep.txt").read_text(encoding="utf-8") == "preserve-me\n"
+        # Tampering with existing tests MUST fail INV-13 lock after test extension
+        (ws / "index.html").write_text(
+            "<!doctype html><html><body><h1>Notas</h1><button id='theme-toggle'>Tema</button><script src='./app.js'></script></body></html>\n",
+            encoding="utf-8",
+        )
+        from agent_factory.ports.code_agent import CodeAgentResult
+
+        return CodeAgentResult(files_written=["index.html"], summary="Added theme toggle button")
+
+    code_agent = FakeCodeAgent(test_gen_steps=[_mod_test_step], impl_steps=[_mod_impl_step])
+    vcs = FakeVCS(
+        ci_results=[CIRunResult(passed=True, summary="CI updated green")],
+        repo_base_url="https://github.com/acme",
+        deploy_base_url="https://acme.github.io",
+    )
+    local_runner = LocalAppRunner(workspace_manager=ws_mgr)
+    orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
+    worker = BuildWorker(
+        orchestrator=orch,
+        workspace_manager=ws_mgr,
+        code_agent=code_agent,
+        runner=FakeRunner(
+            results=[
+                CommandResult(
+                    exit_code=0,
+                    stdout="2 passed",
+                    test_results={"AT-01": True, "MOD-02": True},
+                )
+            ]
+        ),
+        vcs=vcs,
+        local_app_runner=local_runner,
+    )
+    scaffold = TemplateScaffold(workspace_manager=ws_mgr, templates_root=DEFAULT_TEMPLATES_ROOT)
+
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        build_worker=worker,
+        template_scaffold=scaffold,
+        workspace_manager=ws_mgr,
+        local_runner=local_runner,
+    )
+    try:
+        # UI contains post-delivery modification panel
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            html = html_resp.read().decode("utf-8")
+        assert "Pedir cambios o mejoras" in html
+        assert "Aplicar cambios" in html
+        assert "/modify" in html
+
+        # Validation guards
+        assert _http_json(f"{base_url}/api/projects/{pid}/modify", method="POST", body={"instructions": "  "})[0] == 400
+        assert _http_json(f"{base_url}/api/projects/no-existe-mod/modify", method="POST", body={"instructions": "Hola"})[0] == 404
+        assert _http_json(f"{base_url}/api/projects/proj-not-delivered/modify", method="POST", body={"instructions": "Cambiar"})[0] == 409
+
+        # Execute post-delivery modify
+        mod_instr = "Agrega un botón de tema oscuro en la cabecera"
+        m_code, m_res = _http_json(
+            f"{base_url}/api/projects/{pid}/modify",
+            method="POST",
+            body={"instructions": mod_instr},
+        )
+        assert m_code == 200
+        assert m_res["background_started"] is True
+        assert server.controller.wait_for_idle(timeout=5.0) is True
+
+        _, updated_detail = _http_json(f"{base_url}/api/projects/{pid}")
+        assert updated_detail["status"]["state"] == "DELIVERED"
+        assert (ws_dir / "custom-user-keep.txt").read_text(encoding="utf-8") == "preserve-me\n"
+        assert (ws_dir / "tests" / "test_modify_theme.py").is_file()
+        assert "theme-toggle" in (ws_dir / "index.html").read_text(encoding="utf-8")
+        assert any(mod_instr in txt for txt in seen_modify_prompts)
+        assert any(mod_instr in f for f in updated_detail["spec"]["features"])
+        assert len(vcs.pushes) == 1
+        assert len(vcs.merges) == 1
+        assert local_runner.get_status(pid).running is False
+    finally:
+        local_runner.stop_all()
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+

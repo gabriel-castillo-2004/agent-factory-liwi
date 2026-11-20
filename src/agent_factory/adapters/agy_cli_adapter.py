@@ -755,6 +755,64 @@ class AgyCliAdapter(CodeAgent):
             result = result.model_copy(update={"files_written": merged_files})
         return result
 
+    def update_tests(
+        self,
+        workspace_dir: Path,
+        acceptance_tests: Sequence[AcceptanceTest],
+        instructions: str,
+    ) -> CodeAgentResult:
+        """Update or extend tests/ for post-delivery changes when src/ already exists."""
+        ws_path = self.validate_workspace_cwd(workspace_dir)
+        clean_instr = str(instructions or "").strip()
+        payload: dict[str, Any] = {
+            "mode": "update_tests",
+            "workspace_dir": str(ws_path),
+            "modification_instructions": clean_instr,
+            "acceptance_tests": [
+                {
+                    "id": at.id,
+                    "description": at.description,
+                    "type": at.type.value if hasattr(at.type, "value") else str(at.type),
+                }
+                for at in acceptance_tests
+            ],
+        }
+        tests_list = payload["acceptance_tests"]
+        tests_block = "\n".join(
+            f"- {t['id']}: [{t['type']}] {t['description']}" for t in tests_list
+        )
+        prompt = (
+            f"Workspace directory (cwd): {ws_path}\n"
+            "Task: Post-delivery modification — extend or update tests under tests/ ONLY if required by the new instructions while preserving existing passing tests.\n"
+            f"Modification instructions:\n{clean_instr}\n\n"
+            "Requirements:\n"
+            "1. Keep existing valid tests in tests/ intact unless the new instructions directly alter a contract.\n"
+            "2. Do NOT create or modify files under src/ or anywhere outside tests/.\n"
+            "3. Never use pytest.skip, @pytest.mark.skip, pytest.xfail, or external runtimes (node, npm, npx, playwright, selenium).\n"
+            "4. Respond with JSON containing files_written and a short plain-text summary.\n"
+            f"Acceptance tests context:\n{tests_block}"
+        )
+        if len(prompt) > _MAX_CLI_PROMPT_CHARS:
+            prompt = prompt[: _MAX_CLI_PROMPT_CHARS - 24] + "\n...[truncated; see stdin]"
+        before_files = _list_workspace_test_files(ws_path)
+        result, raw_stdout = self._run_cli_with_output(
+            ws_path,
+            "generate-tests",
+            payload,
+            prompt=prompt,
+        )
+        new_files, extracted = self._collect_or_extract_test_files(
+            ws_path, before_files, raw_stdout
+        )
+        merged_files = [
+            p
+            for p in _merge_unique_paths(result.files_written, new_files, extracted)
+            if not is_python_cache_path(p)
+        ]
+        if merged_files != list(result.files_written) or new_files or extracted:
+            result = result.model_copy(update={"files_written": merged_files})
+        return result
+
     def implement_or_fix(
         self,
         workspace_dir: Path,

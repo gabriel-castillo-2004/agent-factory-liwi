@@ -78,6 +78,11 @@ def project_status_from_events(project_id: str, events: Sequence[Event]) -> Proj
                 previous_progress=last_progress,
             )
 
+        elif event.type == EventType.PROJECT_RENAMED:
+            new_name = str(payload.get("name", "")).strip()
+            if new_name:
+                name = new_name
+
         elif event.type == EventType.STATE_TRANSITIONED:
             next_state = ProjectState(payload["to"])
             if next_state == ProjectState.BUILDING and current_state != ProjectState.VERIFYING:

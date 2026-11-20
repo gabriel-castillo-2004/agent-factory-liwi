@@ -105,3 +105,45 @@ def redact_secrets(
         result = result.replace(secret, "[REDACTED]")
 
     return result
+
+
+SAFE_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "PATH",
+        "SYSTEMROOT",
+        "COMSPEC",
+        "PATHEXT",
+        "WINDIR",
+        "TMP",
+        "TEMP",
+        "USER",
+        "USERNAME",
+        "HOME",
+        "USERPROFILE",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "GIT_EXEC_PATH",
+    }
+)
+FORBIDDEN_ENV_SUBSTRINGS: tuple[str, ...] = (
+    "TELEGRAM",
+    "LLM",
+    "OPENAI",
+    "ANTHROPIC",
+    "GEMINI",
+    "SECRET",
+    "PASSWORD",
+    "CREDENTIAL",
+)
+
+
+def sanitize_subprocess_env(host_env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Filter host_env to safe system variables excluding unrelated credentials (INV-19)."""
+    effective = os.environ if host_env is None else host_env
+    clean: dict[str, str] = {}
+    for k, v in effective.items():
+        k_up = k.upper()
+        if k_up in SAFE_ENV_KEYS and not any(sub in k_up for sub in FORBIDDEN_ENV_SUBSTRINGS):
+            clean[k] = v
+    return clean

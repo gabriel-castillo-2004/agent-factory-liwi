@@ -12,8 +12,15 @@ from pydantic import BaseModel, Field
 
 from agent_factory.adapters.agy_cli_adapter import sanitize_agent_summary
 from agent_factory.adapters.model_resolver import ACTIVITY_MESSAGES
-from agent_factory.domain.events import EventType, create_event
-from agent_factory.domain.models import BuildReport, Plan, validate_project_id
+from agent_factory.adapters.subprocess_runner import SubprocessRunner
+from agent_factory.domain.events import Event, EventType, create_event
+from agent_factory.domain.models import (
+    AcceptanceTest,
+    AcceptanceTestType,
+    BuildReport,
+    Plan,
+    validate_project_id,
+)
 from agent_factory.domain.states import IllegalTransition, ProjectState
 from agent_factory.orchestrator import Orchestrator
 from agent_factory.ports.clock import Clock
@@ -21,6 +28,7 @@ from agent_factory.ports.code_agent import CodeAgent, CodeAgentError, QuotaExhau
 from agent_factory.ports.publisher import RegistryPublisher, RegistryPublishError
 from agent_factory.ports.runner import CommandTimeoutError, Runner
 from agent_factory.ports.vcs import VCS
+from agent_factory.runtime_runner import LocalAppRunner, detect_workspace_app, run_http_smoke_test
 from agent_factory.secrets import redact_secrets
 from agent_factory.workspace import (
     SandboxViolationError,
@@ -242,6 +250,7 @@ class BuildWorker:
         max_ci_rounds: int | None = None,
         registry_publisher: RegistryPublisher | None = None,
         secrets_to_redact: Sequence[str] = (),
+        local_app_runner: LocalAppRunner | None = None,
     ) -> None:
         self.orchestrator = orchestrator
         self.workspace_manager = workspace_manager
@@ -256,6 +265,28 @@ class BuildWorker:
             self.max_ci_rounds = self.orchestrator.circuit_breaker._limits.get("ci_rounds", 3)
         self.registry_publisher = registry_publisher
         self.secrets_to_redact: tuple[str, ...] = tuple(secrets_to_redact)
+        self.local_app_runner = local_app_runner
+
+    @staticmethod
+    def _extract_modification_instructions(events: Sequence[Event]) -> str | None:
+        """Return latest modification instructions emitted after the most recent PROJECT_DELIVERED."""
+        last_delivered_idx = -1
+        for idx, ev in enumerate(events):
+            if ev.type == EventType.PROJECT_DELIVERED:
+                last_delivered_idx = idx
+        if last_delivered_idx < 0:
+            return None
+        for ev in reversed(events[last_delivered_idx + 1 :]):
+            pl = ev.payload or {}
+            if ev.type == EventType.STATE_TRANSITIONED and pl.get("instructions"):
+                text = str(pl["instructions"]).strip()
+                if text:
+                    return text
+            if ev.type == EventType.SPEC_UPDATED and pl.get("change_instructions"):
+                text = str(pl["change_instructions"]).strip()
+                if text:
+                    return text
+        return None
 
     def _redact(self, text: str) -> str:
         """Scrub configured secrets and credential patterns from diagnostic strings."""
@@ -594,6 +625,192 @@ class BuildWorker:
         self.workspace_manager.create_workspace(project_id, template_files=template_files)
         return self.queue.enqueue(project_id, plan)
 
+    def _lock_reused_tests(
+        self,
+        project_id: str,
+        job: BuildJob,
+        ws_dir: Path,
+        reused_files: list[str],
+        total_tests: int,
+    ) -> None:
+        """Seal SHA-256 test lock over existing tests and record TESTS_REUSED (INV-13)."""
+        self._report_activity(
+            "Reutilizando pruebas existentes...",
+            agents_count=1,
+            stage="BUILDING",
+            detail=f"{len(reused_files)} archivo(s) de pruebas conservados",
+            tests_passed=0,
+            tests_total=total_tests,
+        )
+        job.lock_snapshot = compute_test_lock(ws_dir)
+        self.orchestrator.store.append(
+            create_event(
+                project_id=project_id,
+                event_type=EventType.TESTS_REUSED,
+                payload={
+                    "files": reused_files[:10],
+                    "tests_hash": job.lock_snapshot.tests_hash,
+                    "summary_short": (
+                        f"Se reutilizaron {len(reused_files)} archivo(s) de pruebas existentes"
+                    ),
+                },
+                at=self.orchestrator._now(),
+            )
+        )
+
+    def _invoke_test_phase(
+        self,
+        project_id: str,
+        job: BuildJob,
+        ws_dir: Path,
+        *,
+        mod_instructions: str | None,
+    ) -> BuildReport | None:
+        """Run initial test generation or post-delivery test extension and seal SHA-256 lock (INV-13)."""
+        building_limit = (
+            self.orchestrator.circuit_breaker.get_limit(ProjectState.BUILDING) or 15
+        )
+        calls = self.orchestrator.circuit_breaker.get_calls(
+            project_id, ProjectState.BUILDING
+        )
+        if calls >= building_limit:
+            status = self.orchestrator.record_state_call(
+                project_id, ProjectState.BUILDING
+            )
+            return self._fail_job(
+                project_id,
+                job,
+                status.failure_reason
+                or f"BUILDING invocation limit ({building_limit}) exceeded",
+                emit_event=False,
+            )
+
+        target_tests = list(job.plan.acceptance_tests)
+        agent_label = "generate_tests"
+        if mod_instructions:
+            agent_label = "update_tests"
+            target_tests.append(
+                AcceptanceTest(
+                    id=f"MOD-{job.invocations_used + 1}",
+                    description=mod_instructions,
+                    type=AcceptanceTestType.E2E,
+                )
+            )
+            self._report_activity(
+                "Actualizando pruebas para los cambios...",
+                agents_count=1,
+                stage="BUILDING",
+                detail="Ampliando pruebas antes de sellar el candado",
+                tests_passed=0,
+                tests_total=len(target_tests),
+            )
+        else:
+            self._report_activity(
+                ACTIVITY_MESSAGES["BUILDING_TESTS"],
+                agents_count=1,
+                stage="BUILDING",
+                detail=f"{len(target_tests)} criterios de aceptación",
+                tests_passed=0,
+                tests_total=len(target_tests),
+            )
+
+        gen_t0 = time.monotonic()
+        try:
+            if mod_instructions:
+                update_fn = getattr(self.code_agent, "update_tests", None)
+                if callable(update_fn):
+                    gen_result = update_fn(ws_dir, target_tests, mod_instructions)
+                elif hasattr(self.code_agent, "_test_gen_steps"):
+                    steps = getattr(self.code_agent, "_test_gen_steps", None)
+                    if steps:
+                        gen_result = self.code_agent.generate_tests(ws_dir, target_tests)
+                    else:
+                        reused = workspace_nonempty_test_files(ws_dir)
+                        self._lock_reused_tests(
+                            project_id, job, ws_dir, reused, len(target_tests)
+                        )
+                        return None
+                elif workspace_nonempty_test_files(ws_dir):
+                    reused = workspace_nonempty_test_files(ws_dir)
+                    self._lock_reused_tests(
+                        project_id, job, ws_dir, reused, len(target_tests)
+                    )
+                    return None
+                else:
+                    gen_result = self.code_agent.generate_tests(ws_dir, target_tests)
+            else:
+                gen_result = self.code_agent.generate_tests(ws_dir, target_tests)
+        except QuotaExhaustedError as err:
+            job.state = JobState.PAUSED_QUOTA
+            job.pause_count += 1
+            self.clock.sleep(err.retry_after_seconds)
+            report = BuildReport(
+                invocations=job.invocations_used,
+                test_results=job.test_results,
+                ci_rounds=job.ci_rounds_used,
+                failure_cause=None,
+            )
+            job.report = report
+            return report
+        except (CodeAgentError, CommandTimeoutError) as err:
+            gen_duration = round(max(0.0, time.monotonic() - gen_t0), 3)
+            self.orchestrator.record_state_call(
+                project_id,
+                ProjectState.BUILDING,
+                model=self._active_code_agent_model(),
+                agent=agent_label,
+                duration_seconds=gen_duration,
+                summary_short=self._summarize_short(err),
+                outcome="failed",
+                extra_secrets=self.secrets_to_redact,
+            )
+            job.invocations_used += 1
+            return self._fail_job(
+                project_id, job, err, failed_state=ProjectState.BUILDING
+            )
+
+        gen_duration = round(max(0.0, time.monotonic() - gen_t0), 3)
+        gen_files = self._sanitize_files_written(
+            getattr(gen_result, "files_written", None), tests_only=True
+        )
+        gen_summary = self._summarize_short(getattr(gen_result, "summary", None))
+        status = self.orchestrator.record_state_call(
+            project_id,
+            ProjectState.BUILDING,
+            model=getattr(gen_result, "model", None) or self._active_code_agent_model(),
+            agent=agent_label,
+            duration_seconds=gen_duration,
+            files_written=gen_files,
+            summary_short=gen_summary,
+            outcome="ok",
+            extra_secrets=self.secrets_to_redact,
+        )
+        job.invocations_used += 1
+
+        if status.state == ProjectState.FAILED:
+            return self._fail_job(
+                project_id,
+                job,
+                status.failure_reason or "Circuit breaker tripped",
+                emit_event=False,
+            )
+
+        tests_dir = ws_dir / "tests"
+        has_tests = tests_dir.is_dir() and any(
+            p.is_file() and not is_python_cache_path(p.relative_to(ws_dir))
+            for p in tests_dir.rglob("*")
+        )
+        if not has_tests:
+            return self._fail_job(
+                project_id,
+                job,
+                "Test generation produced zero test files in tests/ (INV-13)",
+            )
+
+        ensure_workspace_pytest_ini(self.workspace_manager, project_id)
+        job.lock_snapshot = compute_test_lock(ws_dir)
+        return None
+
     def run_job(
         self,
         project_id: str,
@@ -605,6 +822,10 @@ class BuildWorker:
         if status.state != ProjectState.BUILDING:
             raise IllegalTransition(status.state, ProjectState.BUILDING)
 
+        mod_instructions = self._extract_modification_instructions(
+            self.orchestrator.store.get_events(project_id)
+        )
+
         job = self.queue.get_job(project_id)
         if job is None:
             plan = self.orchestrator.get_plan(project_id)
@@ -615,16 +836,66 @@ class BuildWorker:
         job.state = JobState.RUNNING
 
         # -------------------------------------------------------------
-        # Step A: Test generation (blind to Plan and production code)
+        # Step A: Test generation / extension + lock snapshot (INV-13)
         # -------------------------------------------------------------
         if job.lock_snapshot is None:
-            # Check template files for contamination before creating workspace
-            if template_files:
-                for k in template_files:
-                    norm = k.replace("\\", "/")
-                    if norm.startswith("src/") or norm == "src":
+            if mod_instructions:
+                ws_dir = self.workspace_manager.create_workspace(
+                    project_id, template_files=None
+                )
+                self._validate_workspace_links(ws_dir)
+                ensure_workspace_pytest_ini(self.workspace_manager, project_id)
+                early_report = self._invoke_test_phase(
+                    project_id, job, ws_dir, mod_instructions=mod_instructions
+                )
+                if early_report is not None:
+                    return early_report
+            else:
+                # Check template files for contamination before creating workspace
+                if template_files:
+                    for k in template_files:
+                        norm = k.replace("\\", "/")
+                        if norm.startswith("src/") or norm == "src":
+                            msg = (
+                                f"Production file '{k}' found in template files prior to test generation (INV-13)"
+                            )
+                            self.orchestrator.store.append(
+                                create_event(
+                                    project_id=project_id,
+                                    event_type=EventType.PHASE_ERROR,
+                                    payload={
+                                        "state": ProjectState.BUILDING.value,
+                                        "agent": "build_worker",
+                                        "error_type": "SandboxViolationError",
+                                        "detail": self._redact(msg),
+                                    },
+                                    at=self.orchestrator._now(),
+                                )
+                            )
+                            raise SandboxViolationError(msg)
+
+                ws_dir = self.workspace_manager.create_workspace(
+                    project_id, template_files=template_files
+                )
+                self._validate_workspace_links(ws_dir)
+                ensure_workspace_pytest_ini(self.workspace_manager, project_id)
+
+                # Reuse valid existing tests on incremental retry/resume while locking them (INV-13)
+                reused_test_files = workspace_nonempty_test_files(ws_dir)
+                if reused_test_files:
+                    self._lock_reused_tests(
+                        project_id,
+                        job,
+                        ws_dir,
+                        reused_test_files,
+                        len(job.plan.acceptance_tests),
+                    )
+                else:
+                    # Check existing workspace src directory for contamination on disk
+                    src_dir = ws_dir / "src"
+                    if src_dir.is_dir() and any(p.is_file() for p in src_dir.rglob("*")):
                         msg = (
-                            f"Production file '{k}' found in template files prior to test generation (INV-13)"
+                            "Production code in src/ exists before test generation; potential test contamination (INV-13)"
                         )
                         self.orchestrator.store.append(
                             create_event(
@@ -641,163 +912,11 @@ class BuildWorker:
                         )
                         raise SandboxViolationError(msg)
 
-            ws_dir = self.workspace_manager.create_workspace(
-                project_id, template_files=template_files
-            )
-            self._validate_workspace_links(ws_dir)
-            ensure_workspace_pytest_ini(self.workspace_manager, project_id)
-
-            # Reuse valid existing tests on incremental retry/resume while locking them (INV-13)
-            reused_test_files = workspace_nonempty_test_files(ws_dir)
-            if reused_test_files:
-                total_acceptance_tests = len(job.plan.acceptance_tests)
-                self._report_activity(
-                    "Reutilizando pruebas existentes...",
-                    agents_count=1,
-                    stage="BUILDING",
-                    detail=f"{len(reused_test_files)} archivo(s) de pruebas conservados",
-                    tests_passed=0,
-                    tests_total=total_acceptance_tests,
-                )
-                job.lock_snapshot = compute_test_lock(ws_dir)
-                self.orchestrator.store.append(
-                    create_event(
-                        project_id=project_id,
-                        event_type=EventType.TESTS_REUSED,
-                        payload={
-                            "files": reused_test_files[:10],
-                            "tests_hash": job.lock_snapshot.tests_hash,
-                            "summary_short": (
-                                f"Se reutilizaron {len(reused_test_files)} archivo(s) de pruebas existentes"
-                            ),
-                        },
-                        at=self.orchestrator._now(),
+                    early_report = self._invoke_test_phase(
+                        project_id, job, ws_dir, mod_instructions=None
                     )
-                )
-            else:
-                # Check existing workspace src directory for contamination on disk
-                src_dir = ws_dir / "src"
-                if src_dir.is_dir() and any(p.is_file() for p in src_dir.rglob("*")):
-                    msg = (
-                        "Production code in src/ exists before test generation; potential test contamination (INV-13)"
-                    )
-                    self.orchestrator.store.append(
-                        create_event(
-                            project_id=project_id,
-                            event_type=EventType.PHASE_ERROR,
-                            payload={
-                                "state": ProjectState.BUILDING.value,
-                                "agent": "build_worker",
-                                "error_type": "SandboxViolationError",
-                                "detail": self._redact(msg),
-                            },
-                            at=self.orchestrator._now(),
-                        )
-                    )
-                    raise SandboxViolationError(msg)
-
-                # Check circuit breaker limit before invoking
-                building_limit = (
-                    self.orchestrator.circuit_breaker.get_limit(ProjectState.BUILDING) or 15
-                )
-                calls = self.orchestrator.circuit_breaker.get_calls(
-                    project_id, ProjectState.BUILDING
-                )
-                if calls >= building_limit:
-                    status = self.orchestrator.record_state_call(
-                        project_id, ProjectState.BUILDING
-                    )
-                    return self._fail_job(
-                        project_id,
-                        job,
-                        status.failure_reason
-                        or f"BUILDING invocation limit ({building_limit}) exceeded",
-                        emit_event=False,
-                    )
-
-                total_acceptance_tests = len(job.plan.acceptance_tests)
-                self._report_activity(
-                    ACTIVITY_MESSAGES["BUILDING_TESTS"],
-                    agents_count=1,
-                    stage="BUILDING",
-                    detail=f"{total_acceptance_tests} criterios de aceptación",
-                    tests_passed=0,
-                    tests_total=total_acceptance_tests,
-                )
-                gen_t0 = time.monotonic()
-                try:
-                    gen_result = self.code_agent.generate_tests(ws_dir, job.plan.acceptance_tests)
-                except QuotaExhaustedError as err:
-                    job.state = JobState.PAUSED_QUOTA
-                    job.pause_count += 1
-                    self.clock.sleep(err.retry_after_seconds)
-                    report = BuildReport(
-                        invocations=job.invocations_used,
-                        test_results=job.test_results,
-                        ci_rounds=job.ci_rounds_used,
-                        failure_cause=None,
-                    )
-                    job.report = report
-                    return report
-                except (CodeAgentError, CommandTimeoutError) as err:
-                    gen_duration = round(max(0.0, time.monotonic() - gen_t0), 3)
-                    # Fatal code agent error: record the invocation in CircuitBreaker and AGENT_INVOKED before failing
-                    self.orchestrator.record_state_call(
-                        project_id,
-                        ProjectState.BUILDING,
-                        model=self._active_code_agent_model(),
-                        agent="generate_tests",
-                        duration_seconds=gen_duration,
-                        summary_short=self._summarize_short(err),
-                        outcome="failed",
-                        extra_secrets=self.secrets_to_redact,
-                    )
-                    job.invocations_used += 1
-                    return self._fail_job(
-                        project_id, job, err, failed_state=ProjectState.BUILDING
-                    )
-
-                gen_duration = round(max(0.0, time.monotonic() - gen_t0), 3)
-                gen_files = self._sanitize_files_written(
-                    getattr(gen_result, "files_written", None), tests_only=True
-                )
-                gen_summary = self._summarize_short(getattr(gen_result, "summary", None))
-                # Successful test generation: record call in CircuitBreaker and AGENT_INVOKED
-                status = self.orchestrator.record_state_call(
-                    project_id,
-                    ProjectState.BUILDING,
-                    model=getattr(gen_result, "model", None) or self._active_code_agent_model(),
-                    agent="generate_tests",
-                    duration_seconds=gen_duration,
-                    files_written=gen_files,
-                    summary_short=gen_summary,
-                    outcome="ok",
-                    extra_secrets=self.secrets_to_redact,
-                )
-                job.invocations_used += 1
-
-                if status.state == ProjectState.FAILED:
-                    return self._fail_job(
-                        project_id,
-                        job,
-                        status.failure_reason or "Circuit breaker tripped",
-                        emit_event=False,
-                    )
-
-                tests_dir = ws_dir / "tests"
-                has_tests = tests_dir.is_dir() and any(
-                    p.is_file() and not is_python_cache_path(p.relative_to(ws_dir))
-                    for p in tests_dir.rglob("*")
-                )
-                if not has_tests:
-                    return self._fail_job(
-                        project_id,
-                        job,
-                        "Test generation produced zero test files in tests/ (INV-13)",
-                    )
-
-                ensure_workspace_pytest_ini(self.workspace_manager, project_id)
-                job.lock_snapshot = compute_test_lock(ws_dir)
+                    if early_report is not None:
+                        return early_report
         else:
             ws_dir = self.workspace_manager.create_workspace(
                 project_id, template_files=None
@@ -863,11 +982,24 @@ class BuildWorker:
                 max_rounds=max_code_rounds,
             )
             impl_t0 = time.monotonic()
+            effective_plan = (
+                job.plan.model_copy(
+                    update={"summary": f"{job.plan.summary} | Cambio solicitado: {mod_instructions}"}
+                )
+                if mod_instructions
+                else job.plan
+            )
+            effective_failure = job.last_failure_output
+            if mod_instructions and not effective_failure and build_round == 1:
+                effective_failure = (
+                    "Post-delivery modification requested (preserve existing behavior and apply changes):\n"
+                    f"{mod_instructions}"
+                )
             try:
                 impl_result = self.code_agent.implement_or_fix(
                     ws_dir,
-                    job.plan,
-                    failure_output=job.last_failure_output,
+                    effective_plan,
+                    failure_output=effective_failure,
                     attempt=attempt_num,
                 )
             except QuotaExhaustedError as err:
@@ -1117,7 +1249,53 @@ class BuildWorker:
                     last_failure_sig = current_sig
                 continue
 
-            # Local tests passed! Reset stagnation tracking, clear failure output, and transition to VERIFYING
+            # Local HTTP Smoke Test before promoting to VERIFYING
+            if (
+                self.local_app_runner is not None
+                or isinstance(self.runner, SubprocessRunner)
+            ) and detect_workspace_app(ws_dir).app_type in ("static", "python_local"):
+                self._report_activity(
+                    "Verificando arranque local (HTTP Smoke Test)...",
+                    agents_count=1,
+                    stage="VERIFYING",
+                    detail=f"Ronda {build_round} de hasta {max_code_rounds}",
+                    tests_passed=tests_passed_count,
+                    tests_total=tests_total_count,
+                    build_round=build_round,
+                    max_rounds=max_code_rounds,
+                )
+                smoke_runner = (
+                    self.local_app_runner
+                    if self.local_app_runner is not None
+                    else LocalAppRunner(
+                        workspace_manager=self.workspace_manager,
+                        secrets_to_redact=self.secrets_to_redact,
+                    )
+                )
+                smoke_res = run_http_smoke_test(smoke_runner, project_id, ws_dir)
+                if not smoke_res.passed:
+                    smoke_err = self._redact(smoke_res.summary)
+                    job.last_failure_output = smoke_err
+                    smoke_sig = (-1, tuple(smoke_res.failed_resources), smoke_err)
+                    if not impl_files:
+                        same_failure = last_failure_sig is None or smoke_sig == last_failure_sig
+                        consecutive_noop_rounds = (
+                            consecutive_noop_rounds + 1 if same_failure else 1
+                        )
+                        last_failure_sig = smoke_sig
+                        if consecutive_noop_rounds >= 2:
+                            return self._fail_job(
+                                project_id,
+                                job,
+                                f"Proceso detenido automáticamente tras 2 rondas consecutivas sin cambios ({self._bound_redacted(smoke_err, limit=180)}).",
+                                failed_state=ProjectState.BUILDING,
+                            )
+                    else:
+                        consecutive_noop_rounds = 0
+                        last_failure_sig = smoke_sig
+                    continue
+
+            # Local tests and HTTP Smoke Test passed! Reset stagnation tracking, clear failure output, and transition to VERIFYING
             consecutive_noop_rounds = 0
             last_failure_sig = None
             job.last_failure_output = ""

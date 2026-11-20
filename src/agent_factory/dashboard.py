@@ -17,10 +17,15 @@ from agent_factory.builder import BuildWorker
 from agent_factory.domain.events import Event, EventType
 from agent_factory.domain.models import ApprovalEvent, ProjectStatus, validate_project_id
 from agent_factory.domain.states import IllegalTransition, ProjectState
-from agent_factory.orchestrator import ApprovalError, Orchestrator
+from agent_factory.orchestrator import (
+    ApprovalError,
+    Orchestrator,
+    synthesize_project_title,
+)
 from agent_factory.ports.code_agent import CodeAgentError
 from agent_factory.ports.llm import LLMError
 from agent_factory.ports.runner import CommandTimeoutError
+from agent_factory.runtime_runner import LocalAppError, LocalAppRunner
 from agent_factory.scaffold import TemplateScaffold
 from agent_factory.secrets import redact_secrets
 from agent_factory.telegram_bot import TelegramBotService, _slugify
@@ -66,6 +71,7 @@ class DashboardController:
         workspace_manager: WorkspaceManager | None = None,
         bot_service: TelegramBotService | None = None,
         model_resolver: Any = None,
+        local_runner: LocalAppRunner | None = None,
         secrets_to_redact: Sequence[str] = (),
     ) -> None:
         self.orchestrator = orchestrator
@@ -80,6 +86,19 @@ class DashboardController:
                 getattr(build_worker, "code_agent", None), "model_resolver", None
             )
         self.secrets_to_redact: tuple[str, ...] = tuple(secrets_to_redact)
+        effective_ws_mgr = self._resolve_workspace_manager() or getattr(
+            orchestrator, "workspace_manager", None
+        )
+        worker_local_runner = getattr(build_worker, "local_app_runner", None)
+        if local_runner is not None:
+            self.local_runner = local_runner
+        elif isinstance(worker_local_runner, LocalAppRunner):
+            self.local_runner = worker_local_runner
+        else:
+            self.local_runner = LocalAppRunner(
+                workspace_manager=effective_ws_mgr,
+                secrets_to_redact=self.secrets_to_redact,
+            )
         self._lock = threading.RLock()
         self._active_projects: set[str] = set()
         self._threads: list[threading.Thread] = []
@@ -247,6 +266,20 @@ class DashboardController:
                     return redact_secrets(reason, extra_secrets=self.secrets_to_redact)
         return None
 
+    def _local_app_payload(self, project_id: str) -> dict[str, Any]:
+        """Return safe local_app summary dict for API projections."""
+        if self.local_runner.workspace_manager is None:
+            ws_mgr = self._resolve_workspace_manager() or getattr(
+                self.orchestrator, "workspace_manager", None
+            )
+            if ws_mgr is None:
+                return {"running": False, "url": None, "app_type": "unknown"}
+            self.local_runner.workspace_manager = ws_mgr
+        try:
+            return self.local_runner.get_status(project_id).to_api_dict()
+        except (SandboxViolationError, ValueError, OSError):
+            return {"running": False, "url": None, "app_type": "unknown"}
+
     def _serialize_summary(
         self,
         project_id: str,
@@ -264,6 +297,7 @@ class DashboardController:
         raw["has_plan"] = has_plan
         raw["busy"] = running
         raw["is_running"] = running
+        raw["local_app"] = self._local_app_payload(project_id)
         raw.update(live_info)
         raw["last_event_at"] = last_event_at
         return _scrub_value(raw, self.secrets_to_redact)
@@ -300,6 +334,7 @@ class DashboardController:
                         "has_plan": False,
                         "busy": running,
                         "is_running": running,
+                        "local_app": {"running": False, "url": None, "app_type": "unknown"},
                         **live_info,
                         "last_event_at": None,
                     }
@@ -335,6 +370,7 @@ class DashboardController:
             "project_id": project_id,
             "status": summary,
             "is_running": summary["is_running"],
+            "local_app": summary["local_app"],
             "active_model": summary["active_model"],
             "active_stage": summary["active_stage"],
             "activity_summary": summary["activity_summary"],
@@ -570,16 +606,17 @@ class DashboardController:
         )
 
     def create_project(self, prompt: str) -> dict[str, Any]:
-        """Create a new project from prompt and start its first INTERVIEW round in background."""
+        """Create a new project from prompt with a clean synthesized title/slug and start INTERVIEW in background."""
         clean_prompt = str(prompt or "").strip()
         if not clean_prompt:
             raise ValueError("El campo 'prompt' es obligatorio.")
 
+        short_title = synthesize_project_title(clean_prompt)
         with self._lock:
-            pid = self._next_project_id(clean_prompt)
+            pid = self._next_project_id(short_title)
             created = self.orchestrator.create_project(
                 pid,
-                name=clean_prompt,
+                name=short_title,
                 objective=clean_prompt,
             )
             event_id = f"web-msg-{uuid.uuid4().hex[:12]}"
@@ -597,6 +634,185 @@ class DashboardController:
         return {
             "ok": True,
             "project_id": pid,
+            "status": summary,
+            "background_started": background_started,
+        }
+
+    def rename_project(self, project_id: str, title: str) -> dict[str, Any]:
+        """Validate, sanitize, and persist a manual title rename via PROJECT_RENAMED (INV-11)."""
+        validate_project_id(project_id)
+        events = self.orchestrator.store.get_events(project_id)
+        if not events:
+            raise ProjectNotFoundError(f"Project '{project_id}' not found")
+        updated = self.orchestrator.rename_project(project_id, title)
+        summary = self._serialize_summary(
+            project_id,
+            updated,
+            self.orchestrator.store.get_events(project_id),
+            has_plan=(self.orchestrator.get_plan(project_id) is not None),
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "name": updated.name,
+            "status": summary,
+        }
+
+    def start_local_app(self, project_id: str) -> dict[str, Any]:
+        """Start project_id locally via LocalAppRunner and return updated local_app status."""
+        validate_project_id(project_id)
+        events = self.orchestrator.store.get_events(project_id)
+        ws_mgr = self._resolve_workspace_manager() or getattr(
+            self.orchestrator, "workspace_manager", None
+        )
+        if not events and (ws_mgr is None or not ws_mgr.get_workspace_dir(project_id).is_dir()):
+            raise ProjectNotFoundError(f"Project '{project_id}' not found")
+
+        with self._lock:
+            if project_id in self._active_projects:
+                raise ProjectConflictError(
+                    f"Project '{project_id}' has an active background operation in progress"
+                )
+            if self.local_runner.workspace_manager is None:
+                self.local_runner.workspace_manager = ws_mgr
+            try:
+                local_status = self.local_runner.start(project_id)
+            except (LocalAppError, SandboxViolationError, ValueError) as exc:
+                clean_msg = redact_secrets(str(exc), extra_secrets=self.secrets_to_redact)
+                raise ProjectConflictError(clean_msg) from exc
+
+        updated = self.orchestrator.get_status(project_id) if events else None
+        summary = (
+            self._serialize_summary(
+                project_id,
+                updated,
+                self.orchestrator.store.get_events(project_id),
+                has_plan=(self.orchestrator.get_plan(project_id) is not None),
+            )
+            if updated is not None
+            else None
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "local_app": local_status.to_api_dict(),
+            "status": summary,
+        }
+
+    def stop_local_app(self, project_id: str) -> dict[str, Any]:
+        """Stop locally running app for project_id cleanly and release its port."""
+        validate_project_id(project_id)
+        events = self.orchestrator.store.get_events(project_id)
+        ws_mgr = self._resolve_workspace_manager() or getattr(
+            self.orchestrator, "workspace_manager", None
+        )
+        if not events and (ws_mgr is None or not ws_mgr.get_workspace_dir(project_id).is_dir()):
+            raise ProjectNotFoundError(f"Project '{project_id}' not found")
+
+        if self.local_runner.workspace_manager is None:
+            self.local_runner.workspace_manager = ws_mgr
+        local_status = self.local_runner.stop(project_id)
+        updated = self.orchestrator.get_status(project_id) if events else None
+        summary = (
+            self._serialize_summary(
+                project_id,
+                updated,
+                self.orchestrator.store.get_events(project_id),
+                has_plan=(self.orchestrator.get_plan(project_id) is not None),
+            )
+            if updated is not None
+            else None
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "local_app": local_status.to_api_dict(),
+            "status": summary,
+        }
+
+    def modify_project(self, project_id: str, instructions: str) -> dict[str, Any]:
+        """Submit post-delivery modification instructions on a DELIVERED project preserving workspace (INV-13)."""
+        validate_project_id(project_id)
+        events = self.orchestrator.store.get_events(project_id)
+        if not events:
+            raise ProjectNotFoundError(f"Project '{project_id}' not found")
+
+        clean_instructions = str(instructions or "").strip()
+        if not clean_instructions:
+            raise ValueError("El campo 'instructions' es obligatorio.")
+
+        with self._lock:
+            if project_id in self._active_projects:
+                raise ProjectConflictError(
+                    f"Project '{project_id}' already has an active background operation"
+                )
+            self.local_runner.stop(project_id)
+            try:
+                updated = self.orchestrator.modify_project(project_id, clean_instructions)
+            except IllegalTransition as exc:
+                raise ProjectConflictError(str(exc)) from exc
+
+            if self.build_worker is not None and self.build_worker.queue is not None:
+                self.build_worker.queue.remove(project_id)
+
+            background_started = False
+            if self.build_worker is not None:
+                def _run_modify_build() -> None:
+                    assert self.build_worker is not None
+                    try:
+                        if self.build_worker.queue is not None:
+                            self.build_worker.queue.remove(project_id)
+                        self.build_worker.enqueue_approved_project(project_id)
+                        report = self.build_worker.run_job(project_id)
+                        final = self.orchestrator.get_status(project_id)
+                        if final.state == ProjectState.DELIVERED:
+                            repo_url = final.links.repo if final.links else ""
+                            deploy_url = final.links.deploy if final.links else ""
+                            self._notify_chat_best_effort(
+                                project_id,
+                                f"Cambios aplicados con éxito en {project_id}!\nRepo: {repo_url}\nDeploy: {deploy_url}",
+                            )
+                        elif final.state == ProjectState.FAILED:
+                            reason = final.failure_reason or report.failure_cause or "Modify error"
+                            self._notify_chat_best_effort(
+                                project_id,
+                                f"Error aplicando cambios en {project_id}: {reason}",
+                            )
+                    except (
+                        SandboxViolationError,
+                        IllegalTransition,
+                        CodeAgentError,
+                        CommandTimeoutError,
+                        ApprovalError,
+                        ValueError,
+                        TypeError,
+                        LookupError,
+                        TimeoutError,
+                        OSError,
+                        RuntimeError,
+                    ) as exc:
+                        cur = self.orchestrator.get_status(project_id).state
+                        if cur not in (ProjectState.FAILED, ProjectState.DELIVERED):
+                            self.orchestrator.record_phase_failure(
+                                project_id,
+                                failed_state=cur,
+                                error=exc,
+                                agent="dashboard_modify",
+                                extra_secrets=self.secrets_to_redact,
+                            )
+
+                background_started = self._start_background(project_id, _run_modify_build)
+
+            summary = self._serialize_summary(
+                project_id,
+                updated,
+                self.orchestrator.store.get_events(project_id),
+                has_plan=(self.orchestrator.get_plan(project_id) is not None),
+            )
+
+        return {
+            "ok": True,
+            "project_id": project_id,
             "status": summary,
             "background_started": background_started,
         }
@@ -732,6 +948,7 @@ class DashboardController:
             if not had_events and not had_workspace:
                 raise ProjectNotFoundError(f"Project '{project_id}' not found")
 
+            self.local_runner.stop(project_id)
             self.orchestrator.delete_project(project_id)
 
             if self.build_worker is not None and self.build_worker.queue is not None:
@@ -1367,6 +1584,61 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     a:hover { text-decoration: underline; }
     .toast { font-size: 0.85rem; color: var(--accent); }
     .btn-sm { padding: 5px 11px; font-size: 0.82rem; border-radius: 6px; }
+    .title-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .btn-icon {
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      padding: 3px 7px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      line-height: 1;
+      transition: all 0.15s ease;
+    }
+    .btn-icon:hover {
+      border-color: var(--border);
+      background: var(--surface-alt);
+      color: var(--text);
+    }
+    .edit-title-form {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 6px;
+    }
+    .input-inline {
+      flex: 1;
+      min-width: 210px;
+      padding: 6px 10px;
+      font-size: 0.92rem;
+      resize: none;
+    }
+    .local-controls-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .modify-box {
+      margin-top: 4px;
+      padding-top: 12px;
+      border-top: 1px dashed rgba(34, 197, 94, 0.35);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .modify-box-title {
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: var(--text);
+    }
     .new-project-form {
       margin-top: 12px;
       padding: 12px;
@@ -1590,7 +1862,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div id="detail-content" style="display:none">
         <div class="detail-header">
           <div class="detail-titles">
-            <h2 id="detail-title" class="detail-title"></h2>
+            <div class="title-row">
+              <h2 id="detail-title" class="detail-title"></h2>
+              <button id="edit-title-btn" class="btn-icon" type="button" title="Editar título" aria-label="Editar título">✏️</button>
+            </div>
+            <form id="edit-title-form" class="edit-title-form" style="display:none">
+              <input id="edit-title-input" class="input-field input-inline" type="text" maxlength="80" placeholder="Nombre del proyecto" required />
+              <button id="save-title-btn" class="btn btn-primary btn-sm" type="submit">Guardar</button>
+              <button id="cancel-title-btn" class="btn btn-sm" type="button">Cancelar</button>
+            </form>
           </div>
           <span id="detail-badge" class="badge"></span>
         </div>
@@ -1621,6 +1901,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       detail: null,
       replyDrafts: {},
       adjustDrafts: {},
+      modifyDrafts: {},
+      editingTitlePid: null,
       adjustOpen: {},
       phaseOpen: {},
       priorOpen: {},
@@ -1965,6 +2247,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       switch (ev.type) {
         case 'PROJECT_CREATED':
           return 'Proyecto creado e iniciado';
+        case 'PROJECT_RENAMED':
+          return pl.name ? ('Título actualizado a "' + pl.name + '"') : 'Título actualizado';
         case 'INTERVIEW_ROUND':
           return 'Preguntas y respuestas de requisitos';
         case 'SPEC_UPDATED':
@@ -1982,6 +2266,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         case 'AGENT_INVOKED':
           if (pl.agent === 'interviewer') return 'Analizando idea y preparando preguntas';
           if (pl.agent === 'generate_tests') return 'Creando pruebas automáticas';
+          if (pl.agent === 'update_tests') return 'Actualizando pruebas automáticas';
           if (pl.agent === 'implement_or_fix') return 'Escribiendo código';
           if (pl.state === 'VERIFYING') return 'Verificando funcionamiento';
           if (pl.state === 'DEBATE') return 'Evaluación de especialistas';
@@ -2130,6 +2415,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         'BUILDING': 'Construcción de la aplicación',
         'VERIFYING': 'Pruebas y verificación',
         'DELIVERED': 'Proyecto terminado y entregado',
+        'CHANGE_REQUEST': 'Preparando cambios',
         'COMPLETED': 'Proyecto terminado',
         'FAILED': 'Detenido por error',
       };
@@ -2311,21 +2597,41 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
 
       if (st.state === 'DELIVERED' || st.state === 'COMPLETED') {
+        const localApp = st.local_app || { running: false, url: null, app_type: 'unknown' };
         const repoBtn = (st.links && st.links.repo)
-          ? '<a href="' + escapeHtml(st.links.repo) + '" target="_blank" rel="noopener noreferrer" class="btn btn-primary">Abrir repositorio en GitHub</a>'
+          ? '<a href="' + escapeHtml(st.links.repo) + '" target="_blank" rel="noopener noreferrer" class="btn">Abrir repositorio en GitHub</a>'
           : '';
-        const deployBtn = (st.links && st.links.deploy)
+        const deployBtn = (localApp.app_type === 'static' && st.links && st.links.deploy)
           ? '<a href="' + escapeHtml(st.links.deploy) + '" target="_blank" rel="noopener noreferrer" class="btn">Ver despliegue en vivo</a>'
           : '';
+        const localBtns = (localApp.running && localApp.url)
+          ? '<a href="' + escapeHtml(localApp.url) + '" target="_blank" rel="noopener noreferrer" class="btn btn-success">Abrir app en local</a>' +
+            '<button class="btn btn-warn" data-dact="local-stop">Apagar</button>' +
+            '<span class="model-pill">' + escapeHtml(localApp.url) + '</span>'
+          : '<button class="btn btn-primary" data-dact="local-start">Encender en local</button>';
+        const descMsg = localApp.app_type === 'python_local'
+          ? 'Proyecto local con servidor Python listo para ejecutarse en tu computadora.'
+          : 'El proyecto ha sido construido y verificado exitosamente.';
+        const modifyDraft = escapeHtml((state.modifyDrafts && state.modifyDrafts[st.project_id]) || '');
         return '<div class="guidance-banner banner-ok">' +
           '<div class="banner-content">' +
             '<div class="banner-icon">🎉</div>' +
             '<div class="banner-body">' +
               '<div class="banner-title">¡Proyecto terminado con éxito!</div>' +
-              '<div class="banner-desc">El proyecto ha sido construido y verificado exitosamente.</div>' +
+              '<div class="banner-desc">' + escapeHtml(descMsg) + '</div>' +
             '</div>' +
           '</div>' +
-          ((repoBtn || deployBtn) ? '<div class="banner-actions">' + repoBtn + deployBtn + '</div>' : '') +
+          '<div class="banner-actions">' +
+            '<div class="local-controls-row">' + localBtns + '</div>' +
+            repoBtn + deployBtn +
+          '</div>' +
+          '<div class="modify-box">' +
+            '<div class="modify-box-title">Pedir cambios o mejoras</div>' +
+            '<textarea id="modify-project-input" class="input-field" rows="2" placeholder="Describe qué quieres mejorar, cambiar o agregar al proyecto...">' + modifyDraft + '</textarea>' +
+            '<div class="banner-actions">' +
+              '<button id="modify-project-btn" class="btn btn-primary btn-sm" type="button">Aplicar cambios</button>' +
+            '</div>' +
+          '</div>' +
         '</div>';
       }
 
@@ -2738,6 +3044,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const info = stepInfo(st.state, events);
       const titleText = st.name || st.objective || st.project_id;
       document.getElementById('detail-title').textContent = titleText;
+      if (state.editingTitlePid && state.editingTitlePid !== st.project_id) {
+        const editForm = document.getElementById('edit-title-form');
+        const editBtn = document.getElementById('edit-title-btn');
+        if (editForm) editForm.style.display = 'none';
+        if (editBtn) editBtn.style.display = '';
+        state.editingTitlePid = null;
+      }
 
       const badge = document.getElementById('detail-badge');
       badge.textContent = info.step;
@@ -2793,6 +3106,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const inact = st.state === 'INTERVIEW' && !isRunning ? formatInactivityNote(st.last_event_at) : '';
       const bannerSig = JSON.stringify([
         st.project_id,
+        st.name,
         st.state,
         isRunning,
         activeModel,
@@ -2810,6 +3124,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         questions,
         inact,
         st.links,
+        st.local_app,
       ]);
 
       const guidanceEl = document.getElementById('detail-guidance');
@@ -2859,6 +3174,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               await sendProjectMessage(st.project_id, adjInput.value, 'adjust');
             } finally {
               if (document.body.contains(adjBtn)) adjBtn.disabled = false;
+            }
+          });
+        }
+
+        const modifyInput = document.getElementById('modify-project-input');
+        const modifyBtn = document.getElementById('modify-project-btn');
+        if (modifyInput) {
+          modifyInput.addEventListener('input', () => {
+            state.modifyDrafts[st.project_id] = modifyInput.value;
+          });
+        }
+        if (modifyBtn && modifyInput) {
+          modifyBtn.addEventListener('click', async () => {
+            modifyBtn.disabled = true;
+            try {
+              await submitModifyProject(st.project_id, modifyInput.value);
+            } finally {
+              if (document.body.contains(modifyBtn)) modifyBtn.disabled = false;
             }
           });
         }
@@ -3150,6 +3483,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    async function submitModifyProject(pid, rawInstructions) {
+      const instructions = (rawInstructions || '').trim();
+      if (!instructions) {
+        setNote('Describe qué cambios o mejoras deseas aplicar.');
+        return;
+      }
+      try {
+        await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/modify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ instructions }),
+        });
+        delete state.modifyDrafts[pid];
+        setNote('Cambios en curso para ' + pid + '.');
+        state.lastBannerSignature = null;
+        await loadProjects();
+      } catch (err) {
+        setNote('Error aplicando cambios: ' + err.message);
+      }
+    }
+
     async function handleAction(action, pid) {
       try {
         if (action === 'delete') {
@@ -3182,6 +3536,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             body: JSON.stringify({ clean_workspace: true }),
           });
           setNote('Reconstrucción desde cero iniciada para ' + pid + '.');
+        } else if (action === 'local-start') {
+          const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/start', { method: 'POST' });
+          const url = res.local_app && res.local_app.url ? res.local_app.url : '';
+          setNote(url ? ('App encendida en ' + url) : ('App encendida para ' + pid));
+        } else if (action === 'local-stop') {
+          await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/stop', { method: 'POST' });
+          setNote('App local apagada para ' + pid + '.');
         }
         state.lastBannerSignature = null;
         await loadProjects();
@@ -3189,6 +3550,66 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         setNote('Error en ' + action + ': ' + err.message);
       }
     }
+
+    (function initEditTitleForm() {
+      const editBtn = document.getElementById('edit-title-btn');
+      const form = document.getElementById('edit-title-form');
+      const input = document.getElementById('edit-title-input');
+      const saveBtn = document.getElementById('save-title-btn');
+      const cancelBtn = document.getElementById('cancel-title-btn');
+      if (!editBtn || !form || !input || !saveBtn || !cancelBtn) return;
+
+      function closeEditor() {
+        form.style.display = 'none';
+        editBtn.style.display = '';
+        state.editingTitlePid = null;
+      }
+
+      editBtn.addEventListener('click', () => {
+        if (!state.detail || !state.detail.status) return;
+        const st = state.detail.status;
+        state.editingTitlePid = st.project_id;
+        input.value = st.name || st.objective || st.project_id;
+        editBtn.style.display = 'none';
+        form.style.display = 'flex';
+        input.focus();
+        input.select();
+      });
+
+      cancelBtn.addEventListener('click', closeEditor);
+      input.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Escape') {
+          ev.preventDefault();
+          closeEditor();
+        }
+      });
+
+      form.addEventListener('submit', async (ev) => {
+        ev.preventDefault();
+        const pid = state.editingTitlePid || (state.detail && state.detail.project_id);
+        const title = (input.value || '').trim();
+        if (!pid || !title) {
+          setNote('Escribe un título válido para el proyecto.');
+          return;
+        }
+        saveBtn.disabled = true;
+        try {
+          await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/title', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title }),
+          });
+          closeEditor();
+          state.lastBannerSignature = null;
+          setNote('Título actualizado.');
+          await loadProjects();
+        } catch (err) {
+          setNote('Error actualizando título: ' + err.message);
+        } finally {
+          saveBtn.disabled = false;
+        }
+      });
+    })();
 
     (function initNewProjectForm() {
       const toggleBtn = document.getElementById('toggle-new-project-btn');
@@ -3269,6 +3690,13 @@ class DashboardHTTPServer(http.server.ThreadingHTTPServer):
             )
         self.controller = controller
         super().__init__((host, port), _DashboardRequestHandler)
+
+    def server_close(self) -> None:
+        """Ensure any locally launched apps stop cleanly when HTTP server shuts down."""
+        try:
+            self.controller.local_runner.stop_all()
+        finally:
+            super().server_close()
 
 
 class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -3354,7 +3782,15 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         parts = rest.split("/")
         if len(parts) == 1:
             return urllib.parse.unquote(parts[0]), None
-        if len(parts) == 2 and parts[1] in {"approve", "retry", "message"}:
+        if len(parts) == 2 and parts[1] in {
+            "approve",
+            "retry",
+            "message",
+            "start",
+            "stop",
+            "modify",
+            "title",
+        }:
             return urllib.parse.unquote(parts[0]), parts[1]
         # Reject multi-segment or path-traversal attempts (e.g., ../etc) as invalid project_id
         return urllib.parse.unquote(rest), None
@@ -3405,7 +3841,7 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         pid, action = self._parse_project_route()
-        if pid is None or action not in {"approve", "retry", "message"}:
+        if pid is None or action not in {"approve", "retry", "message", "start", "stop", "modify"}:
             self._drain_body()
             self._send_json(404, {"error": "Endpoint not found"})
             return
@@ -3420,10 +3856,44 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
                 if not isinstance(raw_clean, bool):
                     raise TypeError("El campo 'clean_workspace' debe ser booleano.")
                 result = ctrl.retry_project(pid, clean_workspace=raw_clean)
+            elif action == "start":
+                self._drain_body()
+                result = ctrl.start_local_app(pid)
+            elif action == "stop":
+                self._drain_body()
+                result = ctrl.stop_local_app(pid)
+            elif action == "modify":
+                body = self._read_json_body()
+                instructions = self._require_str_field(body, "instructions")
+                result = ctrl.modify_project(pid, instructions)
             else:
                 body = self._read_json_body()
                 message = self._require_str_field(body, "message")
                 result = ctrl.send_message(pid, message)
+        except (ValueError, TypeError) as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except ProjectNotFoundError as exc:
+            self._send_json(404, {"error": str(exc)})
+            return
+        except ProjectConflictError as exc:
+            self._send_json(409, {"error": str(exc)})
+            return
+
+        self._send_json(200, result)
+
+    def do_PATCH(self) -> None:
+        ctrl = self.server.controller
+        pid, action = self._parse_project_route()
+        if pid is None or action != "title":
+            self._drain_body()
+            self._send_json(404, {"error": "Endpoint not found"})
+            return
+
+        try:
+            body = self._read_json_body()
+            title = self._require_str_field(body, "title")
+            result = ctrl.rename_project(pid, title)
         except (ValueError, TypeError) as exc:
             self._send_json(400, {"error": str(exc)})
             return
@@ -3469,6 +3939,7 @@ def start_dashboard_server(
     workspace_manager: WorkspaceManager | None = None,
     bot_service: TelegramBotService | None = None,
     model_resolver: Any = None,
+    local_runner: LocalAppRunner | None = None,
     secrets_to_redact: Sequence[str] = (),
 ) -> tuple[DashboardHTTPServer, threading.Thread, str]:
     """Create and start DashboardHTTPServer on 127.0.0.1:<port> in a daemon thread."""
@@ -3479,6 +3950,7 @@ def start_dashboard_server(
         workspace_manager=workspace_manager,
         bot_service=bot_service,
         model_resolver=model_resolver,
+        local_runner=local_runner,
         secrets_to_redact=secrets_to_redact,
     )
     server = DashboardHTTPServer((LOOPBACK_HOST, port), controller)

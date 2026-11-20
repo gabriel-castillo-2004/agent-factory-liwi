@@ -15,55 +15,15 @@ from agent_factory.domain.models import validate_project_id
 from agent_factory.ports.notifier import TelegramTransportError
 from agent_factory.ports.runner import CommandResult, CommandTimeoutError, Runner
 from agent_factory.ports.vcs import VCS, CIRunResult
-from agent_factory.secrets import redact_secrets
+from agent_factory.runtime_runner import detect_workspace_app
+from agent_factory.secrets import redact_secrets, sanitize_subprocess_env
 
 if TYPE_CHECKING:
     from agent_factory.adapters.static_deploy_publisher import StaticDeployPublisher
 
-SAFE_ENV_KEYS: frozenset[str] = frozenset(
-    {
-        "PATH",
-        "SYSTEMROOT",
-        "COMSPEC",
-        "PATHEXT",
-        "WINDIR",
-        "TMP",
-        "TEMP",
-        "USER",
-        "USERNAME",
-        "HOME",
-        "USERPROFILE",
-        "LANG",
-        "LC_ALL",
-        "TERM",
-        "GIT_EXEC_PATH",
-    }
-)
-FORBIDDEN_ENV_SUBSTRINGS: tuple[str, ...] = (
-    "TELEGRAM",
-    "LLM",
-    "OPENAI",
-    "ANTHROPIC",
-    "GEMINI",
-    "SECRET",
-    "PASSWORD",
-    "CREDENTIAL",
-)
-
 
 class VcsError(RuntimeError):
     """Raised when a Git/GitHub operation fails, with all secrets redacted (INV-07)."""
-
-
-def sanitize_subprocess_env(host_env: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Filter host_env to safe system variables excluding unrelated credentials (INV-19)."""
-    effective = os.environ if host_env is None else host_env
-    clean: dict[str, str] = {}
-    for k, v in effective.items():
-        k_up = k.upper()
-        if k_up in SAFE_ENV_KEYS and not any(sub in k_up for sub in FORBIDDEN_ENV_SUBSTRINGS):
-            clean[k] = v
-    return clean
 
 
 def build_git_push_env(
@@ -936,7 +896,10 @@ class GitHubVCSAdapter(VCS):
             if owner
             else f"{self.repo_base_url}/{project_id}"
         )
-        if self.deploy_publisher is not None:
+        is_python_local = ws_dir.is_dir() and detect_workspace_app(ws_dir).app_type == "python_local"
+        if is_python_local:
+            deploy_url = ""
+        elif self.deploy_publisher is not None:
             deploy_url = self.deploy_publisher.deploy_site(project_id, ws_dir)
             if (
                 use_rest_merge

@@ -12,6 +12,7 @@ class EventType(StrEnum):
     """Canonical event types recorded in the append-only log."""
 
     PROJECT_CREATED = "PROJECT_CREATED"
+    PROJECT_RENAMED = "PROJECT_RENAMED"
     STATE_TRANSITIONED = "STATE_TRANSITIONED"
     INTERVIEW_ROUND = "INTERVIEW_ROUND"
     SPEC_UPDATED = "SPEC_UPDATED"

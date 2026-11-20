@@ -991,3 +991,90 @@ def test_github_vcs_blocks_parent_git_escape_tolerates_422_and_merges_via_pr_api
     assert "[REDACTED]" in str(http_err.value)
     assert http_err.value.__cause__ is None
     assert http_err.value.__context__ is None
+
+
+def test_static_deploy_publisher_publishes_src_subdir_not_empty_root_template(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """StaticDeployPublisher detects when index.html in root is the untouched empty template and publishes src/ (both via gh pages deploy and git subtree commit-tree fallback)."""
+    gh_tok = "TEST_SRC_DEPLOY_TOK_55"
+    ws_dir = tmp_path / "ws" / "pomodoro-src"
+    ws_dir.mkdir(parents=True)
+    # Untouched root shell from templates/static-web/index.html
+    (ws_dir / "index.html").write_text(
+        '<!DOCTYPE html>\n<html lang="es">\n  <head>\n    <title>Static Web App</title>\n'
+        '    <link rel="stylesheet" href="./styles.css" />\n  </head>\n'
+        '  <body>\n    <main id="app" aria-live="polite"></main>\n'
+        '    <script type="module" src="./src/app.js"></script>\n  </body>\n</html>\n',
+        encoding="utf-8",
+    )
+    (ws_dir / "styles.css").write_text("/* empty */\n", encoding="utf-8")
+    (ws_dir / "src").mkdir()
+    (ws_dir / "src" / "index.html").write_text(
+        "<!doctype html><html><body><h1>Real Built App</h1><script src='./app.js'></script></body></html>\n",
+        encoding="utf-8",
+    )
+    (ws_dir / "src" / "app.js").write_text("console.log('built');\n", encoding="utf-8")
+
+    # Part A: With FakeRunner (gh CLI mode), deploy target path points strictly to ws_dir/src
+    fake_runner = FakeRunner(results=[CommandResult(exit_code=0, stdout="deployed")])
+    pub_cli = StaticDeployPublisher(
+        runner=fake_runner,
+        target="github-pages",
+        deploy_base_url="https://acme.github.io",
+        deploy_token=gh_tok,
+    )
+    url = pub_cli.deploy_site("pomodoro-src", ws_dir)
+    assert url == "https://acme.github.io/pomodoro-src"
+    assert len(fake_runner.calls) == 1
+    assert Path(fake_runner.calls[0]["command"][3]).resolve() == (ws_dir / "src").resolve()
+
+    # Part B: Without gh CLI, real git commit-tree publishes ONLY src/ contents to gh-pages branch root
+    orig_which = shutil.which
+
+    def _hide_gh(
+        name: str,
+        mode: int = os.F_OK | os.X_OK,
+        path: str | None = None,
+    ) -> str | None:
+        return None if name == "gh" else orig_which(name, mode=mode, path=path)
+
+    monkeypatch.setattr("agent_factory.adapters.static_deploy_publisher.shutil.which", _hide_gh)
+
+    bare_remote = tmp_path / "bare" / "pomodoro-src.git"
+    bare_remote.parent.mkdir(parents=True)
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare_remote)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=ws_dir, check=True)
+    subprocess.run(["git", "config", "user.email", "test@local.dev"], cwd=ws_dir, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=ws_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "initial built workspace"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare_remote)], cwd=ws_dir, check=True)
+
+    pub_git = StaticDeployPublisher(
+        runner=SubprocessRunner(default_timeout_seconds=15.0),
+        target="github-pages",
+        deploy_base_url="https://acme.github.io",
+        branch="gh-pages",
+        deploy_token=gh_tok,
+    )
+    pub_git.deploy_site("pomodoro-src", ws_dir)
+
+    gh_pages_files = subprocess.run(
+        ["git", "-C", str(bare_remote), "ls-tree", "-r", "refs/heads/gh-pages", "--name-only"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    assert "index.html" in gh_pages_files
+    assert "app.js" in gh_pages_files
+    assert not any(f.startswith("src/") for f in gh_pages_files)
+    deployed_index = subprocess.run(
+        ["git", "-C", str(bare_remote), "show", "refs/heads/gh-pages:index.html"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "Real Built App" in deployed_index
+    assert "Static Web App" not in deployed_index

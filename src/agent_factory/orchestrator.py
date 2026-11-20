@@ -1,6 +1,7 @@
 """State machine orchestrator, approval gate, and circuit breaker (INV-05, INV-17)."""
 
 import logging
+import re
 import threading
 import time
 import tomllib
@@ -24,6 +25,8 @@ from agent_factory.agents.structuralist import StructuralistCritique
 from agent_factory.domain.events import Event, EventType, create_event
 from agent_factory.domain.models import (
     VALID_TEMPLATES,
+    AcceptanceTest,
+    AcceptanceTestType,
     ApprovalEvent,
     Plan,
     ProjectStatus,
@@ -50,6 +53,79 @@ DEFAULT_STATE_LIMITS: dict[str, int] = {
     "VERIFYING": 3,
     "ci_rounds": 3,
 }
+
+_CTRL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_LEADING_FILLER_RE = re.compile(
+    r"^(?:"
+    r"hola[\s,!:.-]*|"
+    r"por\s+favor[\s,!:.-]*|"
+    r"please[\s,!:.-]*|"
+    r"(?:me\s+gustar[ií]a|quisiera|quiero|necesito|deseo|podr[ií]as|puedes|ay[uú]dame\s+a)\s+(?:que\s+|a\s+)?|"
+    r"(?:i\s+want(?:\s+you)?\s+to|i\s+need(?:\s+you)?\s+to|i\s+want|i\s+need|can\s+you|build\s+me)\s+|"
+    r"(?:hazme|haz|cr[eé]ame|crea|crear|construye|construir|desarrolla|desarrollar|dise[ñn]a|dise[ñn]ar|genera|generar|arma|armar)\s+|"
+    r"(?:create|build|make|develop|design|generate)\s+|"
+    r"(?:una?|el|la|los|las|a|an|the)\s+"
+    r"(?:aplicaci[oó]n\s+web|app\s+web|aplicaci[oó]n|app|p[aá]gina\s+web|sitio\s+web|web\s+app|web|sistema|herramienta|plataforma|proyecto|programa|software|servicio|bot|chatbot)"
+    r"(?:\s+(?:que\s+(?:sea|permita|tenga|haga|sirva\s+para)|para|de|sobre|acerca\s+de|with|for|to|about|that))?\s*|"
+    r"(?:una?|el|la|a|an|the|para|de|for|to)\s+"
+    r")+",
+    re.IGNORECASE,
+)
+
+
+def sanitize_project_title(title: str, max_len: int = 80) -> str:
+    """Strip control characters and angle brackets, collapse whitespace, and validate title length."""
+    if not isinstance(title, str):
+        raise TypeError("El título debe ser texto.")
+    cleaned = _CTRL_CHARS_RE.sub(" ", title)
+    cleaned = cleaned.replace("<", " ").replace(">", " ")
+    cleaned = " ".join(cleaned.split()).strip(" .,-:;")
+    if not cleaned:
+        raise ValueError("El título no puede estar vacío.")
+    if len(cleaned) > max_len:
+        raise ValueError(f"El título no puede exceder {max_len} caracteres.")
+    return cleaned
+
+
+def synthesize_project_title(prompt: str, max_len: int = 55) -> str:
+    """Synthesize a concise <=max_len project title from a raw user prompt, removing filler openers."""
+    collapsed = _CTRL_CHARS_RE.sub(" ", str(prompt or ""))
+    collapsed = " ".join(collapsed.split()).strip()
+    if not collapsed:
+        return "Nuevo proyecto"
+
+    first_sentence = re.split(r"(?<=[.!?])\s+", collapsed, maxsplit=1)[0].strip()
+    candidate = first_sentence or collapsed
+
+    stripped = _LEADING_FILLER_RE.sub("", candidate).strip(" ,.:;-")
+    if len(stripped) >= 3:
+        candidate = stripped
+    else:
+        stripped_full = _LEADING_FILLER_RE.sub("", collapsed).strip(" ,.:;-")
+        if len(stripped_full) >= 3:
+            candidate = stripped_full
+
+    if len(candidate) > max_len:
+        for sep in (", ", " con ", " que ", " para ", " y ", " using ", " with ", " that "):
+            idx = candidate.lower().find(sep, 12)
+            if 10 <= idx <= max_len:
+                candidate = candidate[:idx].strip(" ,.:;-")
+                break
+
+    if len(candidate) > max_len:
+        words = candidate.split()
+        acc: list[str] = []
+        for word in words:
+            trial = " ".join([*acc, word])
+            if len(trial) > max_len:
+                break
+            acc.append(word)
+        candidate = " ".join(acc).strip(" ,.:;-") if acc else candidate[:max_len].strip()
+
+    candidate = candidate.strip(" ,.:;-") or collapsed[:max_len].strip()
+    if candidate and candidate[0].islower():
+        candidate = candidate[0].upper() + candidate[1:]
+    return candidate[:max_len]
 
 
 class ApprovalError(Exception):
@@ -268,6 +344,18 @@ class Orchestrator:
     ) -> ProjectStatus:
         """Create a new project in INTERVIEW state and append initial events."""
         validate_project_id(project_id)
+        raw_name = str(name or "").strip()
+        raw_obj = str(objective or "").strip()
+        if not raw_name and raw_obj:
+            effective_name = synthesize_project_title(raw_obj)
+        elif raw_name and (
+            _LEADING_FILLER_RE.match(raw_name)
+            or (len(raw_name) > 55 and raw_name == raw_obj)
+        ):
+            effective_name = synthesize_project_title(raw_name)
+        else:
+            effective_name = raw_name or project_id
+
         with self._project_lock(project_id):
             existing_events = self.store.get_events(project_id)
             if existing_events:
@@ -278,12 +366,151 @@ class Orchestrator:
             event = create_event(
                 project_id=project_id,
                 event_type=EventType.PROJECT_CREATED,
-                payload={"name": name, "objective": objective, "state": ProjectState.INTERVIEW},
+                payload={"name": effective_name, "objective": objective, "state": ProjectState.INTERVIEW},
                 at=self._now(),
             )
             self.store.append(event)
             with self._lock:
                 self._specs[project_id] = Spec(objective=objective)
+            return self.get_status(project_id)
+
+    def rename_project(self, project_id: str, title: str) -> ProjectStatus:
+        """Append PROJECT_RENAMED event validating and sanitizing the new title (INV-11)."""
+        validate_project_id(project_id)
+        clean_title = sanitize_project_title(title)
+        with self._project_lock(project_id):
+            events = self.store.get_events(project_id)
+            if not events:
+                raise ValueError(f"Project '{project_id}' does not exist")
+            current_status = self.get_status(project_id)
+            self.store.append(
+                create_event(
+                    project_id=project_id,
+                    event_type=EventType.PROJECT_RENAMED,
+                    payload={"name": clean_title, "previous_name": current_status.name},
+                    at=self._now(),
+                )
+            )
+            return self.get_status(project_id)
+
+    def modify_project(self, project_id: str, instructions: str) -> ProjectStatus:
+        """Transition a DELIVERED project legally via CHANGE_REQUEST to BUILDING preserving workspace (INV-04, INV-05)."""
+        validate_project_id(project_id)
+        clean_instr = _CTRL_CHARS_RE.sub(" ", str(instructions or "")).strip()
+        if not clean_instr:
+            raise ValueError("Las instrucciones de modificación son obligatorias.")
+        with self._project_lock(project_id):
+            events = self.store.get_events(project_id)
+            if not events:
+                raise ValueError(f"Project '{project_id}' does not exist")
+            current_status = self.get_status(project_id)
+            if current_status.state != ProjectState.DELIVERED:
+                raise IllegalTransition(current_status.state, ProjectState.CHANGE_REQUEST)
+            base_plan = self.get_plan(project_id)
+            if base_plan is None or not current_status.plan_hash:
+                raise ValueError(f"Project '{project_id}' has no approved plan to modify")
+
+            # INV-04 canonical sequence: DELIVERED -> CHANGE_REQUEST -> INTERVIEW -> DEBATE -> MEDIATION -> WAITING_APPROVAL -> BUILDING
+            for src_state, dst_state, extra_payload in (
+                (
+                    ProjectState.DELIVERED,
+                    ProjectState.CHANGE_REQUEST,
+                    {"reason": clean_instr, "instructions": clean_instr},
+                ),
+                (ProjectState.CHANGE_REQUEST, ProjectState.INTERVIEW, {}),
+            ):
+                validate_transition(src_state, dst_state)
+                self.store.append(
+                    create_event(
+                        project_id=project_id,
+                        event_type=EventType.STATE_TRANSITIONED,
+                        payload={"from": src_state.value, "to": dst_state.value, **extra_payload},
+                        at=self._now(),
+                    )
+                )
+
+            spec = self._get_spec(project_id)
+            feature_entry = f"Cambio solicitado: {clean_instr}"
+            updated_features = list(spec.features)
+            if feature_entry not in updated_features:
+                updated_features.append(feature_entry)
+            updated_spec = spec.model_copy(update={"features": updated_features})
+            with self._lock:
+                self._specs[project_id] = updated_spec
+            self.store.append(
+                create_event(
+                    project_id=project_id,
+                    event_type=EventType.SPEC_UPDATED,
+                    payload={
+                        "spec": updated_spec.model_dump(mode="json"),
+                        "change_instructions": clean_instr,
+                    },
+                    at=self._now(),
+                )
+            )
+
+            for src_state, dst_state in (
+                (ProjectState.INTERVIEW, ProjectState.DEBATE),
+                (ProjectState.DEBATE, ProjectState.MEDIATION),
+            ):
+                validate_transition(src_state, dst_state)
+                self.store.append(
+                    create_event(
+                        project_id=project_id,
+                        event_type=EventType.STATE_TRANSITIONED,
+                        payload={"from": src_state.value, "to": dst_state.value},
+                        at=self._now(),
+                    )
+                )
+
+            mod_idx = len(base_plan.acceptance_tests) + 1
+            updated_tests = [
+                *base_plan.acceptance_tests,
+                AcceptanceTest(
+                    id=f"MOD-{mod_idx:02d}",
+                    description=clean_instr,
+                    type=AcceptanceTestType.E2E,
+                ),
+            ]
+            updated_plan = base_plan.model_copy(update={"acceptance_tests": updated_tests})
+            new_plan_hash = updated_plan.compute_hash()
+            validate_transition(ProjectState.MEDIATION, ProjectState.WAITING_APPROVAL)
+            self.store.append(
+                create_event(
+                    project_id=project_id,
+                    event_type=EventType.PLAN_CREATED,
+                    payload={
+                        "plan": updated_plan.model_dump(mode="json"),
+                        "plan_hash": new_plan_hash,
+                        "total_tests": len(updated_plan.acceptance_tests),
+                        "from": ProjectState.MEDIATION.value,
+                        "to": ProjectState.WAITING_APPROVAL.value,
+                        "instructions": clean_instr,
+                    },
+                    at=self._now(),
+                )
+            )
+
+            self.circuit_breaker.reset(project_id, ProjectState.BUILDING)
+            self.circuit_breaker.reset(project_id, ProjectState.VERIFYING)
+
+            validate_transition(ProjectState.WAITING_APPROVAL, ProjectState.BUILDING)
+            self.store.append(
+                create_event(
+                    project_id=project_id,
+                    event_type=EventType.APPROVAL_RECORDED,
+                    payload={
+                        "plan_hash": new_plan_hash,
+                        "decision": "approved",
+                        "timestamp": self._now().isoformat(),
+                        "from": ProjectState.WAITING_APPROVAL.value,
+                        "to": ProjectState.BUILDING.value,
+                        "mode": "modify",
+                        "instructions": clean_instr,
+                    },
+                    at=self._now(),
+                )
+            )
             return self.get_status(project_id)
 
     def handle_interview_message(

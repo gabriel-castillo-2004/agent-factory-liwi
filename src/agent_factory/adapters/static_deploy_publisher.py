@@ -10,15 +10,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from agent_factory.adapters.github_vcs_adapter import (
-    build_git_push_env,
-    sanitize_subprocess_env,
-)
+from agent_factory.adapters.github_vcs_adapter import build_git_push_env
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.domain.events import Event
 from agent_factory.domain.models import BuildReport, ProjectStatus, validate_project_id
 from agent_factory.ports.runner import CommandTimeoutError, Runner
-from agent_factory.secrets import redact_secrets
+from agent_factory.runtime_runner import resolve_static_root
+from agent_factory.secrets import redact_secrets, sanitize_subprocess_env
 
 
 def _sanitize_data(data: Any, secrets: Sequence[str]) -> Any:
@@ -198,9 +196,13 @@ class StaticDeployPublisher:
         clean_env = self.build_clean_env()
         extra_scrub: tuple[str, ...] = self.secrets
         run_env: dict[str, str] = clean_env
+        effective_dir = resolve_static_root(resolved_source) or resolved_source
+        run_cwd = effective_dir
         target_lower = self.target.lower()
+        clean_err: str | None = None
+        res = None
         if target_lower == "vercel":
-            cmd = ["vercel", "deploy", str(resolved_source), "--yes"]
+            cmd = ["vercel", "deploy", str(effective_dir), "--yes"]
         elif (
             isinstance(self.runner, SubprocessRunner)
             and shutil.which("gh") is None
@@ -213,24 +215,56 @@ class StaticDeployPublisher:
             )
             run_env, push_secrets = build_git_push_env(clean_env, gh_tok)
             extra_scrub = (*self.secrets, *push_secrets)
+            run_cwd = resolved_source
+            push_ref = "HEAD"
+            if effective_dir != resolved_source:
+                rel_sub = effective_dir.relative_to(resolved_source).as_posix()
+                try:
+                    tree_res = self.runner.run(
+                        ["git", "rev-parse", "--verify", f"HEAD:{rel_sub}"],
+                        cwd=resolved_source,
+                        env=run_env,
+                    )
+                    if tree_res.exit_code != 0 or not tree_res.stdout.strip():
+                        clean_err = redact_secrets(
+                            tree_res.stderr or tree_res.stdout or f"Missing committed tree for {rel_sub}",
+                            extra_secrets=extra_scrub,
+                        )
+                    else:
+                        tree_sha = tree_res.stdout.strip()
+                        commit_res = self.runner.run(
+                            ["git", "commit-tree", tree_sha, "-m", f"deploy(gh-pages): publish {rel_sub}"],
+                            cwd=resolved_source,
+                            env=run_env,
+                        )
+                        if commit_res.exit_code != 0 or not commit_res.stdout.strip():
+                            clean_err = redact_secrets(
+                                commit_res.stderr or commit_res.stdout or "git commit-tree failed",
+                                extra_secrets=extra_scrub,
+                            )
+                        else:
+                            push_ref = commit_res.stdout.strip()
+                except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
+                    clean_err = redact_secrets(str(exc), extra_secrets=extra_scrub)
             cmd = [
                 "git",
                 "push",
                 "--force",
                 "origin",
-                f"HEAD:refs/heads/{effective_branch}",
+                f"{push_ref}:refs/heads/{effective_branch}",
             ]
         else:
-            cmd = ["gh", "pages", "deploy", str(resolved_source), "--branch", effective_branch]
-        clean_err: str | None = None
-        try:
-            res = self.runner.run(cmd, cwd=resolved_source, env=run_env)
-        except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
-            clean_err = redact_secrets(str(exc), extra_secrets=extra_scrub)
-        else:
-            if res.exit_code != 0:
-                err = res.stderr or res.stdout or f"exit code {res.exit_code}"
-                clean_err = redact_secrets(err, extra_secrets=extra_scrub)
+            cmd = ["gh", "pages", "deploy", str(effective_dir), "--branch", effective_branch]
+
+        if clean_err is None:
+            try:
+                res = self.runner.run(cmd, cwd=run_cwd, env=run_env)
+            except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
+                clean_err = redact_secrets(str(exc), extra_secrets=extra_scrub)
+            else:
+                if res.exit_code != 0:
+                    err = res.stderr or res.stdout or f"exit code {res.exit_code}"
+                    clean_err = redact_secrets(err, extra_secrets=extra_scrub)
 
         if clean_err is not None:
             err_obj = StaticDeployError(f"Static deploy failed: {clean_err}")

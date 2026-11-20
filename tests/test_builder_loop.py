@@ -1892,6 +1892,90 @@ def test_build_worker_passes_on_subprocess_pytest_summary_and_progress_dots_and_
     assert phase_err.payload["state"] == ProjectState.VERIFYING.value
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_build_worker_http_smoke_test_detects_missing_404_asset_and_recovers_after_fix(
+    tmp_path: Path,
+) -> None:
+    """BuildWorker runs real HTTP Smoke Test before VERIFYING, feeds missing 404 resource back to implement_or_fix, stops temp server cleanly in finally, and delivers once all assets return 200."""
+    import urllib.error
+    import urllib.request
+
+    from agent_factory.runtime_runner import LocalAppRunner
+
+    pid = "proj-smoke-test-recovery"
+    orchestrator, _ = _create_approved_project(pid, num_tests=1, approve=True)
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_smoke")
+    local_runner = LocalAppRunner(workspace_manager=ws_mgr)
+
+    agent = FakeCodeAgent(
+        test_gen_steps=[{"tests/test_app.py": "def test_at_01(): assert True\n"}],
+        impl_steps=[
+            # Round 1: writes index.html & styles.css, but forgets app.js referenced in <script src="./app.js">
+            {
+                "index.html": (
+                    "<!doctype html><html><head>"
+                    "<link rel='stylesheet' href='./styles.css'>"
+                    "</head><body><h1>App</h1><script src='./app.js'></script></body></html>\n"
+                ),
+                "styles.css": "body { color: #111; }\n",
+            },
+            # Round 2: fixes the missing app.js reported by HTTP Smoke Test
+            {"app.js": "console.log('loaded');\n"},
+        ],
+    )
+    runner = FakeRunner(
+        results=[
+            CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True}),
+            CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True}),
+        ]
+    )
+    vcs = FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI green")])
+    worker = BuildWorker(
+        orchestrator=orchestrator,
+        workspace_manager=ws_mgr,
+        code_agent=agent,
+        runner=runner,
+        vcs=vcs,
+        local_app_runner=local_runner,
+    )
+
+    try:
+        report = worker.run_job(pid)
+        assert orchestrator.get_status(pid).state == ProjectState.DELIVERED
+        assert report.invocations == 3  # 1 test_gen + 2 impl rounds
+        assert len(agent.impl_calls) == 2
+        round2_failure = agent.impl_calls[1]["failure_output"]
+        assert "404" in round2_failure
+        assert "app.js" in round2_failure
+        assert len(vcs.pushes) == 1
+
+        # Temporary smoke server was stopped cleanly in finally (no active local app or leaked port)
+        st_local = local_runner.get_status(pid)
+        assert st_local.running is False
+        assert st_local.url is None
+
+        # Verify direct LocalAppRunner smoke check helper against clean static workspace
+        from agent_factory.runtime_runner import run_http_smoke_test
+
+        ws_dir = ws_mgr.get_workspace_dir(pid)
+        smoke_ok = run_http_smoke_test(local_runner, pid, ws_dir)
+        assert smoke_ok.passed is True
+        assert smoke_ok.failed_resources == []
+
+        # Remove app.js and verify direct smoke test reports missing app.js -> 404 and cleans up port
+        (ws_dir / "app.js").unlink()
+        smoke_fail = run_http_smoke_test(local_runner, pid, ws_dir)
+        assert smoke_fail.passed is False
+        assert any("app.js" in item and "404" in item for item in smoke_fail.failed_resources)
+        assert local_runner.get_status(pid).running is False
+        if smoke_fail.url:
+            with pytest.raises((urllib.error.URLError, OSError)):
+                urllib.request.urlopen(smoke_fail.url, timeout=1.0)
+    finally:
+        local_runner.stop_all()
+
+
 
 
 
