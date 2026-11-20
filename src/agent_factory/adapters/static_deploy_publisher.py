@@ -10,41 +10,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from agent_factory.adapters.github_vcs_adapter import (
+    build_git_push_env,
+    sanitize_subprocess_env,
+)
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.domain.events import Event
 from agent_factory.domain.models import BuildReport, ProjectStatus, validate_project_id
 from agent_factory.ports.runner import CommandTimeoutError, Runner
 from agent_factory.secrets import redact_secrets
-
-SAFE_ENV_KEYS: frozenset[str] = frozenset(
-    {
-        "PATH",
-        "SYSTEMROOT",
-        "COMSPEC",
-        "PATHEXT",
-        "WINDIR",
-        "TMP",
-        "TEMP",
-        "USER",
-        "USERNAME",
-        "HOME",
-        "USERPROFILE",
-        "LANG",
-        "LC_ALL",
-        "TERM",
-        "GIT_EXEC_PATH",
-    }
-)
-FORBIDDEN_ENV_SUBSTRINGS: tuple[str, ...] = (
-    "TELEGRAM",
-    "LLM",
-    "OPENAI",
-    "ANTHROPIC",
-    "GEMINI",
-    "SECRET",
-    "PASSWORD",
-    "CREDENTIAL",
-)
 
 
 def _sanitize_data(data: Any, secrets: Sequence[str]) -> Any:
@@ -93,12 +67,7 @@ class StaticDeployPublisher:
 
     def build_clean_env(self, host_env: Mapping[str, str] | None = None) -> dict[str, str]:
         """Construct sanitized subprocess env excluding unrelated host secrets (INV-19)."""
-        effective = os.environ if host_env is None else host_env
-        clean: dict[str, str] = {}
-        for k, v in effective.items():
-            k_up = k.upper()
-            if k_up in SAFE_ENV_KEYS and not any(sub in k_up for sub in FORBIDDEN_ENV_SUBSTRINGS):
-                clean[k] = v
+        clean = sanitize_subprocess_env(host_env=host_env)
         if self.deploy_token:
             clean["VERCEL_TOKEN"] = self.deploy_token
             clean["GITHUB_TOKEN"] = self.deploy_token
@@ -227,20 +196,41 @@ class StaticDeployPublisher:
             raise ValueError(f"Invalid or protected branch: '{effective_branch}'")
 
         clean_env = self.build_clean_env()
+        extra_scrub: tuple[str, ...] = self.secrets
+        run_env: dict[str, str] = clean_env
         target_lower = self.target.lower()
         if target_lower == "vercel":
             cmd = ["vercel", "deploy", str(resolved_source), "--yes"]
+        elif (
+            isinstance(self.runner, SubprocessRunner)
+            and shutil.which("gh") is None
+            and (resolved_source / ".git").exists()
+        ):
+            gh_tok = (
+                self.deploy_token
+                or os.environ.get("GITHUB_TOKEN", "").strip()
+                or os.environ.get("GH_TOKEN", "").strip()
+            )
+            run_env, push_secrets = build_git_push_env(clean_env, gh_tok)
+            extra_scrub = (*self.secrets, *push_secrets)
+            cmd = [
+                "git",
+                "push",
+                "--force",
+                "origin",
+                f"HEAD:refs/heads/{effective_branch}",
+            ]
         else:
             cmd = ["gh", "pages", "deploy", str(resolved_source), "--branch", effective_branch]
         clean_err: str | None = None
         try:
-            res = self.runner.run(cmd, cwd=resolved_source, env=clean_env)
+            res = self.runner.run(cmd, cwd=resolved_source, env=run_env)
         except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
-            clean_err = redact_secrets(str(exc), extra_secrets=self.secrets)
+            clean_err = redact_secrets(str(exc), extra_secrets=extra_scrub)
         else:
             if res.exit_code != 0:
                 err = res.stderr or res.stdout or f"exit code {res.exit_code}"
-                clean_err = redact_secrets(err, extra_secrets=self.secrets)
+                clean_err = redact_secrets(err, extra_secrets=extra_scrub)
 
         if clean_err is not None:
             err_obj = StaticDeployError(f"Static deploy failed: {clean_err}")

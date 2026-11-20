@@ -740,11 +740,16 @@ def build_runtime(
                 if (config.deploy_target in {"gh-pages", "github-pages"} and bool(config.github_owner))
                 else ""
             )
+            deploy_token = (
+                config.vercel_token
+                if config.deploy_target.lower() == "vercel"
+                else (config.github_token or config.vercel_token)
+            )
             deploy_publisher = StaticDeployPublisher(
                 runner=effective_runner,
                 target=config.deploy_target,
                 deploy_base_url=deploy_base_url,
-                deploy_token=config.vercel_token,
+                deploy_token=deploy_token,
                 secrets=active_secrets,
             )
 

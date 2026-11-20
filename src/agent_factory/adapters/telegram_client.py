@@ -19,29 +19,33 @@ from agent_factory.secrets import redact_secrets
 
 
 class UrllibHttpTransport:
-    """Standard-library outbound HTTP JSON POST transport (no server sockets, no extra deps)."""
+    """Standard-library outbound HTTP JSON transport (no server sockets, no extra deps)."""
 
-    def post_json(
+    def request_json(
         self,
+        method: str,
         url: str,
-        payload: Mapping[str, Any],
+        payload: Mapping[str, Any] | None = None,
         timeout_seconds: float = 35.0,
         headers: Mapping[str, str] | None = None,
         extra_secrets: Sequence[str] = (),
+        *,
+        raise_on_http_error: bool = False,
     ) -> HttpResponse:
-        """Execute outbound HTTPS POST using urllib.request."""
-        data = json.dumps(payload).encode("utf-8")
+        """Execute outbound HTTPS JSON request using urllib.request."""
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
         req_headers = {
-            "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        if data is not None:
+            req_headers["Content-Type"] = "application/json"
         if headers:
             req_headers.update(headers)
         req = urllib.request.Request(
             url,
             data=data,
             headers=req_headers,
-            method="POST",
+            method=method.upper(),
         )
         extra: list[str] = list(extra_secrets)
         if headers:
@@ -56,7 +60,29 @@ class UrllibHttpTransport:
             with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
                 body = resp.read().decode("utf-8")
                 return HttpResponse(status_code=resp.status, body=body)
-        except (urllib.error.HTTPError, urllib.error.URLError, http.client.HTTPException, OSError) as err:
+        except urllib.error.HTTPError as err:
+            if not raise_on_http_error:
+                try:
+                    raw_body = (
+                        err.read().decode("utf-8", errors="replace")
+                        if err.fp is not None
+                        else str(err)
+                    )
+                except OSError:
+                    raw_body = str(err)
+                finally:
+                    err.close()
+                return HttpResponse(
+                    status_code=int(err.code),
+                    body=redact_secrets(raw_body, extra_secrets=extra),
+                )
+            clean_msg = redact_secrets(
+                f"HTTP transport failed for {url}: {err}",
+                extra_secrets=extra,
+            )
+            err.close()
+            err_to_raise = TelegramTransportError(clean_msg)
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as err:
             clean_msg = redact_secrets(
                 f"HTTP transport failed for {url}: {err}",
                 extra_secrets=extra,
@@ -67,6 +93,26 @@ class UrllibHttpTransport:
             err_to_raise.__cause__ = None
             err_to_raise.__context__ = None
             raise err_to_raise
+        raise AssertionError("unreachable")
+
+    def post_json(
+        self,
+        url: str,
+        payload: Mapping[str, Any],
+        timeout_seconds: float = 35.0,
+        headers: Mapping[str, str] | None = None,
+        extra_secrets: Sequence[str] = (),
+    ) -> HttpResponse:
+        """Execute outbound HTTPS POST using urllib.request."""
+        return self.request_json(
+            "POST",
+            url,
+            payload=payload,
+            timeout_seconds=timeout_seconds,
+            headers=headers,
+            extra_secrets=extra_secrets,
+            raise_on_http_error=True,
+        )
 
 
 class TelegramHttpClient:

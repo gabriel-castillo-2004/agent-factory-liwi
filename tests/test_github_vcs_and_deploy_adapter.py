@@ -1,6 +1,8 @@
 """Tests for real GitHubVCSAdapter and StaticDeployPublisher via Runner with clean env and secret redaction (AC-4.4, INV-07, INV-19, INV-22, INV-23)."""
 
 import json
+import os
+import shutil
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -17,6 +19,7 @@ from agent_factory.adapters.static_deploy_publisher import (
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.domain.models import ProjectLinks, ProjectStatus
 from agent_factory.domain.states import ProjectState
+from agent_factory.ports.notifier import HttpResponse
 from agent_factory.ports.runner import CommandResult, CommandTimeoutError
 from agent_factory.ports.vcs import VCS
 
@@ -640,3 +643,351 @@ def test_github_vcs_push_branch_passes_git_identity_and_raises_vcs_error_on_comm
     assert "[REDACTED]" in str(vcs_err.value)
     assert vcs_err.value.__cause__ is None
     assert vcs_err.value.__context__ is None
+
+
+def test_github_vcs_isolates_workspace_git_repo_and_auto_creates_repo_via_rest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real git + REST fallback creates isolated workspace .git, resolves owner via /user, creates dedicated repo, pushes without persisting token, and deploys gh-pages (INV-19, INV-22)."""
+    gh_tok = "TEST_EPHEMERAL_GH_TOKEN_909"
+    monkeypatch.setenv("GITHUB_TOKEN", gh_tok)
+
+    orig_which = shutil.which
+
+    def _hide_gh(
+        name: str,
+        mode: int = os.F_OK | os.X_OK,
+        path: str | None = None,
+    ) -> str | None:
+        return None if name == "gh" else orig_which(name, mode=mode, path=path)
+
+    monkeypatch.setattr("agent_factory.adapters.github_vcs_adapter.shutil.which", _hide_gh)
+    monkeypatch.setattr("agent_factory.adapters.static_deploy_publisher.shutil.which", _hide_gh)
+
+    parent_repo = tmp_path / "factory_parent"
+    parent_repo.mkdir(parents=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=parent_repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "FactoryUser"], cwd=parent_repo, check=True)
+    subprocess.run(["git", "config", "user.email", "factory@local.test"], cwd=parent_repo, check=True)
+    (parent_repo / "README.md").write_text("# Factory\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=parent_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init parent"], cwd=parent_repo, check=True, capture_output=True)
+    parent_head_before = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=parent_repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    ws_dir = parent_repo / "workspaces" / "pomodoro-web"
+    ws_dir.mkdir(parents=True)
+    (ws_dir / "index.html").write_text("<h1>Pomodoro</h1>\n", encoding="utf-8")
+    (ws_dir / "app.js").write_text("console.log('ready');\n", encoding="utf-8")
+    pycache_dir = ws_dir / "__pycache__"
+    pycache_dir.mkdir()
+    (pycache_dir / "app.cpython-312.pyc").write_bytes(b"\xcb\r\r\n")
+
+    bare_remote = tmp_path / "remotes" / "gabriel-user" / "pomodoro-web.git"
+    bare_remote.parent.mkdir(parents=True)
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare_remote)], check=True, capture_output=True)
+
+    empty_home = tmp_path / "empty_home"
+    empty_home.mkdir()
+
+    recorded_pushes: list[tuple[list[str], dict[str, str], str]] = []
+
+    class _MirrorSubprocessRunner(SubprocessRunner):
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            iso_env = dict(env if env is not None else os.environ)
+            iso_env["HOME"] = str(empty_home)
+            iso_env["USERPROFILE"] = str(empty_home)
+            iso_env["GIT_CONFIG_NOSYSTEM"] = "1"
+            iso_env["GIT_CONFIG_GLOBAL"] = str(empty_home / "none")
+
+            rewritten = list(command)
+            if len(rewritten) >= 2 and rewritten[0] == "git" and rewritten[1] in ("push", "ls-remote"):
+                if rewritten[1] == "push":
+                    cfg_text = (ws_dir / ".git" / "config").read_text(encoding="utf-8")
+                    recorded_pushes.append((list(rewritten), dict(iso_env), cfg_text))
+                rewritten = [str(bare_remote) if arg == "origin" else arg for arg in rewritten]
+            return super().run(rewritten, cwd, timeout_seconds=timeout_seconds, env=iso_env)
+
+    http_calls: list[tuple[str, str, dict[str, Any] | None, dict[str, str] | None]] = []
+
+    class _FakeGitHubHttpTransport:
+        def request_json(
+            self,
+            method: str,
+            url: str,
+            payload: Mapping[str, Any] | None = None,
+            timeout_seconds: float = 30.0,
+            headers: Mapping[str, str] | None = None,
+            extra_secrets: Sequence[str] = (),
+            *,
+            raise_on_http_error: bool = False,
+        ) -> HttpResponse:
+            _ = (timeout_seconds, extra_secrets, raise_on_http_error)
+            hdrs = dict(headers) if headers else None
+            body_payload = dict(payload) if payload is not None else None
+            http_calls.append((method, url, body_payload, hdrs))
+            if method == "GET" and url.endswith("/user"):
+                return HttpResponse(status_code=200, body=json.dumps({"login": "gabriel-user"}))
+            if method == "GET" and url.endswith("/repos/gabriel-user/pomodoro-web"):
+                return HttpResponse(status_code=404, body="{}")
+            if method == "POST" and url.endswith("/user/repos"):
+                return HttpResponse(status_code=201, body=json.dumps({"name": "pomodoro-web"}))
+            if method == "GET" and "/actions/runs?" in url:
+                return HttpResponse(status_code=200, body=json.dumps({"workflow_runs": []}))
+            if method == "POST" and url.endswith("/repos/gabriel-user/pomodoro-web/pages"):
+                return HttpResponse(status_code=201, body="{}")
+            return HttpResponse(status_code=500, body=f"unexpected {method} {url}")
+
+    runner = _MirrorSubprocessRunner()
+    deployer = StaticDeployPublisher(
+        runner=runner,
+        target="gh-pages",
+        deploy_base_url="https://agent-factory.github.io",
+        branch="gh-pages",
+        deploy_token=gh_tok,
+        secrets=(gh_tok,),
+    )
+    vcs = GitHubVCSAdapter(
+        runner=runner,
+        owner="agent-factory",
+        github_token="",  # Must pick up GITHUB_TOKEN from environment in memory
+        deploy_publisher=deployer,
+        http_transport=_FakeGitHubHttpTransport(),
+    )
+
+    ref = vcs.push_branch("pomodoro-web", ws_dir, branch="work")
+    assert "work" in ref
+    assert (ws_dir / ".git" / "HEAD").is_file()
+
+    # Workspace git top-level MUST resolve strictly inside ws_dir (never parent_repo)
+    ws_top = subprocess.run(
+        ["git", "-C", str(ws_dir), "rev-parse", "--show-toplevel"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert Path(ws_top).resolve() == ws_dir.resolve()
+    assert Path(ws_top).resolve() != parent_repo.resolve()
+
+    # Parent factory repo HEAD and tracked tree MUST remain untouched
+    parent_head_after = subprocess.run(
+        ["git", "-C", str(parent_repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert parent_head_after == parent_head_before
+
+    # Origin URL is clean HTTPS pointing to dedicated repo and token is NOT stored on disk
+    origin_url = subprocess.run(
+        ["git", "-C", str(ws_dir), "remote", "get-url", "origin"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert origin_url == "https://github.com/gabriel-user/pomodoro-web.git"
+    assert gh_tok not in (ws_dir / ".git" / "config").read_text(encoding="utf-8")
+
+    # CI passes via REST API fallback when workspace has no .github/workflows and runs=[]
+    ci_res = vcs.get_ci_result("pomodoro-web", branch="work")
+    assert ci_res.passed is True
+
+    # Promote to main + publish gh-pages
+    repo_url, deploy_url = vcs.merge_and_deploy("pomodoro-web", branch="work")
+    assert repo_url == "https://github.com/gabriel-user/pomodoro-web"
+    assert deploy_url == "https://gabriel-user.github.io/pomodoro-web"
+
+    # Verify bare remote has work, main, and gh-pages with expected app files and NO __pycache__
+    for branch_ref in ("refs/heads/work", "refs/heads/main", "refs/heads/gh-pages"):
+        tree_files = subprocess.run(
+            ["git", "-C", str(bare_remote), "ls-tree", "-r", branch_ref, "--name-only"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        assert "index.html" in tree_files
+        assert "app.js" in tree_files
+        assert not any("__pycache__" in f or f.endswith(".pyc") for f in tree_files)
+
+    # Every push used ephemeral GIT_CONFIG_COUNT auth without token on argv or .git/config
+    assert len(recorded_pushes) >= 3  # work push + main push + gh-pages deploy
+    for cmd, push_env, cfg_text in recorded_pushes:
+        assert gh_tok not in " ".join(cmd)
+        assert gh_tok not in cfg_text
+        assert push_env.get("GIT_CONFIG_COUNT") == "1"
+        assert push_env.get("GIT_CONFIG_KEY_0") == "http.https://github.com/.extraheader"
+        assert str(push_env.get("GIT_CONFIG_VALUE_0", "")).startswith("Authorization: basic ")
+        assert push_env.get("GIT_TERMINAL_PROMPT") == "0"
+
+    # REST API sequence: /user -> /repos/gabriel-user/pomodoro-web -> POST /user/repos -> actions/runs -> pages
+    called_endpoints = [(m, u.replace("https://api.github.com", "")) for m, u, _, _ in http_calls]
+    assert ("GET", "/user") in called_endpoints
+    assert ("GET", "/repos/gabriel-user/pomodoro-web") in called_endpoints
+    assert ("POST", "/user/repos") in called_endpoints
+    assert any(m == "GET" and "/repos/gabriel-user/pomodoro-web/actions/runs" in u for m, u in called_endpoints)
+    assert ("POST", "/repos/gabriel-user/pomodoro-web/pages") in called_endpoints
+    create_call = next(c for c in http_calls if c[0] == "POST" and c[1].endswith("/user/repos"))
+    assert create_call[2] == {"name": "pomodoro-web", "private": False, "auto_init": False}
+    assert create_call[3] is not None and create_call[3]["Authorization"] == f"Bearer {gh_tok}"
+
+
+def test_github_vcs_blocks_parent_git_escape_tolerates_422_and_merges_via_pr_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Blocks workspace escaping into parent .git (INV-22), treats HTTP 422 on repo create as existing, redacts tokens on HTTP error, and merges PR via REST when main exists."""
+    gh_tok = "TEST_GH_TOKEN_PR_422"
+    orig_which = shutil.which
+
+    def _hide_gh(
+        name: str,
+        mode: int = os.F_OK | os.X_OK,
+        path: str | None = None,
+    ) -> str | None:
+        return None if name == "gh" else orig_which(name, mode=mode, path=path)
+
+    monkeypatch.setattr("agent_factory.adapters.github_vcs_adapter.shutil.which", _hide_gh)
+
+    # Part A: Escape guard when workspace git resolves to parent repo instead of workspace_dir
+    parent_repo = tmp_path / "parent_factory"
+    parent_repo.mkdir(parents=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=parent_repo, check=True, capture_output=True)
+    ws_escape = parent_repo / "workspaces" / "escape-app"
+    ws_escape.mkdir(parents=True)
+    (ws_escape / "index.html").write_text("<h1>Escape</h1>\n", encoding="utf-8")
+
+    class _NoopInitSubprocessRunner(SubprocessRunner):
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            if len(command) >= 2 and command[0] == "git" and command[1] == "init":
+                return CommandResult(exit_code=0, stdout="noop")
+            return super().run(command, cwd, timeout_seconds=timeout_seconds, env=env)
+
+    vcs_escape = GitHubVCSAdapter(
+        runner=_NoopInitSubprocessRunner(),
+        owner="acme-dev",
+        github_token=gh_tok,
+        secrets=(gh_tok,),
+    )
+    with pytest.raises(VcsError) as escape_err:
+        vcs_escape.push_branch("escape-app", ws_escape, branch="work")
+    assert "INV-22" in str(escape_err.value)
+    assert "escapes" in str(escape_err.value)
+
+    # Part B: 422 "already exists" + existing remote main triggers PR create & merge REST calls
+    ws_pr = tmp_path / "ws" / "pr-app"
+    ws_pr.mkdir(parents=True)
+    (ws_pr / "index.html").write_text("<h1>PR</h1>\n", encoding="utf-8")
+    bare_remote = tmp_path / "bare" / "acme-dev" / "pr-app.git"
+    bare_remote.parent.mkdir(parents=True)
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare_remote)], check=True, capture_output=True)
+    seed_dir = tmp_path / "seed"
+    seed_dir.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=seed_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Seed"], cwd=seed_dir, check=True)
+    subprocess.run(["git", "config", "user.email", "seed@local.test"], cwd=seed_dir, check=True)
+    (seed_dir / "README.md").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=seed_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "seed main"], cwd=seed_dir, check=True, capture_output=True)
+    subprocess.run(["git", "push", str(bare_remote), "main:main"], cwd=seed_dir, check=True, capture_output=True)
+
+    empty_home = tmp_path / "home2"
+    empty_home.mkdir()
+    pr_http_calls: list[tuple[str, str]] = []
+
+    class _PrMirrorRunner(SubprocessRunner):
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            iso_env = dict(env if env is not None else os.environ)
+            iso_env["HOME"] = str(empty_home)
+            iso_env["USERPROFILE"] = str(empty_home)
+            iso_env["GIT_CONFIG_NOSYSTEM"] = "1"
+            iso_env["GIT_CONFIG_GLOBAL"] = str(empty_home / "none")
+            rewritten = (
+                [str(bare_remote) if arg == "origin" else arg for arg in command]
+                if len(command) >= 2 and command[0] == "git" and command[1] in ("push", "ls-remote")
+                else list(command)
+            )
+            return super().run(rewritten, cwd, timeout_seconds=timeout_seconds, env=iso_env)
+
+    class _PrTransport:
+        def __init__(self, create_status: int = 422, create_body: str = '{"message": "already exists"}') -> None:
+            self.create_status = create_status
+            self.create_body = create_body
+
+        def request_json(
+            self,
+            method: str,
+            url: str,
+            payload: Mapping[str, Any] | None = None,
+            timeout_seconds: float = 30.0,
+            headers: Mapping[str, str] | None = None,
+            extra_secrets: Sequence[str] = (),
+            *,
+            raise_on_http_error: bool = False,
+        ) -> HttpResponse:
+            _ = (payload, timeout_seconds, headers, extra_secrets, raise_on_http_error)
+            path = url.replace("https://api.github.com", "")
+            pr_http_calls.append((method, path))
+            if method == "GET" and path == "/repos/acme-dev/pr-app":
+                return HttpResponse(status_code=404, body="{}")
+            if method == "POST" and path == "/user/repos":
+                return HttpResponse(status_code=self.create_status, body=self.create_body)
+            if method == "POST" and path == "/repos/acme-dev/pr-app/pulls":
+                return HttpResponse(status_code=201, body=json.dumps({"number": 7}))
+            if method == "PUT" and path == "/repos/acme-dev/pr-app/pulls/7/merge":
+                return HttpResponse(status_code=200, body=json.dumps({"merged": True}))
+            return HttpResponse(status_code=500, body=f"unexpected {method} {path}")
+
+    vcs_pr = GitHubVCSAdapter(
+        runner=_PrMirrorRunner(),
+        owner="acme-dev",
+        github_token=gh_tok,
+        secrets=(gh_tok,),
+        http_transport=_PrTransport(),
+    )
+    assert "work" in vcs_pr.push_branch("pr-app", ws_pr, branch="work")
+    repo_url, deploy_url = vcs_pr.merge_and_deploy("pr-app", branch="work")
+    assert repo_url == "https://github.com/acme-dev/pr-app"
+    assert deploy_url == "https://acme-dev.github.io/pr-app"
+    assert ("POST", "/repos/acme-dev/pr-app/pulls") in pr_http_calls
+    assert ("PUT", "/repos/acme-dev/pr-app/pulls/7/merge") in pr_http_calls
+
+    # Part C: HTTP error leaking secret is scrubbed without preserving __cause__/__context__
+    ws_http_err = tmp_path / "ws" / "err-app"
+    ws_http_err.mkdir(parents=True)
+    (ws_http_err / "index.html").write_text("<h1>Err</h1>\n", encoding="utf-8")
+    vcs_err_http = GitHubVCSAdapter(
+        runner=_PrMirrorRunner(),
+        owner="acme-dev",
+        github_token=gh_tok,
+        secrets=(gh_tok,),
+        http_transport=_PrTransport(
+            create_status=500,
+            create_body=f"server error for token {gh_tok}",
+        ),
+    )
+    with pytest.raises(VcsError) as http_err:
+        vcs_err_http.push_branch("pr-app", ws_http_err, branch="work")
+    assert gh_tok not in str(http_err.value)
+    assert "[REDACTED]" in str(http_err.value)
+    assert http_err.value.__cause__ is None
+    assert http_err.value.__context__ is None
