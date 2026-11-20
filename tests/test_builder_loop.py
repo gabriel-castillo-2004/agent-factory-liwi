@@ -1552,6 +1552,210 @@ def test_build_worker_stagnation_due_to_skipped_tests_reports_clear_missing_tool
     assert "Node.js is not available in PATH" in failed_events[0].payload["reason"]
 
 
+def test_build_worker_and_scaffold_isolate_pytest_inside_workspace_without_parent_pyproject(
+    tmp_path: Path,
+) -> None:
+    """Workspace pytest.ini and explicit -c/--rootdir keep pytest strictly scoped inside workspace and protected by INV-13."""
+    import sys
+
+    from agent_factory.adapters.subprocess_runner import SubprocessRunner
+    from agent_factory.ports.runner import CommandResult as _CommandResult
+    from agent_factory.scaffold import DEFAULT_TEMPLATES_ROOT, TemplateScaffold
+
+    parent_repo = tmp_path / "agent_factory_parent"
+    parent_repo.mkdir(parents=True, exist_ok=True)
+    # Hostile parent pyproject.toml that would immediately break workspace pytest runs if climbed
+    (parent_repo / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\n'
+        'testpaths = ["nonexistent_parent_tests"]\n'
+        'addopts = "--cov=src/agent_factory --definitely-invalid-parent-option"\n',
+        encoding="utf-8",
+    )
+
+    ws_mgr = WorkspaceManager(base_dir=parent_repo / "workspaces")
+    scaffold = TemplateScaffold(workspace_manager=ws_mgr, templates_root=DEFAULT_TEMPLATES_ROOT)
+
+    # 1. TemplateScaffold.scaffold creates minimal pytest.ini without overwriting custom pytest.ini
+    pid_scaffold = "proj-scaffold-ini"
+    ws_scaffold = scaffold.scaffold(pid_scaffold, template_id="static-web")
+    expected_ini = "[pytest]\ntestpaths = tests\naddopts = -q\n"
+    assert (ws_scaffold / "pytest.ini").is_file()
+    assert (ws_scaffold / "pytest.ini").read_text(encoding="utf-8") == expected_ini
+
+    pid_custom = "proj-custom-ini"
+    custom_ini = "[pytest]\ntestpaths = tests\naddopts = -q -s\n"
+    ws_custom = ws_mgr.create_workspace(pid_custom, template_files={"pytest.ini": custom_ini})
+    scaffold.scaffold(pid_custom, template_id="static-web")
+    assert (ws_custom / "pytest.ini").read_text(encoding="utf-8") == custom_ini
+
+    # 2. BuildWorker isolates real pytest execution inside workspace despite hostile parent pyproject.toml and protects pytest.ini via INV-13
+    pid = "proj-pytest-isolation"
+    orchestrator, store = _create_approved_project(pid, num_tests=2, approve=True)
+    real_sub = SubprocessRunner(default_timeout_seconds=15.0)
+    recorded_cmds: list[list[str]] = []
+
+    class _IsolatingPytestRunner:
+        def run(self, command, cwd: Path, timeout_seconds: float = 30.0, env=None, input=None):
+            cmd_list = list(command)
+            recorded_cmds.append(cmd_list)
+            actual = [sys.executable, "-m", "pytest", *cmd_list[1:]] if cmd_list[0] == "pytest" else cmd_list
+            res = real_sub.run(actual, cwd=cwd, timeout_seconds=timeout_seconds, env=env, input=input)
+            return _CommandResult(
+                exit_code=res.exit_code,
+                stdout=res.stdout,
+                stderr=res.stderr,
+                timed_out=res.timed_out,
+                test_results={"AT-01": res.exit_code == 0, "AT-02": res.exit_code == 0},
+            )
+
+    test_code = (
+        "from pathlib import Path\n\n"
+        "def test_at_01_rootdir_isolated(request):\n"
+        "    ws = Path.cwd().resolve()\n"
+        "    assert request.config.rootpath.resolve() == ws\n"
+        "    assert request.config.inipath is not None\n"
+        "    assert request.config.inipath.resolve() == (ws / 'pytest.ini').resolve()\n\n"
+        "def test_at_02_implementation_present():\n"
+        "    assert (Path.cwd() / 'src' / 'deck.ts').is_file()\n"
+    )
+    agent = FakeCodeAgent(
+        test_gen_steps=[{"tests/test_isolation.py": test_code}],
+        impl_steps=[
+            # Attempt 1: tampers with pytest.ini -> INV-13 must revert and skip pytest run
+            {"pytest.ini": "[pytest]\naddopts = --collect-only\n", "src/deck.ts": "// tampered\n"},
+            # Attempt 2: legitimate implementation without touching pytest.ini
+            {"src/deck.ts": "export const isolated = true;\n"},
+        ],
+    )
+    worker = BuildWorker(
+        orchestrator=orchestrator,
+        workspace_manager=ws_mgr,
+        code_agent=agent,
+        runner=_IsolatingPytestRunner(),  # type: ignore[arg-type]
+        vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
+    )
+    report = worker.run_job(pid)
+
+    assert orchestrator.get_status(pid).state == ProjectState.DELIVERED
+    assert report.invocations == 3  # 1 test_gen + 1 tampered + 1 valid
+    ws_dir = ws_mgr.get_workspace_dir(pid)
+    assert (ws_dir / "pytest.ini").read_text(encoding="utf-8") == expected_ini
+    assert len(recorded_cmds) == 1
+    cmd = recorded_cmds[0]
+    assert cmd[0] == "pytest"
+    assert "-c" in cmd
+    assert str((ws_dir / "pytest.ini").resolve()) in cmd
+    assert f"--rootdir={ws_dir.resolve()}" in cmd
+
+    invoked_impl = [
+        ev
+        for ev in store.get_events(pid)
+        if ev.type == EventType.AGENT_INVOKED and ev.payload.get("agent") == "implement_or_fix"
+    ]
+    assert [ev.payload["outcome"] for ev in invoked_impl] == ["reverted_tamper", "ok"]
+
+
+def test_build_worker_stagnation_ignores_pytest_headers_and_reports_real_failure(
+    tmp_path: Path,
+) -> None:
+    """_summarize_stagnation_cause ignores platform/rootdir/configfile/inifile/plugins/cachedir/collected headers and extracts real errors or summaries."""
+    pid = "proj-stag-headers"
+    orchestrator, _ = _create_approved_project(pid, num_tests=1, approve=True)
+    worker = BuildWorker(
+        orchestrator=orchestrator,
+        workspace_manager=WorkspaceManager(base_dir=tmp_path / "ws_stag_hdr"),
+        code_agent=FakeCodeAgent(),
+        runner=FakeRunner(),
+        vcs=FakeVCS(),
+    )
+
+    # 1. Pytest CLI usage error whose trailing lines are inifile: and rootdir:
+    usage_err = CommandResult(
+        exit_code=4,
+        stderr=(
+            "ERROR: usage: pytest [options] [file_or_dir] [file_or_dir] [...]\n"
+            "pytest: error: unrecognized arguments: --cov=src/agent_factory\n"
+            "  inifile: C:\\Users\\dev\\agent-factory-liwi\\pyproject.toml\n"
+            "  rootdir: C:\\Users\\dev\\agent-factory-liwi\n"
+        ),
+    )
+    cause_usage = worker._summarize_stagnation_cause(usage_err, ["AT-01"])
+    assert "inifile:" not in cause_usage
+    assert "rootdir:" not in cause_usage
+    assert "unrecognized arguments: --cov=src/agent_factory" in cause_usage
+
+    # 2. Standard verbose headers + FAILED line -> ignores headers and reports FAILED
+    hdr_and_fail = CommandResult(
+        exit_code=1,
+        stdout=(
+            "============================= test session starts ==============================\n"
+            "platform win32 -- Python 3.12.10, pytest-9.2.0, pluggy-1.7.0\n"
+            "cachedir: .pytest_cache\n"
+            "rootdir: C:\\Users\\dev\\agent-factory-liwi\n"
+            "configfile: pyproject.toml\n"
+            "inifile: C:\\Users\\dev\\agent-factory-liwi\\pyproject.toml\n"
+            "plugins: cov-7.1.0, socket-0.8.1, timeout-2.4.0\n"
+            "collected 2 items\n\n"
+            "FAILED tests/test_app.py::test_render - AssertionError: missing root\n"
+            "========================= 1 failed, 1 passed in 0.12s ==========================\n"
+        ),
+    )
+    cause_fail = worker._summarize_stagnation_cause(hdr_and_fail, ["AT-01"])
+    for forbidden_hdr in ("platform ", "rootdir:", "configfile:", "inifile:", "plugins:", "cachedir:", "collected "):
+        assert forbidden_hdr not in cause_fail
+    assert "FAILED tests/test_app.py::test_render - AssertionError: missing root" in cause_fail
+
+    # 3. Headers + final summary === ... === without explicit FAILED line
+    hdr_and_summary = CommandResult(
+        exit_code=1,
+        stdout=(
+            "platform win32 -- Python 3.12.10, pytest-9.2.0\n"
+            "cachedir: .pytest_cache\n"
+            "rootdir: C:\\repo\\ws\n"
+            "configfile: pytest.ini\n"
+            "plugins: cov-7.1.0\n"
+            "collected 0 items\n"
+            "=========================== no tests ran in 0.01s ============================\n"
+        ),
+    )
+    cause_summary = worker._summarize_stagnation_cause(hdr_and_summary, ["AT-01"])
+    assert "rootdir:" not in cause_summary
+    assert "configfile:" not in cause_summary
+    assert "no tests ran in 0.01s" in cause_summary
+
+    # 4. Headers + SKIPPED summary -> ignores headers and reports clear Spanish skip explanation
+    hdr_and_skip = CommandResult(
+        exit_code=0,
+        stdout=(
+            "platform win32 -- Python 3.12.10, pytest-9.2.0\n"
+            "rootdir: C:\\repo\\ws\n"
+            "inifile: C:\\repo\\ws\\pytest.ini\n"
+            "collected 6 items\n"
+            "SKIPPED [4] tests/test_app.py:83: Node.js is not available in PATH\n"
+            "======================== 2 passed, 4 skipped in 0.10s ==========================\n"
+        ),
+    )
+    cause_skip = worker._summarize_stagnation_cause(hdr_and_skip, ["AT-01"])
+    assert "inifile:" not in cause_skip
+    assert "rootdir:" not in cause_skip
+    assert "pruebas omitidas [SKIPPED]" in cause_skip
+    assert "Node.js is not available in PATH" in cause_skip
+
+    # 5. Headers only -> never surfaces inifile/rootdir fallback
+    hdr_only = CommandResult(
+        exit_code=1,
+        stdout=(
+            "platform win32 -- Python 3.12.10\n"
+            "inifile: C:\\repo\\pyproject.toml\n"
+            "rootdir: C:\\repo\n"
+        ),
+    )
+    cause_hdr_only = worker._summarize_stagnation_cause(hdr_only, [])
+    assert "inifile:" not in cause_hdr_only
+    assert "rootdir:" not in cause_hdr_only
+    assert "continúan fallando" in cause_hdr_only
+
+
 
 
 

@@ -540,7 +540,7 @@ class AgyCliAdapter(CodeAgent):
                 "Requirements:\n"
                 "1. Before changing code or concluding no changes are needed, READ the test files under tests/ (strictly read-only) together with the pytest failure output to align your implementation with the exact selectors, DOM attributes, exports, and assertions expected.\n"
                 "2. Create and edit the target application files directly on the filesystem.\n"
-                "3. NEVER create, modify, or delete tests/, pyproject.toml, setup.cfg, conftest.py, or package.json (INV-13).\n"
+                "3. NEVER create, modify, or delete tests/, pytest.ini, pyproject.toml, setup.cfg, conftest.py, or package.json (INV-13).\n"
                 "4. Respond with a JSON object containing files_written (only return [] after verifying every assertion in tests/ already holds) and a short plain-text summary (no nested markdown or JSON; full payload also passed via stdin).\n"
                 f"Plan summary: {plan.get('summary', '')}\n"
                 f"File specifications:\n{contracts_block}\n"

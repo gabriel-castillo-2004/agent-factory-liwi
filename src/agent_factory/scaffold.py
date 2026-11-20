@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from agent_factory.workspace import (
     SandboxViolationError,
     WorkspaceManager,
+    ensure_workspace_pytest_ini,
     workspace_nonempty_test_files,
 )
 
@@ -217,6 +218,7 @@ class TemplateScaffold:
                     content = (tpl_dir / rel_file).read_text(encoding="utf-8")
                     self.workspace_manager.write_file(project_id, rel_file, content)
             (ws_dir / "src").mkdir(parents=True, exist_ok=True)
+            ensure_workspace_pytest_ini(self.workspace_manager, project_id)
             return ws_dir
 
         # Enforce empty src/ and empty tests/ when not resuming an existing tested workspace (F2B-06, INV-13)
@@ -239,4 +241,5 @@ class TemplateScaffold:
 
         # Ensure src/ exists and is empty
         (ws_dir / "src").mkdir(parents=True, exist_ok=True)
+        ensure_workspace_pytest_ini(self.workspace_manager, project_id)
         return ws_dir

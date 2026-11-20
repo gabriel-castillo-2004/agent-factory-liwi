@@ -60,6 +60,8 @@ RUNNER_CONFIG_FILENAMES: tuple[str, ...] = (
     "setup.cfg",
 )
 
+DEFAULT_WORKSPACE_PYTEST_INI: str = "[pytest]\ntestpaths = tests\naddopts = -q\n"
+
 
 class SandboxViolationError(ValueError):
     """Raised when a path or project_id attempts to escape workspaces/<project_id>/ (INV-18, INV-22)."""
@@ -177,6 +179,24 @@ class WorkspaceManager:
         if not target_path.is_file():
             raise FileNotFoundError(f"File not found: {target_path}")
         return target_path.read_text(encoding="utf-8")
+
+
+def ensure_workspace_pytest_ini(
+    workspace_manager: WorkspaceManager,
+    project_id: str,
+) -> Path:
+    """Ensure workspaces/<project_id>/pytest.ini exists so pytest never climbs to parent configs (INV-13, INV-22)."""
+    ws_dir = workspace_manager.get_workspace_dir(project_id)
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    raw_ini = ws_dir / "pytest.ini"
+    if raw_ini.is_symlink():
+        raise SandboxViolationError(
+            f"Workspace pytest.ini must not be a symlink: {raw_ini}"
+        )
+    ini_path = workspace_manager.resolve_safe_path(project_id, "pytest.ini")
+    if not ini_path.exists():
+        workspace_manager.write_file(project_id, "pytest.ini", DEFAULT_WORKSPACE_PYTEST_INI)
+    return ini_path
 
 
 def _read_lock_entry(file_path: Path) -> tuple[bytes, str | None]:

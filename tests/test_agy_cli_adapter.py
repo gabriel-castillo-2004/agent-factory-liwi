@@ -1437,6 +1437,7 @@ def test_agy_cli_adapter_implement_prompt_requires_reading_tests_without_modifyi
     assert "read" in lower_prompt and "tests/" in lower_prompt
     assert "read-only" in lower_prompt
     assert "assertions" in lower_prompt
+    assert "pytest.ini" in lower_prompt
     assert "never" in lower_prompt and "modify" in lower_prompt and "tests/" in lower_prompt
     assert "inv-13" in lower_prompt
 

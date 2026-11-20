@@ -27,10 +27,49 @@ from agent_factory.workspace import (
     TestLockSnapshot,
     WorkspaceManager,
     compute_test_lock,
+    ensure_workspace_pytest_ini,
     is_python_cache_path,
     verify_and_restore_test_lock,
     workspace_nonempty_test_files,
 )
+
+_PYTEST_HEADER_PREFIXES: tuple[str, ...] = (
+    "platform ",
+    "rootdir:",
+    "configfile:",
+    "inifile:",
+    "plugins:",
+    "cachedir:",
+    "collected ",
+    "collecting ...",
+    "testpaths:",
+)
+_PYTEST_SECTION_BANNER_RE = re.compile(
+    r"^=+\s*(?:test session starts|failures|errors|short test summary info|warnings summary)\s*=+$",
+    re.IGNORECASE,
+)
+_PYTEST_TIMEOUT_HDR_RE = re.compile(
+    r"^timeout(?:\s+(?:method|func_only))?:\s+(?:\d+(?:\.\d+)?s|thread|signal|true|false)$",
+    re.IGNORECASE,
+)
+
+
+def _filter_pytest_diagnostic_lines(raw_text: str) -> list[str]:
+    """Strip ANSI codes, empty dividers, section titles, and pytest environment header lines."""
+    ansi_free = re.sub(r"\x1b\[[0-9;]*m", "", raw_text)
+    result: list[str] = []
+    for raw in ansi_free.splitlines():
+        ln = " ".join(raw.split())
+        if not ln:
+            continue
+        if ln.lower().startswith(_PYTEST_HEADER_PREFIXES):
+            continue
+        if _PYTEST_TIMEOUT_HDR_RE.match(ln):
+            continue
+        if re.fullmatch(r"[=\-_~*\s]+", ln) or _PYTEST_SECTION_BANNER_RE.match(ln):
+            continue
+        result.append(ln)
+    return result
 
 
 class JobState(StrEnum):
@@ -218,16 +257,32 @@ class BuildWorker:
         if getattr(runner_result, "timed_out", False):
             return f"{prefix}: las pruebas excedieron el tiempo límite."
 
-        lines = [" ".join(raw.split()) for raw in combined.splitlines() if raw.strip()]
+        lines = _filter_pytest_diagnostic_lines(combined)
+        filtered_combined = "\n".join(lines)
+
         failed_line = next(
             (ln for ln in lines if ln.startswith(("FAILED ", "ERROR "))),
+            "",
+        )
+        error_colon_line = next(
+            (
+                ln
+                for ln in lines
+                if ln.startswith(("ERROR:", "pytest: error:"))
+                and not ln.lower().startswith("error: usage:")
+            ),
+            "",
+        )
+        usage_error_line = next(
+            (ln for ln in lines if ln.startswith("ERROR:")),
             "",
         )
         exc_line = next(
             (
                 re.sub(r"^E\s+", "", ln).strip()
                 for ln in lines
-                if re.search(
+                if not ln.lower().startswith("error: usage:")
+                and re.search(
                     r"(AssertionError|ModuleNotFoundError|ImportError|SyntaxError|TypeError|NameError|RuntimeError|Error:|Exception:)",
                     ln,
                 )
@@ -235,14 +290,14 @@ class BuildWorker:
             "",
         )
 
-        mod_match = re.search(r"No module named ['\"]?([^'\"\r\n\s]+)['\"]?", combined)
+        mod_match = re.search(r"No module named ['\"]?([^'\"\r\n\s]+)['\"]?", filtered_combined)
         if mod_match:
             missing_mod = self._redact(mod_match.group(1))
             extra = f" - {self._bound_redacted(failed_line, 110)}" if failed_line else ""
             raw_cause = f"falta la librería externa '{missing_mod}' (ModuleNotFoundError{extra})"
             return f"{prefix} ({self._bound_redacted(raw_cause, 220)})."
 
-        imp_match = re.search(r"ImportError:\s*([^\r\n]+)", combined)
+        imp_match = re.search(r"ImportError:\s*([^\r\n]+)", filtered_combined)
         if imp_match:
             raw_imp = f"ImportError: {imp_match.group(1).strip()}"
             if failed_line and imp_match.group(1).strip() not in failed_line:
@@ -250,7 +305,7 @@ class BuildWorker:
             return f"{prefix} ({self._bound_redacted(raw_imp, 220)})."
 
         skip_count = 0
-        skip_count_match = re.search(r"\b(\d+)\s+skipped\b", combined, re.IGNORECASE)
+        skip_count_match = re.search(r"\b(\d+)\s+skipped\b", filtered_combined, re.IGNORECASE)
         if skip_count_match:
             try:
                 skip_count = int(skip_count_match.group(1))
@@ -261,10 +316,10 @@ class BuildWorker:
 
         skip_match = re.search(
             r"(?:^|[\r\n])\s*(?:[^:\r\n]+:\d+:\s*)?SKIPPED\s*(?:\[\d+\]|\(\d+\))?[:\s]+(?:[^:\r\n]+:\d+[:\s]+)?([^\r\n]+)",
-            combined,
+            filtered_combined,
         )
         if not skip_match:
-            skip_match = re.search(r"SKIPPED\s*\(([^\)\r\n]+)\)", combined)
+            skip_match = re.search(r"SKIPPED\s*\(([^\)\r\n]+)\)", filtered_combined)
 
         skip_reason = ""
         if skip_match:
@@ -274,7 +329,13 @@ class BuildWorker:
 
         any_skipped_line = next((ln for ln in lines if ln.startswith("SKIPPED")), "")
 
-        if not failed_line and not exc_line and (skip_reason or skip_count > 0 or any_skipped_line):
+        if (
+            not failed_line
+            and not error_colon_line
+            and not exc_line
+            and not usage_error_line
+            and (skip_reason or skip_count > 0 or any_skipped_line)
+        ):
             if skip_reason:
                 raw_cause = f"pruebas omitidas [SKIPPED] por requerir herramientas externas ausentes: {skip_reason}"
             elif skip_count > 0:
@@ -283,33 +344,40 @@ class BuildWorker:
                 raw_cause = f"pruebas omitidas [SKIPPED] por requerir herramientas externas ausentes: {any_skipped_line}"
             return f"{prefix} ({self._bound_redacted(raw_cause, 220)})."
 
+        skip_suffix = ""
+        if skip_reason:
+            skip_suffix = f" (además pruebas omitidas [SKIPPED]: {skip_reason})"
+        elif skip_count > 0:
+            skip_suffix = f" (además {skip_count} pruebas omitidas [SKIPPED])"
+
         detail = ""
         if failed_line:
             if " - " not in failed_line and exc_line and exc_line not in failed_line:
                 detail = f"{failed_line} - {exc_line}"
             else:
                 detail = failed_line
-            if skip_reason:
-                detail = f"{detail} (además pruebas omitidas [SKIPPED]: {skip_reason})"
-            elif skip_count > 0:
-                detail = f"{detail} (además {skip_count} pruebas omitidas [SKIPPED])"
+            detail = f"{detail}{skip_suffix}"
+        elif error_colon_line:
+            detail = f"{error_colon_line}{skip_suffix}"
         elif exc_line:
-            detail = exc_line
-            if skip_reason:
-                detail = f"{detail} (además pruebas omitidas [SKIPPED]: {skip_reason})"
-            elif skip_count > 0:
-                detail = f"{detail} (además {skip_count} pruebas omitidas [SKIPPED])"
+            detail = f"{exc_line}{skip_suffix}"
+        elif usage_error_line:
+            detail = usage_error_line
         else:
-            skip_or_summary = next(
+            summary_line = next(
                 (
                     ln
-                    for ln in lines
-                    if re.search(r"\b\d+\s+(?:failed|errors?)\b", ln)
+                    for ln in reversed(lines)
+                    if re.search(
+                        r"(?:\b\d+\s+(?:failed|errors?|skipped|xfailed|deselected)\b|\bno tests ran\b)",
+                        ln,
+                        re.IGNORECASE,
+                    )
                 ),
                 "",
             )
-            if skip_or_summary:
-                detail = skip_or_summary
+            if summary_line:
+                detail = summary_line
             elif failing_tests:
                 detail = "pruebas pendientes: " + ", ".join(failing_tests[:5])
             elif lines:
@@ -486,6 +554,7 @@ class BuildWorker:
                 project_id, template_files=template_files
             )
             self._validate_workspace_links(ws_dir)
+            ensure_workspace_pytest_ini(self.workspace_manager, project_id)
 
             # Reuse valid existing tests on incremental retry/resume while locking them (INV-13)
             reused_test_files = workspace_nonempty_test_files(ws_dir)
@@ -636,6 +705,7 @@ class BuildWorker:
                         "Test generation produced zero test files in tests/ (INV-13)",
                     )
 
+                ensure_workspace_pytest_ini(self.workspace_manager, project_id)
                 job.lock_snapshot = compute_test_lock(ws_dir)
         else:
             ws_dir = self.workspace_manager.create_workspace(
@@ -799,10 +869,17 @@ class BuildWorker:
                 build_round=build_round,
                 max_rounds=max_code_rounds,
             )
+            pytest_ini_path = self.workspace_manager.resolve_safe_path(project_id, "pytest.ini")
+            pytest_cmd = [
+                "pytest",
+                "-q",
+                *(["-c", str(pytest_ini_path)] if pytest_ini_path.is_file() else []),
+                f"--rootdir={ws_dir}",
+            ]
             verify_t0 = time.monotonic()
             try:
                 runner_result = self.runner.run(
-                    command=["pytest", "-q"],
+                    command=pytest_cmd,
                     cwd=ws_dir,
                     timeout_seconds=30.0,
                 )
