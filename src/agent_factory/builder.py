@@ -249,21 +249,62 @@ class BuildWorker:
                 raw_imp = f"{failed_line} - {raw_imp}"
             return f"{prefix} ({self._bound_redacted(raw_imp, 220)})."
 
+        skip_count = 0
+        skip_count_match = re.search(r"\b(\d+)\s+skipped\b", combined, re.IGNORECASE)
+        if skip_count_match:
+            try:
+                skip_count = int(skip_count_match.group(1))
+            except ValueError:
+                pass
+        elif hasattr(runner_result, "skipped") and isinstance(runner_result.skipped, int):
+            skip_count = runner_result.skipped
+
+        skip_match = re.search(
+            r"(?:^|[\r\n])\s*(?:[^:\r\n]+:\d+:\s*)?SKIPPED\s*(?:\[\d+\]|\(\d+\))?[:\s]+(?:[^:\r\n]+:\d+[:\s]+)?([^\r\n]+)",
+            combined,
+        )
+        if not skip_match:
+            skip_match = re.search(r"SKIPPED\s*\(([^\)\r\n]+)\)", combined)
+
+        skip_reason = ""
+        if skip_match:
+            raw_sr = skip_match.group(1).strip()
+            raw_sr = re.sub(r"\s+in\s+\d+(?:\.\d+)?s\b.*$", "", raw_sr, flags=re.IGNORECASE).strip()
+            skip_reason = raw_sr
+
+        any_skipped_line = next((ln for ln in lines if ln.startswith("SKIPPED")), "")
+
+        if not failed_line and not exc_line and (skip_reason or skip_count > 0 or any_skipped_line):
+            if skip_reason:
+                raw_cause = f"pruebas omitidas [SKIPPED] por requerir herramientas externas ausentes: {skip_reason}"
+            elif skip_count > 0:
+                raw_cause = f"pruebas omitidas [SKIPPED] ({skip_count} omitidas) por requerir herramientas externas ausentes"
+            else:
+                raw_cause = f"pruebas omitidas [SKIPPED] por requerir herramientas externas ausentes: {any_skipped_line}"
+            return f"{prefix} ({self._bound_redacted(raw_cause, 220)})."
+
         detail = ""
         if failed_line:
             if " - " not in failed_line and exc_line and exc_line not in failed_line:
                 detail = f"{failed_line} - {exc_line}"
             else:
                 detail = failed_line
+            if skip_reason:
+                detail = f"{detail} (además pruebas omitidas [SKIPPED]: {skip_reason})"
+            elif skip_count > 0:
+                detail = f"{detail} (además {skip_count} pruebas omitidas [SKIPPED])"
         elif exc_line:
             detail = exc_line
+            if skip_reason:
+                detail = f"{detail} (además pruebas omitidas [SKIPPED]: {skip_reason})"
+            elif skip_count > 0:
+                detail = f"{detail} (además {skip_count} pruebas omitidas [SKIPPED])"
         else:
             skip_or_summary = next(
                 (
                     ln
                     for ln in lines
-                    if ln.startswith("SKIPPED ")
-                    or re.search(r"\b\d+\s+(?:failed|skipped|errors?)\b", ln)
+                    if re.search(r"\b\d+\s+(?:failed|errors?)\b", ln)
                 ),
                 "",
             )

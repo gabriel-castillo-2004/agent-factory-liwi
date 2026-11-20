@@ -1485,6 +1485,71 @@ def test_build_worker_stagnation_summary_includes_specific_redacted_pytest_failu
     )
     cause_3 = worker._summarize_stagnation_cause(skipped_out, ["AT-01"])
     assert "Node.js is not available in PATH" in cause_3
+    assert "pruebas omitidas" in cause_3.lower()
+    assert "SKIPPED" in cause_3
+    assert "herramientas externas ausentes" in cause_3.lower()
+
+    skipped_count_out = CommandResult(
+        exit_code=0,
+        stdout="2 passed, 4 skipped in 0.15s\n",
+    )
+    cause_4 = worker._summarize_stagnation_cause(skipped_count_out, ["AT-01"])
+    assert "pruebas omitidas" in cause_4.lower()
+    assert "4 omitidas" in cause_4
+    assert "SKIPPED" in cause_4
+
+
+def test_build_worker_stagnation_due_to_skipped_tests_reports_clear_missing_tool_explanation(
+    tmp_path: Path,
+) -> None:
+    """When tests are skipped due to missing external runtime (Node.js), stagnation brake emits clear explanation in Spanish."""
+    pid = "proj-stagnate-skipped-node"
+    orchestrator, store = _create_approved_project(pid, num_tests=2, approve=True)
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_stag_skip")
+
+    agent = FakeCodeAgent(
+        test_gen_steps=[{"tests/test_app.py": "def test_node(): assert True\n"}],
+        impl_steps=[{}, {}, {"src/app.js": "export const ready = true;\n"}],
+    )
+    skipped_stdout = (
+        "SKIPPED [2] tests/test_app.py:15: Node.js is not available in PATH\n"
+        "2 skipped in 0.10s\n"
+    )
+    runner = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=0,
+                stdout=skipped_stdout,
+                test_results={"AT-01": False, "AT-02": False},
+            ),
+            CommandResult(
+                exit_code=0,
+                stdout=skipped_stdout,
+                test_results={"AT-01": False, "AT-02": False},
+            ),
+        ]
+    )
+    worker = BuildWorker(
+        orchestrator=orchestrator,
+        workspace_manager=ws_mgr,
+        code_agent=agent,
+        runner=runner,
+        vcs=FakeVCS(),
+    )
+    report = worker.run_job(pid)
+
+    assert orchestrator.get_status(pid).state == ProjectState.FAILED
+    assert report.invocations == 3  # 1 test gen + 2 noop impl rounds
+    cause = report.failure_cause or ""
+    assert "sin cambios" in cause.lower()
+    assert "pruebas omitidas" in cause.lower()
+    assert "SKIPPED" in cause
+    assert "Node.js is not available in PATH" in cause
+    assert "herramientas externas ausentes" in cause.lower()
+
+    failed_events = [ev for ev in store.get_events(pid) if ev.type == EventType.PROJECT_FAILED]
+    assert len(failed_events) == 1
+    assert "Node.js is not available in PATH" in failed_events[0].payload["reason"]
 
 
 

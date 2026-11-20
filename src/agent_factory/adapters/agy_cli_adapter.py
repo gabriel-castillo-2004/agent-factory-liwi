@@ -510,9 +510,11 @@ class AgyCliAdapter(CodeAgent):
                 "2. Do NOT read or create files under src/.\n"
                 "3. Respond with a JSON object containing files_written (e.g. [\"tests/test_app.py\"]) and a short plain-text summary (no nested markdown or JSON).\n"
                 "4. If direct file tool writes are unavailable, output each file inside a fenced code block labeled with its relative path (e.g. ```python tests/test_app.py).\n"
-                "5. Self-contained execution: tests in tests/ MUST run using ONLY the Python standard library and pytest already installed in this environment "
-                "(e.g. inspect static HTML/CSS/JS with pathlib, html.parser, re, ast, json). "
-                "NEVER import external packages or browser automation runners such as playwright, selenium, or puppeteer unless already declared in the workspace project.\n"
+                "5. Self-contained execution: tests in tests/ MUST run using ONLY the Python standard library (pathlib, html.parser, re, ast, json) and pytest already installed in this environment. "
+                "Validate structure, styles, logic, and contracts directly in Python without external runtimes.\n"
+                "6. Strict execution guarantee (0 failed, 0 skipped): NEVER use pytest.skip, @pytest.mark.skip, or pytest.xfail. "
+                "NEVER invoke or execute external runtimes or browser automation runners via subprocess (e.g. node, npm, npx, playwright, selenium, puppeteer). "
+                "All acceptance tests must execute fully to completion with 0 failed and 0 skipped.\n"
                 f"Acceptance tests (also passed via stdin JSON):\n{tests_block}"
             )
         else:

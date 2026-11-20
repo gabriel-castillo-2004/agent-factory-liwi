@@ -1341,6 +1341,14 @@ def test_agy_cli_adapter_cleans_fenced_json_summary_and_enforces_stdlib_test_pro
     assert "playwright" in gen_prompt.lower()
     assert "selenium" in gen_prompt.lower()
     assert "standard library" in gen_prompt.lower()
+    assert "pytest.skip" in gen_prompt
+    assert "@pytest.mark.skip" in gen_prompt
+    assert "pytest.xfail" in gen_prompt
+    assert "node" in gen_prompt.lower()
+    assert "npm" in gen_prompt.lower()
+    assert "npx" in gen_prompt.lower()
+    assert "0 failed" in gen_prompt
+    assert "0 skipped" in gen_prompt
 
 
 def test_agy_cli_adapter_excludes_pycache_and_bytecode_files_and_handles_binary_stdout(
