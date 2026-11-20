@@ -242,8 +242,11 @@ class TelegramBotService:
             from agent_factory.adapters.git_registry_publisher import GitRegistryPublisher
 
             is_real_git = isinstance(self.registry_publisher, GitRegistryPublisher)
-            orch_has_pub = getattr(self.orchestrator, "publisher", None) is not None
-            if not is_real_git or orch_has_pub:
+            orch_pub = getattr(self.orchestrator, "publisher", None)
+            if orch_pub is self.registry_publisher:
+                self.orchestrator.get_status(pid)
+                return
+            if not is_real_git or orch_pub is not None:
                 try:
                     st = self.orchestrator.get_status(pid)
                     self.registry_publisher.publish_project(st)

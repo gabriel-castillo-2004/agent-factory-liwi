@@ -101,8 +101,11 @@ class GitRegistryPublisher:
             return self.work_dir
         return Path(tempfile.gettempdir()) / f"af_registry_{abs(hash(str(self.repo_path)))}"
 
-    def _ensure_repository_ready(self, work_dir: Path, branch: str) -> None:
-        """Ensure work_dir is cloned, checked out on branch, and synchronized with remote."""
+    def _ensure_repository_ready(self, work_dir: Path, branch: str) -> bool:
+        """Ensure work_dir is cloned, checked out on branch, and synchronized with remote.
+
+        Returns True when local HEAD is already confirmed identical to remote/branch.
+        """
         if not (work_dir / ".git").exists():
             work_dir.parent.mkdir(parents=True, exist_ok=True)
             self._run_git(["clone", str(self.repo_path), str(work_dir)], cwd=work_dir.parent)
@@ -119,99 +122,125 @@ class GitRegistryPublisher:
             )
             if check_local.exit_code == 0 or check_remote.exit_code == 0:
                 self._run_git(["checkout", branch], cwd=work_dir)
-            else:
-                self._run_git(["checkout", "--orphan", branch], cwd=work_dir)
-                self._run_git(["rm", "-rf", "--ignore-unmatch", "."], cwd=work_dir)
-                for child in work_dir.iterdir():
-                    if child.name != ".git":
-                        if child.is_dir():
-                            shutil.rmtree(child, ignore_errors=True)
-                        else:
-                            child.unlink(missing_ok=True)
-        else:
-            git_dir = work_dir / ".git"
-            if git_dir.is_dir() and (
-                (git_dir / "rebase-merge").exists()
-                or (git_dir / "rebase-apply").exists()
-                or (git_dir / "REBASE_HEAD").exists()
-            ):
-                self.runner.run(["git", "rebase", "--abort"], cwd=work_dir, env=self.env)
-                self.runner.run(["git", "reset", "--hard", "HEAD"], cwd=work_dir, env=self.env)
-            self._run_git(["checkout", branch], cwd=work_dir)
-            if self.push_to_remote:
-                fetch_res = self.runner.run(
-                    ["git", "fetch", self.remote, branch],
-                    cwd=work_dir,
-                    env=self.env,
-                )
-                if fetch_res.exit_code == 0:
-                    local_sha = self.runner.run(
-                        ["git", "rev-parse", "HEAD"], cwd=work_dir, env=self.env
-                    ).stdout.strip()
-                    remote_sha = self.runner.run(
-                        ["git", "rev-parse", "FETCH_HEAD"], cwd=work_dir, env=self.env
-                    ).stdout.strip()
-                    if local_sha and remote_sha and local_sha != remote_sha:
-                        anc = self.runner.run(
-                            ["git", "merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"],
-                            cwd=work_dir,
-                            env=self.env,
-                        )
-                        if anc.exit_code == 0:
-                            self._run_git(["reset", "--hard", "FETCH_HEAD"], cwd=work_dir)
-                        else:
-                            try:
-                                self._run_git(["rebase", "FETCH_HEAD"], cwd=work_dir)
-                            except RegistryPublishError:
-                                self.runner.run(
-                                    ["git", "rebase", "--abort"], cwd=work_dir, env=self.env
-                                )
-                                local_projects_dir = work_dir / "projects"
-                                cached_projects: dict[str, str] = {}
-                                if local_projects_dir.is_dir():
-                                    for pfile in local_projects_dir.glob("*.json"):
-                                        try:
-                                            cached_projects[pfile.name] = pfile.read_text(
-                                                encoding="utf-8"
-                                            )
-                                        except OSError:
-                                            pass
-                                self._run_git(["reset", "--hard", "FETCH_HEAD"], cwd=work_dir)
-                                if cached_projects:
-                                    local_projects_dir.mkdir(parents=True, exist_ok=True)
-                                    reg_file = work_dir / "registry.json"
-                                    idx_data: dict[str, object] = {
-                                        "version": "1.0",
-                                        "updated_at": None,
-                                        "projects": {},
-                                    }
-                                    if reg_file.exists():
-                                        try:
-                                            parsed = json.loads(reg_file.read_text(encoding="utf-8"))
-                                            if isinstance(parsed, dict):
-                                                idx_data = parsed
-                                        except (json.JSONDecodeError, OSError):
-                                            pass
-                                    projs = idx_data.setdefault("projects", {})
-                                    if not isinstance(projs, dict):
-                                        projs = {}
-                                        idx_data["projects"] = projs
-                                    for fname, content in cached_projects.items():
-                                        pid = fname.removesuffix(".json")
-                                        target_file = local_projects_dir / fname
-                                        if not target_file.exists():
-                                            target_file.write_text(content, encoding="utf-8")
-                                        if pid not in projs:
-                                            try:
-                                                projs[pid] = json.loads(content)
-                                            except (json.JSONDecodeError, ValueError):
-                                                pass
-                                    reg_file.write_text(
-                                        json.dumps(idx_data, indent=2, sort_keys=True),
-                                        encoding="utf-8",
-                                    )
+                return check_remote.exit_code == 0
+            self._run_git(["checkout", "--orphan", branch], cwd=work_dir)
+            self._run_git(["rm", "-rf", "--ignore-unmatch", "."], cwd=work_dir)
+            for child in work_dir.iterdir():
+                if child.name != ".git":
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink(missing_ok=True)
+            return False
 
-    def _commit_and_push_if_needed(self, work_dir: Path, branch: str, message: str) -> None:
+        git_dir = work_dir / ".git"
+        if git_dir.is_dir() and (
+            (git_dir / "rebase-merge").exists()
+            or (git_dir / "rebase-apply").exists()
+            or (git_dir / "REBASE_HEAD").exists()
+        ):
+            self.runner.run(["git", "rebase", "--abort"], cwd=work_dir, env=self.env)
+            self.runner.run(["git", "reset", "--hard", "HEAD"], cwd=work_dir, env=self.env)
+
+        head_file = git_dir / "HEAD"
+        on_branch = False
+        if git_dir.is_dir() and head_file.is_file() and not head_file.is_symlink():
+            try:
+                on_branch = (
+                    head_file.read_text(encoding="utf-8", errors="ignore").strip()
+                    == f"ref: refs/heads/{branch}"
+                )
+            except OSError:
+                on_branch = False
+        if not on_branch:
+            self._run_git(["checkout", branch], cwd=work_dir)
+
+        if not self.push_to_remote:
+            return False
+
+        fetch_res = self.runner.run(
+            ["git", "fetch", self.remote, branch],
+            cwd=work_dir,
+            env=self.env,
+        )
+        if fetch_res.exit_code != 0:
+            return False
+
+        sha_res = self.runner.run(
+            ["git", "rev-parse", "HEAD", "FETCH_HEAD"], cwd=work_dir, env=self.env
+        )
+        shas = [line.strip() for line in sha_res.stdout.splitlines() if line.strip()]
+        if sha_res.exit_code != 0 or len(shas) < 2:
+            return False
+        local_sha, remote_sha = shas[0], shas[1]
+        if local_sha == remote_sha:
+            return True
+
+        anc = self.runner.run(
+            ["git", "merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"],
+            cwd=work_dir,
+            env=self.env,
+        )
+        if anc.exit_code == 0:
+            self._run_git(["reset", "--hard", "FETCH_HEAD"], cwd=work_dir)
+            return True
+
+        try:
+            self._run_git(["rebase", "FETCH_HEAD"], cwd=work_dir)
+        except RegistryPublishError:
+            self.runner.run(["git", "rebase", "--abort"], cwd=work_dir, env=self.env)
+            local_projects_dir = work_dir / "projects"
+            cached_projects: dict[str, str] = {}
+            if local_projects_dir.is_dir():
+                for pfile in local_projects_dir.glob("*.json"):
+                    try:
+                        cached_projects[pfile.name] = pfile.read_text(encoding="utf-8")
+                    except OSError:
+                        pass
+            self._run_git(["reset", "--hard", "FETCH_HEAD"], cwd=work_dir)
+            if cached_projects:
+                local_projects_dir.mkdir(parents=True, exist_ok=True)
+                reg_file = work_dir / "registry.json"
+                idx_data: dict[str, object] = {
+                    "version": "1.0",
+                    "updated_at": None,
+                    "projects": {},
+                }
+                if reg_file.exists():
+                    try:
+                        parsed = json.loads(reg_file.read_text(encoding="utf-8"))
+                        if isinstance(parsed, dict):
+                            idx_data = parsed
+                    except (json.JSONDecodeError, OSError):
+                        pass
+                projs = idx_data.setdefault("projects", {})
+                if not isinstance(projs, dict):
+                    projs = {}
+                    idx_data["projects"] = projs
+                for fname, content in cached_projects.items():
+                    pid = fname.removesuffix(".json")
+                    target_file = local_projects_dir / fname
+                    if not target_file.exists():
+                        target_file.write_text(content, encoding="utf-8")
+                    if pid not in projs:
+                        try:
+                            projs[pid] = json.loads(content)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                reg_file.write_text(
+                    json.dumps(idx_data, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+        return False
+
+    def _commit_and_push_if_needed(
+        self,
+        work_dir: Path,
+        branch: str,
+        message: str,
+        *,
+        remote_synced: bool = False,
+    ) -> None:
         """Stage changes, commit if index differs, and push if remote lags behind local HEAD."""
         self._run_git(["add", "-A", "--", "registry.json", "projects"], cwd=work_dir)
         diff_check = self.runner.run(
@@ -219,7 +248,8 @@ class GitRegistryPublisher:
             cwd=work_dir,
             env=self.env,
         )
-        if diff_check.exit_code != 0:
+        did_commit = diff_check.exit_code != 0
+        if did_commit:
             self._run_git(
                 [
                     "-c",
@@ -234,6 +264,11 @@ class GitRegistryPublisher:
             )
 
         if self.push_to_remote:
+            if did_commit:
+                self._run_git(["push", "-u", self.remote, branch], cwd=work_dir)
+                return
+            if remote_synced:
+                return
             ls_res = self.runner.run(
                 ["git", "ls-remote", "--heads", self.remote, branch],
                 cwd=work_dir,
@@ -262,7 +297,7 @@ class GitRegistryPublisher:
         branch = self._validate_branch()
         validate_project_id(status.project_id)
         work_dir = self._resolve_work_dir()
-        self._ensure_repository_ready(work_dir, branch)
+        remote_synced = self._ensure_repository_ready(work_dir, branch)
 
         repo_url = status.links.repo if status.links else None
         deploy_url = status.links.deploy if status.links else None
@@ -326,7 +361,10 @@ class GitRegistryPublisher:
         proj_file.write_text(clean_proj_json, encoding="utf-8")
 
         self._commit_and_push_if_needed(
-            work_dir, branch, f"chore(registry): update {status.project_id}"
+            work_dir,
+            branch,
+            f"chore(registry): update {status.project_id}",
+            remote_synced=remote_synced,
         )
         return entry
 
@@ -384,7 +422,7 @@ class GitRegistryPublisher:
         branch = self._validate_branch()
         validate_project_id(project_id)
         work_dir = self._resolve_work_dir()
-        self._ensure_repository_ready(work_dir, branch)
+        remote_synced = self._ensure_repository_ready(work_dir, branch)
 
         reg_file = work_dir / "registry.json"
         if reg_file.exists():
@@ -406,5 +444,8 @@ class GitRegistryPublisher:
             proj_file.unlink(missing_ok=True)
 
         self._commit_and_push_if_needed(
-            work_dir, branch, f"chore(registry): delete {project_id}"
+            work_dir,
+            branch,
+            f"chore(registry): delete {project_id}",
+            remote_synced=remote_synced,
         )

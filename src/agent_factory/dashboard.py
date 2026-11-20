@@ -81,6 +81,7 @@ class DashboardController:
         model_resolver: Any = None,
         local_runner: LocalAppRunner | None = None,
         logos_dir: Path | None = None,
+        chats_dir: Path | None = None,
         vcs: Any | None = None,
         secrets_to_redact: Sequence[str] = (),
     ) -> None:
@@ -115,6 +116,21 @@ class DashboardController:
                 )
             else:
                 self.logos_dir = Path("data/logos").resolve()
+
+        if chats_dir is not None:
+            self.chats_dir = Path(chats_dir).resolve()
+        else:
+            db_path = getattr(orchestrator.store, "db_path", None)
+            if db_path and str(db_path) != ":memory:":
+                db_parent = Path(db_path).resolve().parent
+                repo_data_dir = Path("data").resolve()
+                self.chats_dir = (
+                    (repo_data_dir / "chats").resolve()
+                    if db_parent == repo_data_dir
+                    else (db_parent / "chats").resolve()
+                )
+            else:
+                self.chats_dir = Path("data/chats").resolve()
         effective_ws_mgr = self._resolve_workspace_manager() or getattr(
             orchestrator, "workspace_manager", None
         )
@@ -295,6 +311,34 @@ class DashboardController:
                     return redact_secrets(reason, extra_secrets=self.secrets_to_redact)
         return None
 
+    def _sync_external_workspace(
+        self,
+        project_id: str,
+        status: ProjectStatus | None = None,
+    ) -> WorkspaceManager | None:
+        """Bind authorized external_workspace_path into active WorkspaceManager instances (INV-22)."""
+        ws_mgr = self._resolve_workspace_manager() or getattr(
+            self.orchestrator, "workspace_manager", None
+        )
+        eff_status = status
+        if eff_status is None:
+            try:
+                if self.orchestrator.store.get_events(project_id):
+                    eff_status = self.orchestrator.get_status(project_id)
+            except (ValueError, IllegalTransition):
+                eff_status = None
+
+        ext_path = eff_status.workspace_path if eff_status is not None else None
+        if ext_path:
+            for mgr in (
+                ws_mgr,
+                getattr(self.orchestrator, "workspace_manager", None),
+                self.local_runner.workspace_manager,
+            ):
+                if mgr is not None and not mgr.is_external_workspace(project_id):
+                    mgr.register_external_workspace(project_id, ext_path)
+        return ws_mgr
+
     def _local_app_payload(self, project_id: str) -> dict[str, Any]:
         """Return safe local_app summary dict for API projections."""
         if self.local_runner.workspace_manager is None:
@@ -304,6 +348,7 @@ class DashboardController:
             if ws_mgr is None:
                 return {"running": False, "url": None, "app_type": "unknown"}
             self.local_runner.workspace_manager = ws_mgr
+        self._sync_external_workspace(project_id)
         try:
             return self.local_runner.get_status(project_id).to_api_dict()
         except (SandboxViolationError, ValueError, OSError):
@@ -408,6 +453,7 @@ class DashboardController:
             raise ProjectNotFoundError(f"Project '{project_id}' not found")
 
         status = self.orchestrator.get_status(project_id)
+        self._sync_external_workspace(project_id, status)
         spec = self.orchestrator.get_spec(project_id)
         plan = self.orchestrator.get_plan(project_id)
 
@@ -741,9 +787,7 @@ class DashboardController:
         events = self.orchestrator.store.get_events(project_id)
         if not events:
             raise ProjectNotFoundError(f"Project '{project_id}' not found")
-        ws_mgr = self._resolve_workspace_manager() or getattr(
-            self.orchestrator, "workspace_manager", None
-        )
+        ws_mgr = self._sync_external_workspace(project_id)
         ws_dir: Path | None = None
         if ws_mgr is not None:
             candidate = ws_mgr.get_workspace_dir(project_id)
@@ -759,6 +803,94 @@ class DashboardController:
             "project_id": project_id,
             "suggested_title": suggested,
         }
+
+    def get_project_chat(self, project_id: str) -> dict[str, Any]:
+        """Return persisted read-only audit/Q&A chat history for project_id."""
+        validate_project_id(project_id)
+        if not self.orchestrator.store.get_events(project_id):
+            raise ProjectNotFoundError(f"Project '{project_id}' not found")
+        history = self.orchestrator.get_project_chat_history(
+            project_id,
+            chats_dir=self.chats_dir,
+            extra_secrets=self.secrets_to_redact,
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "messages": history,
+        }
+
+    def post_project_chat(
+        self,
+        project_id: str,
+        message: str,
+        *,
+        mode: str = "chat",
+    ) -> dict[str, Any]:
+        """Run read-only Q&A, audit, or Markdown document generation for project_id."""
+        validate_project_id(project_id)
+        if not self.orchestrator.store.get_events(project_id):
+            raise ProjectNotFoundError(f"Project '{project_id}' not found")
+        ws_mgr = self._sync_external_workspace(project_id)
+        try:
+            result = self.orchestrator.chat_with_project(
+                project_id,
+                message,
+                mode=mode,
+                chats_dir=self.chats_dir,
+                workspace_manager=ws_mgr,
+                extra_secrets=self.secrets_to_redact,
+            )
+        except LLMError as exc:
+            clean_err = redact_secrets(str(exc), extra_secrets=self.secrets_to_redact)
+            raise ProjectConflictError(clean_err) from None
+        return _scrub_value(result, self.secrets_to_redact)
+
+    def import_external_project(
+        self,
+        local_path: str,
+        *,
+        title: str = "",
+    ) -> dict[str, Any]:
+        """Validate and import an existing local directory as a DELIVERED project (INV-22)."""
+        ws_mgr = self._resolve_workspace_manager() or getattr(
+            self.orchestrator, "workspace_manager", None
+        )
+        status, meta = self.orchestrator.import_project(
+            local_path,
+            title=title,
+            workspace_manager=ws_mgr,
+            extra_secrets=self.secrets_to_redact,
+        )
+        pid = status.project_id
+        self._sync_external_workspace(pid, status)
+        events = self.orchestrator.store.get_events(pid)
+        summary = self._serialize_summary(
+            pid,
+            status,
+            events,
+            has_plan=(self.orchestrator.get_plan(pid) is not None),
+        )
+        return {
+            "ok": True,
+            "project_id": pid,
+            "app_type": meta.get("app_type", "unknown"),
+            "manifest_loaded": bool(meta.get("manifest_loaded", False)),
+            "status": summary,
+        }
+
+    def get_lan_mode(self) -> dict[str, Any]:
+        """Return current LAN/mobile mode setting and local LAN IP when enabled."""
+        enabled = self.local_runner.get_lan_mode()
+        lan_ip = self.local_runner._lan_ip_resolver() if enabled else None
+        return {"ok": True, "lan_mode": enabled, "lan_ip": lan_ip}
+
+    def set_lan_mode(self, enabled: bool) -> dict[str, Any]:
+        """Toggle LAN 0.0.0.0 binding mode on LocalAppRunner."""
+        if not isinstance(enabled, bool):
+            raise TypeError("El campo 'lan_mode' debe ser booleano.")
+        info = self.local_runner.set_lan_mode(enabled)
+        return {"ok": True, **info}
 
     def get_project_logo(self, project_id: str) -> tuple[str, bytes]:
         """Return custom logo bytes+mime from logos_dir or auto-generated 64x64 domain SVG."""
@@ -799,9 +931,7 @@ class DashboardController:
         """Validate/sanitize uploaded SVG/PNG/JPG/WebP logo <=512KB, save under logos_dir, and copy into workspace."""
         validate_project_id(project_id)
         events = self.orchestrator.store.get_events(project_id)
-        ws_mgr = self._resolve_workspace_manager() or getattr(
-            self.orchestrator, "workspace_manager", None
-        )
+        ws_mgr = self._sync_external_workspace(project_id)
         ws_dir: Path | None = None
         if ws_mgr is not None:
             cand = ws_mgr.get_workspace_dir(project_id)
@@ -846,9 +976,7 @@ class DashboardController:
         """Start project_id locally via LocalAppRunner and return updated local_app status."""
         validate_project_id(project_id)
         events = self.orchestrator.store.get_events(project_id)
-        ws_mgr = self._resolve_workspace_manager() or getattr(
-            self.orchestrator, "workspace_manager", None
-        )
+        ws_mgr = self._sync_external_workspace(project_id)
         if not events and (ws_mgr is None or not ws_mgr.get_workspace_dir(project_id).is_dir()):
             raise ProjectNotFoundError(f"Project '{project_id}' not found")
 
@@ -887,9 +1015,7 @@ class DashboardController:
         """Stop locally running app for project_id cleanly and release its port."""
         validate_project_id(project_id)
         events = self.orchestrator.store.get_events(project_id)
-        ws_mgr = self._resolve_workspace_manager() or getattr(
-            self.orchestrator, "workspace_manager", None
-        )
+        ws_mgr = self._sync_external_workspace(project_id)
         if not events and (ws_mgr is None or not ws_mgr.get_workspace_dir(project_id).is_dir()):
             raise ProjectNotFoundError(f"Project '{project_id}' not found")
 
@@ -930,6 +1056,7 @@ class DashboardController:
                 raise ProjectConflictError(
                     f"Project '{project_id}' already has an active background operation"
                 )
+            self._sync_external_workspace(project_id)
             self.local_runner.stop(project_id)
             try:
                 updated = self.orchestrator.modify_project(project_id, clean_instructions)
@@ -1123,7 +1250,7 @@ class DashboardController:
                 )
 
             had_events = bool(self.orchestrator.store.get_events(project_id))
-            ws_mgr = self._resolve_workspace_manager()
+            ws_mgr = self._sync_external_workspace(project_id)
             ws_dir: Path | None = None
             if ws_mgr is not None:
                 ws_dir = ws_mgr.get_workspace_dir(project_id)
@@ -1134,6 +1261,7 @@ class DashboardController:
 
             self.local_runner.stop(project_id)
             self.orchestrator.delete_project(project_id)
+            self.orchestrator.delete_project_chat_history(project_id, chats_dir=self.chats_dir)
 
             if self.build_worker is not None and self.build_worker.queue is not None:
                 self.build_worker.queue.remove(project_id)
@@ -2047,6 +2175,87 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       user-select: none;
     }
     details.prior-attempts-box > summary:hover { color: var(--text); }
+    .mic-btn.listening {
+      border-color: var(--err);
+      background: var(--err-bg);
+      color: var(--err);
+    }
+    .input-row-with-mic {
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+    }
+    .input-row-with-mic > textarea { flex: 1; }
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(2, 6, 23, 0.72);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      z-index: 50;
+    }
+    .modal-card {
+      width: 100%;
+      max-width: 500px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 18px;
+      box-shadow: 0 12px 32px rgba(0,0,0,0.45);
+    }
+    .audit-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .audit-thread {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      max-height: 440px;
+      overflow-y: auto;
+      padding: 10px;
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      margin-bottom: 12px;
+    }
+    .audit-msg {
+      padding: 10px 12px;
+      border-radius: 9px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .audit-msg.user {
+      border-color: rgba(56, 189, 248, 0.45);
+      background: var(--info-bg);
+    }
+    .audit-msg-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .audit-msg-body {
+      white-space: pre-wrap;
+      font-size: 0.88rem;
+      line-height: 1.48;
+      word-break: break-word;
+    }
+    .audit-msg-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px dashed var(--border);
+    }
   </style>
 </head>
 <body>
@@ -2057,6 +2266,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <span id="status-note" class="toast"></span>
     </div>
     <div class="controls">
+      <label class="tech-toggle" title="Permitir acceso desde celulares u otros equipos en tu red Wi-Fi local (0.0.0.0)">
+        <input id="lan-mode-toggle" type="checkbox" />
+        <span>Acceso Wi-Fi (celular)</span>
+      </label>
+      <label class="tech-toggle" title="Leer respuestas nuevas en voz alta en español">
+        <input id="voice-tts-toggle" type="checkbox" />
+        <span>Leer respuestas en voz alta</span>
+      </label>
       <label class="tech-toggle" title="Mostrar IDs, detalles JSON, modelos por paso y trazas técnicas">
         <input id="tech-mode-toggle" type="checkbox" />
         <span>Modo técnico</span>
@@ -2069,10 +2286,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <section class="panel">
       <div class="panel-header">
         <h2 style="margin:0; font-size:1.15rem;">Tus proyectos</h2>
-        <button id="toggle-new-project-btn" class="btn btn-sm" type="button">+ Nuevo proyecto</button>
+        <div style="display:flex; gap:6px; flex-wrap:wrap;">
+          <button id="toggle-import-project-btn" class="btn btn-sm" type="button">Importar proyecto</button>
+          <button id="toggle-new-project-btn" class="btn btn-sm" type="button">+ Nuevo proyecto</button>
+        </div>
       </div>
       <form id="new-project-form" class="new-project-form" style="display:none">
-        <textarea id="new-project-input" class="input-field" rows="3" placeholder="¿Qué quieres construir?" required></textarea>
+        <div class="input-row-with-mic">
+          <textarea id="new-project-input" class="input-field" rows="3" placeholder="¿Qué quieres construir?" required></textarea>
+          <button id="new-project-mic-btn" class="btn btn-sm mic-btn" type="button" title="Dictar idea por voz (es-MX)">🎤</button>
+        </div>
         <div class="new-project-actions">
           <button id="cancel-new-project-btn" class="btn btn-sm" type="button">Cancelar</button>
           <button id="submit-new-project-btn" class="btn btn-primary btn-sm" type="submit">Comenzar</button>
@@ -2080,6 +2303,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </form>
       <div id="project-list" class="muted" style="margin-top:14px;">Cargando proyectos...</div>
     </section>
+
+    <div id="import-project-modal" class="modal-backdrop" style="display:none">
+      <form id="import-project-form" class="modal-card">
+        <h3 style="margin:0 0 8px 0;">Importar proyecto de esta computadora</h3>
+        <p class="muted" style="font-size:0.86rem; margin:0 0 12px 0;">Ingresa la ruta local de una carpeta existente para auditarla, ejecutarla o modificarla sin copiar archivos.</p>
+        <input id="import-path-input" class="input-field" type="text" placeholder="Ej: C:\\Users\\tu-usuario\\proyectos\\mi-app" required style="margin-bottom:8px;" />
+        <input id="import-title-input" class="input-field" type="text" maxlength="80" placeholder="Título opcional (si lo dejas vacío se detecta del repo)" style="margin-bottom:12px;" />
+        <div style="display:flex; justify-content:flex-end; gap:8px;">
+          <button id="cancel-import-project-btn" class="btn btn-sm" type="button">Cancelar</button>
+          <button id="submit-import-project-btn" class="btn btn-primary btn-sm" type="submit">Importar</button>
+        </div>
+      </form>
+    </div>
 
     <section class="panel" id="detail-panel">
       <div id="detail-empty" class="empty-box">Selecciona un proyecto de la lista para ver su estado y detalles.</div>
@@ -2115,10 +2351,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <button class="tab-btn active" data-tab="spec" type="button">Resumen</button>
           <button class="tab-btn" data-tab="plan" type="button">Plan</button>
           <button class="tab-btn" data-tab="events" type="button">Historial</button>
+          <button id="tab-audit-btn" class="tab-btn" data-tab="audit" type="button" style="display:none">Consultar y Auditar proyecto</button>
         </div>
         <div id="tab-spec" class="tab-content"></div>
         <div id="tab-plan" class="tab-content" style="display:none"></div>
         <div id="tab-events" class="tab-content" style="display:none"></div>
+        <div id="tab-audit" class="tab-content" style="display:none"></div>
 
         <div id="detail-secondary"></div>
       </div>
@@ -2134,6 +2372,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       replyDrafts: {},
       adjustDrafts: {},
       modifyDrafts: {},
+      chatDrafts: {},
+      chatHistories: {},
+      chatLoadedFor: {},
+      lastChatSig: null,
+      voiceTts: false,
+      lastSpokenQuestionKey: null,
       editingTitlePid: null,
       adjustOpen: {},
       phaseOpen: {},
@@ -2395,6 +2639,94 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById('tab-spec').style.display = state.activeTab === 'spec' ? 'block' : 'none';
       document.getElementById('tab-plan').style.display = state.activeTab === 'plan' ? 'block' : 'none';
       document.getElementById('tab-events').style.display = state.activeTab === 'events' ? 'block' : 'none';
+      const auditPane = document.getElementById('tab-audit');
+      if (auditPane) {
+        auditPane.style.display = state.activeTab === 'audit' ? 'block' : 'none';
+      }
+    }
+
+    function speakSpanishText(rawText) {
+      if (!state.voiceTts || !('speechSynthesis' in window) || typeof SpeechSynthesisUtterance === 'undefined') {
+        return;
+      }
+      const clean = String(rawText || '')
+        .replace(/```[\\s\\S]*?```/g, ' bloque de código ')
+        .replace(/[#>*_`]/g, ' ')
+        .replace(/\\s+/g, ' ')
+        .trim();
+      if (!clean) return;
+      try {
+        window.speechSynthesis.cancel();
+        const utt = new SpeechSynthesisUtterance(clean.slice(0, 1500));
+        utt.lang = 'es-MX';
+        window.speechSynthesis.speak(utt);
+      } catch (_) {}
+    }
+
+    function wireMicButton(btnOrId, inputOrId) {
+      const btn = typeof btnOrId === 'string' ? document.getElementById(btnOrId) : btnOrId;
+      const target = typeof inputOrId === 'string' ? document.getElementById(inputOrId) : inputOrId;
+      if (!btn || !target) return;
+      const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SpeechRec) {
+        btn.style.display = 'none';
+        return;
+      }
+      if (btn.dataset.micWired === '1') return;
+      btn.dataset.micWired = '1';
+      let activeRec = null;
+      btn.addEventListener('click', () => {
+        if (activeRec) {
+          try { activeRec.stop(); } catch (_) {}
+          return;
+        }
+        try {
+          const rec = new SpeechRec();
+          rec.lang = 'es-MX';
+          rec.interimResults = false;
+          rec.maxAlternatives = 1;
+          activeRec = rec;
+          btn.classList.add('listening');
+          rec.onresult = (ev) => {
+            const transcript = Array.from(ev.results || [])
+              .map((r) => (r[0] ? r[0].transcript : ''))
+              .join(' ')
+              .trim();
+            if (transcript) {
+              const cur = (target.value || '').trim();
+              target.value = cur ? (cur + ' ' + transcript) : transcript;
+              target.dispatchEvent(new Event('input', { bubbles: true }));
+              target.focus();
+            }
+          };
+          rec.onerror = () => {
+            setNote('No se pudo capturar audio con el micrófono.');
+          };
+          rec.onend = () => {
+            btn.classList.remove('listening');
+            activeRec = null;
+          };
+          rec.start();
+        } catch (_) {
+          btn.classList.remove('listening');
+          activeRec = null;
+          btn.style.display = 'none';
+        }
+      });
+    }
+
+    function downloadMarkdownFile(filename, content) {
+      const safeName = String(filename || 'documento.md').replace(/[^a-zA-Z0-9._-]+/g, '-');
+      const finalName = safeName.toLowerCase().endsWith('.md') ? safeName : (safeName + '.md');
+      const blob = new Blob([String(content || '')], { type: 'text/markdown;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = finalName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
 
     async function apiFetch(url, options = {}) {
@@ -2758,7 +3090,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             '</div>' +
           '</div>' +
           '<div class="banner-form">' +
-            '<textarea id="interview-reply-input" class="input-field" rows="3" placeholder="Escribe tu respuesta aquí...">' + draft + '</textarea>' +
+            '<div class="input-row-with-mic">' +
+              '<textarea id="interview-reply-input" class="input-field" rows="3" placeholder="Escribe tu respuesta aquí...">' + draft + '</textarea>' +
+              '<button id="interview-mic-btn" class="btn btn-sm mic-btn" type="button" title="Dictar respuesta por voz (es-MX)">🎤</button>' +
+            '</div>' +
             '<div class="banner-actions">' +
               '<button id="interview-reply-btn" class="btn btn-primary" type="button">Enviar respuesta</button>' +
             '</div>' +
@@ -2840,10 +3175,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const deployBtn = (localApp.app_type === 'static' && st.links && st.links.deploy)
           ? '<a href="' + escapeHtml(st.links.deploy) + '" target="_blank" rel="noopener noreferrer" class="btn">Ver despliegue en vivo</a>'
           : '';
+        const lanBtn = (localApp.running && localApp.lan_url)
+          ? '<a href="' + escapeHtml(localApp.lan_url) + '" target="_blank" rel="noopener noreferrer" class="btn btn-sm">Abrir desde celular</a>' +
+            '<span class="model-pill">' + escapeHtml(localApp.lan_url) + '</span>'
+          : '';
         const localBtns = (localApp.running && localApp.url)
           ? '<a href="' + escapeHtml(localApp.url) + '" target="_blank" rel="noopener noreferrer" class="btn btn-success">Abrir app en local</a>' +
             '<button class="btn btn-warn" data-dact="local-stop">Apagar</button>' +
-            '<span class="model-pill">' + escapeHtml(localApp.url) + '</span>'
+            '<span class="model-pill">' + escapeHtml(localApp.url) + '</span>' +
+            lanBtn
           : '<button class="btn btn-primary" data-dact="local-start">Encender en local</button>';
         const descMsg = localApp.app_type === 'python_local'
           ? 'Proyecto local con servidor Python listo para ejecutarse en tu computadora.'
@@ -2863,7 +3203,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           '</div>' +
           '<div class="modify-box">' +
             '<div class="modify-box-title">Pedir cambios o mejoras</div>' +
-            '<textarea id="modify-project-input" class="input-field" rows="2" placeholder="Describe qué quieres mejorar, cambiar o agregar al proyecto...">' + modifyDraft + '</textarea>' +
+            '<div class="input-row-with-mic">' +
+              '<textarea id="modify-project-input" class="input-field" rows="2" placeholder="Describe qué quieres mejorar, cambiar o agregar al proyecto...">' + modifyDraft + '</textarea>' +
+              '<button id="modify-mic-btn" class="btn btn-sm mic-btn" type="button" title="Dictar cambios por voz (es-MX)">🎤</button>' +
+            '</div>' +
             '<div class="banner-actions">' +
               '<button id="modify-project-btn" class="btn btn-primary btn-sm" type="button">Aplicar cambios</button>' +
             '</div>' +
@@ -3387,6 +3730,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             state.replyDrafts[st.project_id] = replyInput.value;
           });
         }
+        wireMicButton('interview-mic-btn', 'interview-reply-input');
+        if (st.state === 'INTERVIEW' && !isRunning && questions.length) {
+          const qKey = st.project_id + ':' + questions.join('|');
+          if (state.lastSpokenQuestionKey !== qKey) {
+            state.lastSpokenQuestionKey = qKey;
+            speakSpanishText(questions.join('. '));
+          }
+        }
         if (replyBtn && replyInput) {
           replyBtn.addEventListener('click', async () => {
             replyBtn.disabled = true;
@@ -3429,6 +3780,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             state.modifyDrafts[st.project_id] = modifyInput.value;
           });
         }
+        wireMicButton('modify-mic-btn', 'modify-project-input');
         if (modifyBtn && modifyInput) {
           modifyBtn.addEventListener('click', async () => {
             modifyBtn.disabled = true;
@@ -3663,7 +4015,178 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         });
       }
 
+      const auditTabBtn = document.getElementById('tab-audit-btn');
+      if (auditTabBtn) {
+        if (isDelivered) {
+          auditTabBtn.style.display = '';
+          if (!state.chatLoadedFor[st.project_id]) {
+            loadProjectChatHistory(st.project_id);
+          }
+          renderAuditChatTab(st.project_id);
+        } else {
+          auditTabBtn.style.display = 'none';
+          if (state.activeTab === 'audit') {
+            state.activeTab = 'spec';
+          }
+        }
+      }
+
       renderTabs();
+    }
+
+    function renderAuditChatTab(pid) {
+      const container = document.getElementById('tab-audit');
+      if (!container) return;
+      const msgs = state.chatHistories[pid] || [];
+      const draft = state.chatDrafts[pid] || '';
+      const chatSig = pid + ':' + JSON.stringify(msgs.map((m) => [m.id, m.role, m.content]));
+      if (state.lastChatSig === chatSig && container.querySelector('#audit-chat-input')) {
+        return;
+      }
+      state.lastChatSig = chatSig;
+
+      const msgsHtml = msgs.length
+        ? msgs.map((m, idx) => {
+            const isUser = m.role === 'user';
+            const modeLabel = m.mode === 'audit' ? 'Auditoría' : (m.mode === 'document' ? 'Documento .md' : 'Consulta');
+            const who = isUser ? ('Tú · ' + modeLabel) : ('Auditor · ' + modeLabel);
+            const actionsHtml = !isUser
+              ? '<div class="audit-msg-actions">' +
+                  '<button class="btn btn-sm" type="button" data-audit-dl="' + idx + '">Descargar .md</button>' +
+                  '<button class="btn btn-sm" type="button" data-audit-apply="' + idx + '">Enviar hallazgos a Aplicar cambios</button>' +
+                '</div>'
+              : '';
+            return '<div class="audit-msg ' + (isUser ? 'user' : 'assistant') + '">' +
+              '<div class="audit-msg-head"><span><strong>' + escapeHtml(who) + '</strong></span><span>' + escapeHtml(formatFriendlyTime(m.created_at)) + '</span></div>' +
+              '<div class="audit-msg-body">' + escapeHtml(m.content || '') + '</div>' +
+              actionsHtml +
+            '</div>';
+          }).join('')
+        : '<div class="muted" style="font-size:0.86rem;">Consulta código, solicita una auditoría de solo lectura o genera documentación en Markdown sin alterar tus archivos.</div>';
+
+      container.innerHTML =
+        '<div class="audit-toolbar">' +
+          '<button id="audit-quick-audit-btn" class="btn btn-sm" type="button">🔍 Auditar código</button>' +
+          '<button id="audit-quick-explain-btn" class="btn btn-sm" type="button">📖 Explicar funcionamiento</button>' +
+          '<button id="audit-quick-doc-btn" class="btn btn-sm" type="button">📄 Generar documento (.md)</button>' +
+        '</div>' +
+        '<div id="audit-chat-history" class="audit-thread">' + msgsHtml + '</div>' +
+        '<div class="input-row-with-mic">' +
+          '<textarea id="audit-chat-input" class="input-field" rows="2" placeholder="Haz una pregunta sobre el proyecto, su arquitectura o posibles mejoras...">' + escapeHtml(draft) + '</textarea>' +
+          '<button id="audit-chat-mic-btn" class="btn btn-sm mic-btn" type="button" title="Dictar consulta por voz (es-MX)">🎤</button>' +
+        '</div>' +
+        '<div class="banner-actions">' +
+          '<button id="audit-chat-send-btn" class="btn btn-primary btn-sm" type="button">Enviar consulta</button>' +
+        '</div>';
+
+      const threadEl = document.getElementById('audit-chat-history');
+      if (threadEl) {
+        threadEl.scrollTop = threadEl.scrollHeight;
+      }
+
+      const inputEl = document.getElementById('audit-chat-input');
+      const sendBtn = document.getElementById('audit-chat-send-btn');
+      if (inputEl) {
+        inputEl.addEventListener('input', () => {
+          state.chatDrafts[pid] = inputEl.value;
+        });
+      }
+      wireMicButton('audit-chat-mic-btn', 'audit-chat-input');
+
+      const quickAuditBtn = document.getElementById('audit-quick-audit-btn');
+      const quickExplainBtn = document.getElementById('audit-quick-explain-btn');
+      const quickDocBtn = document.getElementById('audit-quick-doc-btn');
+      if (quickAuditBtn) {
+        quickAuditBtn.addEventListener('click', () => submitProjectChat(pid, '', 'audit'));
+      }
+      if (quickExplainBtn) {
+        quickExplainBtn.addEventListener('click', () =>
+          submitProjectChat(pid, 'Explica cómo funciona este proyecto, sus archivos clave y cómo utilizarlo.', 'chat')
+        );
+      }
+      if (quickDocBtn) {
+        quickDocBtn.addEventListener('click', () => submitProjectChat(pid, '', 'document'));
+      }
+      if (sendBtn && inputEl) {
+        sendBtn.addEventListener('click', () => submitProjectChat(pid, inputEl.value, 'chat'));
+      }
+
+      container.querySelectorAll('button[data-audit-dl]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const idx = Number(btn.getAttribute('data-audit-dl'));
+          const entry = msgs[idx];
+          if (!entry) return;
+          const fallbackName = entry.mode === 'audit' ? (pid + '-auditoria.md') : (pid + '-documentacion.md');
+          downloadMarkdownFile(entry.document_title || fallbackName, entry.content || '');
+        });
+      });
+
+      container.querySelectorAll('button[data-audit-apply]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const idx = Number(btn.getAttribute('data-audit-apply'));
+          const entry = msgs[idx];
+          if (!entry) return;
+          const textToApply = (entry.suggested_changes && String(entry.suggested_changes).trim())
+            ? String(entry.suggested_changes).trim()
+            : String(entry.content || '').trim();
+          state.modifyDrafts[pid] = textToApply;
+          const modifyBox = document.getElementById('modify-project-input');
+          if (modifyBox) {
+            modifyBox.value = textToApply;
+            modifyBox.dispatchEvent(new Event('input', { bubbles: true }));
+            modifyBox.focus();
+            modifyBox.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }
+          setNote('Hallazgos copiados al panel "Pedir cambios o mejoras". Revisa y pulsa Aplicar cambios si deseas ejecutarlos.');
+        });
+      });
+    }
+
+    async function loadProjectChatHistory(pid) {
+      if (!pid) return;
+      state.chatLoadedFor[pid] = true;
+      try {
+        const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/chat');
+        state.chatHistories[pid] = Array.isArray(res.messages) ? res.messages : [];
+        state.lastChatSig = null;
+        if (state.detail && state.detail.project_id === pid) {
+          renderAuditChatTab(pid);
+        }
+      } catch (_) {}
+    }
+
+    async function submitProjectChat(pid, rawMessage, mode) {
+      const msg = String(rawMessage || '').trim();
+      if (mode === 'chat' && !msg) {
+        setNote('Escribe una pregunta para consultar el proyecto.');
+        return;
+      }
+      const sendBtn = document.getElementById('audit-chat-send-btn');
+      if (sendBtn) sendBtn.disabled = true;
+      setNote('Analizando código del proyecto (solo lectura)...');
+      try {
+        const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: msg, mode: mode || 'chat' }),
+        });
+        if (mode === 'chat') {
+          state.chatDrafts[pid] = '';
+        }
+        state.chatHistories[pid] = Array.isArray(res.history) ? res.history : [];
+        state.chatLoadedFor[pid] = true;
+        state.lastChatSig = null;
+        renderAuditChatTab(pid);
+        if (res && res.reply) {
+          speakSpanishText(res.reply);
+        }
+        setNote('Respuesta generada.');
+      } catch (err) {
+        setNote('Error en chat auditor: ' + err.message);
+      } finally {
+        const curBtn = document.getElementById('audit-chat-send-btn');
+        if (curBtn) curBtn.disabled = false;
+      }
     }
 
     async function loadDetail(pid) {
@@ -3946,6 +4469,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const form = document.getElementById('new-project-form');
       const input = document.getElementById('new-project-input');
       const submitBtn = document.getElementById('submit-new-project-btn');
+      wireMicButton('new-project-mic-btn', 'new-project-input');
 
       toggleBtn.addEventListener('click', () => {
         const showing = form.style.display !== 'none';
@@ -3988,6 +4512,106 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           submitBtn.disabled = false;
         }
       });
+    })();
+
+    (function initImportProjectModal() {
+      const openBtn = document.getElementById('toggle-import-project-btn');
+      const modal = document.getElementById('import-project-modal');
+      const form = document.getElementById('import-project-form');
+      const pathInput = document.getElementById('import-path-input');
+      const titleInput = document.getElementById('import-title-input');
+      const cancelBtn = document.getElementById('cancel-import-project-btn');
+      const submitBtn = document.getElementById('submit-import-project-btn');
+      if (!openBtn || !modal || !form || !pathInput || !cancelBtn || !submitBtn) return;
+
+      function closeModal() {
+        modal.style.display = 'none';
+        pathInput.value = '';
+        if (titleInput) titleInput.value = '';
+      }
+
+      openBtn.addEventListener('click', () => {
+        modal.style.display = 'flex';
+        pathInput.focus();
+      });
+      cancelBtn.addEventListener('click', closeModal);
+      modal.addEventListener('click', (ev) => {
+        if (ev.target === modal) closeModal();
+      });
+      form.addEventListener('submit', async (ev) => {
+        ev.preventDefault();
+        const localPath = (pathInput.value || '').trim();
+        const title = titleInput ? (titleInput.value || '').trim() : '';
+        if (!localPath) {
+          setNote('Ingresa la ruta de la carpeta local a importar.');
+          return;
+        }
+        submitBtn.disabled = true;
+        try {
+          const res = await apiFetch('/api/projects/import', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ local_path: localPath, title }),
+          });
+          closeModal();
+          if (res.project_id) {
+            state.selectedId = res.project_id;
+            state.lastBannerSignature = null;
+          }
+          setNote('Proyecto importado: ' + (res.project_id || '') + '.');
+          await loadProjects();
+        } catch (err) {
+          setNote('Error importando proyecto: ' + err.message);
+        } finally {
+          submitBtn.disabled = false;
+        }
+      });
+    })();
+
+    (function initVoiceAndLanToggles() {
+      const ttsToggle = document.getElementById('voice-tts-toggle');
+      if (ttsToggle) {
+        let savedTts = false;
+        try { savedTts = localStorage.getItem('af_voice_tts') === '1'; } catch (_) {}
+        state.voiceTts = savedTts;
+        ttsToggle.checked = savedTts;
+        ttsToggle.addEventListener('change', () => {
+          state.voiceTts = Boolean(ttsToggle.checked);
+          try { localStorage.setItem('af_voice_tts', state.voiceTts ? '1' : '0'); } catch (_) {}
+          if (!state.voiceTts && 'speechSynthesis' in window) {
+            try { window.speechSynthesis.cancel(); } catch (_) {}
+          }
+        });
+      }
+
+      const lanToggle = document.getElementById('lan-mode-toggle');
+      if (lanToggle) {
+        apiFetch('/api/settings/lan-mode')
+          .then((res) => {
+            if (res && typeof res.lan_mode === 'boolean') {
+              lanToggle.checked = res.lan_mode;
+            }
+          })
+          .catch(() => {});
+        lanToggle.addEventListener('change', async () => {
+          const desired = Boolean(lanToggle.checked);
+          try {
+            const res = await apiFetch('/api/settings/lan-mode', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ lan_mode: desired }),
+            });
+            setNote(
+              res.lan_mode
+                ? ('Acceso Wi-Fi activado' + (res.lan_ip ? (' (' + res.lan_ip + ')') : '') + '. Apaga y enciende tu app para aplicar.')
+                : 'Acceso Wi-Fi desactivado (solo 127.0.0.1).'
+            );
+          } catch (err) {
+            lanToggle.checked = !desired;
+            setNote('Error cambiando acceso Wi-Fi: ' + err.message);
+          }
+        });
+      }
     })();
 
     setInterval(updateLiveTimers, 1000);
@@ -4179,6 +4803,7 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             "title",
             "suggest-title",
             "logo",
+            "chat",
         }:
             return urllib.parse.unquote(parts[0]), parts[1]
         # Reject multi-segment or path-traversal attempts (e.g., ../etc) as invalid project_id
@@ -4196,6 +4821,10 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, {"projects": ctrl.list_projects()})
             return
 
+        if path == "/api/settings/lan-mode":
+            self._send_json(200, ctrl.get_lan_mode())
+            return
+
         pid, action = self._parse_project_route()
         if pid is not None and action == "logo":
             try:
@@ -4207,6 +4836,18 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(404, {"error": str(exc)})
                 return
             self._send_bytes(200, mime, data)
+            return
+
+        if pid is not None and action == "chat":
+            try:
+                chat_data = ctrl.get_project_chat(pid)
+            except (ValueError, SandboxViolationError) as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            except ProjectNotFoundError as exc:
+                self._send_json(404, {"error": str(exc)})
+                return
+            self._send_json(200, chat_data)
             return
 
         if pid is not None and action is None:
@@ -4241,6 +4882,38 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, result)
             return
 
+        if path == "/api/projects/import":
+            try:
+                body = self._read_json_body()
+                local_path = self._require_str_field(body, "local_path")
+                raw_title = body.get("title", "")
+                if raw_title is not None and not isinstance(raw_title, str):
+                    raise TypeError("El campo 'title' debe ser texto.")
+                result = ctrl.import_external_project(local_path, title=str(raw_title or ""))
+            except (ValueError, TypeError, SandboxViolationError) as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            except ProjectConflictError as exc:
+                self._send_json(409, {"error": str(exc)})
+                return
+            self._send_json(200, result)
+            return
+
+        if path == "/api/settings/lan-mode":
+            try:
+                body = self._read_json_body()
+                raw_flag = body.get("lan_mode")
+                if raw_flag is None and "enabled" in body:
+                    raw_flag = body.get("enabled")
+                if not isinstance(raw_flag, bool):
+                    raise TypeError("El campo 'lan_mode' debe ser booleano.")
+                result = ctrl.set_lan_mode(raw_flag)
+            except (ValueError, TypeError) as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            self._send_json(200, result)
+            return
+
         pid, action = self._parse_project_route()
         if pid is None or action not in {
             "approve",
@@ -4251,6 +4924,7 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             "modify",
             "suggest-title",
             "logo",
+            "chat",
         }:
             self._drain_body()
             self._send_json(404, {"error": "Endpoint not found"})
@@ -4282,6 +4956,15 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             elif action == "logo":
                 raw_logo, filename = self._extract_uploaded_logo_payload()
                 result = ctrl.upload_project_logo(pid, raw_logo, filename=filename)
+            elif action == "chat":
+                body = self._read_json_body()
+                raw_mode = body.get("mode", "chat")
+                if not isinstance(raw_mode, str):
+                    raise TypeError("El campo 'mode' debe ser texto.")
+                raw_msg = body.get("message", "")
+                if raw_msg is not None and not isinstance(raw_msg, str):
+                    raise TypeError("El campo 'message' debe ser texto.")
+                result = ctrl.post_project_chat(pid, str(raw_msg or ""), mode=raw_mode)
             else:
                 body = self._read_json_body()
                 message = self._require_str_field(body, "message")
@@ -4364,6 +5047,7 @@ def start_dashboard_server(
     model_resolver: Any = None,
     local_runner: LocalAppRunner | None = None,
     logos_dir: Path | None = None,
+    chats_dir: Path | None = None,
     vcs: Any | None = None,
     secrets_to_redact: Sequence[str] = (),
 ) -> tuple[DashboardHTTPServer, threading.Thread, str]:
@@ -4377,6 +5061,7 @@ def start_dashboard_server(
         model_resolver=model_resolver,
         local_runner=local_runner,
         logos_dir=logos_dir,
+        chats_dir=chats_dir,
         vcs=vcs,
         secrets_to_redact=secrets_to_redact,
     )

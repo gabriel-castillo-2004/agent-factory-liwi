@@ -292,6 +292,7 @@ class CliConfig(BaseModel):
     llm_fallback_to_agy: bool = True
     agy_cli_timeout_seconds: float = 300.0
     dashboard_port: int = 8000
+    lan_mode: bool = False
 
 
 class RuntimeBundle(BaseModel):
@@ -520,6 +521,9 @@ def load_cli_config(env: Mapping[str, str] | None = None) -> CliConfig:
         err_port.__context__ = None
         raise err_port
 
+    raw_lan_mode = effective.get("AGENT_FACTORY_LAN_MODE", "false").strip().lower() or "false"
+    lan_mode = raw_lan_mode in {"1", "true", "yes", "on"}
+
     return CliConfig(
         telegram_bot_token=token,
         allowed_chat_ids=allowed_chats,
@@ -542,6 +546,7 @@ def load_cli_config(env: Mapping[str, str] | None = None) -> CliConfig:
         llm_fallback_to_agy=llm_fallback_to_agy,
         agy_cli_timeout_seconds=agy_cli_timeout_seconds,
         dashboard_port=dashboard_port,
+        lan_mode=lan_mode,
     )
 
 
@@ -771,6 +776,7 @@ def build_runtime(
         local_runner = LocalAppRunner(
             workspace_manager=workspace_manager,
             secrets_to_redact=active_secrets,
+            lan_mode=config.lan_mode,
         )
 
         build_worker = BuildWorker(
@@ -929,6 +935,7 @@ def main(
                 bot_service=runtime.bot_service,
                 model_resolver=runtime.model_resolver,
                 local_runner=runtime.local_runner,
+                vcs=runtime.vcs,
                 secrets_to_redact=active_secrets,
             )
             print(f"Dashboard local disponible en {dashboard_url}", flush=True)

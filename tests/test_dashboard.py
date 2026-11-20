@@ -2693,5 +2693,339 @@ def test_dashboard_rename_project_updates_github_repo_remote_and_status(
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_project_chat_audit_document_persistence_and_secret_redaction(
+    tmp_path: Path,
+) -> None:
+    """collect_workspace_code_context & POST/GET /api/projects/<id>/chat support chat/audit/document read-only over real workspace code, redact secrets (INV-19), persist in chats_dir, and wire audit/doc/voice UI controls."""
+    from agent_factory.workspace import collect_workspace_code_context
+
+    pid = "audit-chat-demo"
+    secret_val = "TEST_CHAT_AUDIT_SECRET_999"
+    store = SqliteEventStore(str(tmp_path / "chat_dash.db"))
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_chat")
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / "src").mkdir()
+    app_file = ws_dir / "src" / "app.py"
+    app_src = f'"""Music app."""\nTOKEN_HINT = "{secret_val}"\ndef route_home(): return "ok"\n'
+    app_file.write_text(app_src, encoding="utf-8")
+    (ws_dir / ".env").write_text(f"SECRET={secret_val}\n", encoding="utf-8")
+    (ws_dir / "node_modules").mkdir()
+    (ws_dir / "node_modules" / "ignored.js").write_text("SHOULD_NOT_APPEAR\n", encoding="utf-8")
+    (ws_dir / ".venv").mkdir()
+    (ws_dir / ".venv" / "lib.py").write_text("VENV_IGNORED\n", encoding="utf-8")
+    (ws_dir / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00")
+
+    ctx = collect_workspace_code_context(ws_dir, max_chars=8000, extra_secrets=(secret_val,))
+    assert "src/app.py" in ctx
+    assert "route_home" in ctx
+    assert "SHOULD_NOT_APPEAR" not in ctx
+    assert "VENV_IGNORED" not in ctx
+    assert ".env" not in ctx
+    assert secret_val not in ctx
+    assert "[REDACTED]" in ctx
+
+    now = datetime(2026, 11, 20, 14, 0, tzinfo=UTC)
+    store.append(
+        create_event(
+            pid,
+            EventType.PROJECT_CREATED,
+            {"name": "Audit Demo", "objective": "App local para pruebas", "state": "INTERVIEW"},
+            at=now,
+        )
+    )
+    store.append(create_event(pid, EventType.STATE_TRANSITIONED, {"to": "DEBATE"}, at=now))
+    store.append(create_event(pid, EventType.STATE_TRANSITIONED, {"to": "MEDIATION"}, at=now))
+    store.append(
+        create_event(
+            pid,
+            EventType.PLAN_CREATED,
+            {
+                "plan_hash": "h-chat",
+                "total_tests": 1,
+                "plan": {
+                    "summary": "App local auditada",
+                    "rationale": "Simple",
+                    "template_id": "static-web",
+                    "files": [],
+                    "acceptance_tests": [],
+                    "risks": [],
+                    "deployment_target": "github-pages",
+                },
+            },
+            at=now,
+        )
+    )
+    store.append(
+        create_event(
+            pid,
+            EventType.APPROVAL_RECORDED,
+            {"decision": "approved", "plan_hash": "h-chat", "to": "BUILDING"},
+            at=now,
+        )
+    )
+    store.append(create_event(pid, EventType.STATE_TRANSITIONED, {"to": "VERIFYING"}, at=now))
+    store.append(create_event(pid, EventType.PROJECT_DELIVERED, {"repo_url": "", "deploy_url": ""}, at=now))
+
+    llm = FakeLLM(
+        responses=[
+            {"reply": f"La ruta route_home responde ok (sin {secret_val}).", "suggested_changes": ""},
+            {
+                "reply": f"## Auditoría\n- Revisar token {secret_val}\n- Añadir manejo de errores.",
+                "suggested_changes": f"Añadir validación de errores y quitar {secret_val}.",
+            },
+            {
+                "reply": "# Documentación Técnica\nEjecuta `src/app.py`.",
+                "document_title": f"{pid}-documentacion.md",
+            },
+        ]
+    )
+    orch = Orchestrator(store=store, llm=llm, workspace_manager=ws_mgr)
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        workspace_manager=ws_mgr,
+        secrets_to_redact=(secret_val,),
+    )
+    try:
+        # 1. GET / exposes Audit chat & voice UI controls
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            html = html_resp.read().decode("utf-8")
+        for needle in (
+            "Consultar y Auditar proyecto",
+            "Auditar código",
+            "Explicar funcionamiento",
+            "Generar documento (.md)",
+            "Descargar .md",
+            "Enviar hallazgos a Aplicar cambios",
+            "SpeechRecognition",
+            "Leer respuestas en voz alta",
+            "speechSynthesis",
+        ):
+            assert needle in html
+
+        # 2. Mode chat
+        c1, r1 = _http_json(
+            f"{base_url}/api/projects/{pid}/chat",
+            method="POST",
+            body={"message": "¿Qué hace route_home?", "mode": "chat"},
+        )
+        assert c1 == 200
+        assert r1["mode"] == "chat"
+        assert "route_home" in r1["reply"]
+        assert secret_val not in r1["reply"]
+        assert "[REDACTED]" in r1["reply"]
+
+        # Prompt sent to LLM contained real file content (with secret redacted)
+        assert any("route_home" in str(m.get("content", "")) for m in llm.calls[0]["messages"])
+        assert secret_val not in json.dumps(llm.calls[0]["messages"])
+
+        # 3. Mode audit
+        c2, r2 = _http_json(
+            f"{base_url}/api/projects/{pid}/chat",
+            method="POST",
+            body={"message": "", "mode": "audit"},
+        )
+        assert c2 == 200
+        assert r2["mode"] == "audit"
+        assert "Auditoría" in r2["reply"]
+        assert secret_val not in r2["suggested_changes"]
+
+        # 4. Mode document
+        c3, r3 = _http_json(
+            f"{base_url}/api/projects/{pid}/chat",
+            method="POST",
+            body={"message": "", "mode": "document"},
+        )
+        assert c3 == 200
+        assert r3["mode"] == "document"
+        assert "# Documentación Técnica" in r3["reply"]
+
+        # 5. GET chat reloads persisted history cleanly (secrets redacted) and workspace file stayed untouched
+        c_hist, r_hist = _http_json(f"{base_url}/api/projects/{pid}/chat")
+        assert c_hist == 200
+        assert len(r_hist["messages"]) == 6
+        assert secret_val not in json.dumps(r_hist)
+        assert app_file.read_text(encoding="utf-8") == app_src
+
+        # Invalid mode returns 400
+        c_bad, _ = _http_json(
+            f"{base_url}/api/projects/{pid}/chat",
+            method="POST",
+            body={"message": "hola", "mode": "unknown"},
+        )
+        assert c_bad == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_import_project_and_lan_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /api/projects/import registers external directories (with/without manifest) as DELIVERED with external_workspace_path while rejecting symlinks, factory repo & system paths (INV-22); POST /api/settings/lan-mode toggles 0.0.0.0 LAN binding safely."""
+    import os
+
+    from agent_factory.runtime_runner import LocalAppRunner
+
+    store = SqliteEventStore(str(tmp_path / "import_lan.db"))
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_internal")
+    local_runner = LocalAppRunner(
+        workspace_manager=ws_mgr,
+        lan_ip_resolver=lambda: "192.168.1.42",
+    )
+    orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        workspace_manager=ws_mgr,
+        local_runner=local_runner,
+    )
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            html = html_resp.read().decode("utf-8")
+        assert "Importar proyecto" in html
+        assert "import-project-modal" in html
+        assert "Acceso Wi-Fi (celular)" in html
+        assert "/api/settings/lan-mode" in html
+
+        # 1. Import project WITH .agent-factory/manifest.json
+        ext_a = tmp_path / "external_music_app"
+        (ext_a / ".agent-factory").mkdir(parents=True)
+        (ext_a / ".agent-factory" / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "project_id": "ext-music-app",
+                    "title": "Musiquita Externa",
+                    "app_type": "python_local",
+                    "objective": "App local importada",
+                    "plan_summary": "Servidor HTTP Python",
+                    "repo_url": "https://github.com/acme/ext-music-app",
+                    "deploy_url": "",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (ext_a / "app.py").write_text(
+            "import http.server, os\n"
+            "class H(http.server.BaseHTTPRequestHandler):\n"
+            "    def do_GET(self):\n"
+            "        body = f'host={os.environ[\"HOST\"]}'.encode()\n"
+            "        self.send_response(200)\n"
+            "        self.send_header('Content-Length', str(len(body)))\n"
+            "        self.end_headers()\n"
+            "        self.wfile.write(body)\n"
+            "    def log_message(self, *a): pass\n"
+            "if __name__ == '__main__':\n"
+            "    http.server.ThreadingHTTPServer((os.environ['HOST'], int(os.environ['PORT'])), H).serve_forever()\n",
+            encoding="utf-8",
+        )
+
+        c_imp, r_imp = _http_json(
+            f"{base_url}/api/projects/import",
+            method="POST",
+            body={"local_path": str(ext_a), "title": ""},
+        )
+        assert c_imp == 200
+        assert r_imp["ok"] is True
+        pid_a = r_imp["project_id"]
+        assert pid_a == "ext-music-app"
+        assert r_imp["app_type"] == "python_local"
+        assert r_imp["status"]["state"] == "DELIVERED"
+        assert r_imp["status"]["name"] == "Musiquita Externa"
+        assert r_imp["status"]["workspace_path"] == str(ext_a.resolve())
+        assert r_imp["status"]["links"]["repo"] == "https://github.com/acme/ext-music-app"
+
+        # 2. Import project WITHOUT manifest (static web folder)
+        ext_b = tmp_path / "external_static_site"
+        ext_b.mkdir()
+        (ext_b / "index.html").write_text("<h1>Mi Sitio Importado</h1>\n", encoding="utf-8")
+        c_imp_b, r_imp_b = _http_json(
+            f"{base_url}/api/projects/import",
+            method="POST",
+            body={"local_path": str(ext_b), "title": "Sitio Local"},
+        )
+        assert c_imp_b == 200
+        assert r_imp_b["app_type"] == "static"
+        assert r_imp_b["status"]["state"] == "DELIVERED"
+        assert r_imp_b["status"]["name"] == "Sitio Local"
+
+        # 3. INV-22 import path rejections (factory repo, system dirs, nonexistent)
+        factory_sub = Path(__file__).resolve().parents[1] / "src"
+        c_fac, _ = _http_json(
+            f"{base_url}/api/projects/import",
+            method="POST",
+            body={"local_path": str(factory_sub)},
+        )
+        assert c_fac == 400
+
+        sys_dir = Path(os.environ.get("SystemRoot", "C:/Windows")) if os.name == "nt" else Path("/etc")
+        c_sys, _ = _http_json(
+            f"{base_url}/api/projects/import",
+            method="POST",
+            body={"local_path": str(sys_dir)},
+        )
+        assert c_sys == 400
+
+        c_missing, _ = _http_json(
+            f"{base_url}/api/projects/import",
+            method="POST",
+            body={"local_path": str(tmp_path / "does_not_exist")},
+        )
+        assert c_missing == 400
+
+        # 4. LAN mode defaults to False -> local start binds 127.0.0.1 and has no lan_url
+        _, r_lan0 = _http_json(f"{base_url}/api/settings/lan-mode")
+        assert r_lan0["lan_mode"] is False
+
+        _, s_off = _http_json(f"{base_url}/api/projects/{pid_a}/start", method="POST")
+        assert s_off["local_app"]["running"] is True
+        assert s_off["local_app"]["url"].startswith("http://127.0.0.1:")
+        assert s_off["local_app"].get("lan_url") is None
+        with urllib.request.urlopen(s_off["local_app"]["url"], timeout=5.0) as h_off:
+            assert h_off.read().decode("utf-8") == "host=127.0.0.1"
+        _http_json(f"{base_url}/api/projects/{pid_a}/stop", method="POST")
+
+        # Enable LAN mode -> local start binds 0.0.0.0 and exposes lan_url 192.168.1.42
+        c_lan_on, r_lan_on = _http_json(
+            f"{base_url}/api/settings/lan-mode",
+            method="POST",
+            body={"lan_mode": True},
+        )
+        assert c_lan_on == 200
+        assert r_lan_on["lan_mode"] is True
+
+        _, s_on = _http_json(f"{base_url}/api/projects/{pid_a}/start", method="POST")
+        assert s_on["local_app"]["running"] is True
+        assert s_on["local_app"]["url"].startswith("http://127.0.0.1:")
+        assert s_on["local_app"]["lan_url"].startswith("http://192.168.1.42:")
+        with urllib.request.urlopen(s_on["local_app"]["url"], timeout=5.0) as h_on:
+            assert h_on.read().decode("utf-8") == "host=0.0.0.0"
+        _http_json(f"{base_url}/api/projects/{pid_a}/stop", method="POST")
+
+        # Deleting imported project removes registry entry without deleting ext_a on disk!
+        c_del, _ = _http_json(f"{base_url}/api/projects/{pid_a}", method="DELETE")
+        assert c_del == 200
+        assert (ext_a / "app.py").is_file()
+    finally:
+        local_runner.stop_all()
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+
 
 

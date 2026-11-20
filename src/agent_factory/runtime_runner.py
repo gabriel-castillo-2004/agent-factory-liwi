@@ -109,16 +109,20 @@ class LocalAppStatus(BaseModel):
 
     running: bool = False
     url: str | None = None
+    lan_url: str | None = None
     app_type: str = "unknown"
     port: int | None = None
 
     def to_api_dict(self) -> dict[str, object]:
         """Serialize public API payload expected under local_app."""
-        return {
+        data: dict[str, object] = {
             "running": self.running,
             "url": self.url,
             "app_type": self.app_type,
         }
+        if self.lan_url is not None:
+            data["lan_url"] = self.lan_url
+        return data
 
 
 class HttpSmokeTestResult(BaseModel):
@@ -136,10 +140,32 @@ class _RunningAppProcess:
     process: subprocess.Popen[str]
     port: int
     url: str
+    lan_url: str | None
     app_type: str
     serve_dir: Path
     stderr_lines: deque[str] = field(default_factory=lambda: deque(maxlen=50))
     stderr_thread: threading.Thread | None = None
+
+
+def detect_local_lan_ip() -> str | None:
+    """Best-effort detection of non-loopback local LAN IPv4 address without contacting external hosts."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("10.255.255.255", 1))
+            ip = str(sock.getsockname()[0] or "").strip()
+            if ip and not ip.startswith("127.") and ip != "0.0.0.0":
+                return ip
+    except OSError as exc:
+        logger.debug("UDP LAN IP probe fallback: %s", exc)
+    try:
+        _, _, addrs = socket.gethostbyname_ex(socket.gethostname())
+        for addr in addrs:
+            cand = str(addr).strip()
+            if cand and "." in cand and not cand.startswith("127."):
+                return cand
+    except OSError as exc:
+        logger.debug("Hostname LAN IP lookup fallback: %s", exc)
+    return None
 
 
 def _ensure_contained(path: Path, workspace_dir: Path) -> Path:
@@ -612,13 +638,19 @@ class LocalAppRunner:
         port_max: int = DEFAULT_PORT_MAX,
         secrets_to_redact: Sequence[str] = (),
         dep_command_runner: Callable[..., Any] | None = None,
+        lan_mode: bool = False,
+        lan_ip_resolver: Callable[[], str | None] | None = None,
     ) -> None:
-        if host != LOOPBACK_HOST:
-            raise ValueError(f"LocalAppRunner must bind exclusively to {LOOPBACK_HOST}, got '{host}'")
+        if host not in (LOOPBACK_HOST, "0.0.0.0"):
+            raise ValueError(f"LocalAppRunner host must be '{LOOPBACK_HOST}' or '0.0.0.0', got '{host}'")
         if port_min < 1024 or port_max > 65535 or port_min > port_max:
             raise ValueError(f"Invalid port range {port_min}..{port_max}")
         self.workspace_manager = workspace_manager
-        self.host = host
+        self.host = LOOPBACK_HOST
+        self.lan_mode: bool = bool(lan_mode or host == "0.0.0.0")
+        self._lan_ip_resolver: Callable[[], str | None] = (
+            lan_ip_resolver if lan_ip_resolver is not None else detect_local_lan_ip
+        )
         self.port_min = port_min
         self.port_max = port_max
         self.secrets_to_redact: tuple[str, ...] = tuple(secrets_to_redact)
@@ -629,6 +661,19 @@ class LocalAppRunner:
         self._dep_locks: dict[str, threading.Lock] = {}
         self._processes: dict[str, _RunningAppProcess] = {}
         atexit.register(_weak_atexit_cleanup, weakref.ref(self))
+
+    def get_lan_mode(self) -> bool:
+        """Return whether local apps currently bind to 0.0.0.0 for LAN access."""
+        with self._lock:
+            return self.lan_mode
+
+    def set_lan_mode(self, enabled: bool) -> dict[str, Any]:
+        """Toggle LAN 0.0.0.0 binding for subsequent local app starts."""
+        flag = bool(enabled)
+        with self._lock:
+            self.lan_mode = flag
+        lan_ip = self._lan_ip_resolver() if flag else None
+        return {"lan_mode": flag, "lan_ip": lan_ip}
 
     def _resolve_workspace_dir(
         self, project_id: str, workspace_dir: Path | None = None
@@ -653,13 +698,21 @@ class LocalAppRunner:
 
     def _allocate_free_port_locked(self) -> int:
         used_ports = {entry.port for entry in self._processes.values()}
+        bind_target = "0.0.0.0" if self.lan_mode else self.host
         for port in range(self.port_min, self.port_max + 1):
             if port in used_ports:
                 continue
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.05)
+                if probe.connect_ex((self.host, port)) == 0:
+                    continue
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                elif os.name != "nt":
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 try:
-                    sock.bind((self.host, port))
+                    sock.bind((bind_target, port))
                     return port
                 except OSError:
                     continue
@@ -672,13 +725,14 @@ class LocalAppRunner:
         *,
         port: int,
         app_type: str,
+        bind_host: str = LOOPBACK_HOST,
         pythonpath: Path | None = None,
         venv_dir: Path | None = None,
     ) -> dict[str, str]:
         clean = sanitize_subprocess_env()
         if app_type == "python_local":
             clean["PORT"] = str(port)
-            clean["HOST"] = self.host
+            clean["HOST"] = bind_host
             clean["PYTHONUNBUFFERED"] = "1"
             if venv_dir is not None:
                 venv_bin = str(_venv_python_path(venv_dir).parent)
@@ -854,10 +908,11 @@ class LocalAppRunner:
                 return LocalAppStatus(
                     running=True,
                     url=entry.url,
+                    lan_url=entry.lan_url,
                     app_type=entry.app_type,
                     port=entry.port,
                 )
-        return LocalAppStatus(running=False, url=None, app_type=detected_type, port=None)
+        return LocalAppStatus(running=False, url=None, lan_url=None, app_type=detected_type, port=None)
 
     def start(
         self,
@@ -868,7 +923,7 @@ class LocalAppRunner:
         install_deps: bool = False,
         dep_install_timeout: float = 180.0,
     ) -> LocalAppStatus:
-        """Start project_id app on a free 127.0.0.1 port (8081..8199) and wait until HTTP socket is ready."""
+        """Start project_id app on a free 127.0.0.1 (or 0.0.0.0 in lan_mode) port (8081..8199) and wait until ready."""
         ws_dir = self._resolve_workspace_dir(project_id, workspace_dir)
         if not ws_dir.is_dir():
             raise LocalAppError(f"Workspace directory for '{project_id}' does not exist")
@@ -886,6 +941,7 @@ class LocalAppRunner:
                 return LocalAppStatus(
                     running=True,
                     url=existing.url,
+                    lan_url=existing.lan_url,
                     app_type=existing.app_type,
                     port=existing.port,
                 )
@@ -907,21 +963,26 @@ class LocalAppRunner:
                 return LocalAppStatus(
                     running=True,
                     url=existing.url,
+                    lan_url=existing.lan_url,
                     app_type=existing.app_type,
                     port=existing.port,
                 )
 
             port = self._allocate_free_port_locked()
+            bind_host = "0.0.0.0" if self.lan_mode else self.host
             url = f"http://{self.host}:{port}"
+            lan_ip = self._lan_ip_resolver() if self.lan_mode else None
+            lan_url = f"http://{lan_ip}:{port}" if (self.lan_mode and lan_ip) else None
             sub_env = self._build_env(
                 port=port,
                 app_type=app_info.app_type,
+                bind_host=bind_host,
                 pythonpath=app_info.pythonpath,
                 venv_dir=venv_dir,
             )
 
             if app_info.app_type == "static":
-                cmd = [sys.executable, "-m", "http.server", str(port), "--bind", self.host]
+                cmd = [sys.executable, "-m", "http.server", str(port), "--bind", bind_host]
                 cwd = app_info.serve_dir
             elif app_info.module_name:
                 cmd = [str(python_exe), "-m", app_info.module_name]
@@ -961,6 +1022,7 @@ class LocalAppRunner:
                 process=proc,
                 port=port,
                 url=url,
+                lan_url=lan_url,
                 app_type=app_info.app_type,
                 serve_dir=cwd,
                 stderr_lines=stderr_lines,
@@ -986,6 +1048,7 @@ class LocalAppRunner:
                     return LocalAppStatus(
                         running=True,
                         url=url,
+                        lan_url=lan_url,
                         app_type=app_info.app_type,
                         port=port,
                     )

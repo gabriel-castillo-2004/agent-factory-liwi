@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import html
+import json
 import os
 import re
 import shutil
@@ -11,10 +12,12 @@ import sys
 import unicodedata
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any
 
 from pydantic import BaseModel, Field
 
 from agent_factory.domain.models import validate_project_id
+from agent_factory.secrets import redact_secrets
 
 _CACHE_DIR_NAMES: frozenset[str] = frozenset({"__pycache__", ".pytest_cache"})
 _BYTECODE_SUFFIXES: frozenset[str] = frozenset({".pyc", ".pyo"})
@@ -145,17 +148,43 @@ class TestLockSnapshot(BaseModel):
 
 
 class WorkspaceManager:
-    """Manages isolated workspaces/<project_id>/ directories and enforces path containment."""
+    """Manages isolated workspaces/<project_id>/ or authorized external project dirs with containment."""
 
     def __init__(self, base_dir: Path = Path("workspaces")) -> None:
         self.base_dir = Path(base_dir).resolve()
+        self._external_dirs: dict[str, Path] = {}
+
+    def is_external_workspace(self, project_id: str) -> bool:
+        """Return True if project_id is bound to an imported external directory."""
+        validate_project_id(project_id)
+        return project_id in self._external_dirs
+
+    def register_external_workspace(
+        self,
+        project_id: str,
+        external_path: str | Path,
+        *,
+        factory_root: Path | None = None,
+    ) -> Path:
+        """Validate and bind an external project directory for project_id (INV-22)."""
+        validate_project_id(project_id)
+        validated = validate_external_project_path(external_path, factory_root=factory_root)
+        self._external_dirs[project_id] = validated
+        return validated
+
+    def unregister_external_workspace(self, project_id: str) -> None:
+        """Remove external directory binding for project_id without touching disk files."""
+        self._external_dirs.pop(project_id, None)
 
     def get_workspace_dir(self, project_id: str) -> Path:
-        """Validate project_id and return the resolved workspace directory path."""
+        """Validate project_id and return the resolved internal or authorized external workspace directory."""
         try:
             validate_project_id(project_id)
         except ValueError as err:
             raise SandboxViolationError(str(err)) from err
+
+        if project_id in self._external_dirs:
+            return self._external_dirs[project_id]
 
         target = (self.base_dir / project_id).resolve()
         if not target.is_relative_to(self.base_dir) or target == self.base_dir:
@@ -176,8 +205,12 @@ class WorkspaceManager:
         return ws_dir
 
     def remove_workspace(self, project_id: str) -> bool:
-        """Safely remove workspaces/<project_id>/ inside base_dir, clearing readonly .git files (INV-22)."""
+        """Remove internal workspaces/<project_id>/; unregister external imported folders without deleting files (INV-22)."""
         ws_dir = self.get_workspace_dir(project_id)
+        if project_id in self._external_dirs:
+            self._external_dirs.pop(project_id, None)
+            return False
+
         raw_path = self.base_dir / project_id
         if raw_path.is_symlink():
             raise SandboxViolationError(
@@ -592,3 +625,310 @@ def ensure_workspace_favicon(
         if idx == 0:
             primary_written = fav_svg
     return primary_written
+
+
+_DEFAULT_FACTORY_ROOT: Path = Path(__file__).resolve().parents[2]
+_CONTEXT_IGNORED_DIRS: frozenset[str] = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".pytest_cache",
+        "node_modules",
+        ".mypy_cache",
+        ".ruff_cache",
+        "dist",
+        "build",
+    }
+)
+_BINARY_SKIP_EXTS: frozenset[str] = frozenset(
+    {
+        ".pyc",
+        ".pyo",
+        ".pyd",
+        ".exe",
+        ".dll",
+        ".so",
+        ".dylib",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".ico",
+        ".bmp",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".eot",
+        ".zip",
+        ".tar",
+        ".gz",
+        ".bz2",
+        ".7z",
+        ".db",
+        ".sqlite",
+        ".sqlite3",
+        ".pdf",
+        ".mp3",
+        ".mp4",
+        ".wav",
+        ".webm",
+    }
+)
+_SECRET_FILENAME_EXTS: frozenset[str] = frozenset({".pem", ".key", ".pfx", ".p12", ".jks"})
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    """Return True if path is a POSIX/Windows symlink or NTFS junction."""
+    if path.is_symlink():
+        return True
+    is_junc = getattr(os.path, "isjunction", None)
+    return bool(is_junc and is_junc(path))
+
+
+def validate_external_project_path(
+    local_path: str | Path,
+    *,
+    factory_root: Path | None = None,
+) -> Path:
+    """Validate local_path is a real existing directory outside system folders, symlinks, and factory repo (INV-22)."""
+    if not isinstance(local_path, (str, Path)):
+        raise SandboxViolationError("La ruta del proyecto debe ser texto válido.")
+    raw_str = str(local_path).strip()
+    if not raw_str or "\x00" in raw_str:
+        raise SandboxViolationError("La ruta local no puede estar vacía ni contener caracteres inválidos.")
+    if raw_str.startswith("\\\\") and not raw_str.startswith("\\\\?\\"):
+        raise SandboxViolationError("No se permiten rutas de red UNC al importar proyectos.")
+
+    candidate = Path(raw_str).expanduser()
+    if _is_link_or_junction(candidate):
+        raise SandboxViolationError(f"Se rechazó un symlink o junction externo (INV-22): {candidate}")
+    for ancestor in candidate.parents:
+        if ancestor == ancestor.parent:
+            break
+        if _is_link_or_junction(ancestor):
+            raise SandboxViolationError(f"Se rechazó ruta con symlink padre (INV-22): {ancestor}")
+
+    try:
+        resolved = candidate.resolve()
+    except OSError as exc:
+        raise SandboxViolationError(f"No se pudo resolver la ruta local '{raw_str}': {exc}") from exc
+
+    if not resolved.exists() or not resolved.is_dir():
+        raise SandboxViolationError(f"La carpeta '{raw_str}' no existe o no es un directorio válido.")
+    if resolved == resolved.parent:
+        raise SandboxViolationError("No se permite importar la raíz del sistema de archivos (INV-22).")
+
+    eff_factory = (
+        Path(factory_root).resolve() if factory_root is not None else _DEFAULT_FACTORY_ROOT
+    )
+    if (
+        resolved == eff_factory
+        or resolved.is_relative_to(eff_factory)
+        or eff_factory.is_relative_to(resolved)
+    ):
+        raise SandboxViolationError(
+            "No se permite importar carpetas dentro de Agent Factory ni directorios contenedores (INV-22)."
+        )
+
+    posix_low = resolved.as_posix().lower()
+    win_prefixes = [
+        "c:/windows",
+        "c:/program files",
+        "c:/program files (x86)",
+        "c:/programdata",
+        "c:/system volume information",
+    ]
+    for env_key in ("SystemRoot", "WINDIR"):
+        env_val = os.environ.get(env_key, "").strip()
+        if env_val:
+            try:
+                sys_p = Path(env_val).resolve().as_posix().lower()
+                if sys_p not in win_prefixes:
+                    win_prefixes.append(sys_p)
+            except OSError:
+                pass
+    for prefix in win_prefixes:
+        if posix_low == prefix or posix_low.startswith(prefix + "/"):
+            raise SandboxViolationError(f"Directorio del sistema rechazado por seguridad (INV-22): {resolved}")
+
+    posix_sys_dirs = (
+        "/bin",
+        "/boot",
+        "/dev",
+        "/etc",
+        "/lib",
+        "/lib64",
+        "/proc",
+        "/root",
+        "/run",
+        "/sbin",
+        "/sys",
+        "/usr",
+        "/system",
+        "/library",
+    )
+    for sys_dir in posix_sys_dirs:
+        if posix_low == sys_dir or posix_low.startswith(sys_dir + "/"):
+            raise SandboxViolationError(f"Directorio del sistema rechazado por seguridad (INV-22): {resolved}")
+
+    return resolved
+
+
+def _is_sensitive_or_binary_file(file_path: Path) -> bool:
+    name_low = file_path.name.lower()
+    if name_low == ".env" or name_low.startswith(".env."):
+        return True
+    suf = file_path.suffix.lower()
+    if suf in _BINARY_SKIP_EXTS or suf in _SECRET_FILENAME_EXTS:
+        return True
+    try:
+        head = file_path.read_bytes()[:4096]
+    except OSError:
+        return True
+    return b"\x00" in head
+
+
+def _context_file_sort_key(rel_posix: str) -> tuple[int, str]:
+    low = rel_posix.lower()
+    if low in {
+        "readme.md",
+        "package.json",
+        "pyproject.toml",
+        "requirements.txt",
+        ".agent-factory/manifest.json",
+    } or low.startswith("requirements"):
+        return (0, rel_posix)
+    if low.startswith("src/") or low in {"app.py", "main.py", "server.py", "index.html", "app.js", "styles.css"}:
+        return (1, rel_posix)
+    if low.startswith("tests/") or "/test_" in low:
+        return (3, rel_posix)
+    return (2, rel_posix)
+
+
+def collect_workspace_code_context(
+    workspace_dir: Path,
+    max_chars: int = 36000,
+    *,
+    extra_secrets: Sequence[str] = (),
+) -> str:
+    """Safely collect contained, redacted source context from workspace_dir up to max_chars (INV-19, INV-22)."""
+    if max_chars <= 0:
+        return ""
+    ws = Path(workspace_dir)
+    if not ws.is_dir() or _is_link_or_junction(ws):
+        return ""
+    ws_resolved = ws.resolve()
+
+    collected: list[tuple[int, str, Path]] = []
+
+    def _walk(current: Path, depth: int) -> None:
+        try:
+            entries = sorted(current.iterdir(), key=lambda p: p.name.lower())
+        except OSError:
+            return
+        for entry in entries:
+            if _is_link_or_junction(entry):
+                continue
+            try:
+                resolved = entry.resolve()
+            except OSError:
+                continue
+            if resolved != ws_resolved and not resolved.is_relative_to(ws_resolved):
+                continue
+            if resolved.is_dir():
+                if resolved.name in _CONTEXT_IGNORED_DIRS:
+                    continue
+                if depth < 5:
+                    _walk(resolved, depth + 1)
+            elif resolved.is_file():
+                rel_posix = resolved.relative_to(ws_resolved).as_posix()
+                if is_python_cache_path(rel_posix) or _is_sensitive_or_binary_file(resolved):
+                    continue
+                tier, key_path = _context_file_sort_key(rel_posix)
+                collected.append((tier, key_path, resolved))
+
+    _walk(ws_resolved, 0)
+    if not collected:
+        return ""
+
+    collected.sort(key=lambda item: (item[0], item[1]))
+    tree_lines = ["Archivos del proyecto:"]
+    for _, rel_p, _ in collected[:60]:
+        tree_lines.append(f"- {rel_p}")
+    header = "\n".join(tree_lines) + "\n\n"
+
+    chunks: list[str] = [header]
+    used = len(header)
+    for tier, rel_p, fpath in collected:
+        if used >= max_chars - 80:
+            break
+        per_file_cap = min(2200 if tier == 3 else 6000, max_chars - used - 60)
+        if per_file_cap < 80:
+            break
+        try:
+            raw_txt = fpath.read_bytes()[: max(per_file_cap * 2, 8192)].decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        clean_txt = redact_secrets(raw_txt, extra_secrets=extra_secrets)
+        if len(clean_txt) > per_file_cap:
+            clean_txt = clean_txt[: per_file_cap - 30].rstrip() + "\n... [archivo recortado]"
+        block = f"=== {rel_p} ===\n{clean_txt.rstrip()}\n\n"
+        if used + len(block) > max_chars:
+            rem = max_chars - used
+            if rem > 80:
+                chunks.append(block[: rem - 22].rstrip() + "\n... [contexto recortado]\n")
+                used = max_chars
+            break
+        chunks.append(block)
+        used += len(block)
+
+    combined = redact_secrets("".join(chunks), extra_secrets=extra_secrets)
+    if len(combined) > max_chars:
+        combined = combined[:max_chars]
+    return combined
+
+
+def _scrub_manifest_value(val: Any, extra_secrets: Sequence[str]) -> Any:
+    if isinstance(val, str):
+        return redact_secrets(val, extra_secrets=extra_secrets)
+    if isinstance(val, Mapping):
+        return {str(k): _scrub_manifest_value(v, extra_secrets) for k, v in val.items()}
+    if isinstance(val, Sequence) and not isinstance(val, (bytes, bytearray)):
+        return [_scrub_manifest_value(item, extra_secrets) for item in val]
+    return val
+
+
+def write_workspace_manifest(
+    workspace_dir: Path,
+    payload: Mapping[str, Any],
+    *,
+    extra_secrets: Sequence[str] = (),
+) -> Path:
+    """Safely write redacted .agent-factory/manifest.json inside workspace_dir (INV-19, INV-22)."""
+    ws_resolved = Path(workspace_dir).resolve()
+    if not ws_resolved.is_dir():
+        raise SandboxViolationError(f"Workspace directory '{workspace_dir}' does not exist")
+    agent_dir = ws_resolved / ".agent-factory"
+    if _is_link_or_junction(agent_dir):
+        raise SandboxViolationError(f"Symlink .agent-factory rejected in '{ws_resolved}' (INV-22)")
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    resolved_dir = agent_dir.resolve()
+    if not resolved_dir.is_relative_to(ws_resolved):
+        raise SandboxViolationError(f".agent-factory escapes workspace '{ws_resolved}' (INV-22)")
+
+    manifest_path = agent_dir / "manifest.json"
+    if _is_link_or_junction(manifest_path):
+        raise SandboxViolationError(f"Symlink manifest.json rejected in '{ws_resolved}' (INV-22)")
+    resolved_manifest = manifest_path.resolve()
+    if not resolved_manifest.is_relative_to(ws_resolved):
+        raise SandboxViolationError(f"manifest.json escapes workspace '{ws_resolved}' (INV-22)")
+
+    sanitized = _scrub_manifest_value(dict(payload), extra_secrets)
+    resolved_manifest.write_text(
+        json.dumps(sanitized, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return resolved_manifest

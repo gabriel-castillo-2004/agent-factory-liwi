@@ -469,6 +469,19 @@ class GitHubVCSAdapter(VCS):
             self._run_git(branch_cmd, cwd=workspace_dir, env=env, context="Git branch setup failed")
 
         self._run_git(["add", "-A"], cwd=workspace_dir, env=env, context="Git add failed")
+        agent_dir = workspace_dir / ".agent-factory"
+        manifest_path = agent_dir / "manifest.json"
+        if (
+            manifest_path.is_file()
+            and not agent_dir.is_symlink()
+            and not manifest_path.is_symlink()
+        ):
+            self._run_git(
+                ["add", "-f", ".agent-factory/manifest.json"],
+                cwd=workspace_dir,
+                env=env,
+                context="Git add manifest failed",
+            )
         head_res = self.runner.run(["git", "rev-parse", "--verify", "HEAD"], cwd=workspace_dir, env=env)
         diff_res = self.runner.run(["git", "diff", "--cached", "--quiet"], cwd=workspace_dir, env=env)
         if head_res.exit_code != 0 or diff_res.exit_code != 0:

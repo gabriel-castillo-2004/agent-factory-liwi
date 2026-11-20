@@ -157,6 +157,7 @@ class ProjectStatus(BaseModel):
     agent_invocations: int = 0
     ci_rounds: int = 0
     links: ProjectLinks = Field(default_factory=ProjectLinks)
+    workspace_path: str | None = None
     last_event: str | None = None
     updated_at: datetime | None = None
     failure_reason: str | None = None

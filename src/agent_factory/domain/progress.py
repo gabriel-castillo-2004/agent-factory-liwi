@@ -51,6 +51,7 @@ def project_status_from_events(project_id: str, events: Sequence[Event]) -> Proj
     updated_at = None
     last_progress = 0
     links = ProjectLinks()
+    workspace_path: str | None = None
 
     for event in events:
         last_event = event.id
@@ -67,6 +68,9 @@ def project_status_from_events(project_id: str, events: Sequence[Event]) -> Proj
         if event.type == EventType.PROJECT_CREATED:
             name = payload.get("name", name)
             objective = payload.get("objective", objective)
+            raw_ext_ws = payload.get("external_workspace_path")
+            if raw_ext_ws:
+                workspace_path = str(raw_ext_ws).strip() or workspace_path
             raw_state = payload.get("state", ProjectState.INTERVIEW)
             next_state = ProjectState(raw_state)
             validate_transition(current_state, next_state)
@@ -208,6 +212,7 @@ def project_status_from_events(project_id: str, events: Sequence[Event]) -> Proj
         agent_invocations=agent_invocations,
         ci_rounds=ci_rounds,
         links=links,
+        workspace_path=workspace_path,
         last_event=last_event,
         updated_at=updated_at,
         failure_reason=failure_reason,

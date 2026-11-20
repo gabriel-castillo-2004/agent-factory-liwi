@@ -2561,6 +2561,145 @@ def test_local_app_runner_ast_detects_missing_deps_without_requirements_txt(
         runner.stop_all()
 
 
+def test_build_worker_writes_manifest_json_without_secrets_and_commits_to_git(
+    tmp_path: Path,
+) -> None:
+    """BuildWorker writes redacted .agent-factory/manifest.json before push/commit so GitHub commits include it while keeping secrets out (INV-19)."""
+    import json
+    import subprocess
+
+    from agent_factory.adapters.github_vcs_adapter import GitHubVCSAdapter
+
+    pid = "proj-manifest-git"
+    secret_val = "TEST_MANIFEST_SECRET_555"
+    store = MemoryEventStore()
+    fake_llm = FakeLLM(
+        responses=[
+            {
+                "spec": {
+                    "objective": f"Objective token={secret_val}",
+                    "users": ["Gabriel"],
+                    "features": ["Manifest export"],
+                    "business_rules": ["No secrets"],
+                    "edge_cases": ["Missing remote"],
+                    "constraints": ["Static web"],
+                    "success_criteria": ["Committed manifest"],
+                    "assumptions": [],
+                },
+                "questions": [],
+            },
+            {
+                "approach": "Vanilla static app",
+                "components": ["index.html"],
+                "tradeoffs": ["Simple structure"],
+            },
+            {
+                "critique": ["None"],
+                "robust_proposal": "Single HTML entrypoint",
+                "architectural_safeguards": ["Secret redaction"],
+            },
+            {
+                "summary": f"App manifest token={secret_val}",
+                "rationale": "Static template with redacted manifest",
+                "template_id": "static-app",
+                "files": [
+                    {
+                        "path": "index.html",
+                        "purpose": "Main entry",
+                        "contract": "Valid HTML5 document",
+                        "depends_on": [],
+                    }
+                ],
+                "acceptance_tests": [
+                    {"id": "AT-01", "description": "Serves index.html", "type": "e2e"}
+                ],
+                "risks": ["None"],
+                "deployment_target": "github-pages",
+            },
+        ]
+    )
+    orch = Orchestrator(store=store, llm=fake_llm)
+    orch.create_project(project_id=pid, name="Manifest Test", objective=f"Objective token={secret_val}")
+    orch.handle_interview_message(pid, f"evt-int-{pid}", "Complete spec")
+    waiting = orch.run_debate(pid)
+    assert waiting.plan_hash is not None
+    orch.submit_approval(
+        pid,
+        ApprovalEvent(
+            plan_hash=waiting.plan_hash,
+            timestamp=datetime(2026, 11, 16, 15, 30, tzinfo=UTC),
+            decision="approved",
+        ),
+    )
+
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_manifest")
+    bare_remote = tmp_path / "bare_manifest_remote.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare_remote)], check=True, capture_output=True)
+
+    vcs = GitHubVCSAdapter(
+        repo_base_url=str(tmp_path),
+        github_token="",
+        secrets=(secret_val,),
+    )
+    # Pre-point workspace origin to bare remote once workspace exists
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / ".agent-factory").mkdir(parents=True, exist_ok=True)
+    (ws_dir / ".agent-factory" / "state.json").write_text('{"tmp": true}\n', encoding="utf-8")
+    subprocess.run(["git", "init", "-b", "main"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare_remote)], cwd=ws_dir, check=True)
+
+    worker = BuildWorker(
+        orchestrator=orch,
+        workspace_manager=ws_mgr,
+        code_agent=FakeCodeAgent(
+            test_gen_steps=[{"tests/test_app.py": "def test_ok(): assert True\n"}],
+            impl_steps=[{"index.html": "<h1>Manifest App</h1>\n"}],
+        ),
+        runner=FakeRunner(
+            results=[CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True})]
+        ),
+        vcs=vcs,
+        secrets_to_redact=(secret_val,),
+    )
+
+    report = worker.run_job(pid)
+    assert report.ci_rounds == 1
+    assert orch.get_status(pid).state == ProjectState.DELIVERED
+
+    manifest_file = ws_dir / ".agent-factory" / "manifest.json"
+    assert manifest_file.is_file()
+    raw_manifest = manifest_file.read_text(encoding="utf-8")
+    assert secret_val not in raw_manifest
+    assert "[REDACTED]" in raw_manifest
+    manifest_data = json.loads(raw_manifest)
+    for key in (
+        "schema_version",
+        "project_id",
+        "title",
+        "app_type",
+        "objective",
+        "plan_summary",
+        "repo_url",
+        "deploy_url",
+        "updated_at",
+    ):
+        assert key in manifest_data
+    assert manifest_data["project_id"] == pid
+    assert manifest_data["app_type"] == "static"
+    assert manifest_data["repo_url"] == f"{tmp_path}/agent-factory/{pid}" or bool(manifest_data["repo_url"])
+
+    # Verify manifest.json is committed in Git while state.json inside .agent-factory/ stays ignored!
+    tree_files = subprocess.run(
+        ["git", "-C", str(bare_remote), "ls-tree", "-r", "refs/heads/work", "--name-only"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    assert ".agent-factory/manifest.json" in tree_files
+    assert ".agent-factory/state.json" not in tree_files
+
+
+
 
 
 

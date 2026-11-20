@@ -40,6 +40,7 @@ from agent_factory.workspace import (
     is_python_cache_path,
     verify_and_restore_test_lock,
     workspace_nonempty_test_files,
+    write_workspace_manifest,
 )
 
 _PYTEST_HEADER_PREFIXES: tuple[str, ...] = (
@@ -812,6 +813,43 @@ class BuildWorker:
         job.lock_snapshot = compute_test_lock(ws_dir)
         return None
 
+    def _write_manifest(
+        self,
+        project_id: str,
+        ws_dir: Path,
+        job: BuildJob,
+        *,
+        repo_url: str | None = None,
+        deploy_url: str | None = None,
+    ) -> Path:
+        """Write redacted portable .agent-factory/manifest.json inside ws_dir (INV-19, INV-22)."""
+        cur_status = self.orchestrator.get_status(project_id)
+        eff_repo = (
+            repo_url
+            if repo_url is not None
+            else ((cur_status.links.repo if cur_status.links else None) or "")
+        )
+        eff_deploy = (
+            deploy_url
+            if deploy_url is not None
+            else ((cur_status.links.deploy if cur_status.links else None) or "")
+        )
+        return write_workspace_manifest(
+            ws_dir,
+            {
+                "schema_version": "1.0",
+                "project_id": project_id,
+                "title": cur_status.name or project_id,
+                "app_type": detect_workspace_app(ws_dir).app_type,
+                "objective": cur_status.objective or job.plan.summary,
+                "plan_summary": job.plan.summary,
+                "repo_url": eff_repo,
+                "deploy_url": eff_deploy,
+                "updated_at": self.orchestrator._now().isoformat(),
+            },
+            extra_secrets=self.secrets_to_redact,
+        )
+
     def run_job(
         self,
         project_id: str,
@@ -822,6 +860,8 @@ class BuildWorker:
         status = self.orchestrator.get_status(project_id)
         if status.state != ProjectState.BUILDING:
             raise IllegalTransition(status.state, ProjectState.BUILDING)
+        if status.workspace_path and not self.workspace_manager.is_external_workspace(project_id):
+            self.workspace_manager.register_external_workspace(project_id, status.workspace_path)
 
         mod_instructions = self._extract_modification_instructions(
             self.orchestrator.store.get_events(project_id)
@@ -1321,6 +1361,8 @@ class BuildWorker:
             )
 
             try:
+                # Write portable manifest before commit/push in Git
+                self._write_manifest(project_id, ws_dir, job)
                 # Push branch
                 self.vcs.push_branch(project_id, ws_dir, branch="work")
 
@@ -1390,16 +1432,34 @@ class BuildWorker:
                     f"## Deployment Target\n{job.plan.deployment_target}\n"
                 )
                 prompt_file.write_text(prompt_content, encoding="utf-8")
+                self._write_manifest(
+                    project_id,
+                    ws_dir,
+                    job,
+                    repo_url=repo_url,
+                    deploy_url=deploy_url,
+                )
 
                 registry_warning: str | None = None
                 if self.registry_publisher is not None:
                     try:
-                        delivered_status = self.orchestrator.get_status(project_id)
+                        same_pub = (
+                            getattr(self.orchestrator, "publisher", None)
+                            is self.registry_publisher
+                        )
+                        if same_pub:
+                            delivered_status = self.orchestrator.get_status(
+                                project_id, notify_publisher=False
+                            )
+                        else:
+                            delivered_status = self.orchestrator.get_status(project_id)
                         events = self.orchestrator.store.get_events(project_id)
                         self.registry_publisher.publish_project(
                             delivered_status,
                             events=events,
                         )
+                        if same_pub and hasattr(self.orchestrator, "mark_status_published"):
+                            self.orchestrator.mark_status_published(delivered_status)
                     except (
                         RegistryPublishError,
                         OSError,

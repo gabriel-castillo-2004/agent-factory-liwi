@@ -6,11 +6,15 @@ import re
 import threading
 import time
 import tomllib
+import unicodedata
+import uuid
 from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from pydantic import BaseModel, ConfigDict
 
 from agent_factory.adapters.model_resolver import ACTIVITY_MESSAGES
 from agent_factory.adapters.system_clock import SystemClock
@@ -42,7 +46,11 @@ from agent_factory.ports.llm import LLM, LLMError
 from agent_factory.ports.publisher import RegistryPublishError, StatusPublisher
 from agent_factory.ports.store import EventStore
 from agent_factory.secrets import redact_secrets
-from agent_factory.workspace import WorkspaceManager
+from agent_factory.workspace import (
+    WorkspaceManager,
+    collect_workspace_code_context,
+    validate_external_project_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -667,6 +675,30 @@ def suggest_title_from_repo(
     return redacted
 
 
+VALID_CHAT_MODES: frozenset[str] = frozenset({"chat", "audit", "document"})
+
+
+class ProjectChatReply(BaseModel):
+    """Schema for structured read-only repository auditor, Q&A, and document generation responses."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    reply: str = ""
+    markdown: str = ""
+    content: str = ""
+    suggested_changes: str = ""
+    document_title: str = ""
+
+
+def _slugify_imported_id(text: str, max_len: int = 50) -> str:
+    """Normalize text to an ASCII hyphenated slug safe for project_id (INV-22)."""
+    norm = unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-z0-9]+", "-", norm.lower()).strip("-")
+    if len(slug) > max_len:
+        slug = slug[:max_len].strip("-")
+    return slug or "imported-app"
+
+
 class ApprovalError(Exception):
     """Raised when attempting to enter BUILDING without a valid ApprovalEvent (INV-05)."""
 
@@ -984,11 +1016,11 @@ class Orchestrator:
             raise ValueError(f"Project '{project_id}' does not exist")
         status = self.get_status(project_id)
         plan = self.get_plan(project_id)
-        eff_ws = workspace_dir
-        if eff_ws is None and self.workspace_manager is not None:
-            candidate_ws = self.workspace_manager.get_workspace_dir(project_id)
-            if candidate_ws.is_dir():
-                eff_ws = candidate_ws
+        eff_ws = self._resolve_project_workspace_dir(
+            project_id,
+            status=status,
+            workspace_dir=workspace_dir,
+        )
         return suggest_title_from_repo(
             eff_ws,
             current_name=status.name,
@@ -996,6 +1028,487 @@ class Orchestrator:
             plan_summary=plan.summary if plan is not None else "",
             extra_secrets=extra_secrets,
         )
+
+    def _resolve_project_workspace_dir(
+        self,
+        project_id: str,
+        *,
+        status: ProjectStatus | None = None,
+        workspace_dir: Path | None = None,
+        workspace_manager: WorkspaceManager | None = None,
+    ) -> Path | None:
+        """Resolve authorized internal or external workspace directory safely (INV-22)."""
+        if workspace_dir is not None:
+            resolved = Path(workspace_dir).resolve()
+            return resolved if resolved.is_dir() else None
+        eff_status = status if status is not None else self.get_status(project_id)
+        eff_mgr = workspace_manager if workspace_manager is not None else self.workspace_manager
+        if eff_status.workspace_path:
+            validated_ext = validate_external_project_path(eff_status.workspace_path)
+            if eff_mgr is not None and not eff_mgr.is_external_workspace(project_id):
+                eff_mgr.register_external_workspace(project_id, validated_ext)
+            return validated_ext
+        if eff_mgr is not None:
+            cand = eff_mgr.get_workspace_dir(project_id)
+            if cand.is_dir():
+                return cand
+        return None
+
+    def _resolve_chats_dir(self, chats_dir: Path | None = None) -> Path:
+        if chats_dir is not None:
+            return Path(chats_dir).resolve()
+        db_path = getattr(self.store, "db_path", None)
+        if db_path and str(db_path) != ":memory:":
+            db_parent = Path(db_path).resolve().parent
+            repo_data_dir = Path("data").resolve()
+            return (
+                (repo_data_dir / "chats").resolve()
+                if db_parent == repo_data_dir
+                else (db_parent / "chats").resolve()
+            )
+        return Path("data/chats").resolve()
+
+    def _chat_file_path(self, project_id: str, chats_dir: Path) -> Path:
+        validate_project_id(project_id)
+        target = (chats_dir / f"{project_id}.json").resolve()
+        if not target.is_relative_to(chats_dir):
+            raise ValueError(f"Chat file escapes chats_dir: {target}")
+        if (chats_dir / f"{project_id}.json").is_symlink():
+            raise ValueError(f"Chat file symlink rejected: {target}")
+        return target
+
+    def get_project_chat_history(
+        self,
+        project_id: str,
+        *,
+        chats_dir: Path | None = None,
+        extra_secrets: Sequence[str] = (),
+    ) -> list[dict[str, Any]]:
+        """Return persisted read-only audit/Q&A chat history for project_id with secrets redacted."""
+        validate_project_id(project_id)
+        if not self.store.get_events(project_id):
+            raise ValueError(f"Project '{project_id}' does not exist")
+        eff_dir = self._resolve_chats_dir(chats_dir)
+        chat_file = self._chat_file_path(project_id, eff_dir)
+        if not chat_file.is_file():
+            return []
+        try:
+            raw = json.loads(chat_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return []
+        if not isinstance(raw, list):
+            return []
+        cleaned: list[dict[str, Any]] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            item: dict[str, Any] = {}
+            for k, v in entry.items():
+                item[str(k)] = (
+                    redact_secrets(v, extra_secrets=extra_secrets) if isinstance(v, str) else v
+                )
+            cleaned.append(item)
+        return cleaned
+
+    def delete_project_chat_history(
+        self,
+        project_id: str,
+        *,
+        chats_dir: Path | None = None,
+    ) -> None:
+        """Remove persisted chat log file for project_id if present."""
+        validate_project_id(project_id)
+        eff_dir = self._resolve_chats_dir(chats_dir)
+        raw_file = eff_dir / f"{project_id}.json"
+        if raw_file.is_symlink():
+            return
+        resolved = raw_file.resolve()
+        if resolved.is_relative_to(eff_dir) and resolved.is_file():
+            resolved.unlink()
+
+    def chat_with_project(
+        self,
+        project_id: str,
+        message: str,
+        mode: str = "chat",
+        workspace_dir: Path | None = None,
+        *,
+        chats_dir: Path | None = None,
+        workspace_manager: WorkspaceManager | None = None,
+        extra_secrets: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """Execute strictly read-only Q&A, audit, or Markdown doc generation over project code (INV-19)."""
+        validate_project_id(project_id)
+        clean_mode = str(mode or "chat").strip().lower()
+        if clean_mode not in VALID_CHAT_MODES:
+            raise ValueError(
+                f"Modo de chat inválido '{mode}': usa chat, audit o document."
+            )
+
+        clean_msg = redact_secrets(str(message or "").strip(), extra_secrets=extra_secrets)
+        if not clean_msg:
+            if clean_mode == "audit":
+                clean_msg = (
+                    "Audita el proyecto completo: identifica posibles bugs, rutas o recursos rotos, "
+                    "dependencias faltantes, riesgos de seguridad y mejoras claras de UX."
+                )
+            elif clean_mode == "document":
+                clean_msg = (
+                    "Genera un documento técnico y guía de uso completa del proyecto en Markdown "
+                    "listo para descargar."
+                )
+            else:
+                raise ValueError("El mensaje de consulta no puede estar vacío.")
+
+        events = self.store.get_events(project_id)
+        if not events:
+            raise ValueError(f"Project '{project_id}' does not exist")
+
+        status = self.get_status(project_id)
+        plan = self.get_plan(project_id)
+        spec = self._get_spec(project_id)
+        eff_ws = self._resolve_project_workspace_dir(
+            project_id,
+            status=status,
+            workspace_dir=workspace_dir,
+            workspace_manager=workspace_manager,
+        )
+        code_ctx = (
+            collect_workspace_code_context(eff_ws, max_chars=36000, extra_secrets=extra_secrets)
+            if eff_ws is not None
+            else ""
+        )
+
+        eff_chats_dir = self._resolve_chats_dir(chats_dir)
+        history = self.get_project_chat_history(
+            project_id,
+            chats_dir=eff_chats_dir,
+            extra_secrets=extra_secrets,
+        )
+
+        if clean_mode == "audit":
+            mode_guidance = (
+                "MODO AUDITORÍA (SOLO LECTURA): Analiza bugs, casos borde, rutas HTTP o enlaces rotos, "
+                "selectores DOM, dependencias o ejecución local, seguridad (validación de entradas, rutas, "
+                "secretos) y mejoras de UX. Responde en Markdown estructurado en 'reply' y redacta en "
+                "'suggested_changes' instrucciones concretas y accionables para corregir los hallazgos."
+            )
+            default_doc = f"{project_id}-auditoria.md"
+        elif clean_mode == "document":
+            mode_guidance = (
+                "MODO GENERADOR DE DOCUMENTOS (SOLO LECTURA): Genera documentación técnica completa y guía de "
+                "uso en Markdown limpio en 'reply' (resumen, arquitectura/archivos, dependencias y arranque "
+                "local, endpoints/flujos y notas). Define un nombre sugerido .md en 'document_title'."
+            )
+            default_doc = f"{project_id}-documentacion.md"
+        else:
+            mode_guidance = (
+                "MODO CONSULTA (SOLO LECTURA): Responde con claridad y precisión basándote únicamente en el código "
+                "y metadatos observados del proyecto. Si detectas alguna mejora útil, opcionalmente inclúyela en "
+                "'suggested_changes'."
+            )
+            default_doc = f"{project_id}-consulta.md"
+
+        system_prompt = (
+            "Eres un Auditor de Software y Redactor Técnico Senior trabajando en modo ESTRICTAMENTE DE SOLO LECTURA.\n"
+            "No modifiques archivos ni propongas ejecutar cambios automáticamente.\n"
+            "Responde siempre en español claro usando formato Markdown dentro del campo JSON 'reply'.\n"
+            f"{mode_guidance}"
+        )
+
+        meta_block = (
+            f"Proyecto: {status.name or project_id} (ID: {project_id}, estado: {status.state.value})\n"
+            f"Objetivo: {redact_secrets(status.objective or spec.objective or 'N/D', extra_secrets=extra_secrets)}\n"
+            f"Plan: {redact_secrets(plan.summary if plan is not None else 'N/D', extra_secrets=extra_secrets)}\n"
+        )
+        context_block = code_ctx or "(Sin archivos de código disponibles en este workspace.)"
+
+        llm_messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        for prev in history[-8:]:
+            p_role = "assistant" if prev.get("role") == "assistant" else "user"
+            p_text = str(prev.get("content", "")).strip()
+            if p_text:
+                llm_messages.append({"role": p_role, "content": p_text[:2000]})
+        llm_messages.append(
+            {
+                "role": "user",
+                "content": redact_secrets(
+                    f"{meta_block}\nCódigo real del repositorio:\n{context_block}\n\n"
+                    f"Solicitud del usuario ({clean_mode}):\n{clean_msg}",
+                    extra_secrets=extra_secrets,
+                ),
+            }
+        )
+
+        raw_resp = self.llm.complete(llm_messages, schema=ProjectChatReply)
+        raw_reply = ""
+        raw_suggested = ""
+        raw_doc_title = ""
+        if isinstance(raw_resp, Mapping):
+            raw_reply = str(
+                raw_resp.get("reply")
+                or raw_resp.get("markdown")
+                or raw_resp.get("content")
+                or ""
+            ).strip()
+            raw_suggested = str(raw_resp.get("suggested_changes") or "").strip()
+            raw_doc_title = str(raw_resp.get("document_title") or "").strip()
+
+        clean_reply = redact_secrets(
+            raw_reply or "No se recibió contenido del modelo para esta consulta.",
+            extra_secrets=extra_secrets,
+        )
+        clean_suggested = redact_secrets(raw_suggested, extra_secrets=extra_secrets)
+        clean_doc_title = redact_secrets(raw_doc_title, extra_secrets=extra_secrets) or default_doc
+        if not clean_doc_title.lower().endswith(".md"):
+            clean_doc_title = f"{clean_doc_title}.md"
+
+        now_iso = self._now().isoformat()
+        updated_history = [
+            *history,
+            {
+                "id": f"u-{uuid.uuid4().hex[:10]}",
+                "role": "user",
+                "mode": clean_mode,
+                "content": clean_msg,
+                "created_at": now_iso,
+            },
+            {
+                "id": f"a-{uuid.uuid4().hex[:10]}",
+                "role": "assistant",
+                "mode": clean_mode,
+                "content": clean_reply,
+                "suggested_changes": clean_suggested,
+                "document_title": clean_doc_title,
+                "created_at": now_iso,
+            },
+        ][-50:]
+
+        eff_chats_dir.mkdir(parents=True, exist_ok=True)
+        chat_file = self._chat_file_path(project_id, eff_chats_dir)
+        chat_file.write_text(
+            json.dumps(updated_history, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "mode": clean_mode,
+            "reply": clean_reply,
+            "suggested_changes": clean_suggested,
+            "document_title": clean_doc_title,
+            "context_chars": len(code_ctx),
+            "history": updated_history,
+        }
+
+    def import_project(
+        self,
+        local_path: str | Path,
+        *,
+        title: str = "",
+        project_id: str | None = None,
+        workspace_manager: WorkspaceManager | None = None,
+        factory_root: Path | None = None,
+        extra_secrets: Sequence[str] = (),
+    ) -> tuple[ProjectStatus, dict[str, Any]]:
+        """Validate external folder (INV-22), load optional manifest, and register project cleanly as DELIVERED."""
+        from agent_factory.runtime_runner import detect_workspace_app
+
+        validated_dir = validate_external_project_path(local_path, factory_root=factory_root)
+        manifest_path = validated_dir / ".agent-factory" / "manifest.json"
+        manifest: dict[str, Any] = {}
+        manifest_loaded = False
+        raw_manifest = _read_contained_text_snippet(
+            manifest_path,
+            validated_dir,
+            max_bytes=32768,
+            extra_secrets=extra_secrets,
+        )
+        if raw_manifest:
+            try:
+                parsed = json.loads(raw_manifest)
+                if isinstance(parsed, dict):
+                    manifest = parsed
+                    manifest_loaded = True
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        app_info = detect_workspace_app(validated_dir)
+        manifest_title = str(manifest.get("title") or "").strip()
+        user_title = str(title or "").strip()
+        if user_title:
+            effective_title = sanitize_project_title(user_title)
+        elif manifest_title:
+            effective_title = sanitize_project_title(manifest_title)
+        else:
+            suggested = suggest_title_from_repo(
+                validated_dir,
+                current_name=validated_dir.name.replace("-", " ").replace("_", " "),
+                extra_secrets=extra_secrets,
+            )
+            effective_title = sanitize_project_title(suggested or validated_dir.name)
+
+        raw_obj = redact_secrets(
+            str(manifest.get("objective") or effective_title).strip() or effective_title,
+            extra_secrets=extra_secrets,
+        )
+        plan_summary = redact_secrets(
+            str(
+                manifest.get("plan_summary")
+                or f"Proyecto local importado ({app_info.app_type}) desde carpeta existente."
+            ).strip(),
+            extra_secrets=extra_secrets,
+        )
+        repo_url = redact_secrets(str(manifest.get("repo_url") or "").strip(), extra_secrets=extra_secrets)
+        deploy_url = redact_secrets(str(manifest.get("deploy_url") or "").strip(), extra_secrets=extra_secrets)
+
+        candidate_pid = str(project_id or manifest.get("project_id") or "").strip()
+        try:
+            base_slug = validate_project_id(candidate_pid) if candidate_pid else _slugify_imported_id(effective_title)
+        except ValueError:
+            base_slug = _slugify_imported_id(effective_title)
+
+        with self._lock:
+            final_pid = base_slug
+            suffix = 2
+            while self.store.get_events(final_pid):
+                tail = f"-{suffix}"
+                final_pid = f"{base_slug[: 63 - len(tail)]}{tail}"
+                suffix += 1
+            validate_project_id(final_pid)
+
+        now = self._now()
+        spec = Spec(
+            objective=raw_obj,
+            users=["Usuario local"],
+            features=[effective_title],
+            business_rules=["Proyecto importado desde carpeta local autorizada"],
+            edge_cases=["Validación estricta de rutas e invariants"],
+            constraints=[f"Tipo detectado: {app_info.app_type}"],
+            success_criteria=["Ejecución e inspección disponibles desde Agent Factory"],
+        )
+        plan = Plan(
+            summary=plan_summary,
+            rationale="Expediente inicializado al importar proyecto existente.",
+            template_id="static-web",
+            files=[],
+            acceptance_tests=[
+                AcceptanceTest(
+                    id="AT-IMPORT-01",
+                    description="Proyecto local accesible y verificable",
+                    type=AcceptanceTestType.UNIT,
+                )
+            ],
+            risks=[],
+            deployment_target="github-pages" if repo_url else "local",
+        )
+        plan_hash = plan.compute_hash()
+
+        with self._project_lock(final_pid):
+            validate_transition(ProjectState.IDLE, ProjectState.INTERVIEW)
+            self.store.append(
+                create_event(
+                    final_pid,
+                    EventType.PROJECT_CREATED,
+                    {
+                        "name": effective_title,
+                        "objective": raw_obj,
+                        "state": ProjectState.INTERVIEW.value,
+                        "imported": True,
+                        "external_workspace_path": str(validated_dir),
+                    },
+                    at=now,
+                )
+            )
+            self.store.append(
+                create_event(
+                    final_pid,
+                    EventType.SPEC_UPDATED,
+                    {"spec": spec.model_dump(mode="json")},
+                    at=now,
+                )
+            )
+            validate_transition(ProjectState.INTERVIEW, ProjectState.DEBATE)
+            self.store.append(
+                create_event(
+                    final_pid,
+                    EventType.STATE_TRANSITIONED,
+                    {"from": ProjectState.INTERVIEW.value, "to": ProjectState.DEBATE.value},
+                    at=now,
+                )
+            )
+            validate_transition(ProjectState.DEBATE, ProjectState.MEDIATION)
+            self.store.append(
+                create_event(
+                    final_pid,
+                    EventType.STATE_TRANSITIONED,
+                    {"from": ProjectState.DEBATE.value, "to": ProjectState.MEDIATION.value},
+                    at=now,
+                )
+            )
+            validate_transition(ProjectState.MEDIATION, ProjectState.WAITING_APPROVAL)
+            self.store.append(
+                create_event(
+                    final_pid,
+                    EventType.PLAN_CREATED,
+                    {
+                        "to": ProjectState.WAITING_APPROVAL.value,
+                        "plan_hash": plan_hash,
+                        "total_tests": len(plan.acceptance_tests),
+                        "plan": plan.model_dump(mode="json"),
+                    },
+                    at=now,
+                )
+            )
+            validate_transition(ProjectState.WAITING_APPROVAL, ProjectState.BUILDING)
+            self.store.append(
+                create_event(
+                    final_pid,
+                    EventType.APPROVAL_RECORDED,
+                    {
+                        "to": ProjectState.BUILDING.value,
+                        "decision": "approved",
+                        "plan_hash": plan_hash,
+                    },
+                    at=now,
+                )
+            )
+            validate_transition(ProjectState.BUILDING, ProjectState.VERIFYING)
+            self.store.append(
+                create_event(
+                    final_pid,
+                    EventType.STATE_TRANSITIONED,
+                    {"from": ProjectState.BUILDING.value, "to": ProjectState.VERIFYING.value},
+                    at=now,
+                )
+            )
+            validate_transition(ProjectState.VERIFYING, ProjectState.DELIVERED)
+            self.store.append(
+                create_event(
+                    final_pid,
+                    EventType.PROJECT_DELIVERED,
+                    {
+                        "repo_url": repo_url or None,
+                        "deploy_url": deploy_url or None,
+                        "imported": True,
+                    },
+                    at=now,
+                )
+            )
+            with self._lock:
+                self._specs[final_pid] = spec
+
+        eff_mgr = workspace_manager if workspace_manager is not None else self.workspace_manager
+        if eff_mgr is not None:
+            eff_mgr.register_external_workspace(final_pid, validated_dir, factory_root=factory_root)
+
+        final_status = self.get_status(final_pid)
+        return final_status, {
+            "app_type": app_info.app_type,
+            "manifest_loaded": manifest_loaded,
+            "external_workspace_path": str(validated_dir),
+        }
 
     def modify_project(self, project_id: str, instructions: str) -> ProjectStatus:
         """Transition a DELIVERED project legally via CHANGE_REQUEST to BUILDING preserving workspace (INV-04, INV-05)."""
@@ -1739,21 +2252,30 @@ class Orchestrator:
                 )
             return self.get_status(project_id)
 
-    def get_status(self, project_id: str) -> ProjectStatus:
+    @staticmethod
+    def _status_publish_key(status: ProjectStatus) -> tuple[Any, ...]:
+        return (
+            status.project_id,
+            status.state,
+            status.progress_pct,
+            status.plan_hash,
+            status.failure_reason,
+            status.links.repo if status.links else "",
+            status.links.deploy if status.links else "",
+        )
+
+    def mark_status_published(self, status: ProjectStatus) -> None:
+        """Record status as already published so get_status does not republish redundantly."""
+        with self._lock:
+            self._last_published_status[status.project_id] = self._status_publish_key(status)
+
+    def get_status(self, project_id: str, *, notify_publisher: bool = True) -> ProjectStatus:
         """Project current ProjectStatus from the append-only event log (INV-11)."""
         validate_project_id(project_id)
         events = self.store.get_events(project_id)
         status = project_status_from_events(project_id, events)
-        if self.publisher is not None:
-            last_key = (
-                project_id,
-                status.state,
-                status.progress_pct,
-                status.plan_hash,
-                status.failure_reason,
-                status.links.repo if status.links else "",
-                status.links.deploy if status.links else "",
-            )
+        if notify_publisher and self.publisher is not None:
+            last_key = self._status_publish_key(status)
             should_publish = False
             with self._lock:
                 if self._last_published_status.get(project_id) != last_key:
