@@ -2143,6 +2143,263 @@ def test_build_worker_writes_favicon_svg_without_overwriting_existing_one(
     assert (ws_mgr_b.get_workspace_dir(pid_b) / "favicon.svg").read_text(encoding="utf-8") == custom_fav
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_local_app_runner_isolated_venv_deps_hash_cache_and_git_exclude(
+    tmp_path: Path,
+) -> None:
+    """LocalAppRunner creates per-workspace .venv, caches deps via .deps_hash, runs with venv python, skips pip on run_http_smoke_test(install_deps=False), activates install_deps=True via /start, and excludes .venv/ & .agent-factory/ from Git."""
+    import hashlib
+    import http.server  # noqa: F401
+    import json
+    import os
+    import subprocess
+    import urllib.request
+    from collections.abc import Sequence
+    from typing import Any
+
+    from agent_factory.adapters.github_vcs_adapter import GitHubVCSAdapter
+    from agent_factory.adapters.sqlite_store import SqliteEventStore
+    from agent_factory.dashboard import start_dashboard_server
+    from agent_factory.domain.events import create_event
+    from agent_factory.runtime_runner import LocalAppRunner, run_http_smoke_test
+
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_venv")
+    pid = "proj-py-venv"
+    ws_dir = ws_mgr.create_workspace(pid)
+    req_path = ws_dir / "src" / "requirements.txt"
+    req_path.parent.mkdir(parents=True, exist_ok=True)
+    req_v1 = "# local test deps v1\n"
+    req_path.write_text(req_v1, encoding="utf-8", newline="\n")
+
+    (ws_dir / "app.py").write_text(
+        "import http.server, json, os, sys\n"
+        "host = os.environ['HOST']\n"
+        "port = int(os.environ['PORT'])\n"
+        "class H(http.server.BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        body = json.dumps({'prefix': sys.prefix, 'exe': sys.executable}).encode()\n"
+        "        self.send_response(200)\n"
+        "        self.send_header('Content-Type', 'application/json')\n"
+        "        self.send_header('Content-Length', str(len(body)))\n"
+        "        self.end_headers()\n"
+        "        self.wfile.write(body)\n"
+        "    def log_message(self, *args):\n"
+        "        pass\n"
+        "if __name__ == '__main__':\n"
+        "    http.server.ThreadingHTTPServer((host, port), H).serve_forever()\n",
+        encoding="utf-8",
+    )
+
+    venv_cmds: list[list[str]] = []
+    pip_cmds: list[list[str]] = []
+    real_run = subprocess.run
+
+    def _recording_runner(cmd: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        cmd_list = [str(c) for c in cmd]
+        if len(cmd_list) >= 4 and cmd_list[1:3] == ["-m", "venv"]:
+            venv_cmds.append(cmd_list)
+            return real_run([cmd_list[0], "-m", "venv", "--without-pip", *cmd_list[3:]], **kwargs)
+        if "-m" in cmd_list and "pip" in cmd_list:
+            pip_cmds.append(cmd_list)
+            return subprocess.CompletedProcess(cmd_list, 0, stdout="ok", stderr="")
+        return real_run(cmd_list, **kwargs)
+
+    # 1. BuildWorker default run_http_smoke_test keeps install_deps=False (no venv/pip created)
+    smoke_runner = LocalAppRunner(workspace_manager=ws_mgr, dep_command_runner=_recording_runner)
+    try:
+        smoke_res = run_http_smoke_test(smoke_runner, pid, ws_dir)
+        assert smoke_res.passed is True
+        assert not (ws_dir / ".venv").exists()
+        assert pip_cmds == []
+    finally:
+        smoke_runner.stop_all()
+
+    # 2. First explicit start(install_deps=True) creates <ws>/.venv, runs pip -r src/requirements.txt, saves .deps_hash, and runs app using venv python
+    runner = LocalAppRunner(workspace_manager=ws_mgr, dep_command_runner=_recording_runner)
+    try:
+        st1 = runner.start(pid, install_deps=True)
+        assert st1.running is True
+        assert st1.app_type == "python_local"
+        assert len(venv_cmds) == 1
+        assert venv_cmds[0][1:3] == ["-m", "venv"]
+        assert Path(venv_cmds[0][3]).resolve() == (ws_dir / ".venv").resolve()
+        assert len(pip_cmds) == 1
+        assert "-r" in pip_cmds[0]
+        assert str(req_path.resolve()) in pip_cmds[0]
+
+        expected_venv_py = (
+            ws_dir / ".venv" / "Scripts" / "python.exe"
+            if os.name == "nt"
+            else ws_dir / ".venv" / "bin" / "python"
+        )
+        assert expected_venv_py.is_file()
+        assert pip_cmds[0][0] == str(expected_venv_py.resolve())
+
+        deps_hash_file = ws_dir / ".venv" / ".deps_hash"
+        assert deps_hash_file.is_file()
+        expected_hash_v1 = hashlib.sha256(
+            b"src/requirements.txt\0" + req_v1.encode("utf-8") + b"\0"
+        ).hexdigest()
+        assert deps_hash_file.read_text(encoding="utf-8").strip() == expected_hash_v1
+
+        with urllib.request.urlopen(st1.url, timeout=5.0) as resp:
+            info = json.loads(resp.read().decode("utf-8"))
+        assert Path(info["prefix"]).resolve() == (ws_dir / ".venv").resolve()
+        runner.stop(pid)
+
+        # 3. Second start skips pip cleanly when .deps_hash matches
+        st2 = runner.start(pid, install_deps=True)
+        assert st2.running is True
+        assert len(pip_cmds) == 1
+        runner.stop(pid)
+
+        # 4. Updating requirements.txt invalidates cache and triggers pip again
+        req_v2 = "flask==3.0.0\n"
+        req_path.write_text(req_v2, encoding="utf-8", newline="\n")
+        st3 = runner.start(pid, install_deps=True)
+        assert st3.running is True
+        assert len(pip_cmds) == 2
+        expected_hash_v2 = hashlib.sha256(
+            b"src/requirements.txt\0" + req_v2.encode("utf-8") + b"\0"
+        ).hexdigest()
+        assert deps_hash_file.read_text(encoding="utf-8").strip() == expected_hash_v2
+        runner.stop(pid)
+
+        # 5. Dashboard POST /api/projects/<id>/start enables install_deps=True
+        store = SqliteEventStore(str(tmp_path / "dash_venv.db"))
+        store.append(
+            create_event(
+                pid,
+                EventType.PROJECT_CREATED,
+                {"name": "Py Venv App", "objective": "Test venv start", "state": "INTERVIEW"},
+                at=datetime(2026, 11, 20, 12, 0, tzinfo=UTC),
+            )
+        )
+        orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
+        req_v3 = "flask==3.1.0\n"
+        req_path.write_text(req_v3, encoding="utf-8", newline="\n")
+        server, thread, base_url = start_dashboard_server(
+            orchestrator=orch,
+            port=0,
+            workspace_manager=ws_mgr,
+            local_runner=runner,
+        )
+        try:
+            start_req = urllib.request.Request(f"{base_url}/api/projects/{pid}/start", method="POST")
+            with urllib.request.urlopen(start_req, timeout=5.0) as sr:
+                assert sr.status == 200
+            assert len(pip_cmds) == 3
+            stop_req = urllib.request.Request(f"{base_url}/api/projects/{pid}/stop", method="POST")
+            with urllib.request.urlopen(stop_req, timeout=5.0) as stp:
+                assert stp.status == 200
+        finally:
+            server.shutdown()
+            server.server_close()
+            server.controller.wait_for_idle(timeout=5.0)
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+            store.close()
+    finally:
+        runner.stop_all()
+
+    # 6. GitHubVCSAdapter excludes .venv/ and .agent-factory/ via .git/info/exclude & .gitignore
+    (ws_dir / ".agent-factory").mkdir(parents=True, exist_ok=True)
+    (ws_dir / ".agent-factory" / "state.json").write_text('{"step": 1}\n', encoding="utf-8")
+    bare_remote = tmp_path / "bare_venv_remote.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare_remote)], check=True, capture_output=True)
+    vcs = GitHubVCSAdapter(repo_base_url=str(tmp_path), github_token="")
+    subprocess.run(["git", "init", "-b", "main"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare_remote)], cwd=ws_dir, check=True)
+    vcs.push_branch(pid, ws_dir, branch="work")
+
+    excl_text = (ws_dir / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+    assert ".venv/" in excl_text
+    assert ".agent-factory/" in excl_text
+    gitignore_text = (ws_dir / ".gitignore").read_text(encoding="utf-8")
+    assert ".venv/" in gitignore_text
+    assert ".agent-factory/" in gitignore_text
+
+    tree_files = subprocess.run(
+        ["git", "-C", str(bare_remote), "ls-tree", "-r", "refs/heads/work", "--name-only"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    assert "app.py" in tree_files
+    assert "src/requirements.txt" in tree_files
+    assert not any(f == ".venv" or f.startswith(".venv/") for f in tree_files)
+    assert not any(f == ".agent-factory" or f.startswith(".agent-factory/") for f in tree_files)
+
+    # 7. pyproject.toml [project] triggers pip install -e . cleanly while pytest-only pyproject does not
+    pip_pyproj_cmds: list[list[str]] = []
+
+    def _recording_pyproj_runner(
+        cmd: Sequence[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        cmd_list = [str(c) for c in cmd]
+        if len(cmd_list) >= 4 and cmd_list[1:3] == ["-m", "venv"]:
+            return real_run([cmd_list[0], "-m", "venv", "--without-pip", *cmd_list[3:]], **kwargs)
+        if "-m" in cmd_list and "pip" in cmd_list:
+            pip_pyproj_cmds.append(cmd_list)
+            return subprocess.CompletedProcess(cmd_list, 0, stdout="ok", stderr="")
+        return real_run(cmd_list, **kwargs)
+
+    pid_pytest_only = "proj-pytest-only-toml"
+    ws_pytest_only = ws_mgr.create_workspace(pid_pytest_only)
+    (ws_pytest_only / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
+        encoding="utf-8",
+    )
+    (ws_pytest_only / "app.py").write_text(
+        "import http.server, os\n"
+        "class H(http.server.BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        self.send_response(200)\n"
+        "        self.end_headers()\n"
+        "    def log_message(self, *a): pass\n"
+        "if __name__ == '__main__':\n"
+        "    http.server.ThreadingHTTPServer((os.environ['HOST'], int(os.environ['PORT'])), H).serve_forever()\n",
+        encoding="utf-8",
+    )
+
+    pid_pyproj = "proj-pyproject-deps"
+    ws_pyproj = ws_mgr.create_workspace(pid_pyproj)
+    (ws_pyproj / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\nversion = "0.1.0"\ndependencies = ["flask"]\n',
+        encoding="utf-8",
+    )
+    (ws_pyproj / "app.py").write_text(
+        "import http.server, os\n"
+        "class H(http.server.BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        self.send_response(200)\n"
+        "        self.end_headers()\n"
+        "    def log_message(self, *a): pass\n"
+        "if __name__ == '__main__':\n"
+        "    http.server.ThreadingHTTPServer((os.environ['HOST'], int(os.environ['PORT'])), H).serve_forever()\n",
+        encoding="utf-8",
+    )
+    runner_pyproj = LocalAppRunner(
+        workspace_manager=ws_mgr, dep_command_runner=_recording_pyproj_runner
+    )
+    try:
+        st_no = runner_pyproj.start(pid_pytest_only, install_deps=True)
+        assert st_no.running is True
+        assert not (ws_pytest_only / ".venv").exists()
+        assert pip_pyproj_cmds == []
+        runner_pyproj.stop(pid_pytest_only)
+
+        st_p = runner_pyproj.start(pid_pyproj, install_deps=True)
+        assert st_p.running is True
+        assert len(pip_pyproj_cmds) == 1
+        assert pip_pyproj_cmds[0][-2:] == ["-e", "."]
+    finally:
+        runner_pyproj.stop_all()
+
+
+
+
 
 
 

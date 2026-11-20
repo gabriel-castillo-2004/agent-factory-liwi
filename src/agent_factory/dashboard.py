@@ -836,7 +836,7 @@ class DashboardController:
             if self.local_runner.workspace_manager is None:
                 self.local_runner.workspace_manager = ws_mgr
             try:
-                local_status = self.local_runner.start(project_id)
+                local_status = self.local_runner.start(project_id, install_deps=True)
             except (LocalAppError, SandboxViolationError, ValueError) as exc:
                 clean_msg = redact_secrets(str(exc), extra_secrets=self.secrets_to_redact)
                 raise ProjectConflictError(clean_msg) from exc

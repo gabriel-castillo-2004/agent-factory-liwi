@@ -65,6 +65,70 @@ RUNNER_CONFIG_FILENAMES: tuple[str, ...] = (
 
 DEFAULT_WORKSPACE_PYTEST_INI: str = "[pytest]\ntestpaths = tests\naddopts = -ra --tb=short\n"
 
+WORKSPACE_GIT_EXCLUDES: tuple[str, ...] = (
+    "__pycache__/",
+    "*.py[cod]",
+    ".pytest_cache/",
+    ".venv/",
+    "venv/",
+    ".agent-factory/",
+)
+
+
+def _merge_ignore_patterns(ignore_file: Path, ws_resolved: Path, patterns: Sequence[str]) -> None:
+    """Safely ensure ignore_file inside ws_resolved contains each pattern without following symlinks (INV-22)."""
+    if ignore_file.is_symlink():
+        return
+    try:
+        resolved = ignore_file.resolve()
+    except OSError:
+        return
+    if resolved == ws_resolved or not resolved.is_relative_to(ws_resolved):
+        return
+    if resolved.exists() and not resolved.is_file():
+        return
+    try:
+        existing = resolved.read_text(encoding="utf-8") if resolved.exists() else ""
+    except OSError:
+        return
+    existing_lines = {ln.strip() for ln in existing.splitlines() if ln.strip()}
+    missing = [pat for pat in patterns if pat not in existing_lines]
+    if not missing:
+        return
+    prefix = "" if not existing or existing.endswith("\n") else "\n"
+    updated = existing + prefix + "\n".join(missing) + "\n"
+    try:
+        resolved.write_text(updated, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def ensure_workspace_git_excludes(
+    workspace_dir: Path,
+    *,
+    write_gitignore: bool = True,
+) -> None:
+    """Ensure .venv/, .agent-factory/, and Python caches are excluded via .git/info/exclude and .gitignore."""
+    ws = Path(workspace_dir).resolve()
+    if not ws.is_dir():
+        return
+    if write_gitignore:
+        _merge_ignore_patterns(ws / ".gitignore", ws, WORKSPACE_GIT_EXCLUDES)
+
+    git_dir = ws / ".git"
+    if git_dir.is_symlink() or not git_dir.is_dir():
+        return
+    if not (git_dir / "HEAD").is_file():
+        return
+    info_dir = git_dir / "info"
+    if info_dir.is_symlink():
+        return
+    try:
+        info_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    _merge_ignore_patterns(info_dir / "exclude", ws, WORKSPACE_GIT_EXCLUDES)
+
 
 class SandboxViolationError(ValueError):
     """Raised when a path or project_id attempts to escape workspaces/<project_id>/ (INV-18, INV-22)."""

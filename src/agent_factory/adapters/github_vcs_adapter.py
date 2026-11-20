@@ -17,6 +17,7 @@ from agent_factory.ports.runner import CommandResult, CommandTimeoutError, Runne
 from agent_factory.ports.vcs import VCS, CIRunResult
 from agent_factory.runtime_runner import detect_workspace_app
 from agent_factory.secrets import redact_secrets, sanitize_subprocess_env
+from agent_factory.workspace import ensure_workspace_git_excludes
 
 if TYPE_CHECKING:
     from agent_factory.adapters.static_deploy_publisher import StaticDeployPublisher
@@ -407,19 +408,7 @@ class GitHubVCSAdapter(VCS):
 
         self._validate_workspace_git_toplevel(workspace_dir, env=env)
 
-        info_dir = workspace_dir / ".git" / "info"
-        if (workspace_dir / ".git" / "HEAD").is_file() and info_dir.is_dir():
-            exclude_file = info_dir / "exclude"
-            try:
-                existing_excl = exclude_file.read_text(encoding="utf-8") if exclude_file.is_file() else ""
-                updated_excl = existing_excl
-                for pat in ("__pycache__/", "*.py[cod]", ".pytest_cache/"):
-                    if pat not in updated_excl:
-                        updated_excl = (updated_excl.rstrip("\n") + f"\n{pat}\n").lstrip("\n")
-                if updated_excl != existing_excl:
-                    exclude_file.write_text(updated_excl, encoding="utf-8")
-            except OSError:
-                pass
+        ensure_workspace_git_excludes(workspace_dir, write_gitignore=True)
 
         had_local_identity = False
         git_cfg = workspace_dir / ".git" / "config"

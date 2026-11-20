@@ -135,12 +135,19 @@ _REPO_META_DESC_RE = re.compile(
     r"""<meta[^>]+name=["']description["'][^>]+content=["'](.*?)["']""",
     re.IGNORECASE | re.DOTALL,
 )
-_PY_DOCSTRING_RE = re.compile(r'^\s*(?:"""(.*?)"""|\'\'\'(.*?)\'\'\')', re.DOTALL)
+_PY_DOCSTRING_RE = re.compile(
+    r'^(?:\s*(?:#[^\n]*\n|from\s+__future__\s+import\s+[^\n]+\n))*\s*(?:"""(.*?)"""|\'\'\'(.*?)\'\'\')',
+    re.DOTALL,
+)
 _GENERIC_APP_TITLES: frozenset[str] = frozenset(
     {
         "static web app",
+        "static web application",
         "agent factory",
+        "agent-factory",
         "agent-factory-app",
+        "agent-factory-static-web-template",
+        "base template",
         "app",
         "web app",
         "index",
@@ -150,6 +157,74 @@ _GENERIC_APP_TITLES: frozenset[str] = frozenset(
         "nuevo proyecto",
     }
 )
+_TEMPLATE_NOISE_PHRASES: tuple[str, ...] = (
+    "agent factory",
+    "agent-factory",
+    "static web application",
+    "base template",
+    "100% static web",
+    "static web app",
+    "offline-ready, zero backend",
+)
+_SPANISH_HINT_RE = re.compile(
+    r"[áéíóúñü¿¡]|\b(?:de|del|para|con|una?|el|la|los|las|local|locales|localmente|aplicaci[oó]n|descargar|descargador|m[uú]sica|canciones|archivo|archivos|gestor|temporizador|notas|diario|sin|desde)\b",
+    re.IGNORECASE,
+)
+_TECH_ENGLISH_NOISE_RE = re.compile(
+    r"\b(?:application\s+factory|middleware|entrypoint|blueprint|wsgi|asgi|server\s+module|unit\s+test|acceptance\s+test|utility\s+functions|helper\s+module|waitress|flask\s+app(?:lication)?)\b",
+    re.IGNORECASE,
+)
+_TITLE_SKIP_SCAN_DIRS: frozenset[str] = frozenset(
+    {".git", "tests", "__pycache__", ".venv", "venv", ".agent-factory", "node_modules"}
+)
+
+
+def _is_template_text(text: str) -> bool:
+    """Return True if text is empty, generic placeholder, or base template boilerplate."""
+    low = " ".join(str(text or "").lower().split()).strip(" .,:;-_#*`\"'")
+    if not low:
+        return True
+    if low in _GENERIC_APP_TITLES:
+        return True
+    return any(phrase in low for phrase in _TEMPLATE_NOISE_PHRASES)
+
+
+def _split_title_pair(raw_text: str) -> tuple[str, str]:
+    """Split 'Brand - Description' / 'Brand — Description' / 'Brand | Description' cleanly."""
+    cleaned = " ".join(re.sub(r"<[^>]+>", " ", str(raw_text or "")).split()).strip()
+    for sep in (" - ", " — ", " – ", " | "):
+        if sep in cleaned:
+            left, right = cleaned.split(sep, 1)
+            return left.strip(), right.strip()
+    return cleaned, ""
+
+
+def _extract_python_doc_hints(py_txt: str) -> list[str]:
+    """Extract clean non-template summary lines from leading comments and module docstring."""
+    hints: list[str] = []
+    for raw_line in py_txt.splitlines()[:12]:
+        s = raw_line.strip()
+        if not s:
+            continue
+        if s.startswith("#"):
+            comment = s.lstrip("#").strip()
+            low_c = comment.lower()
+            if (
+                comment
+                and not s.startswith("#!")
+                and not low_c.startswith(("coding:", "-*-", "type:", "noqa", "ruff:"))
+                and not _is_template_text(comment)
+            ):
+                hints.append(comment)
+            continue
+        break
+    m_doc = _PY_DOCSTRING_RE.match(py_txt)
+    if m_doc:
+        raw_doc = (m_doc.group(1) or m_doc.group(2) or "").strip()
+        first_doc_line = raw_doc.splitlines()[0].strip() if raw_doc else ""
+        if first_doc_line and not _is_template_text(first_doc_line):
+            hints.append(first_doc_line)
+    return hints
 
 
 def _read_contained_text_snippet(
@@ -176,13 +251,18 @@ def _read_contained_text_snippet(
 
 
 def _clean_short_brand(raw_name: str, max_len: int = 22) -> str:
-    """Extract a crisp 1-2 word friendly brand name without separator dashes."""
-    cleaned = _CTRL_CHARS_RE.sub(" ", str(raw_name or "")).replace(" - ", " ")
+    """Extract a crisp 1-3 word friendly brand name within max_len, filtering template placeholders."""
+    if not raw_name or _is_template_text(raw_name):
+        return ""
+    head, _ = _split_title_pair(raw_name)
+    cleaned = _CTRL_CHARS_RE.sub(" ", head)
     cleaned = re.sub(r"<[^>]+>", " ", cleaned)
     cleaned = " ".join(cleaned.split()).strip(" .,:;-_#*`\"'")
-    if not cleaned or cleaned.lower() in _GENERIC_APP_TITLES:
+    if _is_template_text(cleaned):
         return ""
     cleaned = _LEADING_FILLER_RE.sub("", cleaned).strip(" .,:;-_#*`\"'")
+    if _is_template_text(cleaned):
+        return ""
     words = [w.strip(",.:;()[]") for w in cleaned.split() if w.strip(",.:;()[]")]
     picked: list[str] = []
     for word in words[:3]:
@@ -190,12 +270,85 @@ def _clean_short_brand(raw_name: str, max_len: int = 22) -> str:
         if len(trial) > max_len:
             break
         picked.append(word)
-        if len(picked) == 2:
-            break
+    while len(picked) > 1 and picked[-1].lower() in {
+        "de",
+        "del",
+        "la",
+        "el",
+        "en",
+        "con",
+        "para",
+        "y",
+        "a",
+        "the",
+        "for",
+        "with",
+        "of",
+        "and",
+    }:
+        picked.pop()
     out = " ".join(picked) if picked else (words[0][:max_len] if words else "")
+    if _is_template_text(out):
+        return ""
     if out and out[0].islower():
         out = out[0].upper() + out[1:]
     return out
+
+
+def _collect_workspace_html_paths(ws: Path) -> list[Path]:
+    """Return contained non-symlink HTML files ordered with src/**/templates/*.html before root index.html."""
+    candidates: list[tuple[int, str, Path]] = []
+    for p in ws.rglob("*.html"):
+        if p.is_symlink():
+            continue
+        try:
+            resolved = p.resolve()
+        except OSError:
+            continue
+        if not resolved.is_relative_to(ws) or not resolved.is_file():
+            continue
+        rel_parts = resolved.relative_to(ws).parts
+        if len(rel_parts) > 5 or any(part in _TITLE_SKIP_SCAN_DIRS for part in rel_parts):
+            continue
+        rel_posix = resolved.relative_to(ws).as_posix()
+        low_rel = rel_posix.lower()
+        name_low = resolved.name.lower()
+        if low_rel.startswith("src/") and "templates/" in low_rel:
+            tier = 0 if name_low == "index.html" else 1
+        elif low_rel.startswith("src/"):
+            tier = 2 if name_low == "index.html" else 3
+        elif rel_posix != "index.html" and name_low == "index.html":
+            tier = 4
+        elif rel_posix != "index.html":
+            tier = 5
+        else:
+            tier = 6
+        candidates.append((tier, rel_posix, resolved))
+    candidates.sort(key=lambda item: (item[0], len(item[1]), item[1]))
+    return [item[2] for item in candidates]
+
+
+def _humanize_package_dir_name(ws: Path) -> str:
+    """Derive a clean readable brand name from src/<package>/ when explicit HTML/README titles are absent."""
+    src_dir = ws / "src"
+    if not src_dir.is_dir() or src_dir.is_symlink():
+        return ""
+    acronyms = {"yt", "dl", "ai", "ui", "api", "cli", "pdf", "csv", "mp3", "tv", "db", "sql"}
+    for child in sorted(src_dir.iterdir(), key=lambda c: c.name.lower()):
+        if (
+            not child.is_dir()
+            or child.is_symlink()
+            or child.name.startswith((".", "_"))
+            or child.name in _TITLE_SKIP_SCAN_DIRS
+        ):
+            continue
+        if not (child / "__init__.py").is_file():
+            continue
+        tokens = [t for t in re.split(r"[-_]+", child.name) if t]
+        pretty = " ".join(t.upper() if t.lower() in acronyms else t.capitalize() for t in tokens)
+        if pretty and not _is_template_text(pretty):
+            return pretty
+    return ""
 
 
 def suggest_title_from_repo(
@@ -210,11 +363,17 @@ def suggest_title_from_repo(
     """Analyze workspace files, objective, and plan to suggest 'Nombre - Descripción breve' <= 65 chars (INV-19)."""
     readme_heading = ""
     readme_desc = ""
-    html_title = ""
+    html_title_brand = ""
+    html_title_desc = ""
+    html_h1_brand = ""
+    html_h1_desc = ""
     html_desc = ""
     pkg_name = ""
     pkg_desc = ""
-    py_doc = ""
+    pyproj_name = ""
+    pyproj_desc = ""
+    pkg_dir_brand = ""
+    py_docs: list[str] = []
     py_combined = ""
 
     if workspace_dir is not None and workspace_dir.is_dir():
@@ -229,9 +388,15 @@ def suggest_title_from_repo(
                 stripped = line.strip()
                 if not stripped:
                     continue
-                if stripped.startswith("#") and not readme_heading:
-                    readme_heading = stripped.lstrip("#").strip()
-                elif not stripped.startswith(("#", "!", "[", "```")) and not readme_desc:
+                if stripped.startswith("#"):
+                    cand_h = stripped.lstrip("#").strip()
+                    if cand_h and not _is_template_text(cand_h) and not readme_heading:
+                        readme_heading = cand_h
+                elif (
+                    not stripped.startswith(("#", "!", "[", "```", "|", "---", "==="))
+                    and not _is_template_text(stripped)
+                    and not readme_desc
+                ):
                     readme_desc = stripped
                 if readme_heading and readme_desc:
                     break
@@ -245,68 +410,115 @@ def suggest_title_from_repo(
                 pkg = json.loads(pkg_txt)
                 if isinstance(pkg, dict):
                     raw_pn = str(pkg.get("name", "")).strip()
-                    if raw_pn and raw_pn.lower() not in _GENERIC_APP_TITLES:
-                        pkg_name = raw_pn.replace("-", " ").replace("_", " ").strip()
-                    pkg_desc = str(pkg.get("description", "")).strip()
+                    pretty_pn = raw_pn.replace("-", " ").replace("_", " ").strip()
+                    if raw_pn and not _is_template_text(raw_pn) and not _is_template_text(pretty_pn):
+                        pkg_name = pretty_pn
+                    raw_pd = str(pkg.get("description", "")).strip()
+                    if raw_pd and not _is_template_text(raw_pd):
+                        pkg_desc = raw_pd
             except (json.JSONDecodeError, ValueError):
                 pass
 
-        for html_rel in (
-            "src/index.html",
-            "public/index.html",
-            "web/index.html",
-            "static/index.html",
-            "index.html",
-        ):
+        pyproj_txt = _read_contained_text_snippet(
+            ws / "pyproject.toml", ws, extra_secrets=extra_secrets
+        )
+        if pyproj_txt:
+            try:
+                pyproj = tomllib.loads(pyproj_txt)
+                proj_meta = pyproj.get("project", {}) if isinstance(pyproj, dict) else {}
+                if isinstance(proj_meta, dict):
+                    raw_ppn = str(proj_meta.get("name", "")).strip()
+                    pretty_ppn = raw_ppn.replace("-", " ").replace("_", " ").strip()
+                    if raw_ppn and not _is_template_text(raw_ppn) and not _is_template_text(pretty_ppn):
+                        pyproj_name = pretty_ppn
+                    raw_ppd = str(proj_meta.get("description", "")).strip()
+                    if raw_ppd and not _is_template_text(raw_ppd):
+                        pyproj_desc = raw_ppd
+            except tomllib.TOMLDecodeError:
+                pass
+
+        for html_path in _collect_workspace_html_paths(ws)[:8]:
             html_txt = _read_contained_text_snippet(
-                ws / html_rel, ws, extra_secrets=extra_secrets
+                html_path, ws, extra_secrets=extra_secrets
             )
             if not html_txt:
                 continue
             m_t = _REPO_TITLE_RE.search(html_txt)
             if m_t:
-                t_val = " ".join(m_t.group(1).split()).strip()
-                if t_val and t_val.lower() not in _GENERIC_APP_TITLES and not html_title:
-                    html_title = t_val
+                t_raw = " ".join(m_t.group(1).split()).strip()
+                t_left, t_right = _split_title_pair(t_raw)
+                if t_left and not _is_template_text(t_left) and not html_title_brand:
+                    html_title_brand = t_left
+                if t_right and not _is_template_text(t_right) and not html_title_desc:
+                    html_title_desc = t_right
             m_h1 = _REPO_H1_RE.search(html_txt)
             if m_h1:
-                h_val = " ".join(re.sub(r"<[^>]+>", " ", m_h1.group(1)).split()).strip()
-                if h_val and h_val.lower() not in _GENERIC_APP_TITLES and not html_title:
-                    html_title = h_val
+                h_raw = " ".join(re.sub(r"<[^>]+>", " ", m_h1.group(1)).split()).strip()
+                h_left, h_right = _split_title_pair(h_raw)
+                if h_left and not _is_template_text(h_left) and not html_h1_brand:
+                    html_h1_brand = h_left
+                if h_right and not _is_template_text(h_right) and not html_h1_desc:
+                    html_h1_desc = h_right
+                elif (
+                    not h_right
+                    and h_raw
+                    and not _is_template_text(h_raw)
+                    and h_raw.lower() != html_title_brand.lower()
+                    and not html_h1_desc
+                    and len(h_raw.split()) >= 3
+                ):
+                    html_h1_desc = h_raw
             m_desc = _REPO_META_DESC_RE.search(html_txt)
             if m_desc and not html_desc:
-                html_desc = " ".join(m_desc.group(1).split()).strip()
-            if html_title:
-                break
+                md_val = " ".join(m_desc.group(1).split()).strip()
+                if md_val and not _is_template_text(md_val):
+                    html_desc = md_val
+
+        py_candidates: list[tuple[int, str, Path]] = []
+        for py_path in ws.rglob("*.py"):
+            if py_path.is_symlink():
+                continue
+            try:
+                resolved_py = py_path.resolve()
+            except OSError:
+                continue
+            if not resolved_py.is_relative_to(ws) or not resolved_py.is_file():
+                continue
+            rel_parts = resolved_py.relative_to(ws).parts
+            if len(rel_parts) > 4 or any(part in _TITLE_SKIP_SCAN_DIRS for part in rel_parts):
+                continue
+            if resolved_py.name.startswith("test_") or resolved_py.name.endswith("_test.py") or resolved_py.name == "conftest.py":
+                continue
+            rel_posix = resolved_py.relative_to(ws).as_posix()
+            tier = 0 if rel_posix.lower().startswith("src/") else 1
+            py_candidates.append((tier, rel_posix, resolved_py))
+        py_candidates.sort(key=lambda item: (item[0], len(item[1]), item[1]))
 
         py_snippets: list[str] = []
-        skip_dirs = {".git", "tests", "__pycache__", ".venv", "venv", "node_modules"}
-        for py_path in sorted(ws.rglob("*.py")):
-            rel_parts = py_path.relative_to(ws).parts
-            if len(rel_parts) > 3 or any(part in skip_dirs for part in rel_parts):
-                continue
-            if py_path.name.startswith("test_") or py_path.name == "conftest.py":
-                continue
+        for _, _, py_path in py_candidates[:8]:
             py_txt = _read_contained_text_snippet(
                 py_path, ws, max_bytes=4096, extra_secrets=extra_secrets
             )
             if not py_txt:
                 continue
             py_snippets.append(py_txt)
-            if not py_doc:
-                m_doc = _PY_DOCSTRING_RE.match(py_txt)
-                if m_doc:
-                    raw_doc = (m_doc.group(1) or m_doc.group(2) or "").strip()
-                    first_doc_line = raw_doc.splitlines()[0].strip() if raw_doc else ""
-                    if first_doc_line and first_doc_line.lower() not in _GENERIC_APP_TITLES:
-                        py_doc = first_doc_line
-            if len(py_snippets) >= 6:
-                break
+            for doc_hint in _extract_python_doc_hints(py_txt):
+                if doc_hint not in py_docs:
+                    py_docs.append(doc_hint)
         py_combined = "\n".join(py_snippets).lower()
+        pkg_dir_brand = _humanize_package_dir_name(ws)
 
-    # 1. Pick short creative brand name
+    # 1. Pick short creative brand name ignoring base template strings
     brand = ""
-    for candidate_name in (readme_heading, html_title, pkg_name, current_name):
+    for candidate_name in (
+        html_title_brand,
+        html_h1_brand,
+        readme_heading,
+        pyproj_name,
+        pkg_name,
+        pkg_dir_brand,
+        current_name,
+    ):
         brand = _clean_short_brand(candidate_name)
         if brand:
             break
@@ -316,10 +528,13 @@ def suggest_title_from_repo(
         for part in (
             readme_heading,
             readme_desc,
-            html_title,
+            html_title_brand,
+            html_h1_brand,
+            html_h1_desc,
             html_desc,
             pkg_desc,
-            py_doc,
+            pyproj_desc,
+            *py_docs,
             objective,
             plan_summary,
             current_name,
@@ -339,18 +554,45 @@ def suggest_title_from_repo(
         else:
             brand = _clean_short_brand(synthesize_project_title(objective or "MiApp", max_len=20)) or "MiApp"
 
-    # 2. Pick concise friendly description from repo evidence -> objective -> domain cues
-    desc_source = ""
-    for cand_desc in (readme_desc, html_desc, pkg_desc, objective, plan_summary, py_doc):
+    # 2. Pick concise friendly description matching objective language when possible
+    prefer_spanish = bool(_SPANISH_HINT_RE.search(objective or "")) or not (objective or "").strip()
+    raw_desc_candidates: list[str] = [
+        html_h1_desc,
+        html_title_desc,
+        html_desc,
+        readme_desc,
+        pyproj_desc,
+        pkg_desc,
+        *py_docs,
+        objective,
+        plan_summary,
+    ]
+    cleaned_candidates: list[str] = []
+    for cand_desc in raw_desc_candidates:
         clean_cand = _CTRL_CHARS_RE.sub(" ", str(cand_desc or "")).strip()
-        if not clean_cand or clean_cand.lower() in _GENERIC_APP_TITLES:
+        if not clean_cand or _is_template_text(clean_cand) or _TECH_ENGLISH_NOISE_RE.search(clean_cand):
             continue
-        desc_source = clean_cand
-        break
+        cand_left, cand_right = _split_title_pair(clean_cand)
+        if cand_right and brand and cand_left.lower() == brand.lower():
+            clean_cand = cand_right
+        elif brand and clean_cand.lower().startswith(f"{brand.lower()}:"):
+            clean_cand = clean_cand[len(brand) + 1 :].strip()
+        if _is_template_text(clean_cand) or _TECH_ENGLISH_NOISE_RE.search(clean_cand):
+            continue
+        cleaned_candidates.append(clean_cand)
+
+    desc_source = ""
+    if prefer_spanish:
+        for cand in cleaned_candidates:
+            if _SPANISH_HINT_RE.search(cand):
+                desc_source = cand
+                break
+    if not desc_source and cleaned_candidates:
+        desc_source = cleaned_candidates[0]
 
     if not desc_source:
         if "yt_dlp" in low_ctx or "yt-dlp" in low_ctx or "music" in low_ctx or "músic" in low_ctx:
-            desc_source = "App para descargar y escuchar música"
+            desc_source = "Descargador local de música"
         elif "pomodoro" in low_ctx or "temporizador" in low_ctx:
             desc_source = "Temporizador minimalista para enfocarse"
         else:
@@ -359,6 +601,14 @@ def suggest_title_from_repo(
     desc = redact_secrets(desc_source, extra_secrets=extra_secrets)
     desc = " ".join(desc.split()).strip(" .,-:;")
     desc = _LEADING_FILLER_RE.sub("", desc).strip(" .,-:;")
+    desc = re.sub(
+        r"\b(?:local\s+)?en\s+python(?:\s+con\s+interfaz(?:\s+web)?)?\s+para\b",
+        "local para",
+        desc,
+        flags=re.IGNORECASE,
+    )
+    desc = re.sub(r"^local\s+para\s+", "App local para ", desc, flags=re.IGNORECASE)
+    desc = " ".join(desc.split()).strip(" .,-:;")
     # Strip duplicated leading brand from description
     if brand and desc.lower().startswith(brand.lower() + " "):
         trimmed = desc[len(brand) :].strip(" .,-:;")

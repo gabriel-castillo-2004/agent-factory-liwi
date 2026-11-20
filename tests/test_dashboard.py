@@ -2410,3 +2410,105 @@ def test_dashboard_logo_auto_svg_and_custom_upload_sanitization(tmp_path: Path) 
         store.close()
 
 
+def test_suggest_title_from_repo_filters_template_text_and_inspects_src_templates(
+    tmp_path: Path,
+) -> None:
+    """suggest_title_from_repo ignores base template placeholders in README/root index/package.json and extracts real app title & Spanish description from src/ HTML, docstrings/comments, and objective."""
+    from agent_factory.orchestrator import suggest_title_from_repo
+
+    ws_dir = tmp_path / "ws_yt_dl"
+    ws_dir.mkdir(parents=True)
+    (ws_dir / "README.md").write_text(
+        "# Agent Factory\n\n100% static web application base template for Agent Factory.\n",
+        encoding="utf-8",
+    )
+    (ws_dir / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "agent-factory-static-web-template",
+                "description": "100% static web application base template for Agent Factory (offline-ready, zero backend)",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (ws_dir / "index.html").write_text(
+        "<!DOCTYPE html><html><head><title>Static Web App</title></head>"
+        "<body><main id='app'></main></body></html>\n",
+        encoding="utf-8",
+    )
+
+    tpl_dir = ws_dir / "src" / "yt_music_dl" / "templates"
+    tpl_dir.mkdir(parents=True)
+    (tpl_dir / "index.html").write_text(
+        "<!DOCTYPE html><html lang='es'><head><title>YT Music DL</title></head>"
+        "<body><h1>YT Music DL - Descargador local de música de YouTube</h1></body></html>\n",
+        encoding="utf-8",
+    )
+    (ws_dir / "src" / "yt_music_dl" / "__init__.py").write_text(
+        "# YT Music DL: aplicación web local en español\n",
+        encoding="utf-8",
+    )
+    (ws_dir / "src" / "yt_music_dl" / "app.py").write_text(
+        '"""Flask application factory, local security middleware, and Waitress entrypoint."""\n'
+        "from flask import Flask\n",
+        encoding="utf-8",
+    )
+
+    suggested = suggest_title_from_repo(
+        ws_dir,
+        current_name="Aplicación web local en Python",
+        objective="Quiero una aplicación web local en Python con interfaz para descargar música de YouTube con yt-dlp",
+        plan_summary="App web local con Flask y yt-dlp para bajar audio de YouTube.",
+    )
+    low = suggested.lower()
+    for banned in (
+        "agent factory",
+        "agent-factory",
+        "static web app",
+        "static web application",
+        "base template",
+        "100% static web",
+        "flask application factory",
+    ):
+        assert banned not in low, f"Found unexpected noise '{banned}' in '{suggested}'"
+    assert " - " in suggested
+    assert len(suggested) <= 65
+    short_name, short_desc = suggested.split(" - ", 1)
+    assert short_name == "YT Music DL"
+    assert len(short_desc.strip()) >= 8
+
+    # Variant B: HTML inside src/ only carries <h1>YT Music DL</h1>, leading Python comment + objective provide Spanish summary
+    ws_minimal = tmp_path / "ws_yt_minimal"
+    ws_minimal.mkdir(parents=True)
+    (ws_minimal / "README.md").write_text(
+        "# Static Web Application\n\nBase template for Agent Factory.\n",
+        encoding="utf-8",
+    )
+    (ws_minimal / "index.html").write_text("<title>Static Web App</title>\n", encoding="utf-8")
+    min_tpl = ws_minimal / "src" / "yt_music_dl" / "templates"
+    min_tpl.mkdir(parents=True)
+    (min_tpl / "home.html").write_text(
+        "<html><head><title>Static Web App</title></head><body><h1>YT Music DL</h1></body></html>\n",
+        encoding="utf-8",
+    )
+    (ws_minimal / "src" / "yt_music_dl" / "main.py").write_text(
+        "# Descargador local de música de YouTube\n",
+        encoding="utf-8",
+    )
+    suggested_b = suggest_title_from_repo(
+        ws_minimal,
+        current_name="App música",
+        objective="Descargar canciones de YouTube en formato MP3 localmente",
+    )
+    low_b = suggested_b.lower()
+    assert "agent factory" not in low_b
+    assert "static web" not in low_b
+    assert "base template" not in low_b
+    assert " - " in suggested_b
+    assert len(suggested_b) <= 65
+    name_b, desc_b = suggested_b.split(" - ", 1)
+    assert name_b == "YT Music DL"
+    assert "música" in desc_b.lower() or "youtube" in desc_b.lower() or "mp3" in desc_b.lower()
+
+
+

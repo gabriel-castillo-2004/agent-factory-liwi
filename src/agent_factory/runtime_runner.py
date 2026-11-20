@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import logging
 import os
 import re
@@ -11,22 +12,27 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
 import weakref
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 from agent_factory.domain.models import validate_project_id
 from agent_factory.secrets import redact_secrets, sanitize_subprocess_env
-from agent_factory.workspace import SandboxViolationError, WorkspaceManager
+from agent_factory.workspace import (
+    SandboxViolationError,
+    WorkspaceManager,
+    ensure_workspace_git_excludes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -395,6 +401,60 @@ def _weak_atexit_cleanup(runner_ref: weakref.ref[LocalAppRunner]) -> None:
         runner.stop_all()
 
 
+def _venv_python_path(venv_dir: Path) -> Path:
+    """Return platform-appropriate python executable inside venv_dir."""
+    if os.name == "nt":
+        return venv_dir / "Scripts" / "python.exe"
+    return venv_dir / "bin" / "python"
+
+
+def _is_pyproject_dependency_manifest(pyproject_path: Path) -> bool:
+    """Return True if pyproject.toml defines package metadata/dependencies rather than pytest/tool settings only."""
+    try:
+        data = tomllib.loads(pyproject_path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    if "project" in data or "build-system" in data or "dependency-groups" in data:
+        return True
+    tool_tbl = data.get("tool", {})
+    if isinstance(tool_tbl, dict):
+        return any(k in tool_tbl for k in ("poetry", "pdm", "flit", "hatch"))
+    return False
+
+
+def _find_python_dependency_manifests(ws_dir: Path) -> tuple[list[Path], Path | None]:
+    """Locate contained non-symlink requirements.txt (root or src/) and dependency pyproject.toml."""
+    req_files: list[Path] = []
+    for raw_req in (ws_dir / "requirements.txt", ws_dir / "src" / "requirements.txt"):
+        if raw_req.exists() or raw_req.is_symlink():
+            contained = _ensure_contained(raw_req, ws_dir)
+            if contained.is_file():
+                req_files.append(contained)
+
+    pyproject_file: Path | None = None
+    raw_pyproj = ws_dir / "pyproject.toml"
+    if raw_pyproj.exists() or raw_pyproj.is_symlink():
+        contained_pyproj = _ensure_contained(raw_pyproj, ws_dir)
+        if contained_pyproj.is_file() and _is_pyproject_dependency_manifest(contained_pyproj):
+            pyproject_file = contained_pyproj
+
+    return req_files, pyproject_file
+
+
+def _compute_deps_hash(ws_dir: Path, manifests: Sequence[Path]) -> str:
+    """Compute deterministic SHA-256 over workspace-relative manifest paths and bytes."""
+    hasher = hashlib.sha256()
+    for manifest in sorted(manifests, key=lambda p: p.relative_to(ws_dir).as_posix()):
+        rel = manifest.relative_to(ws_dir).as_posix().encode("utf-8")
+        hasher.update(rel)
+        hasher.update(b"\0")
+        hasher.update(manifest.read_bytes())
+        hasher.update(b"\0")
+    return hasher.hexdigest()
+
+
 class LocalAppRunner:
     """Thread-safe manager launching/stopping generated apps on 127.0.0.1 ports 8081..8199."""
 
@@ -406,6 +466,7 @@ class LocalAppRunner:
         port_min: int = DEFAULT_PORT_MIN,
         port_max: int = DEFAULT_PORT_MAX,
         secrets_to_redact: Sequence[str] = (),
+        dep_command_runner: Callable[..., Any] | None = None,
     ) -> None:
         if host != LOOPBACK_HOST:
             raise ValueError(f"LocalAppRunner must bind exclusively to {LOOPBACK_HOST}, got '{host}'")
@@ -416,7 +477,11 @@ class LocalAppRunner:
         self.port_min = port_min
         self.port_max = port_max
         self.secrets_to_redact: tuple[str, ...] = tuple(secrets_to_redact)
+        self._dep_command_runner: Callable[..., Any] = (
+            dep_command_runner if dep_command_runner is not None else subprocess.run
+        )
         self._lock = threading.RLock()
+        self._dep_locks: dict[str, threading.Lock] = {}
         self._processes: dict[str, _RunningAppProcess] = {}
         atexit.register(_weak_atexit_cleanup, weakref.ref(self))
 
@@ -463,12 +528,20 @@ class LocalAppRunner:
         port: int,
         app_type: str,
         pythonpath: Path | None = None,
+        venv_dir: Path | None = None,
     ) -> dict[str, str]:
         clean = sanitize_subprocess_env()
         if app_type == "python_local":
             clean["PORT"] = str(port)
             clean["HOST"] = self.host
             clean["PYTHONUNBUFFERED"] = "1"
+            if venv_dir is not None:
+                venv_bin = str(_venv_python_path(venv_dir).parent)
+                existing_path = clean.get("PATH", "").strip()
+                clean["PATH"] = (
+                    f"{venv_bin}{os.pathsep}{existing_path}" if existing_path else venv_bin
+                )
+                clean["VIRTUAL_ENV"] = str(venv_dir)
             if pythonpath is not None:
                 existing_pp = clean.get("PYTHONPATH", "").strip()
                 clean["PYTHONPATH"] = (
@@ -478,6 +551,127 @@ class LocalAppRunner:
 
     def _redact(self, text: str) -> str:
         return redact_secrets(text, extra_secrets=self.secrets_to_redact)
+
+    def _run_dep_command(
+        self,
+        cmd: Sequence[str],
+        *,
+        cwd: Path,
+        env: Mapping[str, str],
+        timeout_seconds: float,
+        context: str,
+    ) -> None:
+        """Run isolated venv/pip command synchronously with timeout and redact any stderr on error."""
+        try:
+            res = self._dep_command_runner(
+                [str(part) for part in cmd],
+                cwd=str(cwd),
+                env=dict(env),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            raise LocalAppError(
+                f"{context}: tiempo de espera agotado tras {timeout_seconds:.0f}s."
+            ) from None
+        except (OSError, ValueError) as exc:
+            detail = self._redact(str(exc) or type(exc).__name__)
+            raise LocalAppError(f"{context}: {detail}") from None
+
+        if int(getattr(res, "exit_code", getattr(res, "returncode", 1))) != 0:
+            raw_out = getattr(res, "stderr", "") or getattr(res, "stdout", "") or ""
+            tail = " | ".join(line.strip() for line in str(raw_out).splitlines()[-6:] if line.strip())
+            detail = self._redact(tail) if tail else "código de salida distinto de cero"
+            raise LocalAppError(f"{context}: {detail}")
+
+    def _prepare_python_interpreter(
+        self,
+        project_id: str,
+        ws_dir: Path,
+        *,
+        install_deps: bool,
+        dep_install_timeout: float,
+    ) -> tuple[Path, Path | None]:
+        """Ensure per-workspace .venv and cached dependency install when manifests exist."""
+        req_files, pyproject_file = _find_python_dependency_manifests(ws_dir)
+        manifests: list[Path] = [*req_files, *([pyproject_file] if pyproject_file is not None else [])]
+        raw_venv = ws_dir / ".venv"
+        venv_dir = _ensure_contained(raw_venv, ws_dir)
+        venv_py = _ensure_contained(_venv_python_path(venv_dir), ws_dir)
+
+        if not manifests:
+            return Path(sys.executable), None
+
+        if not install_deps:
+            if venv_py.is_file():
+                return venv_py, venv_dir
+            return Path(sys.executable), None
+
+        with self._lock:
+            dep_lock = self._dep_locks.setdefault(project_id, threading.Lock())
+
+        with dep_lock:
+            target_hash = _compute_deps_hash(ws_dir, manifests)
+            hash_file = _ensure_contained(venv_dir / ".deps_hash", ws_dir)
+            if venv_py.is_file() and hash_file.is_file():
+                try:
+                    if hash_file.read_text(encoding="utf-8").strip() == target_hash:
+                        return venv_py, venv_dir
+                except OSError:
+                    pass
+
+            ensure_workspace_git_excludes(ws_dir)
+
+            dep_env = sanitize_subprocess_env()
+            dep_env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+            dep_env["PIP_NO_INPUT"] = "1"
+            dep_env["PYTHONUNBUFFERED"] = "1"
+            dep_env["VIRTUAL_ENV"] = str(venv_dir)
+
+            if not venv_py.is_file():
+                self._run_dep_command(
+                    [sys.executable, "-m", "venv", str(venv_dir)],
+                    cwd=ws_dir,
+                    env=dep_env,
+                    timeout_seconds=min(dep_install_timeout, 120.0),
+                    context=f"No se pudo crear el entorno virtual en '{project_id}'",
+                )
+                venv_py = _ensure_contained(_venv_python_path(venv_dir), ws_dir)
+                if not venv_py.is_file():
+                    raise LocalAppError(
+                        f"El entorno virtual '{venv_dir}' no generó el intérprete '{venv_py.name}'"
+                    )
+
+            existing_path = dep_env.get("PATH", "").strip()
+            venv_bin = str(venv_py.parent)
+            dep_env["PATH"] = f"{venv_bin}{os.pathsep}{existing_path}" if existing_path else venv_bin
+
+            for req_file in req_files:
+                rel_req = req_file.relative_to(ws_dir).as_posix()
+                self._run_dep_command(
+                    [str(venv_py), "-m", "pip", "install", "-r", str(req_file)],
+                    cwd=ws_dir,
+                    env=dep_env,
+                    timeout_seconds=dep_install_timeout,
+                    context=f"No se pudieron instalar dependencias desde '{rel_req}'",
+                )
+
+            if pyproject_file is not None and not req_files:
+                self._run_dep_command(
+                    [str(venv_py), "-m", "pip", "install", "-e", "."],
+                    cwd=ws_dir,
+                    env=dep_env,
+                    timeout_seconds=dep_install_timeout,
+                    context="No se pudieron instalar dependencias desde 'pyproject.toml'",
+                )
+
+            hash_file.parent.mkdir(parents=True, exist_ok=True)
+            hash_file.write_text(target_hash, encoding="utf-8")
+            return venv_py, venv_dir
 
     def get_status(
         self,
@@ -506,6 +700,8 @@ class LocalAppRunner:
         *,
         workspace_dir: Path | None = None,
         readiness_timeout: float = 8.0,
+        install_deps: bool = True,
+        dep_install_timeout: float = 180.0,
     ) -> LocalAppStatus:
         """Start project_id app on a free 127.0.0.1 port (8081..8199) and wait until HTTP socket is ready."""
         ws_dir = self._resolve_workspace_dir(project_id, workspace_dir)
@@ -529,24 +725,46 @@ class LocalAppRunner:
                     port=existing.port,
                 )
 
+        python_exe = Path(sys.executable)
+        venv_dir: Path | None = None
+        if app_info.app_type == "python_local":
+            python_exe, venv_dir = self._prepare_python_interpreter(
+                project_id,
+                ws_dir,
+                install_deps=install_deps,
+                dep_install_timeout=dep_install_timeout,
+            )
+
+        with self._lock:
+            self._prune_dead_locked()
+            existing = self._processes.get(project_id)
+            if existing is not None and existing.process.poll() is None:
+                return LocalAppStatus(
+                    running=True,
+                    url=existing.url,
+                    app_type=existing.app_type,
+                    port=existing.port,
+                )
+
             port = self._allocate_free_port_locked()
             url = f"http://{self.host}:{port}"
             sub_env = self._build_env(
                 port=port,
                 app_type=app_info.app_type,
                 pythonpath=app_info.pythonpath,
+                venv_dir=venv_dir,
             )
 
             if app_info.app_type == "static":
                 cmd = [sys.executable, "-m", "http.server", str(port), "--bind", self.host]
                 cwd = app_info.serve_dir
             elif app_info.module_name:
-                cmd = [sys.executable, "-m", app_info.module_name]
+                cmd = [str(python_exe), "-m", app_info.module_name]
                 cwd = ws_dir
             else:
                 assert app_info.entrypoint is not None
                 rel_entry = app_info.entrypoint.resolve().relative_to(ws_dir)
-                cmd = [sys.executable, str(rel_entry)]
+                cmd = [str(python_exe), str(rel_entry)]
                 cwd = ws_dir
 
             try:
@@ -694,6 +912,7 @@ def run_http_smoke_test(
     workspace_dir: Path,
     *,
     timeout_seconds: float = 8.0,
+    install_deps: bool = False,
 ) -> HttpSmokeTestResult:
     """Start project_id on 127.0.0.1, probe GET / and relative script/link resources, and stop cleanly."""
     ws_dir = Path(workspace_dir).resolve()
@@ -711,6 +930,7 @@ def run_http_smoke_test(
                 project_id,
                 workspace_dir=ws_dir,
                 readiness_timeout=timeout_seconds,
+                install_deps=install_deps,
             )
             started_url = started.url
         except (LocalAppError, SandboxViolationError, ValueError, OSError) as exc:
