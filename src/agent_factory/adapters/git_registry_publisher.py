@@ -1,6 +1,7 @@
 """Git registry branch publisher updating registry.json and per-project files without touching main (INV-19, INV-21, AC-3.4)."""
 
 import json
+import re
 import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -14,6 +15,7 @@ from agent_factory.domain.models import ProjectStatus, validate_project_id
 from agent_factory.ports.publisher import RegistryEntry, RegistryPublishError
 from agent_factory.ports.runner import CommandResult, Runner
 from agent_factory.secrets import redact_secrets
+from agent_factory.workspace import read_git_head_sha_from_disk
 
 PROTECTED_MAIN_BRANCHES: frozenset[str] = frozenset(
     {"main", "master", "refs/heads/main", "refs/heads/master"}
@@ -166,13 +168,26 @@ class GitRegistryPublisher:
         if fetch_res.exit_code != 0:
             return False
 
-        sha_res = self.runner.run(
-            ["git", "rev-parse", "HEAD", "FETCH_HEAD"], cwd=work_dir, env=self.env
-        )
-        shas = [line.strip() for line in sha_res.stdout.splitlines() if line.strip()]
-        if sha_res.exit_code != 0 or len(shas) < 2:
-            return False
-        local_sha, remote_sha = shas[0], shas[1]
+        local_sha = read_git_head_sha_from_disk(work_dir) or ""
+        remote_sha = ""
+        fetch_head_file = git_dir / "FETCH_HEAD"
+        if git_dir.is_dir() and fetch_head_file.is_file() and not fetch_head_file.is_symlink():
+            try:
+                first_line = fetch_head_file.read_text(encoding="utf-8", errors="ignore").splitlines()[0]
+                m_sha = re.match(r"^([0-9a-fA-F]{40})\b", first_line.strip())
+                if m_sha:
+                    remote_sha = m_sha.group(1).lower()
+            except (OSError, IndexError):
+                remote_sha = ""
+
+        if not local_sha or not remote_sha:
+            sha_res = self.runner.run(
+                ["git", "rev-parse", "HEAD", "FETCH_HEAD"], cwd=work_dir, env=self.env
+            )
+            shas = [line.strip() for line in sha_res.stdout.splitlines() if line.strip()]
+            if sha_res.exit_code != 0 or len(shas) < 2:
+                return False
+            local_sha, remote_sha = shas[0].lower(), shas[1].lower()
         if local_sha == remote_sha:
             return True
 
@@ -240,28 +255,36 @@ class GitRegistryPublisher:
         message: str,
         *,
         remote_synced: bool = False,
+        files_changed: bool = True,
     ) -> None:
-        """Stage changes, commit if index differs, and push if remote lags behind local HEAD."""
-        self._run_git(["add", "-A", "--", "registry.json", "projects"], cwd=work_dir)
-        diff_check = self.runner.run(
-            ["git", "diff", "--cached", "--quiet"],
-            cwd=work_dir,
-            env=self.env,
-        )
-        did_commit = diff_check.exit_code != 0
-        if did_commit:
-            self._run_git(
-                [
-                    "-c",
-                    "user.name=AgentFactory",
-                    "-c",
-                    "user.email=agent@factory.local",
-                    "commit",
-                    "-m",
-                    message,
-                ],
-                cwd=work_dir,
-            )
+        """Stage changes, commit if changed, and push if remote lags behind local HEAD."""
+        did_commit = False
+        if files_changed or not (work_dir / ".git").is_dir():
+            self._run_git(["add", "-A", "--", "registry.json", "projects"], cwd=work_dir)
+            commit_cmd = [
+                "git",
+                "-c",
+                "user.name=AgentFactory",
+                "-c",
+                "user.email=agent@factory.local",
+                "commit",
+                "-m",
+                message,
+            ]
+            commit_res = self.runner.run(commit_cmd, cwd=work_dir, env=self.env)
+            combined_commit = f"{commit_res.stdout}\n{commit_res.stderr}"
+            if commit_res.exit_code == 0:
+                did_commit = True
+            elif "nothing to commit" not in combined_commit.lower():
+                clean_err = redact_secrets(
+                    (commit_res.stderr or commit_res.stdout or f"exit code {commit_res.exit_code}"),
+                    extra_secrets=self.secrets,
+                    env=self.env,
+                )
+                err_obj = RegistryPublishError(f"Git command failed (commit): {clean_err}")
+                err_obj.__cause__ = None
+                err_obj.__context__ = None
+                raise err_obj
 
         if self.push_to_remote:
             if did_commit:
@@ -320,9 +343,11 @@ class GitRegistryPublisher:
 
         reg_file = work_dir / "registry.json"
         index_data: dict[str, object] = {"version": "1.0", "updated_at": None, "projects": {}}
+        prev_reg_txt: str | None = None
         if reg_file.exists():
             try:
-                raw_index = json.loads(reg_file.read_text(encoding="utf-8"))
+                prev_reg_txt = reg_file.read_text(encoding="utf-8")
+                raw_index = json.loads(prev_reg_txt)
                 if isinstance(raw_index, dict):
                     index_data = raw_index
             except (json.JSONDecodeError, OSError):
@@ -341,11 +366,19 @@ class GitRegistryPublisher:
             extra_secrets=self.secrets,
             env=self.env,
         )
-        reg_file.write_text(clean_index_json, encoding="utf-8")
+        reg_changed = prev_reg_txt != clean_index_json
+        if reg_changed:
+            reg_file.write_text(clean_index_json, encoding="utf-8")
 
         proj_dir = work_dir / "projects"
         proj_dir.mkdir(parents=True, exist_ok=True)
         proj_file = proj_dir / f"{status.project_id}.json"
+        prev_proj_txt: str | None = None
+        if proj_file.is_file():
+            try:
+                prev_proj_txt = proj_file.read_text(encoding="utf-8")
+            except OSError:
+                prev_proj_txt = None
 
         status_dict = status.model_dump(mode="json")
         status_dict = self._scrub_value(status_dict)
@@ -358,13 +391,16 @@ class GitRegistryPublisher:
             extra_secrets=self.secrets,
             env=self.env,
         )
-        proj_file.write_text(clean_proj_json, encoding="utf-8")
+        proj_changed = prev_proj_txt != clean_proj_json
+        if proj_changed:
+            proj_file.write_text(clean_proj_json, encoding="utf-8")
 
         self._commit_and_push_if_needed(
             work_dir,
             branch,
             f"chore(registry): update {status.project_id}",
             remote_synced=remote_synced,
+            files_changed=(reg_changed or proj_changed),
         )
         return entry
 

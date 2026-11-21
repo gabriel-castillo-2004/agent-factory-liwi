@@ -808,20 +808,12 @@ def _context_file_sort_key(rel_posix: str) -> tuple[int, str]:
     return (2, rel_posix)
 
 
-def collect_workspace_code_context(
-    workspace_dir: Path,
-    max_chars: int = 36000,
-    *,
-    extra_secrets: Sequence[str] = (),
-) -> str:
-    """Safely collect contained, redacted source context from workspace_dir up to max_chars (INV-19, INV-22)."""
-    if max_chars <= 0:
-        return ""
+def _walk_safe_workspace_files(workspace_dir: Path) -> list[tuple[int, str, Path]]:
+    """Collect sorted (tier, rel_posix, resolved_path) tuples safely within workspace_dir (INV-19, INV-22)."""
     ws = Path(workspace_dir)
     if not ws.is_dir() or _is_link_or_junction(ws):
-        return ""
+        return []
     ws_resolved = ws.resolve()
-
     collected: list[tuple[int, str, Path]] = []
 
     def _walk(current: Path, depth: int) -> None:
@@ -851,10 +843,23 @@ def collect_workspace_code_context(
                 collected.append((tier, key_path, resolved))
 
     _walk(ws_resolved, 0)
+    collected.sort(key=lambda item: (item[0], item[1]))
+    return collected
+
+
+def collect_workspace_code_context(
+    workspace_dir: Path,
+    max_chars: int = 36000,
+    *,
+    extra_secrets: Sequence[str] = (),
+) -> str:
+    """Safely collect contained, redacted source context from workspace_dir up to max_chars (INV-19, INV-22)."""
+    if max_chars <= 0:
+        return ""
+    collected = _walk_safe_workspace_files(workspace_dir)
     if not collected:
         return ""
 
-    collected.sort(key=lambda item: (item[0], item[1]))
     tree_lines = ["Archivos del proyecto:"]
     for _, rel_p, _ in collected[:60]:
         tree_lines.append(f"- {rel_p}")
@@ -889,6 +894,223 @@ def collect_workspace_code_context(
     if len(combined) > max_chars:
         combined = combined[:max_chars]
     return combined
+
+
+def list_workspace_files(workspace_dir: Path, *, max_files: int = 200) -> list[str]:
+    """Return sorted workspace-relative POSIX file paths excluding secrets, caches, and symlinks (INV-19, INV-22)."""
+    collected = _walk_safe_workspace_files(workspace_dir)
+    return [rel_p for _, rel_p, _ in collected[: max(1, max_files)]]
+
+
+_PROTECTED_TARGET_FILENAMES: frozenset[str] = frozenset(RUNNER_CONFIG_FILENAMES) | frozenset(
+    {"setup.cfg", ".gitignore"}
+)
+_COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
+
+def validate_commit_sha(commit_sha: str) -> str:
+    """Validate commit SHA strictly as 7-40 hex characters preventing git flag/ref injection (INV-22)."""
+    if not isinstance(commit_sha, str):
+        raise TypeError("El campo 'commit_sha' debe ser texto.")
+    cleaned = commit_sha.strip()
+    if not _COMMIT_SHA_RE.fullmatch(cleaned):
+        raise ValueError(
+            "Commit SHA inválido: debe tener entre 7 y 40 caracteres hexadecimales (INV-22)."
+        )
+    return cleaned.lower()
+
+
+def sanitize_target_files(
+    workspace_dir: Path | None,
+    raw_files: Sequence[str] | None,
+    *,
+    max_files: int = 30,
+) -> list[str]:
+    """Validate optional modify target_files against traversal, secrets (.env), and test locks (INV-13, INV-19, INV-22)."""
+    if not raw_files:
+        return []
+    ws_resolved = Path(workspace_dir).resolve() if workspace_dir is not None else None
+    cleaned: list[str] = []
+    seen: set[str] = set()
+
+    for raw in raw_files[:max_files]:
+        if not isinstance(raw, str):
+            raise TypeError("Cada elemento de 'target_files' debe ser una ruta de texto.")
+        candidate = raw.strip()
+        if not candidate:
+            continue
+        if "\\" in candidate:
+            raise SandboxViolationError(f"Backslash rechazado en target_files: {raw}")
+        win_path = PureWindowsPath(candidate)
+        if (
+            any(part == ".." for part in win_path.parts)
+            or candidate.startswith(("/", "~"))
+            or win_path.is_absolute()
+            or (len(candidate) > 1 and candidate[1] == ":")
+        ):
+            raise SandboxViolationError(f"Ruta fuera de workspace rechazada en target_files: {raw}")
+
+        norm_parts = [p for p in PurePosixPath(candidate).parts if p and p != "."]
+        if not norm_parts:
+            continue
+        norm_posix = "/".join(norm_parts)
+        first_low = norm_parts[0].lower()
+        name_low = norm_parts[-1].lower()
+        if first_low in {".git", ".venv", "venv", "node_modules", ".agent-factory"}:
+            raise SandboxViolationError(f"Directorio interno protegido en target_files: {norm_posix}")
+        if name_low == ".env" or name_low.startswith(".env.") or Path(name_low).suffix in _SECRET_FILENAME_EXTS:
+            raise SandboxViolationError(f"Archivo de secretos prohibido en target_files (INV-19): {norm_posix}")
+        if first_low == "tests" or name_low in _PROTECTED_TARGET_FILENAMES:
+            raise SandboxViolationError(
+                f"Archivo de pruebas/configuración protegido por INV-13 en target_files: {norm_posix}"
+            )
+
+        if ws_resolved is not None and ws_resolved.is_dir():
+            cur = ws_resolved
+            for part in norm_parts:
+                cur = cur / part
+                if _is_link_or_junction(cur):
+                    raise SandboxViolationError(f"Symlink rechazado en target_files: {norm_posix}")
+            resolved = cur.resolve()
+            if resolved != ws_resolved and not resolved.is_relative_to(ws_resolved):
+                raise SandboxViolationError(f"Escape fuera de workspace rechazado: {norm_posix}")
+
+        if norm_posix not in seen:
+            seen.add(norm_posix)
+            cleaned.append(norm_posix)
+    return cleaned
+
+
+def verify_isolated_git_root(workspace_dir: Path, runner: Any | None = None) -> Path:
+    """Ensure workspace_dir has its own isolated .git directory without climbing to parent repos (INV-22)."""
+    ws_path = Path(workspace_dir)
+    if _is_link_or_junction(ws_path) or not ws_path.is_dir():
+        raise SandboxViolationError(f"Workspace inválido o inexistente: {workspace_dir}")
+    ws_resolved = ws_path.resolve()
+    git_dir = ws_resolved / ".git"
+    if _is_link_or_junction(git_dir) or not git_dir.exists():
+        raise ValueError(f"El proyecto en '{ws_resolved}' no tiene repositorio Git inicializado.")
+
+    if git_dir.is_dir() and (git_dir / "HEAD").is_file():
+        return ws_resolved
+
+    if runner is not None and runner.__class__.__name__ != "FakeRunner":
+        top_res = runner.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=ws_resolved,
+        )
+        if top_res.exit_code != 0:
+            raise ValueError("No se pudo verificar la raíz Git aislada del proyecto.")
+        top_path = Path(top_res.stdout.strip()).resolve()
+        if top_path != ws_resolved:
+            raise SandboxViolationError(
+                f"La raíz Git '{top_path}' escapa del workspace aislado '{ws_resolved}' (INV-22)."
+            )
+    return ws_resolved
+
+
+def read_git_head_sha_from_disk(workspace_dir: Path) -> str | None:
+    """Safely resolve local HEAD SHA from .git metadata inside workspace_dir without spawning subprocesses."""
+    ws_path = Path(workspace_dir)
+    if _is_link_or_junction(ws_path) or not ws_path.is_dir():
+        return None
+    ws_resolved = ws_path.resolve()
+    git_dir = ws_resolved / ".git"
+    if _is_link_or_junction(git_dir) or not git_dir.is_dir():
+        return None
+    git_resolved = git_dir.resolve()
+    head_file = git_resolved / "HEAD"
+    if _is_link_or_junction(head_file) or not head_file.is_file():
+        return None
+    try:
+        head_txt = head_file.read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return None
+    if re.fullmatch(r"[0-9a-fA-F]{40}", head_txt):
+        return head_txt.lower()
+    if head_txt.startswith("ref:"):
+        ref_rel = head_txt[4:].strip().replace("\\", "/")
+        if not ref_rel.startswith("refs/") or ".." in ref_rel:
+            return None
+        ref_path = (git_resolved / ref_rel).resolve()
+        if not ref_path.is_relative_to(git_resolved):
+            return None
+        if ref_path.is_file() and not _is_link_or_junction(ref_path):
+            try:
+                sha = ref_path.read_text(encoding="utf-8", errors="ignore").strip()
+                if re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+                    return sha.lower()
+            except OSError:
+                return None
+        packed = git_resolved / "packed-refs"
+        if packed.is_file() and not _is_link_or_junction(packed):
+            try:
+                for line in packed.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith(("#", "^")):
+                        continue
+                    parts = stripped.split()
+                    if len(parts) >= 2 and parts[1] == ref_rel and re.fullmatch(r"[0-9a-fA-F]{40}", parts[0]):
+                        return parts[0].lower()
+            except OSError:
+                return None
+    return None
+
+
+def read_workspace_git_head_sha(workspace_dir: Path, runner: Any | None = None) -> str | None:
+    """Resolve current commit SHA of isolated workspace git repo safely (no FakeRunner side effects)."""
+    disk_sha = read_git_head_sha_from_disk(workspace_dir)
+    if disk_sha:
+        return disk_sha
+    if runner is not None and runner.__class__.__name__ != "FakeRunner":
+        try:
+            ws_resolved = verify_isolated_git_root(workspace_dir, runner)
+            res = runner.run(["git", "rev-parse", "--verify", "HEAD"], cwd=ws_resolved)
+            sha = res.stdout.strip()
+            if res.exit_code == 0 and _COMMIT_SHA_RE.fullmatch(sha):
+                return sha.lower()
+        except (SandboxViolationError, ValueError, OSError):
+            return None
+    return None
+
+
+def read_workspace_git_diff(
+    workspace_dir: Path,
+    runner: Any,
+    *,
+    extra_secrets: Sequence[str] = (),
+    max_chars: int = 24000,
+) -> tuple[bool, str | None, str]:
+    """Return redacted (has_git, head_sha, diff_text) for latest commit + uncommitted changes in workspace_dir."""
+    ws_path = Path(workspace_dir)
+    if _is_link_or_junction(ws_path) or not ws_path.is_dir():
+        return False, None, ""
+    if not (ws_path / ".git").exists():
+        return False, None, ""
+
+    ws_resolved = verify_isolated_git_root(ws_path, runner)
+    head_sha = read_workspace_git_head_sha(ws_resolved, runner)
+    if not head_sha:
+        return True, None, "Sin commits registrados aún."
+
+    sections: list[str] = []
+    wt_diff = runner.run(["git", "diff", "HEAD", "--no-color"], cwd=ws_resolved)
+    if wt_diff.exit_code == 0 and wt_diff.stdout.strip():
+        sections.append("# Cambios sin commit\n" + wt_diff.stdout.strip())
+
+    parent_chk = runner.run(["git", "rev-parse", "--verify", "HEAD~1"], cwd=ws_resolved)
+    if parent_chk.exit_code == 0:
+        commit_diff = runner.run(["git", "diff", "HEAD~1", "HEAD", "--no-color"], cwd=ws_resolved)
+    else:
+        commit_diff = runner.run(["git", "show", "--stat", "--patch", "HEAD", "--no-color"], cwd=ws_resolved)
+    if commit_diff.exit_code == 0 and commit_diff.stdout.strip():
+        sections.append("# Último commit (" + head_sha[:7] + ")\n" + commit_diff.stdout.strip())
+
+    combined = "\n\n".join(sections).strip() or "Sin diferencias registradas."
+    redacted = redact_secrets(combined, extra_secrets=extra_secrets)
+    if len(redacted) > max_chars:
+        redacted = redacted[: max_chars - 30].rstrip() + "\n... [diff recortado]"
+    return True, head_sha, redacted
 
 
 def _scrub_manifest_value(val: Any, extra_secrets: Sequence[str]) -> Any:

@@ -2699,6 +2699,140 @@ def test_build_worker_writes_manifest_json_without_secrets_and_commits_to_git(
     assert ".agent-factory/state.json" not in tree_files
 
 
+def test_agy_llm_adapter_uses_stdin_or_temp_file_for_long_prompts_avoiding_winerror_206(
+    tmp_path: Path,
+) -> None:
+    """AgyLLMAdapter keeps short prompts in argv and switches prompts >6,000 chars to stdin (or temp-file fallback) so Windows argv never hits WinError 206."""
+    import sys
+
+    from agent_factory.adapters.agy_llm_adapter import AgyLLMAdapter
+    from agent_factory.adapters.fake_runner import FakeRunner
+    from agent_factory.adapters.subprocess_runner import SubprocessRunner
+
+    # 1. Short prompt preserves legacy -p <prompt> argv invocation
+    short_runner = FakeRunner(results=[CommandResult(exit_code=0, stdout='{"ok": true}')])
+    short_adapter = AgyLLMAdapter(runner=short_runner, cwd=tmp_path)
+    assert short_adapter.complete([{"role": "user", "content": "hola corto"}]) == {"ok": True}
+    assert "hola corto" in " ".join(short_runner.calls[0]["command"])
+    assert short_runner.calls[0]["input"] is None
+
+    # 2. Long prompt (> 10,000 chars) passes payload via stdin and keeps argv tiny
+    long_body = "CODIGO_REPOSITORIO_" + ("x" * 12500)
+    long_runner = FakeRunner(results=[CommandResult(exit_code=0, stdout='{"reply": "audit ok"}')])
+    long_adapter = AgyLLMAdapter(runner=long_runner, cwd=tmp_path)
+    out = long_adapter.complete(
+        [{"role": "user", "content": long_body}],
+        schema={"type": "object", "properties": {"reply": {"type": "string"}}},
+    )
+    assert out == {"reply": "audit ok"}
+    call_long = long_runner.calls[0]
+    assert sum(len(a) for a in call_long["command"]) < 1000
+    assert long_body not in " ".join(call_long["command"])
+    assert isinstance(call_long["input"], str)
+    assert len(call_long["input"]) > 12500
+    assert long_body in call_long["input"]
+
+    # 3. Fallback to UTF-8 temp file (cleaned up in finally) if custom runner lacks 'input' kwarg
+    class _NoInputRunner:
+        def __init__(self) -> None:
+            self.seen_files: list[Path] = []
+            self.seen_text: list[str] = []
+            self.argv_len: int = 0
+
+        def run(self, command, cwd, timeout_seconds=30.0, env=None):
+            self.argv_len = sum(len(str(x)) for x in command)
+            joined = " ".join(str(x) for x in command)
+            for token in command:
+                p = Path(str(token).split(":", 1)[-1].strip()) if ":" in str(token) else Path(str(token))
+                if p.suffix == ".txt" and p.exists():
+                    self.seen_files.append(p)
+                    self.seen_text.append(p.read_text(encoding="utf-8"))
+            assert len(joined) < 1000
+            return CommandResult(exit_code=0, stdout='{"fallback": "temp-ok"}')
+
+    no_in_runner = _NoInputRunner()
+    fb_adapter = AgyLLMAdapter(runner=no_in_runner, cwd=tmp_path)
+    assert fb_adapter.complete([{"role": "user", "content": long_body}]) == {"fallback": "temp-ok"}
+    assert len(no_in_runner.seen_files) == 1
+    assert long_body in no_in_runner.seen_text[0]
+    assert not no_in_runner.seen_files[0].exists()
+
+    # 4. Real SubprocessRunner executes >20,000-char prompt via stdin without WinError 206
+    echo_script = tmp_path / "echo_stdin_len.py"
+    echo_script.write_text(
+        "import json, sys\n"
+        "data = sys.stdin.read()\n"
+        "print(json.dumps({'chars': len(data)}))\n",
+        encoding="utf-8",
+    )
+    real_adapter = AgyLLMAdapter(
+        runner=SubprocessRunner(default_timeout_seconds=10.0),
+        cli_command=[sys.executable, str(echo_script)],
+        cwd=tmp_path,
+    )
+    huge_res = real_adapter.complete([{"role": "user", "content": "Z" * 22000}])
+    assert huge_res["chars"] > 22000
+
+
+def test_build_worker_records_commit_sha_and_version_label_on_project_delivered(
+    tmp_path: Path,
+) -> None:
+    """BuildWorker records commit_sha and incremental version_label ('v1', 'v2') in PROJECT_DELIVERED payload."""
+    import subprocess
+
+    from agent_factory.adapters.github_vcs_adapter import GitHubVCSAdapter
+
+    pid = "proj-checkpoints-ver"
+    orch, store = _create_approved_project(pid, num_tests=1, approve=True)
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_ver")
+    ws_dir = ws_mgr.create_workspace(pid)
+    bare_remote = tmp_path / "bare_ver_remote.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare_remote)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare_remote)], cwd=ws_dir, check=True)
+
+    vcs = GitHubVCSAdapter(repo_base_url=str(tmp_path), github_token="")
+    worker = BuildWorker(
+        orchestrator=orch,
+        workspace_manager=ws_mgr,
+        code_agent=FakeCodeAgent(
+            test_gen_steps=[{"tests/test_app.py": "def test_ok(): assert True\n"}],
+            impl_steps=[
+                {"index.html": "<h1>v1</h1>\n"},
+                {"index.html": "<h1>v2</h1>\n"},
+            ],
+        ),
+        runner=FakeRunner(
+            results=[
+                CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True}),
+                CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True, "MOD-02": True}),
+            ]
+        ),
+        vcs=vcs,
+    )
+
+    worker.run_job(pid)
+    delivered_events = [e for e in store.get_events(pid) if e.type == EventType.PROJECT_DELIVERED]
+    assert len(delivered_events) == 1
+    v1_sha = delivered_events[0].payload.get("commit_sha")
+    assert isinstance(v1_sha, str) and len(v1_sha) == 40
+    assert delivered_events[0].payload.get("version_label") == "v1"
+
+    # Trigger post-delivery modify -> v2 delivery has distinct commit_sha and version_label='v2'
+    orch.modify_project(pid, "Update header to v2")
+    worker.queue.remove(pid)
+    worker.enqueue_approved_project(pid)
+    worker.run_job(pid)
+
+    delivered_events2 = [e for e in store.get_events(pid) if e.type == EventType.PROJECT_DELIVERED]
+    assert len(delivered_events2) == 2
+    v2_sha = delivered_events2[1].payload.get("commit_sha")
+    assert isinstance(v2_sha, str) and len(v2_sha) == 40
+    assert v2_sha != v1_sha
+    assert delivered_events2[1].payload.get("version_label") == "v2"
+
+
+
 
 
 

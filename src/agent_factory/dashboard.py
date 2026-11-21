@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_factory.adapters.github_vcs_adapter import VcsError
+from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.builder import BuildWorker
 from agent_factory.domain.events import Event, EventType
 from agent_factory.domain.models import ApprovalEvent, ProjectStatus, validate_project_id
@@ -29,7 +30,7 @@ from agent_factory.orchestrator import (
 )
 from agent_factory.ports.code_agent import CodeAgentError
 from agent_factory.ports.llm import LLMError
-from agent_factory.ports.runner import CommandTimeoutError
+from agent_factory.ports.runner import CommandTimeoutError, Runner
 from agent_factory.runtime_runner import LocalAppError, LocalAppRunner
 from agent_factory.scaffold import TemplateScaffold
 from agent_factory.secrets import redact_secrets
@@ -83,6 +84,7 @@ class DashboardController:
         logos_dir: Path | None = None,
         chats_dir: Path | None = None,
         vcs: Any | None = None,
+        runner: Runner | None = None,
         secrets_to_redact: Sequence[str] = (),
     ) -> None:
         self.orchestrator = orchestrator
@@ -95,6 +97,7 @@ class DashboardController:
             if vcs is not None
             else getattr(build_worker, "vcs", None) or getattr(orchestrator, "vcs", None)
         )
+        self.runner = runner
         if model_resolver is not None:
             self.model_resolver = model_resolver
         else:
@@ -804,6 +807,114 @@ class DashboardController:
             "suggested_title": suggested,
         }
 
+    def _effective_git_runner(self) -> Runner:
+        """Return explicit Runner or real SubprocessRunner for isolated workspace git/pytest checks."""
+        if self.runner is not None:
+            return self.runner
+        worker_runner = getattr(self.build_worker, "runner", None)
+        if worker_runner is not None and worker_runner.__class__.__name__ != "FakeRunner":
+            return worker_runner
+        vcs_runner = getattr(self.vcs, "runner", None)
+        if vcs_runner is not None and vcs_runner.__class__.__name__ != "FakeRunner":
+            return vcs_runner
+        return SubprocessRunner(default_timeout_seconds=25.0)
+
+    def _require_project_events(self, project_id: str) -> list[Event]:
+        """Validate project_id and ensure at least one event exists or raise ProjectNotFoundError."""
+        validate_project_id(project_id)
+        events = self.orchestrator.store.get_events(project_id)
+        if not events:
+            raise ProjectNotFoundError(f"Project '{project_id}' not found")
+        return events
+
+    def get_project_checkpoints(self, project_id: str) -> dict[str, Any]:
+        """Return delivered version checkpoints (newest first) for Rollback panel."""
+        self._require_project_events(project_id)
+        checkpoints = self.orchestrator.list_project_checkpoints(
+            project_id,
+            extra_secrets=self.secrets_to_redact,
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "checkpoints": checkpoints,
+        }
+
+    def get_project_files(self, project_id: str) -> dict[str, Any]:
+        """Return safe sorted relative file paths for Vista Desarrollador without .env."""
+        self._require_project_events(project_id)
+        ws_mgr = self._sync_external_workspace(project_id)
+        files = self.orchestrator.list_project_files(project_id, workspace_manager=ws_mgr)
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "files": files,
+        }
+
+    def get_project_diff(self, project_id: str) -> dict[str, Any]:
+        """Return redacted Git diff for project_id workspace (INV-19, INV-22)."""
+        self._require_project_events(project_id)
+        ws_mgr = self._sync_external_workspace(project_id)
+        diff_info = self.orchestrator.get_project_diff(
+            project_id,
+            workspace_manager=ws_mgr,
+            runner=self._effective_git_runner(),
+            extra_secrets=self.secrets_to_redact,
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            **diff_info,
+        }
+
+    def rollback_project(self, project_id: str, commit_sha: str) -> dict[str, Any]:
+        """Restore isolated repository to commit_sha, run pytest + smoke test, push if remote, and record DELIVERED."""
+        self._require_project_events(project_id)
+        with self._lock:
+            if project_id in self._active_projects:
+                raise ProjectConflictError(
+                    f"Project '{project_id}' already has an active background operation"
+                )
+            self._active_projects.add(project_id)
+            ws_mgr = self._sync_external_workspace(project_id)
+            if self.local_runner.workspace_manager is None and ws_mgr is not None:
+                self.local_runner.workspace_manager = ws_mgr
+            eff_runner = self._effective_git_runner()
+        try:
+            try:
+                updated, cp_info = self.orchestrator.rollback_project(
+                    project_id,
+                    commit_sha,
+                    workspace_manager=ws_mgr,
+                    runner=eff_runner,
+                    local_app_runner=self.local_runner,
+                    vcs=self.vcs,
+                    extra_secrets=self.secrets_to_redact,
+                )
+            except (IllegalTransition, VcsError, RuntimeError) as exc:
+                clean_msg = redact_secrets(str(exc), extra_secrets=self.secrets_to_redact)
+                raise ProjectConflictError(clean_msg) from exc
+        finally:
+            with self._lock:
+                self._active_projects.discard(project_id)
+
+        summary = self._serialize_summary(
+            project_id,
+            updated,
+            self.orchestrator.store.get_events(project_id),
+            has_plan=(self.orchestrator.get_plan(project_id) is not None),
+        )
+        checkpoints = self.orchestrator.list_project_checkpoints(
+            project_id, extra_secrets=self.secrets_to_redact
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "checkpoint": cp_info,
+            "checkpoints": checkpoints,
+            "status": summary,
+        }
+
     def get_project_chat(self, project_id: str) -> dict[str, Any]:
         """Return persisted read-only audit/Q&A chat history for project_id."""
         validate_project_id(project_id)
@@ -1040,7 +1151,13 @@ class DashboardController:
             "status": summary,
         }
 
-    def modify_project(self, project_id: str, instructions: str) -> dict[str, Any]:
+    def modify_project(
+        self,
+        project_id: str,
+        instructions: str,
+        *,
+        target_files: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
         """Submit post-delivery modification instructions on a DELIVERED project preserving workspace (INV-13)."""
         validate_project_id(project_id)
         events = self.orchestrator.store.get_events(project_id)
@@ -1056,10 +1173,15 @@ class DashboardController:
                 raise ProjectConflictError(
                     f"Project '{project_id}' already has an active background operation"
                 )
-            self._sync_external_workspace(project_id)
+            ws_mgr = self._sync_external_workspace(project_id)
             self.local_runner.stop(project_id)
             try:
-                updated = self.orchestrator.modify_project(project_id, clean_instructions)
+                updated = self.orchestrator.modify_project(
+                    project_id,
+                    clean_instructions,
+                    target_files=target_files,
+                    workspace_manager=ws_mgr,
+                )
             except IllegalTransition as exc:
                 raise ProjectConflictError(str(exc)) from exc
 
@@ -2256,6 +2378,71 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       padding-top: 8px;
       border-top: 1px dashed var(--border);
     }
+    .tech-mode-hint { font-size: 0.76rem; }
+    .versions-box {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: var(--surface-alt);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .versions-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .versions-row > select { flex: 1; min-width: 190px; }
+    .diff-pre {
+      max-height: 300px;
+      overflow: auto;
+      padding: 10px;
+      border-radius: 8px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      font-size: 0.78rem;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .detail-work-split.preview-open {
+      display: grid;
+      grid-template-columns: minmax(340px, 1fr) minmax(360px, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
+    @media (max-width: 1080px) {
+      .detail-work-split.preview-open { grid-template-columns: 1fr; }
+    }
+    .preview-card {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface-alt);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      position: sticky;
+      top: 72px;
+    }
+    .preview-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+    #live-preview-iframe {
+      width: 100%;
+      height: 540px;
+      border: 0;
+      background: #ffffff;
+    }
   </style>
 </head>
 <body>
@@ -2274,9 +2461,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <input id="voice-tts-toggle" type="checkbox" />
         <span>Leer respuestas en voz alta</span>
       </label>
-      <label class="tech-toggle" title="Mostrar IDs, detalles JSON, modelos por paso y trazas técnicas">
+      <label class="tech-toggle" title="Modo técnico: alterna entre Vista Simple y Vista Desarrollador">
         <input id="tech-mode-toggle" type="checkbox" />
-        <span>Modo técnico</span>
+        <span id="view-mode-label">Vista Simple</span>
+        <span class="tech-mode-hint muted">(Vista Desarrollador)</span>
       </label>
       <button id="theme-btn" class="btn" type="button">Modo claro</button>
     </div>
@@ -2320,45 +2508,60 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <section class="panel" id="detail-panel">
       <div id="detail-empty" class="empty-box">Selecciona un proyecto de la lista para ver su estado y detalles.</div>
       <div id="detail-content" style="display:none">
-        <div class="detail-header">
-          <div class="detail-titles">
-            <div class="title-row">
-              <img id="detail-logo-img" class="detail-logo" src="" alt="Logo del proyecto" style="display:none" />
-              <h2 id="detail-title" class="detail-title"></h2>
-              <button id="edit-title-btn" class="btn-icon" type="button" title="Editar título" aria-label="Editar título">✏️</button>
-              <button id="change-logo-btn" class="btn btn-sm" type="button" title="Subir logo propio">Cambiar logo</button>
-              <input id="logo-file-input" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" style="display:none" />
+        <div id="detail-work-split" class="detail-work-split">
+          <div id="detail-main-col">
+            <div class="detail-header">
+              <div class="detail-titles">
+                <div class="title-row">
+                  <img id="detail-logo-img" class="detail-logo" src="" alt="Logo del proyecto" style="display:none" />
+                  <h2 id="detail-title" class="detail-title"></h2>
+                  <button id="edit-title-btn" class="btn-icon" type="button" title="Editar título" aria-label="Editar título">✏️</button>
+                  <button id="change-logo-btn" class="btn btn-sm" type="button" title="Subir logo propio">Cambiar logo</button>
+                  <input id="logo-file-input" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" style="display:none" />
+                </div>
+                <form id="edit-title-form" class="edit-title-form" style="display:none">
+                  <input id="edit-title-input" class="input-field input-inline" type="text" maxlength="80" placeholder="Nombre del proyecto" required />
+                  <button id="suggest-title-btn" class="btn btn-sm" type="button" title="Analizar archivos del repositorio y sugerir título">✨ Sugerir analizando repo</button>
+                  <label id="rename-github-wrap" class="rename-github-check" style="display:none">
+                    <input id="rename-github-checkbox" type="checkbox" checked />
+                    <span>Renombrar también en GitHub</span>
+                  </label>
+                  <button id="save-title-btn" class="btn btn-primary btn-sm" type="submit">Guardar</button>
+                  <button id="cancel-title-btn" class="btn btn-sm" type="button">Cancelar</button>
+                </form>
+              </div>
+              <span id="detail-badge" class="badge"></span>
             </div>
-            <form id="edit-title-form" class="edit-title-form" style="display:none">
-              <input id="edit-title-input" class="input-field input-inline" type="text" maxlength="80" placeholder="Nombre del proyecto" required />
-              <button id="suggest-title-btn" class="btn btn-sm" type="button" title="Analizar archivos del repositorio y sugerir título">✨ Sugerir analizando repo</button>
-              <label id="rename-github-wrap" class="rename-github-check" style="display:none">
-                <input id="rename-github-checkbox" type="checkbox" checked />
-                <span>Renombrar también en GitHub</span>
-              </label>
-              <button id="save-title-btn" class="btn btn-primary btn-sm" type="submit">Guardar</button>
-              <button id="cancel-title-btn" class="btn btn-sm" type="button">Cancelar</button>
-            </form>
+            <div id="detail-segments" class="stage-segments"></div>
+            <div id="detail-time" class="muted" style="font-size:0.78rem; margin:-2px 0 10px 0; text-align:right;"></div>
+
+            <div id="detail-guidance"></div>
+
+            <div class="tabs">
+              <button class="tab-btn active" data-tab="spec" type="button">Resumen</button>
+              <button class="tab-btn" data-tab="plan" type="button">Plan</button>
+              <button class="tab-btn" data-tab="events" type="button">Historial</button>
+              <button id="tab-audit-btn" class="tab-btn" data-tab="audit" type="button" style="display:none">Consultar y Auditar proyecto</button>
+            </div>
+            <div id="tab-spec" class="tab-content"></div>
+            <div id="tab-plan" class="tab-content" style="display:none"></div>
+            <div id="tab-events" class="tab-content" style="display:none"></div>
+            <div id="tab-audit" class="tab-content" style="display:none"></div>
+
+            <div id="detail-secondary"></div>
           </div>
-          <span id="detail-badge" class="badge"></span>
+          <div id="live-preview-panel" class="preview-card" style="display:none">
+            <div class="preview-toolbar">
+              <strong style="font-size:0.88rem;">Vista previa visual</strong>
+              <div style="display:flex; gap:6px; flex-wrap:wrap;">
+                <button id="reload-preview-btn" class="btn btn-sm" type="button">Recargar vista previa</button>
+                <a id="open-preview-tab-link" href="#" target="_blank" rel="noopener noreferrer" class="btn btn-sm">Abrir en pestaña</a>
+                <button id="close-preview-btn" class="btn btn-sm" type="button">Cerrar</button>
+              </div>
+            </div>
+            <iframe id="live-preview-iframe" title="Vista previa en vivo" src="about:blank"></iframe>
+          </div>
         </div>
-        <div id="detail-segments" class="stage-segments"></div>
-        <div id="detail-time" class="muted" style="font-size:0.78rem; margin:-2px 0 10px 0; text-align:right;"></div>
-
-        <div id="detail-guidance"></div>
-
-        <div class="tabs">
-          <button class="tab-btn active" data-tab="spec" type="button">Resumen</button>
-          <button class="tab-btn" data-tab="plan" type="button">Plan</button>
-          <button class="tab-btn" data-tab="events" type="button">Historial</button>
-          <button id="tab-audit-btn" class="tab-btn" data-tab="audit" type="button" style="display:none">Consultar y Auditar proyecto</button>
-        </div>
-        <div id="tab-spec" class="tab-content"></div>
-        <div id="tab-plan" class="tab-content" style="display:none"></div>
-        <div id="tab-events" class="tab-content" style="display:none"></div>
-        <div id="tab-audit" class="tab-content" style="display:none"></div>
-
-        <div id="detail-secondary"></div>
       </div>
     </section>
   </main>
@@ -2376,6 +2579,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       chatHistories: {},
       chatLoadedFor: {},
       lastChatSig: null,
+      checkpointsByPid: {},
+      filesByPid: {},
+      diffByPid: {},
+      devMetaLoadedSig: {},
+      targetFilesSelected: {},
+      previewOpen: {},
+      previewRenderedUrl: {},
+      diffOpen: {},
       voiceTts: false,
       lastSpokenQuestionKey: null,
       editingTitlePid: null,
@@ -2526,6 +2737,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.body.classList.toggle('tech-mode', on);
       const cb = document.getElementById('tech-mode-toggle');
       if (cb) cb.checked = on;
+      const modeLbl = document.getElementById('view-mode-label');
+      if (modeLbl) {
+        modeLbl.textContent = on ? 'Vista Desarrollador' : 'Vista Simple';
+      }
       try { localStorage.setItem('af_tech_mode', on ? '1' : '0'); } catch (_) {}
     }
 
@@ -3168,7 +3383,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
 
       if (st.state === 'DELIVERED' || st.state === 'COMPLETED') {
+        const pid = st.project_id;
         const localApp = st.local_app || { running: false, url: null, app_type: 'unknown' };
+        const isPrevOpen = Boolean(state.previewOpen && state.previewOpen[pid] && localApp.running && localApp.url);
         const repoBtn = (st.links && st.links.repo)
           ? '<a href="' + escapeHtml(st.links.repo) + '" target="_blank" rel="noopener noreferrer" class="btn">Abrir repositorio en GitHub</a>'
           : '';
@@ -3179,16 +3396,40 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           ? '<a href="' + escapeHtml(localApp.lan_url) + '" target="_blank" rel="noopener noreferrer" class="btn btn-sm">Abrir desde celular</a>' +
             '<span class="model-pill">' + escapeHtml(localApp.lan_url) + '</span>'
           : '';
+        const prevBtn = (localApp.running && localApp.url)
+          ? '<button id="toggle-preview-btn" class="btn btn-sm" type="button" data-dact="toggle-preview">' +
+            (isPrevOpen ? 'Ocultar vista previa' : 'Mostrar vista previa aquí') + '</button>'
+          : '';
         const localBtns = (localApp.running && localApp.url)
           ? '<a href="' + escapeHtml(localApp.url) + '" target="_blank" rel="noopener noreferrer" class="btn btn-success">Abrir app en local</a>' +
+            prevBtn +
             '<button class="btn btn-warn" data-dact="local-stop">Apagar</button>' +
-            '<span class="model-pill">' + escapeHtml(localApp.url) + '</span>' +
+            '<span class="model-pill tech-only">' + escapeHtml(localApp.url) + '</span>' +
             lanBtn
           : '<button class="btn btn-primary" data-dact="local-start">Encender en local</button>';
         const descMsg = localApp.app_type === 'python_local'
           ? 'Proyecto local con servidor Python listo para ejecutarse en tu computadora.'
           : 'El proyecto ha sido construido y verificado exitosamente.';
-        const modifyDraft = escapeHtml((state.modifyDrafts && state.modifyDrafts[st.project_id]) || '');
+        const modifyDraft = escapeHtml((state.modifyDrafts && state.modifyDrafts[pid]) || '');
+        const filesList = (state.filesByPid && state.filesByPid[pid]) || [];
+        const selSet = new Set((state.targetFilesSelected && state.targetFilesSelected[pid]) || []);
+        const fileOptsHtml = filesList.map((fp) =>
+          '<option value="' + escapeHtml(fp) + '"' + (selSet.has(fp) ? ' selected' : '') + '>' + escapeHtml(fp) + '</option>'
+        ).join('');
+        const cps = (state.checkpointsByPid && state.checkpointsByPid[pid]) || [];
+        const validCps = cps.filter((c) => c && c.commit_sha);
+        const cpOptsHtml = validCps.map((c) => {
+          const shaShort = c.short_sha || String(c.commit_sha || '').slice(0, 7);
+          const timeLbl = formatFriendlyTime(c.delivered_at);
+          const curTag = c.is_current ? ' (actual)' : '';
+          const txt = c.version_label + curTag + (timeLbl ? (' · ' + timeLbl) : '');
+          return '<option value="' + escapeHtml(c.commit_sha) + '" title="' + escapeHtml(c.commit_sha) + '">' + escapeHtml(txt) + '</option>';
+        }).join('');
+        const rollbackDisabled = validCps.length === 0 ? ' disabled' : '';
+        const curCp = validCps.find((c) => c.is_current) || validCps[0] || null;
+        const diffInfo = (state.diffByPid && state.diffByPid[pid]) || null;
+        const diffText = diffInfo && diffInfo.diff ? diffInfo.diff : 'Sin cambios recientes registrados o sin repositorio Git.';
+        const diffOpenAttr = (state.diffOpen && state.diffOpen[pid]) ? ' open' : '';
         return '<div class="guidance-banner banner-ok">' +
           '<div class="banner-content">' +
             '<div class="banner-icon">🎉</div>' +
@@ -3207,10 +3448,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               '<textarea id="modify-project-input" class="input-field" rows="2" placeholder="Describe qué quieres mejorar, cambiar o agregar al proyecto...">' + modifyDraft + '</textarea>' +
               '<button id="modify-mic-btn" class="btn btn-sm mic-btn" type="button" title="Dictar cambios por voz (es-MX)">🎤</button>' +
             '</div>' +
+            '<div id="modify-target-files-wrap" class="tech-only" style="margin-top:8px;">' +
+              '<label for="modify-target-files" class="muted" style="display:block; font-size:0.78rem; margin-bottom:4px;">Archivos objetivo (opcional):</label>' +
+              '<select id="modify-target-files" class="input-field" multiple size="4">' + fileOptsHtml + '</select>' +
+            '</div>' +
             '<div class="banner-actions">' +
               '<button id="modify-project-btn" class="btn btn-primary btn-sm" type="button">Aplicar cambios</button>' +
             '</div>' +
           '</div>' +
+          '<div class="versions-box">' +
+            '<div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">' +
+              '<div class="modify-box-title" style="margin:0;">Versiones estables (Rollback)</div>' +
+              (curCp ? '<span class="model-pill tech-only">HEAD: ' + escapeHtml(curCp.short_sha || curCp.commit_sha) + '</span>' : '') +
+            '</div>' +
+            '<div class="versions-row">' +
+              '<select id="rollback-version-select" class="input-field"' + rollbackDisabled + '>' +
+                (validCps.length ? cpOptsHtml : '<option value="">Sin checkpoints Git registrados</option>') +
+              '</select>' +
+              '<button id="rollback-version-btn" class="btn btn-sm btn-warn" type="button"' + rollbackDisabled + '>Restaurar esta versión</button>' +
+            '</div>' +
+          '</div>' +
+          '<details id="git-diff-details" class="tech-details tech-only"' + diffOpenAttr + '>' +
+            '<summary>Últimos cambios (git diff)</summary>' +
+            '<pre id="git-diff-pre" class="diff-pre">' + escapeHtml(diffText) + '</pre>' +
+          '</details>' +
         '</div>';
       }
 
@@ -3712,6 +3973,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         inact,
         st.links,
         st.local_app,
+        Boolean(state.previewOpen[st.project_id]),
+        (state.checkpointsByPid[st.project_id] || []).length,
+        (state.filesByPid[st.project_id] || []).length,
+        Boolean(state.diffByPid[st.project_id]),
       ]);
 
       const guidanceEl = document.getElementById('detail-guidance');
@@ -3775,9 +4040,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         const modifyInput = document.getElementById('modify-project-input');
         const modifyBtn = document.getElementById('modify-project-btn');
+        const targetSelect = document.getElementById('modify-target-files');
         if (modifyInput) {
           modifyInput.addEventListener('input', () => {
             state.modifyDrafts[st.project_id] = modifyInput.value;
+          });
+        }
+        if (targetSelect) {
+          targetSelect.addEventListener('change', () => {
+            state.targetFilesSelected[st.project_id] = Array.from(targetSelect.selectedOptions).map((o) => o.value);
           });
         }
         wireMicButton('modify-mic-btn', 'modify-project-input');
@@ -3785,15 +4056,41 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           modifyBtn.addEventListener('click', async () => {
             modifyBtn.disabled = true;
             try {
-              await submitModifyProject(st.project_id, modifyInput.value);
+              const selFiles = targetSelect
+                ? Array.from(targetSelect.selectedOptions).map((o) => o.value).filter(Boolean)
+                : [];
+              await submitModifyProject(st.project_id, modifyInput.value, selFiles);
             } finally {
               if (document.body.contains(modifyBtn)) modifyBtn.disabled = false;
             }
           });
         }
+
+        const rbSelect = document.getElementById('rollback-version-select');
+        const rbBtn = document.getElementById('rollback-version-btn');
+        if (rbBtn && rbSelect) {
+          rbBtn.addEventListener('click', async () => {
+            const sha = rbSelect.value;
+            if (!sha) return;
+            rbBtn.disabled = true;
+            try {
+              await submitRollbackProject(st.project_id, sha);
+            } finally {
+              if (document.body.contains(rbBtn)) rbBtn.disabled = false;
+            }
+          });
+        }
+
+        const diffDetails = document.getElementById('git-diff-details');
+        if (diffDetails) {
+          diffDetails.addEventListener('toggle', () => {
+            state.diffOpen[st.project_id] = diffDetails.open;
+          });
+        }
       } else {
         updateLiveTimers();
       }
+      renderLivePreviewPanel(st);
 
       // Secondary action (Delete)
       const secEl = document.getElementById('detail-secondary');
@@ -4022,6 +4319,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (!state.chatLoadedFor[st.project_id]) {
             loadProjectChatHistory(st.project_id);
           }
+          loadProjectDevAndVersionData(st.project_id, st.last_event_at || String(events.length));
           renderAuditChatTab(st.project_id);
         } else {
           auditTabBtn.style.display = 'none';
@@ -4250,19 +4548,111 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    async function submitModifyProject(pid, rawInstructions) {
+    async function loadProjectDevAndVersionData(pid, sig) {
+      if (!pid) return;
+      const metaKey = pid + ':' + String(sig || '');
+      if (state.devMetaLoadedSig[pid] === metaKey) {
+        return;
+      }
+      state.devMetaLoadedSig[pid] = metaKey;
+      try {
+        const [cpRes, filesRes, diffRes] = await Promise.all([
+          apiFetch('/api/projects/' + encodeURIComponent(pid) + '/checkpoints').catch(() => null),
+          apiFetch('/api/projects/' + encodeURIComponent(pid) + '/files').catch(() => null),
+          apiFetch('/api/projects/' + encodeURIComponent(pid) + '/diff').catch(() => null),
+        ]);
+        if (cpRes && Array.isArray(cpRes.checkpoints)) {
+          state.checkpointsByPid[pid] = cpRes.checkpoints;
+        }
+        if (filesRes && Array.isArray(filesRes.files)) {
+          state.filesByPid[pid] = filesRes.files;
+        }
+        if (diffRes) {
+          state.diffByPid[pid] = diffRes;
+        }
+        if (state.detail && state.detail.project_id === pid) {
+          state.lastBannerSignature = null;
+          renderDetail();
+        }
+      } catch (_) {}
+    }
+
+    function renderLivePreviewPanel(st) {
+      const splitEl = document.getElementById('detail-work-split');
+      const panelEl = document.getElementById('live-preview-panel');
+      const iframeEl = document.getElementById('live-preview-iframe');
+      const openLink = document.getElementById('open-preview-tab-link');
+      const reloadBtn = document.getElementById('reload-preview-btn');
+      const closeBtn = document.getElementById('close-preview-btn');
+      if (!splitEl || !panelEl || !iframeEl) return;
+
+      const pid = st && st.project_id;
+      const localApp = (st && st.local_app) || {};
+      const shouldShow = Boolean(pid && state.previewOpen[pid] && localApp.running && localApp.url);
+      if (!shouldShow) {
+        splitEl.classList.remove('preview-open');
+        panelEl.style.display = 'none';
+        if (pid && state.previewOpen[pid] && !localApp.running) {
+          state.previewOpen[pid] = false;
+          delete state.previewRenderedUrl[pid];
+          iframeEl.src = 'about:blank';
+        }
+        return;
+      }
+
+      splitEl.classList.add('preview-open');
+      panelEl.style.display = 'flex';
+      if (openLink) openLink.href = localApp.url;
+      if (state.previewRenderedUrl[pid] !== localApp.url) {
+        state.previewRenderedUrl[pid] = localApp.url;
+        iframeEl.src = localApp.url;
+      }
+      if (reloadBtn && !reloadBtn.dataset.wired) {
+        reloadBtn.dataset.wired = '1';
+        reloadBtn.addEventListener('click', () => {
+          const curPid = state.selectedId;
+          const curSt = state.detail && state.detail.status;
+          const url = curSt && curSt.local_app && curSt.local_app.url;
+          if (!url) return;
+          const sep = url.indexOf('?') >= 0 ? '&' : '?';
+          iframeEl.src = url + sep + 'preview_t=' + Date.now();
+          if (curPid) state.previewRenderedUrl[curPid] = url;
+        });
+      }
+      if (closeBtn && !closeBtn.dataset.wired) {
+        closeBtn.dataset.wired = '1';
+        closeBtn.addEventListener('click', () => {
+          const curPid = state.selectedId;
+          if (curPid) {
+            state.previewOpen[curPid] = false;
+            delete state.previewRenderedUrl[curPid];
+          }
+          iframeEl.src = 'about:blank';
+          state.lastBannerSignature = null;
+          renderDetail();
+        });
+      }
+    }
+
+    async function submitModifyProject(pid, rawInstructions, targetFiles) {
       const instructions = (rawInstructions || '').trim();
       if (!instructions) {
         setNote('Describe qué cambios o mejoras deseas aplicar.');
         return;
       }
       try {
+        const bodyPayload = { instructions };
+        if (Array.isArray(targetFiles) && targetFiles.length) {
+          bodyPayload.target_files = targetFiles;
+        }
         await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/modify', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ instructions }),
+          body: JSON.stringify(bodyPayload),
         });
         delete state.modifyDrafts[pid];
+        delete state.targetFilesSelected[pid];
+        delete state.devMetaLoadedSig[pid];
         setNote('Cambios en curso para ' + pid + '.');
         state.lastBannerSignature = null;
         await loadProjects();
@@ -4271,9 +4661,40 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    async function submitRollbackProject(pid, commitSha) {
+      if (!commitSha) return;
+      if (!window.confirm('¿Deseas restaurar "' + pid + '" a esta versión estable y volver a verificar las pruebas?')) {
+        return;
+      }
+      setNote('Restaurando versión estable y ejecutando pruebas...');
+      try {
+        const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/rollback', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ commit_sha: commitSha }),
+        });
+        if (res && Array.isArray(res.checkpoints)) {
+          state.checkpointsByPid[pid] = res.checkpoints;
+        }
+        delete state.devMetaLoadedSig[pid];
+        state.previewOpen[pid] = false;
+        delete state.previewRenderedUrl[pid];
+        setNote('Versión restaurada con éxito para ' + pid + '.');
+        state.lastBannerSignature = null;
+        await loadProjects();
+      } catch (err) {
+        setNote('Error restaurando versión: ' + err.message);
+      }
+    }
+
     async function handleAction(action, pid) {
       try {
-        if (action === 'delete') {
+        if (action === 'toggle-preview') {
+          state.previewOpen[pid] = !Boolean(state.previewOpen[pid]);
+          state.lastBannerSignature = null;
+          renderDetail();
+          return;
+        } else if (action === 'delete') {
           if (!window.confirm('¿Deseas eliminar el proyecto "' + pid + '"? Esta acción no se puede deshacer.')) {
             return;
           }
@@ -4308,6 +4729,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const url = res.local_app && res.local_app.url ? res.local_app.url : '';
           setNote(url ? ('App encendida en ' + url) : ('App encendida para ' + pid));
         } else if (action === 'local-stop') {
+          state.previewOpen[pid] = false;
+          delete state.previewRenderedUrl[pid];
           await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/stop', { method: 'POST' });
           setNote('App local apagada para ' + pid + '.');
         }
@@ -4804,6 +5227,10 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             "suggest-title",
             "logo",
             "chat",
+            "checkpoints",
+            "files",
+            "diff",
+            "rollback",
         }:
             return urllib.parse.unquote(parts[0]), parts[1]
         # Reject multi-segment or path-traversal attempts (e.g., ../etc) as invalid project_id
@@ -4838,28 +5265,23 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_bytes(200, mime, data)
             return
 
-        if pid is not None and action == "chat":
+        get_json_actions = {
+            None: ctrl.get_project_detail,
+            "chat": ctrl.get_project_chat,
+            "checkpoints": ctrl.get_project_checkpoints,
+            "files": ctrl.get_project_files,
+            "diff": ctrl.get_project_diff,
+        }
+        if pid is not None and action in get_json_actions:
             try:
-                chat_data = ctrl.get_project_chat(pid)
+                payload = get_json_actions[action](pid)
             except (ValueError, SandboxViolationError) as exc:
                 self._send_json(400, {"error": str(exc)})
                 return
             except ProjectNotFoundError as exc:
                 self._send_json(404, {"error": str(exc)})
                 return
-            self._send_json(200, chat_data)
-            return
-
-        if pid is not None and action is None:
-            try:
-                detail = ctrl.get_project_detail(pid)
-            except ValueError as exc:
-                self._send_json(400, {"error": str(exc)})
-                return
-            except ProjectNotFoundError as exc:
-                self._send_json(404, {"error": str(exc)})
-                return
-            self._send_json(200, detail)
+            self._send_json(200, payload)
             return
 
         self._send_json(404, {"error": "Endpoint not found"})
@@ -4925,6 +5347,7 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             "suggest-title",
             "logo",
             "chat",
+            "rollback",
         }:
             self._drain_body()
             self._send_json(404, {"error": "Endpoint not found"})
@@ -4949,7 +5372,14 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             elif action == "modify":
                 body = self._read_json_body()
                 instructions = self._require_str_field(body, "instructions")
-                result = ctrl.modify_project(pid, instructions)
+                raw_targets = body.get("target_files")
+                if raw_targets is not None and not isinstance(raw_targets, list):
+                    raise TypeError("El campo 'target_files' debe ser una lista de rutas.")
+                result = ctrl.modify_project(pid, instructions, target_files=raw_targets)
+            elif action == "rollback":
+                body = self._read_json_body()
+                commit_sha = self._require_str_field(body, "commit_sha")
+                result = ctrl.rollback_project(pid, commit_sha)
             elif action == "suggest-title":
                 self._drain_body()
                 result = ctrl.suggest_project_title(pid)
@@ -5049,6 +5479,7 @@ def start_dashboard_server(
     logos_dir: Path | None = None,
     chats_dir: Path | None = None,
     vcs: Any | None = None,
+    runner: Runner | None = None,
     secrets_to_redact: Sequence[str] = (),
 ) -> tuple[DashboardHTTPServer, threading.Thread, str]:
     """Create and start DashboardHTTPServer on 127.0.0.1:<port> in a daemon thread."""
@@ -5063,6 +5494,7 @@ def start_dashboard_server(
         logos_dir=logos_dir,
         chats_dir=chats_dir,
         vcs=vcs,
+        runner=runner,
         secrets_to_redact=secrets_to_redact,
     )
     server = DashboardHTTPServer((LOOPBACK_HOST, port), controller)

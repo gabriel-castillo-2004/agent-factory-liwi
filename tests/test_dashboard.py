@@ -99,17 +99,21 @@ def _plan_payload(summary: str = "Pomodoro timer static web plan") -> dict[str, 
     ).model_dump(mode="json")
 
 
+_LOOPBACK_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def _http_json(
     url: str,
     *,
     method: str = "GET",
     body: dict[str, Any] | None = None,
+    timeout: float = 5.0,
 ) -> tuple[int, dict[str, Any]]:
     data = json.dumps(body).encode("utf-8") if body is not None else None
     headers = {"Content-Type": "application/json"} if data is not None else {}
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=5.0) as resp:
+        with _LOOPBACK_HTTP_OPENER.open(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as err:
         return err.code, json.loads(err.read().decode("utf-8"))
@@ -3024,6 +3028,359 @@ def test_dashboard_import_project_and_lan_mode(
         if thread.is_alive():
             thread.join(timeout=2.0)
         store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_checkpoints_and_rollback_with_inv22_and_verification(
+    tmp_path: Path,
+) -> None:
+    """GET /checkpoints & POST /rollback list delivered commits, validate history (INV-22), stop local app, restore files cleanly via new commit, run pytest+smoke test, push to origin, and append PROJECT_DELIVERED (INV-04, INV-11)."""
+    import subprocess
+
+    from agent_factory.runtime_runner import LocalAppRunner
+
+    pid = "proj-rollback-demo"
+    store = SqliteEventStore(str(tmp_path / "rb_dash.db"))
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_rb")
+    ws_dir = ws_mgr.create_workspace(pid)
+    bare_remote = tmp_path / "bare_rb_origin.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare_remote)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare_remote)], cwd=ws_dir, check=True)
+
+    # Commit v1
+    (ws_dir / "index.html").write_text("<!doctype html><html><body><h1>Version Uno</h1></body></html>\n", encoding="utf-8")
+    (ws_dir / "tests").mkdir()
+    (ws_dir / "tests" / "test_app.py").write_text(
+        "from pathlib import Path\n"
+        "def test_html_nonempty():\n"
+        "    assert 'Version' in Path('index.html').read_text(encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "-A"], cwd=ws_dir, check=True)
+    subprocess.run(["git", "-c", "user.name=TestBot", "-c", "user.email=test@local", "commit", "-m", "chore: v1"], cwd=ws_dir, check=True, capture_output=True)
+    sha_v1 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ws_dir, check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(["git", "push", "-u", "origin", "main"], cwd=ws_dir, check=True, capture_output=True)
+
+    # Commit v2
+    (ws_dir / "index.html").write_text("<!doctype html><html><body><h1>Version Dos</h1></body></html>\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=ws_dir, check=True)
+    subprocess.run(["git", "-c", "user.name=TestBot", "-c", "user.email=test@local", "commit", "-m", "chore: v2"], cwd=ws_dir, check=True, capture_output=True)
+    sha_v2 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ws_dir, check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(["git", "push", "origin", "main"], cwd=ws_dir, check=True, capture_output=True)
+
+    now = datetime(2026, 11, 20, 18, 0, tzinfo=UTC)
+    plan_dict = _plan_payload("Rollback Demo")
+    plan_hash = Plan.model_validate(plan_dict).compute_hash()
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "Rollback App", "objective": "Probar rollback", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+        create_event(pid, EventType.PROJECT_DELIVERED, {"repo_url": str(bare_remote), "deploy_url": "", "commit_sha": sha_v1, "version_label": "v1"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DELIVERED", "to": "CHANGE_REQUEST", "instructions": "Cambiar a v2"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "CHANGE_REQUEST", "to": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+        create_event(pid, EventType.PROJECT_DELIVERED, {"repo_url": str(bare_remote), "deploy_url": "", "commit_sha": sha_v2, "version_label": "v2"}, at=now),
+    ):
+        store.append(ev)
+
+    local_runner = LocalAppRunner(workspace_manager=ws_mgr)
+    orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        workspace_manager=ws_mgr,
+        local_runner=local_runner,
+    )
+    try:
+        # 1. GET /checkpoints returns v2 & v1
+        c_cp, r_cp = _http_json(f"{base_url}/api/projects/{pid}/checkpoints")
+        assert c_cp == 200
+        labels = [cp["version_label"] for cp in r_cp["checkpoints"]]
+        assert "v1" in labels and "v2" in labels
+        shas = {cp["version_label"]: cp["commit_sha"] for cp in r_cp["checkpoints"]}
+        assert shas["v1"] == sha_v1 and shas["v2"] == sha_v2
+
+        # 2. Invalid/unsafe or foreign commit SHA rejected (INV-22)
+        assert _http_json(f"{base_url}/api/projects/{pid}/rollback", method="POST", body={"commit_sha": "../bad"})[0] == 400
+        assert _http_json(f"{base_url}/api/projects/{pid}/rollback", method="POST", body={"commit_sha": "-flag"})[0] == 400
+        assert _http_json(f"{base_url}/api/projects/{pid}/rollback", method="POST", body={"commit_sha": "deadbeef1234"})[0] == 400
+        factory_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[1],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert _http_json(f"{base_url}/api/projects/{pid}/rollback", method="POST", body={"commit_sha": factory_head})[0] == 400
+
+        # 3. Start local app first, then execute rollback -> stops local app, restores v1 cleanly, commits & pushes, records DELIVERED v3
+        c_st, r_st = _http_json(f"{base_url}/api/projects/{pid}/start", method="POST")
+        assert c_st == 200 and r_st["local_app"]["running"] is True
+
+        c_rb, r_rb = _http_json(
+            f"{base_url}/api/projects/{pid}/rollback",
+            method="POST",
+            body={"commit_sha": sha_v1},
+            timeout=25.0,
+        )
+        assert c_rb == 200
+        assert r_rb["ok"] is True
+        assert r_rb["status"]["state"] == "DELIVERED"
+        assert local_runner.get_status(pid).running is False
+        assert "Version Uno" in (ws_dir / "index.html").read_text(encoding="utf-8")
+
+        new_head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ws_dir, check=True, capture_output=True, text=True).stdout.strip()
+        remote_head = subprocess.run(["git", "-C", str(bare_remote), "rev-parse", "refs/heads/main"], check=True, capture_output=True, text=True).stdout.strip()
+        assert new_head == remote_head
+        assert new_head not in (sha_v1, sha_v2)
+
+        _, r_cp2 = _http_json(f"{base_url}/api/projects/{pid}/checkpoints")
+        assert len(r_cp2["checkpoints"]) == 3
+        assert r_cp2["checkpoints"][0]["version_label"] == "v3"
+        assert r_cp2["checkpoints"][0]["commit_sha"] == new_head
+        assert r_cp2["checkpoints"][0]["rollback_from"] == sha_v1
+        assert r_cp2["checkpoints"][0]["is_current"] is True
+    finally:
+        local_runner.stop_all()
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_dev_view_files_diff_target_files_and_live_preview(
+    tmp_path: Path,
+) -> None:
+    """GET /files, GET /diff (redacting secrets INV-19), POST /modify target_files validation (INV-13/22), and UI controls for Vista Simple/Desarrollador, Rollback, Diff & Live Preview."""
+    import subprocess
+
+    from agent_factory.runtime_runner import LocalAppRunner
+
+    pid = "proj-dev-view"
+    secret_val = "TEST_DIFF_SECRET_8899"
+    store = SqliteEventStore(str(tmp_path / "dev_dash.db"))
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_dev")
+    ws_dir = ws_mgr.create_workspace(pid)
+    subprocess.run(["git", "init", "-b", "main"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "--local", "user.name", "TestBot"], cwd=ws_dir, check=True)
+    subprocess.run(["git", "config", "--local", "user.email", "test@local"], cwd=ws_dir, check=True)
+
+    (ws_dir / "src").mkdir()
+    (ws_dir / "index.html").write_text("<h1>Hola</h1>\n", encoding="utf-8")
+    (ws_dir / "src" / "app.js").write_text("export const v = 1;\n", encoding="utf-8")
+    (ws_dir / ".env").write_text(f"API_KEY={secret_val}\n", encoding="utf-8")
+    (ws_dir / "tests").mkdir()
+    (ws_dir / "tests" / "test_app.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "index.html", "src/app.js", "tests/test_app.py"], cwd=ws_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "chore: initial"], cwd=ws_dir, check=True, capture_output=True)
+
+    (ws_dir / "src" / "app.js").write_text(
+        f"export const v = 2;\nexport const hint = '{secret_val}';\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "src/app.js"], cwd=ws_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "feat: bump v2"], cwd=ws_dir, check=True, capture_output=True)
+
+    now = datetime(2026, 11, 20, 18, 30, tzinfo=UTC)
+    plan_dict = _plan_payload("Dev View App")
+    plan_hash = Plan.model_validate(plan_dict).compute_hash()
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "Dev View", "objective": "Modo dev", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+        create_event(pid, EventType.PROJECT_DELIVERED, {"repo_url": "", "deploy_url": "", "version_label": "v1"}, at=now),
+    ):
+        store.append(ev)
+
+    seen_impl_failure: list[str] = []
+
+    def _capture_impl(ws: Path, plan_obj: Any, failure_out: str, _attempt: int) -> Any:
+        seen_impl_failure.append(f"{plan_obj.summary}\n{failure_out}")
+        from agent_factory.ports.code_agent import CodeAgentResult
+
+        return CodeAgentResult(files_written=["src/app.js"], summary="Updated app.js")
+
+    orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
+    worker = BuildWorker(
+        orchestrator=orch,
+        workspace_manager=ws_mgr,
+        code_agent=FakeCodeAgent(
+            test_gen_steps=[{"tests/test_mod.py": "def test_m(): assert True\n"}],
+            impl_steps=[_capture_impl],
+        ),
+        runner=FakeRunner(results=[CommandResult(exit_code=0, stdout="2 passed", test_results={"AT-01": True, "MOD-02": True})]),
+        vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="ok")]),
+    )
+    local_runner = LocalAppRunner(workspace_manager=ws_mgr)
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        build_worker=worker,
+        workspace_manager=ws_mgr,
+        local_runner=local_runner,
+        secrets_to_redact=(secret_val,),
+    )
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            html = html_resp.read().decode("utf-8")
+        for needle in (
+            "Vista Simple",
+            "Vista Desarrollador",
+            "Modo técnico",
+            "af_tech_mode",
+            "Versiones estables (Rollback)",
+            "Restaurar esta versión",
+            "Últimos cambios",
+            "git diff",
+            "modify-target-files",
+            "Mostrar vista previa aquí",
+            "Recargar vista previa",
+            "live-preview-iframe",
+        ):
+            assert needle in html
+
+        # 1. GET /files hides .env and lists real project files
+        c_files, r_files = _http_json(f"{base_url}/api/projects/{pid}/files")
+        assert c_files == 200
+        assert "src/app.js" in r_files["files"]
+        assert "index.html" in r_files["files"]
+        assert ".env" not in r_files["files"]
+
+        # 2. GET /diff returns latest commit diff and redacts secrets (INV-19)
+        c_diff, r_diff = _http_json(f"{base_url}/api/projects/{pid}/diff")
+        assert c_diff == 200
+        assert r_diff["has_git"] is True
+        assert "export const v = 2;" in r_diff["diff"]
+        assert secret_val not in r_diff["diff"]
+        assert "[REDACTED]" in r_diff["diff"]
+
+        # 3. target_files validation & forwarding in POST /modify
+        assert _http_json(f"{base_url}/api/projects/{pid}/modify", method="POST", body={"instructions": "Fix", "target_files": ["../outside.py"]})[0] == 400
+        assert _http_json(f"{base_url}/api/projects/{pid}/modify", method="POST", body={"instructions": "Fix", "target_files": [".env"]})[0] == 400
+        assert _http_json(f"{base_url}/api/projects/{pid}/modify", method="POST", body={"instructions": "Fix", "target_files": ["tests/test_app.py"]})[0] == 400
+
+        c_mod, r_mod = _http_json(
+            f"{base_url}/api/projects/{pid}/modify",
+            method="POST",
+            body={"instructions": "Refactor helper", "target_files": ["src/app.js"]},
+        )
+        assert c_mod == 200 and r_mod["background_started"] is True
+        assert server.controller.wait_for_idle(timeout=5.0) is True
+        assert any("src/app.js" in txt for txt in seen_impl_failure)
+    finally:
+        local_runner.stop_all()
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_rollback_resets_cleanly_when_post_rollback_tests_fail(
+    tmp_path: Path,
+) -> None:
+    """When pytest fails during POST /rollback, workspace is reset back to pre-rollback commit cleanly, 409 is returned, and no PROJECT_DELIVERED is recorded."""
+    import subprocess
+
+    pid = "proj-rb-fail-reset"
+    store = SqliteEventStore(str(tmp_path / "rb_fail.db"))
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_rb_fail")
+    ws_dir = ws_mgr.create_workspace(pid)
+    subprocess.run(["git", "init", "-b", "main"], cwd=ws_dir, check=True, capture_output=True)
+
+    (ws_dir / "app.txt").write_text("broken-v1\n", encoding="utf-8")
+    (ws_dir / "tests").mkdir()
+    (ws_dir / "tests" / "test_check.py").write_text(
+        "from pathlib import Path\n"
+        "def test_ok():\n"
+        "    assert Path('app.txt').read_text(encoding='utf-8').strip() == 'healthy-v2'\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "-A"], cwd=ws_dir, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=T", "-c", "user.email=t@l", "commit", "-m", "v1"],
+        cwd=ws_dir,
+        check=True,
+        capture_output=True,
+    )
+    sha_v1 = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ws_dir, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    (ws_dir / "app.txt").write_text("healthy-v2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.txt"], cwd=ws_dir, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=T", "-c", "user.email=t@l", "commit", "-m", "v2"],
+        cwd=ws_dir,
+        check=True,
+        capture_output=True,
+    )
+    sha_v2 = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ws_dir, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    now = datetime(2026, 11, 20, 19, 0, tzinfo=UTC)
+    plan_dict = _plan_payload("RB Fail Plan")
+    plan_hash = Plan.model_validate(plan_dict).compute_hash()
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "RB Fail", "objective": "Obj", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+        create_event(pid, EventType.PROJECT_DELIVERED, {"repo_url": "", "deploy_url": "", "commit_sha": sha_v2, "version_label": "v2"}, at=now),
+    ):
+        store.append(ev)
+
+    orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        workspace_manager=ws_mgr,
+    )
+    try:
+        c_rb, r_rb = _http_json(
+            f"{base_url}/api/projects/{pid}/rollback",
+            method="POST",
+            body={"commit_sha": sha_v1},
+            timeout=20.0,
+        )
+        assert c_rb == 409
+        assert "fallaron" in r_rb["error"].lower()
+        assert (ws_dir / "app.txt").read_text(encoding="utf-8").strip() == "healthy-v2"
+        head_after = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=ws_dir, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        assert head_after == sha_v2
+        assert len([e for e in store.get_events(pid) if e.type == EventType.PROJECT_DELIVERED]) == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
 
 
 

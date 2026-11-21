@@ -38,6 +38,7 @@ from agent_factory.workspace import (
     ensure_workspace_favicon,
     ensure_workspace_pytest_ini,
     is_python_cache_path,
+    read_workspace_git_head_sha,
     verify_and_restore_test_lock,
     workspace_nonempty_test_files,
     write_workspace_manifest,
@@ -270,25 +271,36 @@ class BuildWorker:
         self.local_app_runner = local_app_runner
 
     @staticmethod
-    def _extract_modification_instructions(events: Sequence[Event]) -> str | None:
-        """Return latest modification instructions emitted after the most recent PROJECT_DELIVERED."""
+    def _extract_modification_context(events: Sequence[Event]) -> tuple[str | None, list[str]]:
+        """Return latest modification instructions and optional target_files after the most recent PROJECT_DELIVERED."""
         last_delivered_idx = -1
         for idx, ev in enumerate(events):
             if ev.type == EventType.PROJECT_DELIVERED:
                 last_delivered_idx = idx
         if last_delivered_idx < 0:
-            return None
+            return None, []
+        instr: str | None = None
+        target_files: list[str] = []
         for ev in reversed(events[last_delivered_idx + 1 :]):
             pl = ev.payload or {}
-            if ev.type == EventType.STATE_TRANSITIONED and pl.get("instructions"):
-                text = str(pl["instructions"]).strip()
-                if text:
-                    return text
-            if ev.type == EventType.SPEC_UPDATED and pl.get("change_instructions"):
-                text = str(pl["change_instructions"]).strip()
-                if text:
-                    return text
-        return None
+            if not target_files and isinstance(pl.get("target_files"), list):
+                target_files = [str(x).strip() for x in pl["target_files"] if str(x).strip()]
+            if instr is None:
+                if ev.type == EventType.STATE_TRANSITIONED and pl.get("instructions"):
+                    text = str(pl["instructions"]).strip()
+                    if text:
+                        instr = text
+                elif ev.type == EventType.SPEC_UPDATED and pl.get("change_instructions"):
+                    text = str(pl["change_instructions"]).strip()
+                    if text:
+                        instr = text
+        return instr, target_files
+
+    @staticmethod
+    def _extract_modification_instructions(events: Sequence[Event]) -> str | None:
+        """Return latest modification instructions emitted after the most recent PROJECT_DELIVERED."""
+        instr, _ = BuildWorker._extract_modification_context(events)
+        return instr
 
     def _redact(self, text: str) -> str:
         """Scrub configured secrets and credential patterns from diagnostic strings."""
@@ -863,7 +875,7 @@ class BuildWorker:
         if status.workspace_path and not self.workspace_manager.is_external_workspace(project_id):
             self.workspace_manager.register_external_workspace(project_id, status.workspace_path)
 
-        mod_instructions = self._extract_modification_instructions(
+        mod_instructions, mod_target_files = self._extract_modification_context(
             self.orchestrator.store.get_events(project_id)
         )
 
@@ -1032,9 +1044,18 @@ class BuildWorker:
             )
             effective_failure = job.last_failure_output
             if mod_instructions and not effective_failure and build_round == 1:
+                target_hint = (
+                    f"\nTarget files to inspect/update: {', '.join(mod_target_files)}"
+                    if mod_target_files
+                    else ""
+                )
                 effective_failure = (
                     "Post-delivery modification requested (preserve existing behavior and apply changes):\n"
-                    f"{mod_instructions}"
+                    f"{mod_instructions}{target_hint}"
+                )
+            elif mod_target_files and effective_failure:
+                effective_failure = (
+                    f"{effective_failure}\nTarget files to inspect/update: {', '.join(mod_target_files)}"
                 )
             try:
                 impl_result = self.code_agent.implement_or_fix(
@@ -1411,15 +1432,25 @@ class BuildWorker:
                     )
 
                 pub_duration = round(max(0.0, time.monotonic() - pub_t0), 3)
+                prior_delivered = sum(
+                    1
+                    for ev in self.orchestrator.store.get_events(project_id)
+                    if ev.type == EventType.PROJECT_DELIVERED
+                )
+                commit_sha = read_workspace_git_head_sha(ws_dir, runner=self.runner)
+                delivered_payload: dict[str, object] = {
+                    "repo_url": repo_url,
+                    "deploy_url": deploy_url,
+                    "duration_seconds": pub_duration,
+                    "version_label": f"v{prior_delivered + 1}",
+                }
+                if commit_sha:
+                    delivered_payload["commit_sha"] = commit_sha
                 self.orchestrator.store.append(
                     create_event(
                         project_id=project_id,
                         event_type=EventType.PROJECT_DELIVERED,
-                        payload={
-                            "repo_url": repo_url,
-                            "deploy_url": deploy_url,
-                            "duration_seconds": pub_duration,
-                        },
+                        payload=delivered_payload,
                         at=self.orchestrator._now(),
                     )
                 )

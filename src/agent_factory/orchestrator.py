@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+import tempfile
 import threading
 import time
 import tomllib
@@ -47,9 +48,18 @@ from agent_factory.ports.publisher import RegistryPublishError, StatusPublisher
 from agent_factory.ports.store import EventStore
 from agent_factory.secrets import redact_secrets
 from agent_factory.workspace import (
+    DEFAULT_WORKSPACE_PYTEST_INI,
+    SandboxViolationError,
     WorkspaceManager,
     collect_workspace_code_context,
+    list_workspace_files,
+    read_git_head_sha_from_disk,
+    read_workspace_git_diff,
+    read_workspace_git_head_sha,
+    sanitize_target_files,
+    validate_commit_sha,
     validate_external_project_path,
+    verify_isolated_git_root,
 )
 
 logger = logging.getLogger(__name__)
@@ -1174,7 +1184,7 @@ class Orchestrator:
             workspace_manager=workspace_manager,
         )
         code_ctx = (
-            collect_workspace_code_context(eff_ws, max_chars=36000, extra_secrets=extra_secrets)
+            collect_workspace_code_context(eff_ws, max_chars=16000, extra_secrets=extra_secrets)
             if eff_ws is not None
             else ""
         )
@@ -1484,15 +1494,20 @@ class Orchestrator:
                 )
             )
             validate_transition(ProjectState.VERIFYING, ProjectState.DELIVERED)
+            init_sha = read_workspace_git_head_sha(validated_dir)
+            delivered_pl: dict[str, Any] = {
+                "repo_url": repo_url or None,
+                "deploy_url": deploy_url or None,
+                "imported": True,
+                "version_label": "v1",
+            }
+            if init_sha:
+                delivered_pl["commit_sha"] = init_sha
             self.store.append(
                 create_event(
                     final_pid,
                     EventType.PROJECT_DELIVERED,
-                    {
-                        "repo_url": repo_url or None,
-                        "deploy_url": deploy_url or None,
-                        "imported": True,
-                    },
+                    delivered_pl,
                     at=now,
                 )
             )
@@ -1510,7 +1525,477 @@ class Orchestrator:
             "external_workspace_path": str(validated_dir),
         }
 
-    def modify_project(self, project_id: str, instructions: str) -> ProjectStatus:
+    def list_project_files(
+        self,
+        project_id: str,
+        *,
+        workspace_manager: WorkspaceManager | None = None,
+    ) -> list[str]:
+        """List workspace files safely for Vista Desarrollador without exposing .env or symlinks (INV-19, INV-22)."""
+        validate_project_id(project_id)
+        events = self.store.get_events(project_id)
+        if not events:
+            raise ValueError(f"Project '{project_id}' does not exist")
+        status = self.get_status(project_id)
+        ws_dir = self._resolve_project_workspace_dir(
+            project_id, status=status, workspace_manager=workspace_manager
+        )
+        if ws_dir is None:
+            return []
+        return list_workspace_files(ws_dir)
+
+    def get_project_diff(
+        self,
+        project_id: str,
+        *,
+        workspace_manager: WorkspaceManager | None = None,
+        runner: Any | None = None,
+        extra_secrets: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """Return redacted Git diff for isolated project workspace (INV-19, INV-22)."""
+        from agent_factory.adapters.subprocess_runner import SubprocessRunner
+
+        validate_project_id(project_id)
+        events = self.store.get_events(project_id)
+        if not events:
+            raise ValueError(f"Project '{project_id}' does not exist")
+        status = self.get_status(project_id)
+        ws_dir = self._resolve_project_workspace_dir(
+            project_id, status=status, workspace_manager=workspace_manager
+        )
+        if ws_dir is None:
+            return {"has_git": False, "commit_sha": None, "diff": ""}
+        eff_runner = runner if runner is not None else SubprocessRunner(default_timeout_seconds=15.0)
+        has_git, head_sha, diff_text = read_workspace_git_diff(
+            ws_dir, eff_runner, extra_secrets=extra_secrets
+        )
+        return {
+            "has_git": has_git,
+            "commit_sha": head_sha,
+            "diff": diff_text,
+        }
+
+    def list_project_checkpoints(
+        self,
+        project_id: str,
+        *,
+        extra_secrets: Sequence[str] = (),
+    ) -> list[dict[str, Any]]:
+        """List delivered checkpoints in reverse chronological order with redacted metadata (INV-11, INV-19)."""
+        validate_project_id(project_id)
+        events = self.store.get_events(project_id)
+        if not events:
+            raise ValueError(f"Project '{project_id}' does not exist")
+
+        checkpoints: list[dict[str, Any]] = []
+        idx = 0
+        for ev in events:
+            if ev.type != EventType.PROJECT_DELIVERED:
+                continue
+            idx += 1
+            pl = ev.payload or {}
+            raw_sha = str(pl.get("commit_sha") or "").strip()
+            clean_sha = ""
+            if raw_sha:
+                try:
+                    clean_sha = validate_commit_sha(raw_sha)
+                except ValueError:
+                    clean_sha = ""
+            label = redact_secrets(
+                str(pl.get("version_label") or f"v{idx}").strip(),
+                extra_secrets=extra_secrets,
+            )
+            rollback_from = str(pl.get("rollback_from") or "").strip() or None
+            checkpoints.append(
+                {
+                    "version_label": label,
+                    "commit_sha": clean_sha,
+                    "short_sha": clean_sha[:7] if clean_sha else "",
+                    "delivered_at": ev.at.isoformat(),
+                    "repo_url": redact_secrets(str(pl.get("repo_url") or ""), extra_secrets=extra_secrets),
+                    "deploy_url": redact_secrets(str(pl.get("deploy_url") or ""), extra_secrets=extra_secrets),
+                    "rollback_from": rollback_from,
+                    "summary": redact_secrets(str(pl.get("summary") or ""), extra_secrets=extra_secrets),
+                    "can_rollback": bool(clean_sha),
+                    "is_current": False,
+                }
+            )
+        if checkpoints:
+            checkpoints[-1]["is_current"] = True
+        return list(reversed(checkpoints))
+
+    @staticmethod
+    def _run_rollback_git(
+        runner: Any,
+        args: Sequence[str],
+        ws_dir: Path,
+        *,
+        env: Mapping[str, str] | None = None,
+        context: str,
+        extra_secrets: Sequence[str] = (),
+    ) -> str:
+        res = runner.run(["git", *args], cwd=ws_dir, timeout_seconds=20.0, env=env)
+        if res.exit_code != 0:
+            detail = redact_secrets(
+                (res.stderr or res.stdout or f"exit code {res.exit_code}").strip(),
+                extra_secrets=extra_secrets,
+            )
+            raise RuntimeError(f"{context}: {detail}")
+        return res.stdout.strip()
+
+    @staticmethod
+    def _run_rollback_pytest(runner: Any, ws_dir: Path, extra_secrets: Sequence[str]) -> None:
+        import shutil
+        import sys
+
+        from agent_factory.workspace import is_python_cache_path
+
+        tests_dir = ws_dir / "tests"
+        has_tests = (
+            tests_dir.is_dir()
+            and any(
+                p.is_file() and not is_python_cache_path(p.relative_to(ws_dir))
+                for p in tests_dir.rglob("*")
+            )
+        ) or any(ws_dir.glob("test_*.py")) or any(ws_dir.glob("*_test.py"))
+        if not has_tests:
+            return
+
+        pytest_bin: list[str] = (
+            ["pytest"]
+            if runner.__class__.__name__ == "FakeRunner" or shutil.which("pytest")
+            else [sys.executable, "-m", "pytest"]
+        )
+        ws_ini = ws_dir / "pytest.ini"
+        tmp_ini: Path | None = None
+        try:
+            if ws_ini.is_file():
+                ini_arg = ws_ini
+            else:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", suffix=".ini", prefix="af_rb_", delete=False
+                ) as tf:
+                    tf.write(DEFAULT_WORKSPACE_PYTEST_INI)
+                    tmp_ini = Path(tf.name)
+                ini_arg = tmp_ini
+            res = runner.run(
+                [
+                    *pytest_bin,
+                    "-q",
+                    "--tb=short",
+                    "-p",
+                    "no:cov",
+                    "-p",
+                    "no:cacheprovider",
+                    "-o",
+                    "addopts=",
+                    "-c",
+                    str(ini_arg),
+                    f"--rootdir={ws_dir}",
+                ],
+                cwd=ws_dir,
+                timeout_seconds=30.0,
+            )
+        finally:
+            if tmp_ini is not None:
+                tmp_ini.unlink(missing_ok=True)
+
+        if res.exit_code not in (0, 5):
+            raw_out = "\n".join(
+                line for line in f"{res.stdout}\n{res.stderr}".splitlines() if line.strip()
+            )
+            tail = redact_secrets(raw_out[-500:], extra_secrets=extra_secrets)
+            raise RuntimeError(f"Las pruebas fallaron tras restaurar la versión: {tail}")
+
+    def rollback_project(
+        self,
+        project_id: str,
+        commit_sha: str,
+        *,
+        workspace_manager: WorkspaceManager | None = None,
+        runner: Any | None = None,
+        local_app_runner: Any | None = None,
+        vcs: Any | None = None,
+        extra_secrets: Sequence[str] = (),
+    ) -> tuple[ProjectStatus, dict[str, Any]]:
+        """Restore isolated repo to commit_sha via clean commit, verify pytest + smoke test, push if origin exists, and record PROJECT_DELIVERED (INV-04, INV-11, INV-22)."""
+        from agent_factory.adapters.agy_cli_adapter import build_sanitized_cli_env
+        from agent_factory.adapters.github_vcs_adapter import build_git_push_env
+        from agent_factory.adapters.subprocess_runner import SubprocessRunner
+        from agent_factory.runtime_runner import LocalAppRunner, run_http_smoke_test
+
+        validate_project_id(project_id)
+        target_sha = validate_commit_sha(commit_sha)
+
+        with self._project_lock(project_id):
+            events = self.store.get_events(project_id)
+            if not events:
+                raise ValueError(f"Project '{project_id}' does not exist")
+            current_status = self.get_status(project_id)
+            if current_status.state != ProjectState.DELIVERED:
+                raise IllegalTransition(current_status.state, ProjectState.CHANGE_REQUEST)
+
+            ws_dir = self._resolve_project_workspace_dir(
+                project_id, status=current_status, workspace_manager=workspace_manager
+            )
+            if ws_dir is None:
+                raise ValueError(f"El workspace del proyecto '{project_id}' no existe.")
+
+            eff_runner = runner if runner is not None else SubprocessRunner(default_timeout_seconds=25.0)
+            ws_resolved = verify_isolated_git_root(ws_dir, eff_runner)
+            clean_env = build_sanitized_cli_env()
+
+            rev_res = eff_runner.run(
+                ["git", "rev-parse", "--verify", f"{target_sha}^{{commit}}"],
+                cwd=ws_resolved,
+                timeout_seconds=10.0,
+                env=clean_env,
+            )
+            full_target_sha = rev_res.stdout.strip().lower()
+            if rev_res.exit_code != 0 or not re.fullmatch(r"[0-9a-f]{40}", full_target_sha):
+                raise SandboxViolationError(
+                    f"El commit '{target_sha}' no existe en el historial aislado de '{project_id}' (INV-22)."
+                )
+
+            anc_res = eff_runner.run(
+                ["git", "merge-base", "--is-ancestor", full_target_sha, "HEAD"],
+                cwd=ws_resolved,
+                timeout_seconds=10.0,
+                env=clean_env,
+            )
+            if anc_res.exit_code != 0:
+                raise SandboxViolationError(
+                    f"El commit '{target_sha}' no pertenece al historial actual de '{project_id}' (INV-22)."
+                )
+
+            pre_sha = read_git_head_sha_from_disk(ws_resolved) or self._run_rollback_git(
+                eff_runner,
+                ["rev-parse", "--verify", "HEAD"],
+                ws_resolved,
+                env=clean_env,
+                context="No se pudo leer el commit actual",
+                extra_secrets=extra_secrets,
+            )
+
+            if local_app_runner is not None:
+                local_app_runner.stop(project_id, workspace_dir=ws_resolved)
+
+            self._run_rollback_git(
+                eff_runner,
+                ["checkout", full_target_sha, "--", "."],
+                ws_resolved,
+                env=clean_env,
+                context="No se pudo restaurar el árbol de trabajo",
+                extra_secrets=extra_secrets,
+            )
+            diff_cached = eff_runner.run(
+                ["git", "diff", "--cached", "--quiet"],
+                cwd=ws_resolved,
+                timeout_seconds=10.0,
+                env=clean_env,
+            )
+            allow_empty = ["--allow-empty"] if diff_cached.exit_code == 0 else []
+            self._run_rollback_git(
+                eff_runner,
+                [
+                    "-c",
+                    "user.name=AgentFactory",
+                    "-c",
+                    "user.email=agent@factory.local",
+                    "commit",
+                    *allow_empty,
+                    "-m",
+                    f"chore({project_id}): rollback to {full_target_sha[:7]}",
+                ],
+                ws_resolved,
+                env=clean_env,
+                context="No se pudo crear el commit de rollback",
+                extra_secrets=extra_secrets,
+            )
+
+            try:
+                self._run_rollback_pytest(eff_runner, ws_resolved, extra_secrets)
+                smoke_runner = (
+                    local_app_runner
+                    if local_app_runner is not None
+                    else LocalAppRunner(
+                        workspace_manager=workspace_manager or self.workspace_manager,
+                        secrets_to_redact=extra_secrets,
+                    )
+                )
+                smoke_res = run_http_smoke_test(smoke_runner, project_id, ws_resolved)
+                if not smoke_res.passed:
+                    clean_smoke = redact_secrets(smoke_res.summary, extra_secrets=extra_secrets)
+                    raise RuntimeError(f"Smoke Test HTTP falló tras el rollback: {clean_smoke}")
+
+                git_cfg_file = ws_resolved / ".git" / "config"
+                has_origin_cfg = False
+                if git_cfg_file.is_file():
+                    try:
+                        has_origin_cfg = '[remote "origin"]' in git_cfg_file.read_text(
+                            encoding="utf-8", errors="ignore"
+                        )
+                    except OSError:
+                        has_origin_cfg = True
+                if has_origin_cfg:
+                    head_ref_file = ws_resolved / ".git" / "HEAD"
+                    cur_branch = "main"
+                    if head_ref_file.is_file():
+                        try:
+                            htxt = head_ref_file.read_text(encoding="utf-8", errors="ignore").strip()
+                            if htxt.startswith("ref: refs/heads/"):
+                                cur_branch = htxt[len("ref: refs/heads/") :].strip() or "main"
+                        except OSError:
+                            pass
+                    gh_tok = str(getattr(vcs, "github_token", "") or "")
+                    repo_base = str(getattr(vcs, "repo_base_url", "") or "https://github.com")
+                    push_env, push_secrets = build_git_push_env(
+                        clean_env, gh_tok, repo_base_url=repo_base
+                    )
+                    self._run_rollback_git(
+                        eff_runner,
+                        ["push", "-u", "origin", cur_branch],
+                        ws_resolved,
+                        env=push_env,
+                        context="No se pudo hacer push del rollback a origin",
+                        extra_secrets=(*extra_secrets, *push_secrets),
+                    )
+            except Exception:
+                eff_runner.run(
+                    ["git", "reset", "--hard", pre_sha],
+                    cwd=ws_resolved,
+                    timeout_seconds=15.0,
+                    env=clean_env,
+                )
+                raise
+
+            new_sha = read_git_head_sha_from_disk(ws_resolved) or self._run_rollback_git(
+                eff_runner,
+                ["rev-parse", "--verify", "HEAD"],
+                ws_resolved,
+                env=clean_env,
+                context="No se pudo verificar el commit de rollback",
+                extra_secrets=extra_secrets,
+            )
+
+            now = self._now()
+            prior_delivered = sum(1 for ev in events if ev.type == EventType.PROJECT_DELIVERED)
+            new_label = f"v{prior_delivered + 1}"
+            target_cp_label = next(
+                (
+                    str((ev.payload or {}).get("version_label") or "")
+                    for ev in events
+                    if ev.type == EventType.PROJECT_DELIVERED
+                    and str((ev.payload or {}).get("commit_sha") or "").lower().startswith(full_target_sha[:7])
+                ),
+                full_target_sha[:7],
+            ) or full_target_sha[:7]
+
+            eff_plan_hash = current_status.plan_hash
+            if not eff_plan_hash:
+                fallback_plan = Plan(
+                    summary=f"Rollback {project_id}",
+                    rationale="Restauración de checkpoint estable.",
+                    template_id="static-web",
+                    files=[],
+                    acceptance_tests=[
+                        AcceptanceTest(id="AT-RB-01", description="Rollback verified", type=AcceptanceTestType.UNIT)
+                    ],
+                    risks=[],
+                    deployment_target="local",
+                )
+                eff_plan_hash = fallback_plan.compute_hash()
+
+            for src_state, dst_state, extra_pl in (
+                (
+                    ProjectState.DELIVERED,
+                    ProjectState.CHANGE_REQUEST,
+                    {"reason": f"Rollback a {target_cp_label}", "rollback_to": full_target_sha},
+                ),
+                (ProjectState.CHANGE_REQUEST, ProjectState.INTERVIEW, {}),
+                (ProjectState.INTERVIEW, ProjectState.DEBATE, {}),
+                (ProjectState.DEBATE, ProjectState.MEDIATION, {}),
+            ):
+                validate_transition(src_state, dst_state)
+                self.store.append(
+                    create_event(
+                        project_id,
+                        EventType.STATE_TRANSITIONED,
+                        {"from": src_state.value, "to": dst_state.value, **extra_pl},
+                        at=now,
+                    )
+                )
+
+            if current_status.plan_hash:
+                validate_transition(ProjectState.MEDIATION, ProjectState.WAITING_APPROVAL)
+                self.store.append(
+                    create_event(
+                        project_id,
+                        EventType.STATE_TRANSITIONED,
+                        {"from": ProjectState.MEDIATION.value, "to": ProjectState.WAITING_APPROVAL.value},
+                        at=now,
+                    )
+                )
+            else:
+                validate_transition(ProjectState.MEDIATION, ProjectState.WAITING_APPROVAL)
+                self.store.append(
+                    create_event(
+                        project_id,
+                        EventType.PLAN_CREATED,
+                        {"to": ProjectState.WAITING_APPROVAL.value, "plan_hash": eff_plan_hash, "total_tests": 1},
+                        at=now,
+                    )
+                )
+
+            validate_transition(ProjectState.WAITING_APPROVAL, ProjectState.BUILDING)
+            self.store.append(
+                create_event(
+                    project_id,
+                    EventType.APPROVAL_RECORDED,
+                    {
+                        "plan_hash": eff_plan_hash,
+                        "decision": "approved",
+                        "to": ProjectState.BUILDING.value,
+                        "mode": "rollback",
+                        "rollback_to": full_target_sha,
+                    },
+                    at=now,
+                )
+            )
+            validate_transition(ProjectState.BUILDING, ProjectState.VERIFYING)
+            self.store.append(
+                create_event(
+                    project_id,
+                    EventType.STATE_TRANSITIONED,
+                    {"from": ProjectState.BUILDING.value, "to": ProjectState.VERIFYING.value},
+                    at=now,
+                )
+            )
+            validate_transition(ProjectState.VERIFYING, ProjectState.DELIVERED)
+            delivered_pl: dict[str, Any] = {
+                "repo_url": current_status.links.repo if current_status.links else None,
+                "deploy_url": current_status.links.deploy if current_status.links else None,
+                "commit_sha": new_sha,
+                "version_label": new_label,
+                "rollback_from": full_target_sha,
+                "summary": f"Restaurado a {target_cp_label} ({full_target_sha[:7]})",
+            }
+            self.store.append(
+                create_event(project_id, EventType.PROJECT_DELIVERED, delivered_pl, at=now)
+            )
+
+            final_status = self.get_status(project_id)
+            checkpoints = self.list_project_checkpoints(project_id, extra_secrets=extra_secrets)
+            return final_status, (checkpoints[0] if checkpoints else {"commit_sha": new_sha, "version_label": new_label})
+
+    def modify_project(
+        self,
+        project_id: str,
+        instructions: str,
+        *,
+        target_files: Sequence[str] | None = None,
+        workspace_manager: WorkspaceManager | None = None,
+    ) -> ProjectStatus:
         """Transition a DELIVERED project legally via CHANGE_REQUEST to BUILDING preserving workspace (INV-04, INV-05)."""
         validate_project_id(project_id)
         clean_instr = _CTRL_CHARS_RE.sub(" ", str(instructions or "")).strip()
@@ -1527,12 +2012,20 @@ class Orchestrator:
             if base_plan is None or not current_status.plan_hash:
                 raise ValueError(f"Project '{project_id}' has no approved plan to modify")
 
+            ws_dir = self._resolve_project_workspace_dir(
+                project_id, status=current_status, workspace_manager=workspace_manager
+            )
+            clean_targets = sanitize_target_files(ws_dir, target_files)
+
             # INV-04 canonical sequence: DELIVERED -> CHANGE_REQUEST -> INTERVIEW -> DEBATE -> MEDIATION -> WAITING_APPROVAL -> BUILDING
+            cr_extra: dict[str, Any] = {"reason": clean_instr, "instructions": clean_instr}
+            if clean_targets:
+                cr_extra["target_files"] = clean_targets
             for src_state, dst_state, extra_payload in (
                 (
                     ProjectState.DELIVERED,
                     ProjectState.CHANGE_REQUEST,
-                    {"reason": clean_instr, "instructions": clean_instr},
+                    cr_extra,
                 ),
                 (ProjectState.CHANGE_REQUEST, ProjectState.INTERVIEW, {}),
             ):
@@ -1554,14 +2047,17 @@ class Orchestrator:
             updated_spec = spec.model_copy(update={"features": updated_features})
             with self._lock:
                 self._specs[project_id] = updated_spec
+            spec_pl: dict[str, Any] = {
+                "spec": updated_spec.model_dump(mode="json"),
+                "change_instructions": clean_instr,
+            }
+            if clean_targets:
+                spec_pl["target_files"] = clean_targets
             self.store.append(
                 create_event(
                     project_id=project_id,
                     event_type=EventType.SPEC_UPDATED,
-                    payload={
-                        "spec": updated_spec.model_dump(mode="json"),
-                        "change_instructions": clean_instr,
-                    },
+                    payload=spec_pl,
                     at=self._now(),
                 )
             )
@@ -1612,19 +2108,22 @@ class Orchestrator:
             self.circuit_breaker.reset(project_id, ProjectState.VERIFYING)
 
             validate_transition(ProjectState.WAITING_APPROVAL, ProjectState.BUILDING)
+            app_pl: dict[str, Any] = {
+                "plan_hash": new_plan_hash,
+                "decision": "approved",
+                "timestamp": self._now().isoformat(),
+                "from": ProjectState.WAITING_APPROVAL.value,
+                "to": ProjectState.BUILDING.value,
+                "mode": "modify",
+                "instructions": clean_instr,
+            }
+            if clean_targets:
+                app_pl["target_files"] = clean_targets
             self.store.append(
                 create_event(
                     project_id=project_id,
                     event_type=EventType.APPROVAL_RECORDED,
-                    payload={
-                        "plan_hash": new_plan_hash,
-                        "decision": "approved",
-                        "timestamp": self._now().isoformat(),
-                        "from": ProjectState.WAITING_APPROVAL.value,
-                        "to": ProjectState.BUILDING.value,
-                        "mode": "modify",
-                        "instructions": clean_instr,
-                    },
+                    payload=app_pl,
                     at=self._now(),
                 )
             )

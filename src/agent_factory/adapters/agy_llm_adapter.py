@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, NoReturn
@@ -25,6 +26,11 @@ from agent_factory.secrets import redact_secrets
 logger = logging.getLogger(__name__)
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\r?\n?(.*?)\r?\n?```", re.DOTALL | re.IGNORECASE)
+MAX_CLI_ARG_PROMPT_CHARS = 6000
+_STDIN_PROMPT_INSTRUCTION = (
+    "Follow all instructions, repository context, and JSON formatting rules "
+    "provided via standard input (stdin)."
+)
 
 
 def _extract_schema_dict(schema: type[BaseModel] | dict[str, Any] | None) -> dict[str, Any] | None:
@@ -272,6 +278,67 @@ class AgyLLMAdapter:
             invalid_response=True,
         )
 
+    def _invoke_cli_prompt(
+        self,
+        *,
+        prompt: str,
+        active_model: str | None,
+        clean_env: dict[str, str],
+    ) -> CommandResult:
+        """Execute CLI keeping prompts <=6,000 chars inline and piping longer prompts via stdin or temp file."""
+        if len(prompt) <= MAX_CLI_ARG_PROMPT_CHARS:
+            command = list(self.cli_command) + ["-p", prompt]
+            if active_model:
+                command.extend(["--model", active_model])
+            return self.runner.run(
+                command=command,
+                cwd=self.cwd,
+                timeout_seconds=self.timeout_seconds,
+                env=clean_env,
+            )
+
+        command = list(self.cli_command) + ["-p", _STDIN_PROMPT_INSTRUCTION]
+        if active_model:
+            command.extend(["--model", active_model])
+        try:
+            return self.runner.run(
+                command=command,
+                cwd=self.cwd,
+                timeout_seconds=self.timeout_seconds,
+                env=clean_env,
+                input=prompt,
+            )
+        except TypeError as exc:
+            if "input" not in str(exc):
+                raise
+
+        tmp_file_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                suffix=".txt",
+                prefix="agy_prompt_",
+                delete=False,
+            ) as tmp_file:
+                tmp_file.write(prompt)
+                tmp_file_path = Path(tmp_file.name)
+            file_command = list(self.cli_command) + [
+                "-p",
+                f"Read and execute all instructions from UTF-8 file: {tmp_file_path}",
+            ]
+            if active_model:
+                file_command.extend(["--model", active_model])
+            return self.runner.run(
+                command=file_command,
+                cwd=self.cwd,
+                timeout_seconds=self.timeout_seconds,
+                env=clean_env,
+            )
+        finally:
+            if tmp_file_path is not None:
+                tmp_file_path.unlink(missing_ok=True)
+
     def complete(
         self,
         messages: list[dict[str, str]],
@@ -296,18 +363,14 @@ class AgyLLMAdapter:
                 attempt_idx,
                 max_attempts,
             )
-            command = list(self.cli_command) + ["-p", prompt]
-            if active_model:
-                command.extend(["--model", active_model])
 
             res: CommandResult | None = None
             run_error: str | None = None
             try:
-                res = self.runner.run(
-                    command=command,
-                    cwd=self.cwd,
-                    timeout_seconds=self.timeout_seconds,
-                    env=clean_env,
+                res = self._invoke_cli_prompt(
+                    prompt=prompt,
+                    active_model=active_model,
+                    clean_env=clean_env,
                 )
             except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
                 run_error = f"agy CLI execution failed: {exc}"
