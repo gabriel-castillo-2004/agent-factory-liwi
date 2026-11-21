@@ -3477,6 +3477,111 @@ def test_dashboard_ux_redesign_progress_timer_header_and_four_tabs(tmp_path: Pat
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_blocks_b0_b1_b2_b3_a11y_responsive_feedback_and_simple_mode(
+    tmp_path: Path,
+) -> None:
+    """Blocks B0-B3: tokens/a11y, responsive breakpoints/switcher, unified feedback/AbortController, Simple mode clarity."""
+    store = SqliteEventStore(db_path=tmp_path / "blocks_b0_b3.db")
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_b0_b3")
+    pid = "b0-b3-app"
+    now = datetime(2026, 4, 21, 9, 0, tzinfo=UTC)
+    plan_dict = _plan_payload("Plan B0-B3")
+    plan_hash = Plan.model_validate(plan_dict).compute_hash()
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "App B0", "objective": "Probar B0-B3", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+        create_event(pid, EventType.PROJECT_DELIVERED, {"repo_url": "", "deploy_url": "", "commit_sha": "abc1234", "version_label": "v1"}, at=now),
+    ):
+        store.append(ev)
+
+    orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        workspace_manager=ws_mgr,
+    )
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            assert html_resp.status == 200
+            html = html_resp.read().decode("utf-8")
+
+        # Never introduce external CDNs or https:// links in DASHBOARD_HTML
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+
+        # B0: Tokens, focus-visible, reduced motion, contrast, and dead CSS cleanup
+        for b0_marker in (
+            "--fs-",
+            "--sp-",
+            ":focus-visible",
+            "prefers-reduced-motion",
+        ):
+            assert b0_marker in html
+        assert ".tech-toggle {" not in html
+        assert ".tech-mode-hint" not in html
+        assert "versions-box" not in html
+
+        # B1: Responsive layout, coarse touch targets, switcher, scrollIntoView, minmax, fullscreen sheet, modal dvh
+        for b1_marker in (
+            "@media (max-width: 600px)",
+            "@media (max-width: 1023px)",
+            "@media (max-width: 1279px)",
+            "@media (pointer: coarse)",
+            "min-height: 44px",
+            'id="mobile-project-switcher"',
+            "scrollIntoView",
+            "minmax(0, 1fr)",
+            "100dvh",
+        ):
+            assert b1_marker in html
+
+        # B2: Unified progress banner, STALL_BG_MINUTES, AbortController timeouts, toast stack, panel signatures
+        for b2_marker in (
+            'id="toast-stack"',
+            "AbortController",
+            "STALL_BG_MINUTES = 10",
+            "lastListSignature",
+            "lastSpecSignature",
+            "lastEventsSignature",
+            "Reintentar",
+        ):
+            assert b2_marker in html
+
+        # B3: Clear Simple mode vs tech-only isolation, rollback button + custom modal, examples, optimistic state
+        for b3_marker in (
+            'id="example-prompts"',
+            'id="simple-rollback-btn"',
+            'id="confirm-action-modal"',
+            "Qué se va a construir",
+            "Verificaciones:",
+            "simple-only",
+            "Respuesta enviada · Analizando",
+            "Volver a la versión anterior",
+        ):
+            assert b3_marker in html
+
+        # Verify Modelo: and activity_detail in buildGuidanceBanner are isolated as tech-only
+        fn_start = html.index("function buildGuidanceBanner(")
+        fn_end = html.index("function renderDetail()", fn_start)
+        running_block = html[fn_start:fn_end].split("if (st.state === 'INTERVIEW')", 1)[0]
+        assert "model-pill tech-only" in running_block
+        assert "banner-subdesc tech-only" in running_block
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+
 
 
 

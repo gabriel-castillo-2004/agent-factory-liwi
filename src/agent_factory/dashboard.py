@@ -1425,40 +1425,65 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       --muted: #94a3b8;
       --accent: #38bdf8;
       --accent-hover: #0ea5e9;
+      --btn-primary-fg: #082f49;
       --ok: #22c55e;
-      --ok-hover: #16a34a;
+      --ok-btn: #15803d;
+      --ok-btn-hover: #166534;
       --ok-bg: rgba(34, 197, 94, 0.14);
       --warn: #f59e0b;
+      --warn-btn: #b45309;
+      --warn-btn-hover: #92400e;
       --warn-bg: rgba(245, 158, 11, 0.14);
-      --err: #ef4444;
+      --err: #f87171;
       --err-bg: rgba(239, 68, 68, 0.14);
       --info-bg: rgba(56, 189, 248, 0.12);
+      --fs-xs: 0.76rem;
+      --fs-sm: 0.84rem;
+      --fs-base: 0.94rem;
+      --fs-lg: 1.15rem;
+      --fs-xl: 1.35rem;
+      --sp-1: 4px;
+      --sp-2: 8px;
+      --sp-3: 12px;
+      --sp-4: 16px;
+      --sp-5: 20px;
+      --sp-6: 24px;
     }
     html[data-theme="light"] {
       --bg: #f8fafc;
       --surface: #ffffff;
       --surface-alt: #f1f5f9;
-      --border: #e2e8f0;
+      --border: #cbd5e1;
       --text: #0f172a;
       --muted: #475569;
-      --accent: #0284c7;
-      --accent-hover: #0369a1;
-      --ok: #16a34a;
-      --ok-hover: #15803d;
+      --accent: #0369a1;
+      --accent-hover: #075985;
+      --btn-primary-fg: #ffffff;
+      --ok: #15803d;
+      --ok-btn: #15803d;
+      --ok-btn-hover: #166534;
       --ok-bg: #dcfce7;
-      --warn: #d97706;
+      --warn: #b45309;
+      --warn-btn: #b45309;
+      --warn-btn-hover: #92400e;
       --warn-bg: #fef3c7;
-      --err: #dc2626;
+      --err: #b91c1c;
       --err-bg: #fee2e2;
       --info-bg: #e0f2fe;
     }
     * { box-sizing: border-box; }
+    :focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
     body {
       margin: 0;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-size: var(--fs-base);
       background: var(--bg);
       color: var(--text);
       line-height: 1.5;
+      overflow-x: hidden;
     }
     header {
       display: flex;
@@ -1516,25 +1541,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .btn-primary {
       background: var(--accent);
-      color: #082f49;
+      color: var(--btn-primary-fg);
       border-color: var(--accent);
       font-weight: 600;
     }
     .btn-primary:hover { background: var(--accent-hover); }
     .btn-success {
-      background: var(--ok);
+      background: var(--ok-btn);
       color: #ffffff;
-      border-color: var(--ok);
+      border-color: var(--ok-btn);
       font-weight: 600;
-      box-shadow: 0 2px 4px rgba(34, 197, 94, 0.2);
+      box-shadow: 0 2px 4px rgba(21, 128, 61, 0.25);
     }
-    .btn-success:hover { background: var(--ok-hover); }
+    .btn-success:hover { background: var(--ok-btn-hover); }
     .btn-warn {
-      background: var(--warn);
+      background: var(--warn-btn);
       color: #ffffff;
-      border-color: var(--warn);
+      border-color: var(--warn-btn);
       font-weight: 600;
     }
+    .btn-warn:hover { background: var(--warn-btn-hover); }
     .btn-subtle-danger {
       background: transparent;
       border: 1px solid transparent;
@@ -1552,14 +1578,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
     .layout {
       display: grid;
-      grid-template-columns: minmax(320px, 390px) 1fr;
-      gap: 20px;
-      padding: 20px 24px;
+      grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
+      gap: var(--sp-5);
+      padding: var(--sp-5) var(--sp-6);
       max-width: 1440px;
       margin: 0 auto;
     }
-    @media (max-width: 900px) {
-      .layout { grid-template-columns: 1fr; }
+    @media (max-width: 1023px) {
+      .layout {
+        grid-template-columns: minmax(0, 1fr);
+        padding: var(--sp-3);
+        gap: var(--sp-3);
+      }
     }
     .panel {
       background: var(--surface);
@@ -1934,8 +1964,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       border-color: var(--err);
     }
     .phase-card.phase-pending {
-      opacity: 0.55;
       background: var(--surface-alt);
+      border-style: dashed;
+    }
+    .phase-card.phase-pending .phase-title,
+    .phase-card.phase-pending .phase-meta-badge {
+      color: var(--muted);
+    }
+    .phase-card.phase-pending .phase-circle {
+      opacity: 0.55;
     }
     .phase-summary {
       list-style: none;
@@ -2141,6 +2178,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .input-field:focus {
       outline: none;
       border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.25);
     }
     .banner-form {
       display: flex;
@@ -2208,20 +2246,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       color: var(--muted);
       margin-top: 8px;
     }
-    .tech-toggle {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 0.85rem;
-      color: var(--muted);
-      cursor: pointer;
-      user-select: none;
-      padding: 4px 8px;
-      border-radius: 6px;
-      border: 1px solid var(--border);
-      background: var(--surface);
-    }
     body:not(.tech-mode) .tech-only { display: none; }
+    body.tech-mode .simple-only { display: none; }
     .history-toolbar {
       display: flex;
       justify-content: space-between;
@@ -2378,8 +2404,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       padding-top: 8px;
       border-top: 1px dashed var(--border);
     }
-    .tech-mode-hint { font-size: 0.76rem; }
-    .versions-box {
+    .versions-panel {
       margin-top: 10px;
       padding: 10px 12px;
       border: 1px solid var(--border);
@@ -2410,12 +2435,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
     .detail-work-split.preview-open {
       display: grid;
-      grid-template-columns: minmax(340px, 1fr) minmax(360px, 1fr);
-      gap: 16px;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: var(--sp-4);
       align-items: start;
-    }
-    @media (max-width: 1080px) {
-      .detail-work-split.preview-open { grid-template-columns: 1fr; }
     }
     .preview-card {
       border: 1px solid var(--border);
@@ -2439,7 +2461,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
     #live-preview-iframe {
       width: 100%;
-      height: 540px;
+      height: clamp(320px, 62vh, 720px);
       border: 0;
       background: #ffffff;
     }
@@ -2524,6 +2546,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       max-width: 1440px;
       margin: 12px auto 0 auto;
       padding: 0 24px;
+      position: sticky;
+      top: 62px;
+      z-index: 9;
     }
     .live-activity-banner {
       padding: 10px 16px;
@@ -2593,6 +2618,241 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       flex-direction: column;
       gap: 12px;
     }
+    .modal-card {
+      max-height: 100dvh;
+      overflow: auto;
+    }
+    .mobile-switcher-row {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--sp-2);
+    }
+    .mobile-switcher-btn {
+      flex: 1;
+      justify-content: space-between;
+      text-align: left;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .badge-short { display: none; }
+    .example-prompts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .example-chip {
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: var(--fs-xs);
+      cursor: pointer;
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+    .example-chip:hover {
+      border-color: var(--accent);
+      background: var(--info-bg);
+    }
+    .toast-stack {
+      position: fixed;
+      right: 20px;
+      bottom: 20px;
+      z-index: 70;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-width: 360px;
+      width: calc(100vw - 32px);
+      pointer-events: none;
+    }
+    .toast-item {
+      pointer-events: auto;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 14px;
+      border-radius: 10px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-left-width: 4px;
+      color: var(--text);
+      font-size: var(--fs-sm);
+      box-shadow: 0 10px 26px rgba(0, 0, 0, 0.35);
+    }
+    .toast-item.toast-ok { border-left-color: var(--ok); }
+    .toast-item.toast-err { border-left-color: var(--err); }
+    .toast-item.toast-info { border-left-color: var(--accent); }
+    .toast-close {
+      background: transparent;
+      border: 0;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 1rem;
+      line-height: 1;
+      padding: 2px 4px;
+    }
+    .inline-error-box {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 8px;
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: var(--err-bg);
+      border: 1px solid rgba(239, 68, 68, 0.4);
+      color: var(--err);
+      font-size: var(--fs-sm);
+    }
+    .optimistic-sent-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 8px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: var(--fs-sm);
+      font-weight: 600;
+      color: var(--ok);
+      background: var(--ok-bg);
+      border: 1px solid rgba(34, 197, 94, 0.35);
+    }
+    .flash-saved {
+      outline: 2px solid var(--ok);
+      outline-offset: 2px;
+      border-radius: 6px;
+    }
+    .simple-rollback-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface-alt);
+    }
+    .settings-feedback {
+      font-size: var(--fs-xs);
+      color: var(--ok);
+      font-weight: 600;
+    }
+    @media (max-width: 1279px) {
+      .detail-work-split.preview-open {
+        display: block;
+      }
+      .detail-work-split.preview-open .preview-card {
+        position: fixed;
+        inset: 0;
+        top: 0;
+        z-index: 60;
+        border-radius: 0;
+        border: 0;
+        height: 100dvh;
+        max-height: 100dvh;
+      }
+      .detail-work-split.preview-open #live-preview-iframe {
+        flex: 1;
+        height: auto;
+        min-height: 0;
+      }
+    }
+    @media (max-width: 1023px) {
+      .mobile-switcher-row { display: flex; }
+      #sidebar-panel.sidebar-collapsed .panel-header,
+      #sidebar-panel.sidebar-collapsed #sidebar-projects-body {
+        display: none;
+      }
+      #sidebar-panel.sidebar-collapsed .mobile-switcher-row {
+        margin-bottom: 0;
+      }
+    }
+    @media (max-width: 600px) {
+      header {
+        padding: 10px 14px;
+        gap: 8px;
+      }
+      .brand { font-size: 1rem; gap: 8px; }
+      .panel { padding: 14px; }
+      .detail-header { flex-wrap: wrap; }
+      .badge-full { display: none; }
+      .badge-short { display: inline; }
+      .tabs {
+        overflow-x: auto;
+        white-space: nowrap;
+        flex-wrap: nowrap;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: thin;
+      }
+      .tab-btn { flex: 0 0 auto; }
+      .modal-backdrop {
+        padding: 0;
+        align-items: flex-end;
+      }
+      .modal-card {
+        max-width: 100%;
+        border-radius: 14px 14px 0 0;
+      }
+      .live-activity-shell {
+        position: fixed;
+        bottom: 12px;
+        left: 12px;
+        right: 12px;
+        top: auto;
+        margin: 0;
+        padding: 0;
+        z-index: 45;
+      }
+      .live-activity-banner {
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+        cursor: pointer;
+      }
+      .live-activity-banner:not(.expanded):not(.stall) #live-activity-subtext {
+        display: none;
+      }
+      .toast-stack {
+        right: auto;
+        left: 50%;
+        transform: translateX(-50%);
+        bottom: 72px;
+      }
+    }
+    @media (pointer: coarse) {
+      .btn,
+      .btn-sm,
+      .btn-icon,
+      .seg-btn,
+      .tab-btn,
+      .settings-item,
+      .example-chip,
+      .mobile-switcher-btn {
+        min-height: 44px;
+      }
+      .btn-icon { min-width: 44px; }
+      input[type="checkbox"] {
+        width: 22px;
+        height: 22px;
+      }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+      }
+      .project-card:hover { transform: none; }
+    }
   </style>
 </head>
 <body>
@@ -2601,7 +2861,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <span id="server-health-dot" class="live-dot" title="Sincronización activa con el servidor"></span>
       <span>Fábrica de Proyectos</span>
       <span id="server-health-label" class="health-label" aria-live="polite" style="display:none">Servidor desconectado</span>
-      <span id="status-note" class="toast"></span>
+      <span id="status-note" class="sr-only"></span>
     </div>
     <div class="controls">
       <div id="view-mode-segmented" class="segmented-control" role="group" aria-label="Modo técnico: Vista Simple o Vista Desarrollador" title="Modo técnico: alterna entre Vista Simple y Vista Desarrollador">
@@ -2624,6 +2884,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <span>Apariencia</span>
             <button id="theme-btn" class="btn btn-sm" type="button">Modo claro</button>
           </div>
+          <div id="settings-feedback" class="settings-feedback" style="display:none"></div>
         </div>
       </div>
     </div>
@@ -2650,25 +2911,38 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 
   <main class="layout">
-    <section class="panel">
+    <section class="panel sidebar-collapsed" id="sidebar-panel">
+      <div class="mobile-switcher-row" style="margin-bottom:10px;">
+        <button id="mobile-project-switcher" class="btn btn-sm mobile-switcher-btn" type="button" aria-expanded="false" aria-controls="sidebar-projects-body">Proyecto: Cargando… ▾ (0)</button>
+        <button id="mobile-new-project-shortcut" class="btn btn-primary btn-sm" type="button">+ Nuevo</button>
+      </div>
       <div class="panel-header">
-        <h2 style="margin:0; font-size:1.15rem;">Tus proyectos</h2>
+        <h2 style="margin:0; font-size:var(--fs-lg);">Tus proyectos</h2>
         <div style="display:flex; gap:6px; flex-wrap:wrap;">
           <button id="toggle-import-project-btn" class="btn btn-sm" type="button">Importar proyecto</button>
           <button id="toggle-new-project-btn" class="btn btn-sm" type="button">+ Nuevo proyecto</button>
         </div>
       </div>
-      <form id="new-project-form" class="new-project-form" style="display:none">
-        <div class="input-row-with-mic">
-          <textarea id="new-project-input" class="input-field" rows="3" placeholder="¿Qué quieres construir?" required></textarea>
-          <button id="new-project-mic-btn" class="btn btn-sm mic-btn" type="button" title="Dictar idea por voz (es-MX)">🎤</button>
-        </div>
-        <div class="new-project-actions">
-          <button id="cancel-new-project-btn" class="btn btn-sm" type="button">Cancelar</button>
-          <button id="submit-new-project-btn" class="btn btn-primary btn-sm" type="submit">Comenzar</button>
-        </div>
-      </form>
-      <div id="project-list" class="muted" style="margin-top:14px;">Cargando proyectos...</div>
+      <div id="sidebar-projects-body">
+        <form id="new-project-form" class="new-project-form" style="display:none">
+          <div id="example-prompts" class="example-prompts">
+            <span class="muted" style="font-size:var(--fs-xs);">Ejemplos:</span>
+            <button type="button" class="example-chip" data-example="Crea un temporizador Pomodoro minimalista con pausas configurables y alertas visuales.">⏱️ Temporizador Pomodoro</button>
+            <button type="button" class="example-chip" data-example="Crea un diario didáctico que tenga preguntas guía diarias y calendario para revisar entradas anteriores.">📓 Diario con preguntas guía</button>
+            <button type="button" class="example-chip" data-example="Crea una interfaz web local para organizar y descargar mi música favorita con barra de progreso.">🎵 Organizador de música</button>
+          </div>
+          <div class="muted" style="font-size:var(--fs-xs); margin-bottom:8px;">Consejo: cuéntanos para quién es y 2 o 3 funciones principales que deseas.</div>
+          <div class="input-row-with-mic">
+            <textarea id="new-project-input" class="input-field" rows="3" placeholder="¿Qué quieres construir?" required></textarea>
+            <button id="new-project-mic-btn" class="btn btn-sm mic-btn" type="button" title="Dictar idea por voz (es-MX)">🎤</button>
+          </div>
+          <div class="new-project-actions">
+            <button id="cancel-new-project-btn" class="btn btn-sm" type="button">Cancelar</button>
+            <button id="submit-new-project-btn" class="btn btn-primary btn-sm" type="submit">Comenzar</button>
+          </div>
+        </form>
+        <div id="project-list" class="muted" style="margin-top:14px;">Cargando proyectos...</div>
+      </div>
     </section>
 
     <div id="import-project-modal" class="modal-backdrop" style="display:none">
@@ -2688,7 +2962,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
     <section class="panel" id="detail-panel">
-      <div id="detail-empty" class="empty-box">Selecciona un proyecto de la lista para ver su estado y detalles.</div>
+      <div id="detail-empty" class="empty-box">
+        <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" style="opacity:0.6; margin-bottom:8px;" aria-hidden="true">
+          <rect x="3" y="4" width="18" height="16" rx="3"></rect>
+          <path d="M8 9h8M8 13h5" stroke-linecap="round"></path>
+        </svg>
+        <div style="font-weight:600; color:var(--text); margin-bottom:4px;">Selecciona un proyecto de la lista para ver su estado y detalles.</div>
+        <div class="muted" style="margin-bottom:12px;">También puedes crear uno nuevo describiendo tu idea en español.</div>
+        <button id="empty-detail-create-btn" class="btn btn-primary btn-sm" type="button">+ Nuevo proyecto</button>
+      </div>
       <div id="detail-content" style="display:none">
         <div id="detail-work-split" class="detail-work-split">
           <div id="detail-main-col">
@@ -2748,7 +3030,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </section>
   </main>
 
+  <div id="confirm-action-modal" class="modal-backdrop" style="display:none">
+    <div class="modal-card" style="max-width:440px;">
+      <h3 id="confirm-modal-title" style="margin:0 0 8px 0;">Confirmar acción</h3>
+      <p id="confirm-modal-body" class="muted" style="font-size:var(--fs-sm); margin:0 0 16px 0;"></p>
+      <div style="display:flex; justify-content:flex-end; gap:8px;">
+        <button id="confirm-modal-cancel" class="btn btn-sm" type="button">Cancelar</button>
+        <button id="confirm-modal-ok" class="btn btn-warn btn-sm" type="button">Confirmar</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="false"></div>
+
   <script>
+    const STALL_HTTP_SECONDS = 75;
+    const STALL_BG_MINUTES = 10;
     const state = {
       projects: [],
       selectedId: null,
@@ -2778,14 +3075,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       phaseOpen: {},
       priorOpen: {},
       userChoseTabByPid: {},
+      interviewPendingByPid: {},
       lastBannerSignature: null,
       lastModifySignature: null,
+      lastListSignature: null,
+      lastSpecSignature: null,
+      lastEventsSignature: null,
       activeOp: null,
+      opHandoff: null,
       bgOpPid: null,
       bgOpStartedAtMs: null,
       serverConnected: true,
     };
     let statusNoteTimer = null;
+    let lastToastEntry = { msg: '', at: 0 };
 
     function escapeHtml(text) {
       return String(text ?? '')
@@ -2883,20 +3186,139 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    function setNote(msg) {
-      const el = document.getElementById('status-note');
-      if (!el) return;
-      if (statusNoteTimer) {
-        clearTimeout(statusNoteTimer);
-        statusNoteTimer = null;
-      }
-      el.textContent = msg || '';
-      if (msg) {
-        statusNoteTimer = setTimeout(() => {
-          el.textContent = '';
+    function setNote(msg, variant) {
+      const cleanMsg = String(msg || '').trim();
+      const hiddenEl = document.getElementById('status-note');
+      if (hiddenEl) {
+        if (statusNoteTimer) {
+          clearTimeout(statusNoteTimer);
           statusNoteTimer = null;
-        }, 4000);
+        }
+        hiddenEl.textContent = cleanMsg;
+        if (cleanMsg) {
+          statusNoteTimer = setTimeout(() => {
+            hiddenEl.textContent = '';
+            statusNoteTimer = null;
+          }, 4000);
+        }
       }
+      if (!cleanMsg) return;
+      const nowMs = Date.now();
+      if (lastToastEntry.msg === cleanMsg && (nowMs - lastToastEntry.at) < 6000) {
+        return;
+      }
+      lastToastEntry = { msg: cleanMsg, at: nowMs };
+      const stack = document.getElementById('toast-stack');
+      if (!stack) return;
+      let kind = variant || 'info';
+      if (!variant && /^Error|^No se pudo/i.test(cleanMsg)) {
+        kind = 'err';
+      } else if (!variant && /^✓|actualizad|guardad|activado|encendida|restaurad/i.test(cleanMsg)) {
+        kind = 'ok';
+      }
+      const item = document.createElement('div');
+      item.className = 'toast-item toast-' + kind;
+      item.setAttribute('role', kind === 'err' ? 'alert' : 'status');
+      const txtSpan = document.createElement('span');
+      txtSpan.textContent = cleanMsg;
+      const closeBtn = document.createElement('button');
+      closeBtn.type = 'button';
+      closeBtn.className = 'toast-close';
+      closeBtn.setAttribute('aria-label', 'Cerrar aviso');
+      closeBtn.textContent = '×';
+      closeBtn.addEventListener('click', () => {
+        if (item.parentNode) item.parentNode.removeChild(item);
+      });
+      item.appendChild(txtSpan);
+      item.appendChild(closeBtn);
+      stack.appendChild(item);
+      while (stack.children.length > 3) {
+        stack.removeChild(stack.firstChild);
+      }
+      const ttl = kind === 'err' ? 6500 : 4500;
+      setTimeout(() => {
+        if (item.parentNode) item.parentNode.removeChild(item);
+      }, ttl);
+    }
+
+    function flashSavedElement(elOrId) {
+      const el = typeof elOrId === 'string' ? document.getElementById(elOrId) : elOrId;
+      if (!el) return;
+      el.classList.add('flash-saved');
+      setTimeout(() => el.classList.remove('flash-saved'), 1400);
+    }
+
+    function showSettingsFeedback(msg) {
+      const el = document.getElementById('settings-feedback');
+      if (!el) return;
+      el.textContent = msg;
+      el.style.display = 'block';
+      setTimeout(() => {
+        if (el.textContent === msg) el.style.display = 'none';
+      }, 2500);
+    }
+
+    function askCustomConfirm(opts) {
+      const cfg = opts || {};
+      const modal = document.getElementById('confirm-action-modal');
+      const titleEl = document.getElementById('confirm-modal-title');
+      const bodyEl = document.getElementById('confirm-modal-body');
+      const okBtn = document.getElementById('confirm-modal-ok');
+      const cancelBtn = document.getElementById('confirm-modal-cancel');
+      if (!modal || !titleEl || !bodyEl || !okBtn || !cancelBtn) {
+        return Promise.resolve(window.confirm(cfg.body || '¿Confirmar acción?'));
+      }
+      titleEl.textContent = cfg.title || 'Confirmar acción';
+      bodyEl.textContent = cfg.body || '';
+      okBtn.textContent = cfg.confirmLabel || 'Confirmar';
+      modal.style.display = 'flex';
+      okBtn.focus();
+      return new Promise((resolve) => {
+        let settled = false;
+        function finish(val) {
+          if (settled) return;
+          settled = true;
+          modal.style.display = 'none';
+          okBtn.removeEventListener('click', onOk);
+          cancelBtn.removeEventListener('click', onCancel);
+          modal.removeEventListener('click', onBackdrop);
+          document.removeEventListener('keydown', onKey);
+          resolve(val);
+        }
+        function onOk() { finish(true); }
+        function onCancel() { finish(false); }
+        function onBackdrop(ev) { if (ev.target === modal) finish(false); }
+        function onKey(ev) { if (ev.key === 'Escape') finish(false); }
+        okBtn.addEventListener('click', onOk);
+        cancelBtn.addEventListener('click', onCancel);
+        modal.addEventListener('click', onBackdrop);
+        document.addEventListener('keydown', onKey);
+      });
+    }
+
+    function showInlineError(targetId, errMsg, retryFn) {
+      const el = targetId ? document.getElementById(targetId) : null;
+      if (!el) return;
+      el.innerHTML = '';
+      if (!errMsg) return;
+      const box = document.createElement('div');
+      box.className = 'inline-error-box';
+      box.setAttribute('role', 'alert');
+      const msgSpan = document.createElement('span');
+      msgSpan.textContent = String(errMsg);
+      box.appendChild(msgSpan);
+      if (typeof retryFn === 'function') {
+        const retryBtn = document.createElement('button');
+        retryBtn.type = 'button';
+        retryBtn.className = 'btn btn-sm btn-warn';
+        retryBtn.textContent = 'Reintentar';
+        retryBtn.addEventListener('click', () => {
+          el.innerHTML = '';
+          retryFn();
+        });
+        box.appendChild(retryBtn);
+      }
+      el.appendChild(box);
     }
 
     function applyTheme(theme) {
@@ -2919,7 +3341,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     document.getElementById('theme-btn').addEventListener('click', () => {
       const cur = document.documentElement.getAttribute('data-theme') || 'dark';
-      applyTheme(cur === 'dark' ? 'light' : 'dark');
+      const next = cur === 'dark' ? 'light' : 'dark';
+      applyTheme(next);
+      const label = next === 'light' ? 'Modo claro activado' : 'Modo oscuro activado';
+      showSettingsFeedback('✓ ' + label);
+      setNote('✓ ' + label, 'ok');
     });
 
     function applyTechMode(enabled) {
@@ -3183,19 +3609,92 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
 
+    function resolveFetchTimeoutMs(url, explicitMs) {
+      if (typeof explicitMs === 'number' && explicitMs > 0) return explicitMs;
+      const u = String(url || '');
+      if (u.indexOf('/chat') >= 0) return 180000;
+      if (/\\/(start|modify|rollback|import)\\b/.test(u)) return 120000;
+      return 30000;
+    }
+
     async function apiFetch(url, options = {}) {
-      const res = await fetch(url, options);
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(data.error || ('HTTP ' + res.status));
+      const opts = Object.assign({}, options);
+      const timeoutMs = resolveFetchTimeoutMs(url, opts.timeoutMs);
+      delete opts.timeoutMs;
+      const ctrl = new AbortController();
+      const tid = setTimeout(() => ctrl.abort(), timeoutMs);
+      opts.signal = ctrl.signal;
+      try {
+        const res = await fetch(url, opts);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data.error || ('HTTP ' + res.status));
+        }
+        return data;
+      } catch (err) {
+        if (err && err.name === 'AbortError') {
+          const secs = Math.round(timeoutMs / 1000);
+          const timeoutErr = new Error('Tiempo de espera agotado (' + secs + 's).');
+          timeoutErr.isTimeout = true;
+          throw timeoutErr;
+        }
+        throw err;
+      } finally {
+        clearTimeout(tid);
       }
-      return data;
+    }
+
+    function openNewProjectComposer() {
+      const sidePanel = document.getElementById('sidebar-panel');
+      if (sidePanel) sidePanel.classList.remove('sidebar-collapsed');
+      const swBtn = document.getElementById('mobile-project-switcher');
+      if (swBtn) swBtn.setAttribute('aria-expanded', 'true');
+      const form = document.getElementById('new-project-form');
+      const input = document.getElementById('new-project-input');
+      if (form) form.style.display = 'block';
+      if (input) input.focus();
+    }
+
+    function updateMobileSwitcherLabel() {
+      const swBtn = document.getElementById('mobile-project-switcher');
+      if (!swBtn) return;
+      const count = state.projects.length;
+      const active = state.projects.find((p) => p.project_id === state.selectedId) || state.projects[0] || null;
+      const label = active
+        ? ('Proyecto: ' + (active.name || active.objective || active.project_id) + ' ▾ (' + count + ')')
+        : 'Sin proyectos ▾ (0)';
+      swBtn.textContent = label;
     }
 
     function renderProjectList() {
       const container = document.getElementById('project-list');
+      updateMobileSwitcherLabel();
+      const listSig = JSON.stringify([
+        state.selectedId,
+        state.projects.map((p) => [p.project_id, p.name, p.state, Boolean(p.is_running || p.busy), p.last_event_at, p.logo_url]),
+      ]);
+      if (state.lastListSignature === listSig && container.children.length > 0) {
+        return;
+      }
+      state.lastListSignature = listSig;
+
       if (!state.projects.length) {
-        container.innerHTML = '<div class="empty-box">No hay proyectos registrados todavía.</div>';
+        const sidePanel = document.getElementById('sidebar-panel');
+        if (sidePanel) sidePanel.classList.remove('sidebar-collapsed');
+        container.innerHTML =
+          '<div class="empty-box">' +
+            '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" style="opacity:0.65; margin-bottom:6px;" aria-hidden="true">' +
+              '<rect x="3" y="4" width="18" height="16" rx="3"></rect>' +
+              '<path d="M12 9v6M9 12h6" stroke-linecap="round"></path>' +
+            '</svg>' +
+            '<div style="font-weight:600; color:var(--text); margin-bottom:4px;">No hay proyectos registrados todavía.</div>' +
+            '<div class="muted" style="margin-bottom:10px;">Empieza describiendo tu aplicación con tus propias palabras.</div>' +
+            '<button id="empty-create-btn" class="btn btn-primary btn-sm" type="button">+ Crear mi primer proyecto</button>' +
+          '</div>';
+        const emptyBtn = document.getElementById('empty-create-btn');
+        if (emptyBtn) {
+          emptyBtn.addEventListener('click', openNewProjectComposer);
+        }
         return;
       }
       container.innerHTML = state.projects.map((p) => {
@@ -3237,11 +3736,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       container.querySelectorAll('.project-card').forEach((card) => {
         card.addEventListener('click', () => {
           state.selectedId = card.dataset.id;
+          state.lastListSignature = null;
           state.lastBannerSignature = null;
           state.lastModifySignature = null;
+          state.lastSpecSignature = null;
+          state.lastEventsSignature = null;
           state.lastChatSig = null;
+          const sidePanel = document.getElementById('sidebar-panel');
+          if (sidePanel && window.innerWidth < 1024) {
+            sidePanel.classList.add('sidebar-collapsed');
+            const swBtn = document.getElementById('mobile-project-switcher');
+            if (swBtn) swBtn.setAttribute('aria-expanded', 'false');
+          }
           renderProjectList();
           loadDetail(state.selectedId);
+          const detailPanel = document.getElementById('detail-panel');
+          if (detailPanel && window.innerWidth < 1024) {
+            detailPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }
         });
       });
     }
@@ -3499,6 +4011,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    function formatHandoffElapsed(pid, startedIso) {
+      const parsedMs = startedIso ? Date.parse(startedIso) : NaN;
+      let startMs = isFinite(parsedMs) ? parsedMs : NaN;
+      if (state.opHandoff && state.opHandoff.pid === pid && (Date.now() - state.opHandoff.endedAtMs) < 30000) {
+        if (!isFinite(startMs) || startMs >= (state.opHandoff.startedAtMs - 1500)) {
+          startMs = state.opHandoff.startedAtMs;
+        }
+      }
+      if (!isFinite(startMs)) return '';
+      const elapsedSecs = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+      return formatDurationHuman(elapsedSecs, '0s') || '0s';
+    }
+
     function renderLiveActivityBanner() {
       const banner = document.getElementById('live-activity-banner');
       const textEl = document.getElementById('live-activity-text');
@@ -3510,23 +4035,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       let label = '';
       let subtext = '';
       let startedAtMs = null;
+      let stalled = false;
       if (state.activeOp && state.activeOp.startedAtMs) {
         label = state.activeOp.label || 'Procesando operación...';
         subtext = state.activeOp.subtext || '';
         startedAtMs = state.activeOp.startedAtMs;
+        const httpSecs = Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000));
+        stalled = httpSecs >= STALL_HTTP_SECONDS;
       } else if (state.detail && state.detail.status && (state.detail.status.is_running || state.detail.status.busy)) {
         const st = state.detail.status;
-        label = st.activity_summary || friendlyStateName(st.state) || 'Procesando...';
-        subtext = st.activity_detail || '';
-        const parsedMs = st.step_started_at ? Date.parse(st.step_started_at) : NaN;
-        if (isFinite(parsedMs)) {
-          startedAtMs = parsedMs;
+        const refIso = st.last_event_at || st.step_started_at;
+        const refMs = refIso ? Date.parse(refIso) : NaN;
+        const idleMins = isFinite(refMs) ? ((Date.now() - refMs) / 60000) : 0;
+        if (idleMins >= STALL_BG_MINUTES) {
+          label = st.activity_summary || friendlyStateName(st.state) || 'Procesando...';
+          subtext = 'Sin cambios recientes en la etapa actual.';
+          startedAtMs = refMs;
+          stalled = true;
         } else {
-          if (state.bgOpPid !== st.project_id || !state.bgOpStartedAtMs) {
-            state.bgOpPid = st.project_id;
-            state.bgOpStartedAtMs = Date.now();
-          }
-          startedAtMs = state.bgOpStartedAtMs;
+          banner.style.display = 'none';
+          banner.classList.remove('stall');
+          stallEl.style.display = 'none';
+          return;
         }
       } else {
         state.bgOpPid = null;
@@ -3546,7 +4076,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       textEl.textContent = label;
       subEl.textContent = subtext;
       timerEl.textContent = formatClockMmSs(elapsedSecs);
-      const stalled = elapsedSecs >= 75;
       banner.classList.toggle('stall', stalled);
       stallEl.style.display = stalled ? 'flex' : 'none';
     }
@@ -3565,20 +4094,42 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             '<span>' + escapeHtml(cfg.label || 'Procesando...') + '</span>' +
           '</span>';
       }
+      const opStart = Date.now();
       state.activeOp = {
+        pid: cfg.pid || state.selectedId || null,
         label: cfg.label || 'Procesando...',
         subtext: cfg.subtext || '',
-        startedAtMs: Date.now(),
-        retryFn: cfg.retryFn || null,
+        startedAtMs: opStart,
       };
+      state.lastBannerSignature = null;
       renderLiveActivityBanner();
+      let hadError = false;
       try {
         return await asyncFn();
+      } catch (err) {
+        hadError = true;
+        const errText = (err && err.message) ? err.message : String(err || 'Error inesperado.');
+        setNote('Error: ' + errText, 'err');
+        if (cfg.inlineTargetId) {
+          showInlineError(cfg.inlineTargetId, errText, () => runTrackedOperation(cfg, asyncFn));
+        }
+        return undefined;
       } finally {
+        const finishedOp = state.activeOp;
         state.activeOp = null;
+        if (!hadError && finishedOp && finishedOp.pid) {
+          state.opHandoff = {
+            pid: finishedOp.pid,
+            startedAtMs: opStart,
+            endedAtMs: Date.now(),
+          };
+        }
+        state.lastBannerSignature = null;
         renderLiveActivityBanner();
-        const inlineAfter = cfg.inlineTargetId ? document.getElementById(cfg.inlineTargetId) : null;
-        if (inlineAfter) inlineAfter.innerHTML = '';
+        if (!hadError) {
+          const inlineAfter = cfg.inlineTargetId ? document.getElementById(cfg.inlineTargetId) : null;
+          if (inlineAfter) inlineAfter.innerHTML = '';
+        }
         const btnAfter = typeof cfg.buttonEl === 'string'
           ? document.getElementById(cfg.buttonEl)
           : cfg.buttonEl;
@@ -3588,22 +4139,34 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    (function initActivityReloadBtn() {
+    (function initActivityBannerInteractions() {
       const reloadBtn = document.getElementById('live-activity-reload-btn');
-      if (!reloadBtn) return;
-      reloadBtn.addEventListener('click', () => {
-        state.activeOp = null;
-        state.bgOpStartedAtMs = null;
-        renderLiveActivityBanner();
-        setNote('Recargando estado del servidor...');
-        loadProjects();
-      });
+      if (reloadBtn) {
+        reloadBtn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          state.activeOp = null;
+          state.bgOpStartedAtMs = null;
+          state.lastBannerSignature = null;
+          renderLiveActivityBanner();
+          setNote('Recargando estado del servidor...', 'info');
+          loadProjects();
+        });
+      }
+      const banner = document.getElementById('live-activity-banner');
+      if (banner) {
+        banner.addEventListener('click', () => {
+          if (window.innerWidth <= 600) {
+            banner.classList.toggle('expanded');
+          }
+        });
+      }
     })();
 
     function updateLiveTimers() {
       document.querySelectorAll('.live-step-timer[data-started-at]').forEach((el) => {
         const startedAt = el.getAttribute('data-started-at');
-        const formatted = formatElapsedSince(startedAt);
+        const pid = el.getAttribute('data-pid') || state.selectedId;
+        const formatted = formatHandoffElapsed(pid, startedAt);
         if (formatted) {
           el.textContent = 'Tiempo en este paso: ' + formatted;
         }
@@ -3614,17 +4177,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     function buildGuidanceBanner(st, events) {
       const isRunning = Boolean(st.is_running || st.busy);
       if (isRunning) {
+        if (state.activeOp) {
+          return '';
+        }
         const descText = st.activity_summary
           ? escapeHtml(st.activity_summary)
           : 'Los agentes están avanzando en esta etapa. Esta pantalla se actualiza sola cada 5 segundos.';
         const subDescHtml = st.activity_detail
-          ? '<div class="banner-subdesc">' + escapeHtml(st.activity_detail) + '</div>'
+          ? '<div class="banner-subdesc tech-only">' + escapeHtml(st.activity_detail) + '</div>'
           : '';
         const hasTests = typeof st.tests_passed === 'number' && typeof st.tests_total === 'number' && st.tests_total > 0;
         const testsPending = hasTests && st.tests_passed < st.tests_total;
         const testsHtml = hasTests
           ? '<div class="banner-tests' + (testsPending ? ' pending' : '') + '">' +
-              (testsPending ? '' : '✓ ') + st.tests_passed + ' de ' + st.tests_total + ' pruebas aprobadas' +
+              '<span class="simple-only">Verificaciones: ' + st.tests_passed + ' de ' + st.tests_total + (testsPending ? ' en curso' : ' ✓') + '</span>' +
+              '<span class="tech-only">' + (testsPending ? '' : '✓ ') + st.tests_passed + ' de ' + st.tests_total + ' pruebas aprobadas</span>' +
             '</div>'
           : '';
         const agentsCount = Number(st.agents_count || 1);
@@ -3633,11 +4200,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           : (agentsCount > 1 ? (agentsCount + ' agentes colaborando') : '1 agente trabajando');
         const agentsPill = '<span class="model-pill">' + escapeHtml(agentsText) + '</span>';
         const modelPill = st.active_model
-          ? '<span class="model-pill">Modelo: ' + escapeHtml(st.active_model) + '</span>'
+          ? '<span class="model-pill tech-only">Modelo: ' + escapeHtml(st.active_model) + '</span>'
           : '';
-        const elapsedText = st.step_started_at ? formatElapsedSince(st.step_started_at) : '';
+        const elapsedText = st.step_started_at ? formatHandoffElapsed(st.project_id, st.step_started_at) : '';
         const timerPill = st.step_started_at
-          ? '<span class="model-pill live-step-timer" data-started-at="' + escapeHtml(st.step_started_at) + '">Tiempo en este paso: ' + escapeHtml(elapsedText || '0s') + '</span>'
+          ? '<span class="model-pill live-step-timer" data-pid="' + escapeHtml(st.project_id) + '" data-started-at="' + escapeHtml(st.step_started_at) + '">Tiempo en este paso: ' + escapeHtml(elapsedText || '0s') + '</span>'
           : '';
         return '<div class="guidance-banner banner-info">' +
           '<div class="banner-content">' +
@@ -3662,6 +4229,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const inact = formatInactivityNote(st.last_event_at);
         const inactHtml = inact ? '<div class="inactivity-note">' + escapeHtml(inact) + '</div>' : '';
         const draft = escapeHtml((state.replyDrafts && state.replyDrafts[st.project_id]) || '');
+        const pendingHtml = (state.interviewPendingByPid && state.interviewPendingByPid[st.project_id])
+          ? '<div class="optimistic-sent-pill">✓ Respuesta enviada · Analizando…</div>'
+          : '';
         return '<div class="guidance-banner banner-info">' +
           '<div class="banner-content">' +
             '<div class="banner-icon">💬</div>' +
@@ -3669,6 +4239,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               '<div class="banner-title">Esperando tus respuestas</div>' +
               qHtml +
               inactHtml +
+              pendingHtml +
             '</div>' +
           '</div>' +
           '<div class="banner-form">' +
@@ -3678,6 +4249,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             '</div>' +
             '<div class="banner-actions">' +
               '<button id="interview-reply-btn" class="btn btn-primary" type="button">Enviar respuesta</button>' +
+              '<span id="interview-inline-status"></span>' +
             '</div>' +
           '</div>' +
         '</div>';
@@ -3875,7 +4447,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       while (i < rawEvents.length) {
         const ev = rawEvents[i];
         const pl = ev && ev.payload ? ev.payload : {};
-        if (ev.type === 'STATE_TRANSITIONED') {
+        if (ev.type === 'STATE_TRANSITIONED' || ev.type === 'PRAGMATIST_PROPOSED' || ev.type === 'STRUCTURALIST_CRITIQUED') {
           items.push({ kind: 'tech_only', ev });
           i++;
           continue;
@@ -4038,7 +4610,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     function renderFileChips(files) {
       if (!Array.isArray(files) || !files.length) return '';
-      return '<div class="file-chips">' + files.map((f) =>
+      return '<div class="file-chips tech-only">' + files.map((f) =>
         '<span class="file-chip">' + escapeHtml(f) + '</span>'
       ).join('') + '</div>';
     }
@@ -4130,7 +4702,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const testBadge = hasTests
           ? '<span class="test-badge' + (allOk ? ' ok' : '') + '">' + passed + '/' + tpl.total + (allOk ? ' ✓' : ' pruebas') + '</span>'
           : '';
-        const ciBadge = item.ciEv ? '<span class="test-badge ok">CI ✓</span>' : '';
+        const ciBadge = item.ciEv ? '<span class="test-badge ok tech-only">CI ✓</span>' : '';
         const modelPill = pl.model ? '<span class="model-pill tech-only">' + escapeHtml(String(pl.model)) + '</span>' : '';
         const durPill = item.durSecs !== null ? '<span class="duration-pill">Tardó ' + escapeHtml(formatDurationHuman(item.durSecs, '< 1s')) + '</span>' : '';
         const cleanRoundSummary = sanitizeDisplaySummary(item.summaryShort);
@@ -4219,9 +4791,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
 
       const badge = document.getElementById('detail-badge');
-      badge.textContent = info.step;
+      badge.innerHTML =
+        '<span class="badge-full">' + escapeHtml(info.step) + '</span>' +
+        '<span class="badge-short">' + escapeHtml(info.cardStep || info.step) + '</span>';
       badge.className = 'badge ' + info.cls;
+      updateMobileSwitcherLabel();
       const isRunning = Boolean(st.is_running || st.busy || (state.detail && state.detail.is_running));
+      if (state.interviewPendingByPid[st.project_id]) {
+        const sentAt = state.interviewPendingByPid[st.project_id];
+        const lastEvMs = st.last_event_at ? Date.parse(st.last_event_at) : 0;
+        if (st.state !== 'INTERVIEW' || isRunning || (isFinite(lastEvMs) && lastEvMs > sentAt + 2000)) {
+          delete state.interviewPendingByPid[st.project_id];
+        }
+      }
       const pausedActive = !isRunning && (
         st.state === 'DEBATE' || st.state === 'MEDIATION' ||
         st.state === 'BUILDING' || st.state === 'VERIFYING'
@@ -4293,6 +4875,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         st.links,
         st.local_app,
         Boolean(state.previewOpen[st.project_id]),
+        Boolean(state.interviewPendingByPid[st.project_id]),
+        Boolean(state.activeOp),
         (state.checkpointsByPid[st.project_id] || []).length,
         (state.filesByPid[st.project_id] || []).length,
         Boolean(state.diffByPid[st.project_id]),
@@ -4372,215 +4956,244 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         btn.addEventListener('click', () => handleAction(btn.dataset.dact, st.project_id, btn));
       });
 
-      // Unified "Resumen y Plan" tab
+      // Unified "Resumen y Plan" tab (signature-guarded to avoid 5s DOM flicker)
       const spec = state.detail.spec || {};
-      const fields = [];
-      if (spec.objective && String(spec.objective).trim()) {
-        fields.push('<div class="spec-section"><h4>Objetivo</h4><p>' + escapeHtml(spec.objective) + '</p></div>');
-      }
-      if (Array.isArray(spec.users) && spec.users.length) {
-        fields.push('<div class="spec-section"><h4>Usuarios</h4><ul>' + spec.users.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
-      }
-      if (Array.isArray(spec.features) && spec.features.length) {
-        fields.push('<div class="spec-section"><h4>Funcionalidades</h4><ul>' + spec.features.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
-      }
-      if (Array.isArray(spec.business_rules) && spec.business_rules.length) {
-        fields.push('<div class="spec-section"><h4>Reglas de negocio</h4><ul>' + spec.business_rules.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
-      }
-      if (Array.isArray(spec.edge_cases) && spec.edge_cases.length) {
-        fields.push('<div class="spec-section"><h4>Casos borde</h4><ul>' + spec.edge_cases.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
-      }
-      if (Array.isArray(spec.constraints) && spec.constraints.length) {
-        fields.push('<div class="spec-section"><h4>Restricciones</h4><ul>' + spec.constraints.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
-      }
-      if (Array.isArray(spec.success_criteria) && spec.success_criteria.length) {
-        fields.push('<div class="spec-section"><h4>Criterios de éxito</h4><ul>' + spec.success_criteria.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
-      }
-      if (Array.isArray(spec.assumptions) && spec.assumptions.length) {
-        fields.push('<div class="spec-section"><h4>Supuestos</h4><ul>' + spec.assumptions.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
-      }
-      const specHtml = fields.length
-        ? fields.join('')
-        : '<div class="empty-box">Aún estamos definiendo los detalles de este proyecto.</div>';
+      const plan = state.detail.plan || null;
+      const specSig = JSON.stringify([st.project_id, spec, plan]);
+      if (state.lastSpecSignature !== specSig) {
+        state.lastSpecSignature = specSig;
+        const fields = [];
+        if (spec.objective && String(spec.objective).trim()) {
+          fields.push('<div class="spec-section"><h4>Objetivo</h4><p>' + escapeHtml(spec.objective) + '</p></div>');
+        }
+        if (Array.isArray(spec.users) && spec.users.length) {
+          fields.push('<div class="spec-section"><h4>Usuarios</h4><ul>' + spec.users.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
+        }
+        if (Array.isArray(spec.features) && spec.features.length) {
+          fields.push('<div class="spec-section"><h4>Funcionalidades</h4><ul>' + spec.features.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
+        }
+        if (Array.isArray(spec.business_rules) && spec.business_rules.length) {
+          fields.push('<div class="spec-section tech-only"><h4>Reglas de negocio</h4><ul>' + spec.business_rules.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
+        }
+        if (Array.isArray(spec.edge_cases) && spec.edge_cases.length) {
+          fields.push('<div class="spec-section tech-only"><h4>Casos borde</h4><ul>' + spec.edge_cases.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
+        }
+        if (Array.isArray(spec.constraints) && spec.constraints.length) {
+          fields.push('<div class="spec-section tech-only"><h4>Restricciones</h4><ul>' + spec.constraints.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
+        }
+        if (Array.isArray(spec.success_criteria) && spec.success_criteria.length) {
+          fields.push('<div class="spec-section"><h4>Criterios de éxito</h4><ul>' + spec.success_criteria.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
+        }
+        if (Array.isArray(spec.assumptions) && spec.assumptions.length) {
+          fields.push('<div class="spec-section tech-only"><h4>Supuestos</h4><ul>' + spec.assumptions.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
+        }
+        const specHtml = fields.length
+          ? fields.join('')
+          : '<div class="empty-box">Aún estamos definiendo los detalles de este proyecto.</div>';
 
-      const plan = state.detail.plan;
-      let planHtml = '<div class="empty-box">Aún no se ha generado un Plan.</div>';
-      if (plan) {
-        const filesHtml = (plan.files || []).map((f) =>
-          '<div class="file-card"><div class="file-path">' + escapeHtml(f.path) + '</div><div class="file-purpose">' + escapeHtml(f.purpose) + '</div>' +
-          (f.contract ? '<details class="tech-details tech-only"><summary>Contrato</summary><pre>' + escapeHtml(f.contract) + '</pre></details>' : '') +
-          '</div>'
-        ).join('');
-        const testsHtml = (plan.acceptance_tests || []).map((t) =>
-          '<li><strong>[' + escapeHtml(t.id) + '] (' + escapeHtml(t.type) + ')</strong>: ' + escapeHtml(t.description) + '</li>'
-        ).join('');
-        planHtml =
-          '<div class="plan-summary"><strong>Resumen:</strong> ' + escapeHtml(plan.summary) + '</div>' +
-          (plan.rationale ? '<div class="plan-summary"><strong>Justificación:</strong> ' + escapeHtml(plan.rationale) + '</div>' : '') +
-          '<div class="plan-meta">' +
-            '<span class="badge badge-info">Plantilla: ' + escapeHtml(plan.template_id) + '</span>' +
-            '<span class="badge badge-info">Target: ' + escapeHtml(plan.deployment_target) + '</span>' +
-          '</div>' +
-          '<h4 style="margin:14px 0 8px 0;">Archivos (' + (plan.files || []).length + ')</h4>' + filesHtml +
-          '<h4 style="margin:14px 0 8px 0;">Pruebas de aceptación (' + (plan.acceptance_tests || []).length + ')</h4><ul style="padding-left:20px; font-size:0.92rem;">' + testsHtml + '</ul>';
+        let planHtml = '<div class="empty-box">Aún no se ha generado un Plan.</div>';
+        if (plan) {
+          const filesList = plan.files || [];
+          const testsList = plan.acceptance_tests || [];
+          const filesHtml = filesList.map((f) =>
+            '<div class="file-card"><div class="file-path">' + escapeHtml(f.path) + '</div><div class="file-purpose">' + escapeHtml(f.purpose) + '</div>' +
+            (f.contract ? '<details class="tech-details tech-only"><summary>Contrato</summary><pre>' + escapeHtml(f.contract) + '</pre></details>' : '') +
+            '</div>'
+          ).join('');
+          const techTestsHtml = testsList.map((t) =>
+            '<li><strong>[' + escapeHtml(t.id) + '] (' + escapeHtml(t.type) + ')</strong>: ' + escapeHtml(t.description) + '</li>'
+          ).join('');
+          const simpleTestsHtml = testsList.map((t) =>
+            '<li>✓ ' + escapeHtml(t.description) + '</li>'
+          ).join('');
+          planHtml =
+            '<div class="plan-summary"><strong>Resumen:</strong> ' + escapeHtml(plan.summary) + '</div>' +
+            (plan.rationale ? '<div class="plan-summary tech-only"><strong>Justificación:</strong> ' + escapeHtml(plan.rationale) + '</div>' : '') +
+            '<div class="plan-meta tech-only">' +
+              '<span class="badge badge-info">Plantilla: ' + escapeHtml(plan.template_id) + '</span>' +
+              '<span class="badge badge-info">Target: ' + escapeHtml(plan.deployment_target) + '</span>' +
+            '</div>' +
+            '<div class="simple-only">' +
+              '<h4 style="margin:14px 0 8px 0;">Verificaciones: ' + testsList.length + ' comprobaciones automáticas ✓</h4>' +
+              '<ul style="padding-left:20px; font-size:0.92rem;">' + simpleTestsHtml + '</ul>' +
+            '</div>' +
+            '<div class="tech-only">' +
+              '<h4 style="margin:14px 0 8px 0;">Archivos (' + filesList.length + ')</h4>' + filesHtml +
+              '<h4 style="margin:14px 0 8px 0;">Pruebas de aceptación (' + testsList.length + ')</h4><ul style="padding-left:20px; font-size:0.92rem;">' + techTestsHtml + '</ul>' +
+            '</div>';
+        }
+        document.getElementById('tab-spec').innerHTML =
+          specHtml +
+          '<div class="tab-section-divider">' +
+            '<h4 class="simple-only" style="margin:0 0 12px 0; font-size:1rem;">Qué se va a construir</h4>' +
+            '<h4 class="tech-only" style="margin:0 0 12px 0; font-size:1rem;">Plan de construcción</h4>' +
+            planHtml +
+          '</div>';
       }
-      document.getElementById('tab-spec').innerHTML =
-        specHtml +
-        '<div class="tab-section-divider">' +
-          '<h4 style="margin:0 0 12px 0; font-size:1rem;">Plan de construcción</h4>' +
-          planHtml +
-        '</div>';
 
       // Events tab ("Historial" grouped into 5 clear lifecycle phases)
-      const LIFECYCLE_PHASES = [
-        { num: 1, id: 'idea', title: '1. Idea y requisitos' },
-        { num: 2, id: 'design', title: '2. Diseño de la solución' },
-        { num: 3, id: 'approval', title: '3. Aprobación del plan' },
-        { num: 4, id: 'build', title: '4. Construcción y pruebas' },
-        { num: 5, id: 'delivery', title: '5. Entrega final' },
-      ];
-
-      const splitRes = splitProjectAttempts(events);
-      const activeEnriched = splitRes.activeEvents.map((ev) => ({
-        ev,
-        phaseNum: phaseNumForEvent(ev),
-      }));
-
       const isDelivered = st.state === 'DELIVERED' || st.state === 'COMPLETED';
       const isFailed = st.state === 'FAILED' || st.state === 'ERROR';
-      const activePhaseNum = isDelivered ? 6 : info.stage;
+      const eventsSig = JSON.stringify([
+        st.project_id,
+        st.state,
+        isRunning,
+        activeModel,
+        events.length,
+        st.last_event_at,
+        st.last_error,
+        info.stage,
+      ]);
+      if (state.lastEventsSignature !== eventsSig) {
+        state.lastEventsSignature = eventsSig;
+        const LIFECYCLE_PHASES = [
+          { num: 1, id: 'idea', title: '1. Idea y requisitos' },
+          { num: 2, id: 'design', title: '2. Diseño de la solución' },
+          { num: 3, id: 'approval', title: '3. Aprobación del plan' },
+          { num: 4, id: 'build', title: '4. Construcción y pruebas' },
+          { num: 5, id: 'delivery', title: '5. Entrega final' },
+        ];
 
-      const phasesHtml = '<div class="phase-list">' + LIFECYCLE_PHASES.map((ph) => {
-        const phaseItems = activeEnriched.filter((it) => it.phaseNum === ph.num);
-        let phaseStatus = 'pending';
-        if (isDelivered) {
-          phaseStatus = 'completed';
-        } else if (isFailed) {
-          if (ph.num < activePhaseNum) phaseStatus = 'completed';
-          else if (ph.num === activePhaseNum) phaseStatus = 'error';
-          else phaseStatus = 'pending';
-        } else {
-          if (ph.num < activePhaseNum) phaseStatus = 'completed';
-          else if (ph.num === activePhaseNum) phaseStatus = 'active';
-          else phaseStatus = 'pending';
-        }
+        const splitRes = splitProjectAttempts(events);
+        const activeEnriched = splitRes.activeEvents.map((ev) => ({
+          ev,
+          phaseNum: phaseNumForEvent(ev),
+        }));
 
-        if (phaseStatus === 'pending') {
-          return '<div class="phase-card phase-pending">' +
-            '<div class="phase-summary">' +
+        const activePhaseNum = isDelivered ? 6 : info.stage;
+
+        const phasesHtml = '<div class="phase-list">' + LIFECYCLE_PHASES.map((ph) => {
+          const phaseItems = activeEnriched.filter((it) => it.phaseNum === ph.num);
+          let phaseStatus = 'pending';
+          if (isDelivered) {
+            phaseStatus = 'completed';
+          } else if (isFailed) {
+            if (ph.num < activePhaseNum) phaseStatus = 'completed';
+            else if (ph.num === activePhaseNum) phaseStatus = 'error';
+            else phaseStatus = 'pending';
+          } else {
+            if (ph.num < activePhaseNum) phaseStatus = 'completed';
+            else if (ph.num === activePhaseNum) phaseStatus = 'active';
+            else phaseStatus = 'pending';
+          }
+
+          if (phaseStatus === 'pending') {
+            return '<div class="phase-card phase-pending">' +
+              '<div class="phase-summary">' +
+                '<span class="phase-summary-left">' +
+                  '<span class="phase-circle">' + ph.num + '</span>' +
+                  '<span class="phase-title">' + escapeHtml(ph.title) + '</span>' +
+                '</span>' +
+                '<span class="phase-meta-badge">Pendiente</span>' +
+              '</div>' +
+            '</div>';
+          }
+
+          let badgeLabel = 'En curso';
+          let circleHtml = String(ph.num);
+          if (phaseStatus === 'completed') {
+            const durStr = computePhaseDuration(ph.num, phaseItems, activeEnriched);
+            badgeLabel = durStr ? ('Completado en ' + durStr) : 'Completado';
+            circleHtml = '✓';
+          } else if (phaseStatus === 'error') {
+            badgeLabel = 'Requiere atención';
+            circleHtml = '!';
+          }
+
+          const stateKey = st.project_id + ':' + ph.id;
+          const defaultOpen = (phaseStatus === 'active' || phaseStatus === 'error');
+          const isOpen = (stateKey in state.phaseOpen) ? state.phaseOpen[stateKey] : defaultOpen;
+          const openAttr = isOpen ? ' open' : '';
+
+          const phaseRawEvents = phaseItems.map((it) => it.ev);
+          const grouped = pairAndGroupPhaseEvents(phaseRawEvents);
+          const hasVisible = grouped.some((g) => g.kind !== 'tech_only');
+          const emptyFallback = !hasVisible
+            ? '<div class="muted" style="font-size:0.86rem;">' + (phaseStatus === 'completed' ? 'Etapa completada.' : 'En progreso en esta fase...') + '</div>'
+            : '';
+          const stepsHtml = grouped.length
+            ? (emptyFallback + '<div class="timeline">' + grouped.map(renderTimelineEntry).join('') + '</div>')
+            : '<div class="muted" style="font-size:0.86rem;">En progreso en esta fase...</div>';
+
+          return '<details class="phase-card phase-' + phaseStatus + '" data-phase-key="' + escapeHtml(stateKey) + '"' + openAttr + '>' +
+            '<summary class="phase-summary">' +
               '<span class="phase-summary-left">' +
-                '<span class="phase-circle">' + ph.num + '</span>' +
+                '<span class="phase-circle">' + circleHtml + '</span>' +
                 '<span class="phase-title">' + escapeHtml(ph.title) + '</span>' +
               '</span>' +
-              '<span class="phase-meta-badge">Pendiente</span>' +
-            '</div>' +
-          '</div>';
+              '<span class="phase-meta-badge">' + escapeHtml(badgeLabel) + '</span>' +
+            '</summary>' +
+            '<div class="phase-steps">' + stepsHtml + '</div>' +
+          '</details>';
+        }).join('') + '</div>';
+
+        let priorHtml = '';
+        if (splitRes.priorGroups.length) {
+          const priorKey = st.project_id + ':prior';
+          const priorOpenAttr = state.priorOpen[priorKey] ? ' open' : '';
+          const attemptsMarkup = splitRes.priorGroups.map((grp, idx) => {
+            const grpGrouped = pairAndGroupPhaseEvents(grp);
+            const lbl = splitRes.priorGroups.length > 1 ? ('Intento ' + (idx + 1)) : 'Intento anterior';
+            return '<div style="margin-top:10px;">' +
+              '<div class="muted" style="font-size:0.8rem; font-weight:600; margin-bottom:6px;">' + escapeHtml(lbl) + '</div>' +
+              '<div class="timeline">' + grpGrouped.map(renderTimelineEntry).join('') + '</div>' +
+            '</div>';
+          }).join('');
+          priorHtml = '<details class="prior-attempts-box" data-prior-key="' + escapeHtml(priorKey) + '"' + priorOpenAttr + '>' +
+            '<summary>Ver intentos anteriores (' + splitRes.priorGroups.length + ')</summary>' +
+            attemptsMarkup +
+          '</details>';
         }
 
-        let badgeLabel = 'En curso';
-        let circleHtml = String(ph.num);
-        if (phaseStatus === 'completed') {
-          const durStr = computePhaseDuration(ph.num, phaseItems, activeEnriched);
-          badgeLabel = durStr ? ('Completado en ' + durStr) : 'Completado';
-          circleHtml = '✓';
-        } else if (phaseStatus === 'error') {
-          badgeLabel = 'Requiere atención';
-          circleHtml = '!';
-        }
+        const toolbarHtml = '<div class="history-toolbar">' +
+          '<span class="muted tech-only">ID: <code>' + escapeHtml(st.project_id) + '</code></span>' +
+          '<button id="copy-diag-btn" class="btn btn-sm tech-only" type="button">Copiar diagnóstico</button>' +
+        '</div>';
 
-        const stateKey = st.project_id + ':' + ph.id;
-        const defaultOpen = (phaseStatus === 'active' || phaseStatus === 'error');
-        const isOpen = (stateKey in state.phaseOpen) ? state.phaseOpen[stateKey] : defaultOpen;
-        const openAttr = isOpen ? ' open' : '';
+        const eventsEl = document.getElementById('tab-events');
+        eventsEl.innerHTML = toolbarHtml + phasesHtml + priorHtml;
 
-        const phaseRawEvents = phaseItems.map((it) => it.ev);
-        const grouped = pairAndGroupPhaseEvents(phaseRawEvents);
-        const hasVisible = grouped.some((g) => g.kind !== 'tech_only');
-        const emptyFallback = !hasVisible
-          ? '<div class="muted" style="font-size:0.86rem;">' + (phaseStatus === 'completed' ? 'Etapa completada.' : 'En progreso en esta fase...') + '</div>'
-          : '';
-        const stepsHtml = grouped.length
-          ? (emptyFallback + '<div class="timeline">' + grouped.map(renderTimelineEntry).join('') + '</div>')
-          : '<div class="muted" style="font-size:0.86rem;">En progreso en esta fase...</div>';
-
-        return '<details class="phase-card phase-' + phaseStatus + '" data-phase-key="' + escapeHtml(stateKey) + '"' + openAttr + '>' +
-          '<summary class="phase-summary">' +
-            '<span class="phase-summary-left">' +
-              '<span class="phase-circle">' + circleHtml + '</span>' +
-              '<span class="phase-title">' + escapeHtml(ph.title) + '</span>' +
-            '</span>' +
-            '<span class="phase-meta-badge">' + escapeHtml(badgeLabel) + '</span>' +
-          '</summary>' +
-          '<div class="phase-steps">' + stepsHtml + '</div>' +
-        '</details>';
-      }).join('') + '</div>';
-
-      let priorHtml = '';
-      if (splitRes.priorGroups.length) {
-        const priorKey = st.project_id + ':prior';
-        const priorOpenAttr = state.priorOpen[priorKey] ? ' open' : '';
-        const attemptsMarkup = splitRes.priorGroups.map((grp, idx) => {
-          const grpGrouped = pairAndGroupPhaseEvents(grp);
-          const lbl = splitRes.priorGroups.length > 1 ? ('Intento ' + (idx + 1)) : 'Intento anterior';
-          return '<div style="margin-top:10px;">' +
-            '<div class="muted" style="font-size:0.8rem; font-weight:600; margin-bottom:6px;">' + escapeHtml(lbl) + '</div>' +
-            '<div class="timeline">' + grpGrouped.map(renderTimelineEntry).join('') + '</div>' +
-          '</div>';
-        }).join('');
-        priorHtml = '<details class="prior-attempts-box" data-prior-key="' + escapeHtml(priorKey) + '"' + priorOpenAttr + '>' +
-          '<summary>Ver intentos anteriores (' + splitRes.priorGroups.length + ')</summary>' +
-          attemptsMarkup +
-        '</details>';
-      }
-
-      const toolbarHtml = '<div class="history-toolbar">' +
-        '<span class="muted tech-only">ID: <code>' + escapeHtml(st.project_id) + '</code></span>' +
-        '<button id="copy-diag-btn" class="btn btn-sm tech-only" type="button">Copiar diagnóstico</button>' +
-      '</div>';
-
-      const eventsEl = document.getElementById('tab-events');
-      eventsEl.innerHTML = toolbarHtml + phasesHtml + priorHtml;
-
-      eventsEl.querySelectorAll('details.phase-card[data-phase-key]').forEach((det) => {
-        det.addEventListener('toggle', () => {
-          state.phaseOpen[det.getAttribute('data-phase-key')] = det.open;
+        eventsEl.querySelectorAll('details.phase-card[data-phase-key]').forEach((det) => {
+          det.addEventListener('toggle', () => {
+            state.phaseOpen[det.getAttribute('data-phase-key')] = det.open;
+          });
         });
-      });
-      eventsEl.querySelectorAll('details.prior-attempts-box[data-prior-key]').forEach((det) => {
-        det.addEventListener('toggle', () => {
-          state.priorOpen[det.getAttribute('data-prior-key')] = det.open;
+        eventsEl.querySelectorAll('details.prior-attempts-box[data-prior-key]').forEach((det) => {
+          det.addEventListener('toggle', () => {
+            state.priorOpen[det.getAttribute('data-prior-key')] = det.open;
+          });
         });
-      });
 
-      const copyDiagBtn = document.getElementById('copy-diag-btn');
-      if (copyDiagBtn) {
-        copyDiagBtn.addEventListener('click', async () => {
-          const diagPayload = JSON.stringify({
-            project_id: st.project_id,
-            state: st.state,
-            is_running: isRunning,
-            active_model: activeModel,
-            tests: st.tests || null,
-            last_error: st.last_error || null,
-            events_count: events.length,
-            events: events,
-          }, null, 2);
-          try {
-            if (navigator.clipboard && navigator.clipboard.writeText) {
-              await navigator.clipboard.writeText(diagPayload);
-            } else {
-              const tmp = document.createElement('textarea');
-              tmp.value = diagPayload;
-              document.body.appendChild(tmp);
-              tmp.select();
-              document.execCommand('copy');
-              document.body.removeChild(tmp);
+        const copyDiagBtn = document.getElementById('copy-diag-btn');
+        if (copyDiagBtn) {
+          copyDiagBtn.addEventListener('click', async () => {
+            const diagPayload = JSON.stringify({
+              project_id: st.project_id,
+              state: st.state,
+              is_running: isRunning,
+              active_model: activeModel,
+              tests: st.tests || null,
+              last_error: st.last_error || null,
+              events_count: events.length,
+              events: events,
+            }, null, 2);
+            try {
+              if (navigator.clipboard && navigator.clipboard.writeText) {
+                await navigator.clipboard.writeText(diagPayload);
+              } else {
+                const tmp = document.createElement('textarea');
+                tmp.value = diagPayload;
+                document.body.appendChild(tmp);
+                tmp.select();
+                document.execCommand('copy');
+                document.body.removeChild(tmp);
+              }
+              setNote('Diagnóstico copiado al portapapeles.', 'ok');
+            } catch (err) {
+              setNote('No se pudo copiar el diagnóstico: ' + err.message, 'err');
             }
-            setNote('Diagnóstico copiado al portapapeles.');
-          } catch (err) {
-            setNote('No se pudo copiar el diagnóstico: ' + err.message);
-          }
-        });
+          });
+        }
       }
 
       const auditTabBtn = document.getElementById('tab-audit-btn');
@@ -4646,10 +5259,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const rollbackDisabled = validCps.length === 0 ? ' disabled' : '';
       const rollbackDisplay = validCps.length === 0 ? ' style="display:none"' : '';
       const curCp = validCps.find((c) => c.is_current) || validCps[0] || null;
+      const prevCp = validCps.find((c) => !c.is_current && (!curCp || c.commit_sha !== curCp.commit_sha)) || null;
       const diffText = diffInfo && diffInfo.diff ? diffInfo.diff : 'Sin cambios recientes registrados o sin repositorio Git.';
       const filesOpenAttr = (state.filesOpen && state.filesOpen[pid]) ? ' open' : '';
       const rollbackOpenAttr = (state.rollbackOpen && state.rollbackOpen[pid]) ? ' open' : '';
       const diffOpenAttr = (state.diffOpen && state.diffOpen[pid]) ? ' open' : '';
+      const simpleRbHtml =
+        '<div id="simple-rollback-wrap" class="simple-rollback-bar simple-only"' + (prevCp ? '' : ' style="display:none"') + '>' +
+          '<div>' +
+            '<div style="font-weight:600; font-size:var(--fs-sm);">¿Algo no quedó como esperabas?</div>' +
+            '<div class="muted" style="font-size:var(--fs-xs);">Vuelve con un clic a la versión estable anterior (' + escapeHtml(prevCp ? prevCp.version_label : '') + ').</div>' +
+          '</div>' +
+          '<button id="simple-rollback-btn" class="btn btn-sm" type="button" data-sha="' + escapeHtml(prevCp ? prevCp.commit_sha : '') + '">↩︎ Volver a la versión anterior</button>' +
+        '</div>';
 
       container.innerHTML =
         '<div class="modify-panel-card">' +
@@ -4664,6 +5286,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               '<span id="modify-inline-status"></span>' +
             '</div>' +
           '</div>' +
+          simpleRbHtml +
           '<details id="modify-files-details" class="tech-details tech-only"' + filesOpenAttr + '>' +
             '<summary>Archivos objetivo (opcional)' + (selSet.size ? (' · ' + selSet.size + ' seleccionado(s)') : '') + '</summary>' +
             '<div id="modify-target-files-wrap" style="margin-top:8px;">' +
@@ -4672,7 +5295,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           '</details>' +
           '<details id="rollback-details" class="tech-details tech-only"' + rollbackDisplay + rollbackOpenAttr + '>' +
             '<summary>Versiones estables (Rollback)' + (curCp ? (' · HEAD: ' + escapeHtml(curCp.short_sha || curCp.commit_sha)) : '') + '</summary>' +
-            '<div class="versions-box" style="margin-top:8px;">' +
+            '<div class="versions-panel" style="margin-top:8px;">' +
               '<div class="versions-row">' +
                 '<select id="rollback-version-select" class="input-field"' + rollbackDisabled + '>' +
                   (validCps.length ? cpOptsHtml : '<option value="">Sin checkpoints Git registrados</option>') +
@@ -4717,6 +5340,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const sha = rbSelect.value;
           if (!sha) return;
           await submitRollbackProject(pid, sha, rbBtn);
+        });
+      }
+      const simpleRbBtn = document.getElementById('simple-rollback-btn');
+      if (simpleRbBtn) {
+        simpleRbBtn.addEventListener('click', async () => {
+          const sha = simpleRbBtn.getAttribute('data-sha');
+          if (!sha) return;
+          await submitRollbackProject(pid, sha, simpleRbBtn);
         });
       }
 
@@ -4879,32 +5510,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           : 'Analizando archivos del repositorio...');
       await runTrackedOperation(
         {
+          pid,
           label: modeLabel,
           subtext: 'Lectura segura del código sin alterar archivos.',
           buttonEl: triggerBtn || 'audit-chat-send-btn',
           inlineTargetId: 'audit-inline-status',
         },
         async () => {
-          try {
-            const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/chat', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ message: msg, mode: mode || 'chat' }),
-            });
-            if (mode === 'chat') {
-              state.chatDrafts[pid] = '';
-            }
-            state.chatHistories[pid] = Array.isArray(res.history) ? res.history : [];
-            state.chatLoadedFor[pid] = true;
-            state.lastChatSig = null;
-            renderAuditChatTab(pid);
-            if (res && res.reply) {
-              speakSpanishText(res.reply);
-            }
-            setNote('Respuesta generada.');
-          } catch (err) {
-            setNote('Error en chat auditor: ' + err.message);
+          const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message: msg, mode: mode || 'chat' }),
+          });
+          if (mode === 'chat') {
+            state.chatDrafts[pid] = '';
           }
+          state.chatHistories[pid] = Array.isArray(res.history) ? res.history : [];
+          state.chatLoadedFor[pid] = true;
+          state.lastChatSig = null;
+          renderAuditChatTab(pid);
+          if (res && res.reply) {
+            speakSpanishText(res.reply);
+          }
+          setNote('✓ Respuesta generada.', 'ok');
         }
       );
     }
@@ -4918,7 +5546,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       } catch (err) {
         state.detail = null;
         renderDetail();
-        setNote('Error cargando detalle: ' + err.message);
+        setNote('Error cargando detalle: ' + err.message, 'err');
       }
     }
 
@@ -4942,7 +5570,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
       } catch (err) {
         updateServerHealth(false);
-        setNote('Error de conexión: ' + err.message);
+        setNote('Error de conexión: ' + err.message, 'err');
       }
     }
 
@@ -4952,6 +5580,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         setNote('Por favor escribe un mensaje antes de enviar.');
         return;
       }
+      const inlineTarget = kind === 'reply' ? 'interview-inline-status' : '';
       try {
         await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/message', {
           method: 'POST',
@@ -4960,16 +5589,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         });
         if (kind === 'reply') {
           delete state.replyDrafts[pid];
-          setNote('Respuesta enviada para ' + pid + '.');
+          state.interviewPendingByPid[pid] = Date.now();
+          setNote('✓ Respuesta enviada · Analizando…', 'ok');
         } else {
           delete state.adjustDrafts[pid];
           state.adjustOpen[pid] = false;
-          setNote('Solicitud de ajuste enviada para ' + pid + '.');
+          setNote('✓ Solicitud de ajuste enviada para ' + pid + '.', 'ok');
         }
         state.lastBannerSignature = null;
         await loadProjects();
       } catch (err) {
-        setNote('Error enviando mensaje: ' + err.message);
+        const errMsg = 'Error enviando mensaje: ' + err.message;
+        setNote(errMsg, 'err');
+        if (inlineTarget) {
+          showInlineError(inlineTarget, errMsg, () => sendProjectMessage(pid, rawMsg, kind));
+        }
       }
     }
 
@@ -5067,68 +5701,65 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
       await runTrackedOperation(
         {
+          pid,
           label: 'Aplicando cambios y ejecutando pruebas...',
           subtext: 'El agente modificará el repositorio y correrá la verificación automática.',
           buttonEl: triggerBtn || 'modify-project-btn',
           inlineTargetId: 'modify-inline-status',
         },
         async () => {
-          try {
-            const bodyPayload = { instructions };
-            if (Array.isArray(targetFiles) && targetFiles.length) {
-              bodyPayload.target_files = targetFiles;
-            }
-            await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/modify', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(bodyPayload),
-            });
-            delete state.modifyDrafts[pid];
-            delete state.targetFilesSelected[pid];
-            delete state.devMetaLoadedSig[pid];
-            state.lastBannerSignature = null;
-            state.lastModifySignature = null;
-            setNote('Cambios en curso para ' + pid + '.');
-            await loadProjects();
-          } catch (err) {
-            setNote('Error aplicando cambios: ' + err.message);
+          const bodyPayload = { instructions };
+          if (Array.isArray(targetFiles) && targetFiles.length) {
+            bodyPayload.target_files = targetFiles;
           }
+          await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/modify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(bodyPayload),
+          });
+          delete state.modifyDrafts[pid];
+          delete state.targetFilesSelected[pid];
+          delete state.devMetaLoadedSig[pid];
+          state.lastBannerSignature = null;
+          state.lastModifySignature = null;
+          setNote('✓ Cambios en curso para ' + pid + '.', 'ok');
+          await loadProjects();
         }
       );
     }
 
     async function submitRollbackProject(pid, commitSha, triggerBtn) {
       if (!commitSha) return;
-      if (!window.confirm('¿Deseas restaurar "' + pid + '" a esta versión estable y volver a verificar las pruebas?')) {
-        return;
-      }
+      const confirmed = await askCustomConfirm({
+        title: 'Restaurar versión estable',
+        body: '¿Deseas restaurar este proyecto a una versión anterior estable? Se verificarán las pruebas automáticas antes de aplicar el cambio.',
+        confirmLabel: 'Sí, restaurar versión',
+      });
+      if (!confirmed) return;
       await runTrackedOperation(
         {
+          pid,
           label: 'Restaurando versión estable y ejecutando pruebas...',
           subtext: 'Verificando que el proyecto pase pruebas tras el rollback.',
           buttonEl: triggerBtn || 'rollback-version-btn',
           inlineTargetId: 'modify-inline-status',
         },
         async () => {
-          try {
-            const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/rollback', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ commit_sha: commitSha }),
-            });
-            if (res && Array.isArray(res.checkpoints)) {
-              state.checkpointsByPid[pid] = res.checkpoints;
-            }
-            delete state.devMetaLoadedSig[pid];
-            state.previewOpen[pid] = false;
-            delete state.previewRenderedUrl[pid];
-            state.lastBannerSignature = null;
-            state.lastModifySignature = null;
-            setNote('Versión restaurada con éxito para ' + pid + '.');
-            await loadProjects();
-          } catch (err) {
-            setNote('Error restaurando versión: ' + err.message);
+          const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/rollback', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ commit_sha: commitSha }),
+          });
+          if (res && Array.isArray(res.checkpoints)) {
+            state.checkpointsByPid[pid] = res.checkpoints;
           }
+          delete state.devMetaLoadedSig[pid];
+          state.previewOpen[pid] = false;
+          delete state.previewRenderedUrl[pid];
+          state.lastBannerSignature = null;
+          state.lastModifySignature = null;
+          setNote('✓ Versión restaurada con éxito.', 'ok');
+          await loadProjects();
         }
       );
     }
@@ -5141,9 +5772,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           renderDetail();
           return;
         } else if (action === 'delete') {
-          if (!window.confirm('¿Deseas eliminar el proyecto "' + pid + '"? Esta acción no se puede deshacer.')) {
-            return;
-          }
+          const delOk = await askCustomConfirm({
+            title: 'Eliminar proyecto',
+            body: '¿Deseas eliminar el proyecto "' + pid + '"? Esta acción no se puede deshacer.',
+            confirmLabel: 'Eliminar proyecto',
+          });
+          if (!delOk) return;
           await apiFetch('/api/projects/' + encodeURIComponent(pid), { method: 'DELETE' });
           setNote('Proyecto ' + pid + ' eliminado.');
           if (state.selectedId === pid) {
@@ -5152,7 +5786,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           }
         } else if (action === 'approve') {
           await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/approve', { method: 'POST' });
-          setNote('Construcción iniciada para ' + pid + '.');
+          setNote('✓ Construcción iniciada para ' + pid + '.', 'ok');
         } else if (action === 'retry') {
           await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/retry', {
             method: 'POST',
@@ -5161,9 +5795,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           });
           setNote('Reintento iniciado para ' + pid + '.');
         } else if (action === 'retry-clean') {
-          if (!window.confirm('¿Deseas borrar el workspace actual de "' + pid + '" y reconstruir desde cero?')) {
-            return;
-          }
+          const cleanOk = await askCustomConfirm({
+            title: 'Reconstruir desde cero',
+            body: '¿Deseas borrar el espacio de trabajo actual de "' + pid + '" y reconstruir desde cero?',
+            confirmLabel: 'Sí, reconstruir',
+          });
+          if (!cleanOk) return;
           await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/retry', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -5173,6 +5810,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         } else if (action === 'local-start') {
           await runTrackedOperation(
             {
+              pid,
               label: 'Preparando entorno virtual e instalando dependencias...',
               subtext: 'Iniciando servidor local y verificando respuesta HTTP...',
               buttonEl: triggerBtn,
@@ -5181,7 +5819,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             async () => {
               const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/start', { method: 'POST' });
               const url = res.local_app && res.local_app.url ? res.local_app.url : '';
-              setNote(url ? ('App encendida en ' + url) : ('App encendida para ' + pid));
+              setNote(url ? ('✓ App encendida en ' + url) : ('✓ App encendida para ' + pid), 'ok');
               state.lastBannerSignature = null;
               await loadProjects();
             }
@@ -5196,7 +5834,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         state.lastBannerSignature = null;
         await loadProjects();
       } catch (err) {
-        setNote('Error en ' + action + ': ' + err.message);
+        setNote('Error en ' + action + ': ' + err.message, 'err');
       }
     }
 
@@ -5287,10 +5925,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           });
           closeEditor();
           state.lastBannerSignature = null;
+          state.lastListSignature = null;
+          flashSavedElement('detail-title');
           setNote(
             renameGithubRepo && res && res.repo_url
-              ? 'Título y repositorio en GitHub actualizados.'
-              : 'Título actualizado.'
+              ? '✓ Título y repositorio en GitHub guardados.'
+              : '✓ Título guardado.',
+            'ok'
           );
           await loadProjects();
         } catch (err) {
@@ -5335,7 +5976,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               const detailLogo = document.getElementById('detail-logo-img');
               if (detailLogo) detailLogo.setAttribute('src', res.logo_url);
             }
-            setNote('Logo actualizado.');
+            flashSavedElement('detail-logo-img');
+            state.lastListSignature = null;
+            setNote('✓ Logo actualizado.', 'ok');
             await loadProjects();
           } catch (err) {
             setNote('Error subiendo logo: ' + err.message);
@@ -5347,6 +5990,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     (function initNewProjectForm() {
       const toggleBtn = document.getElementById('toggle-new-project-btn');
+      const mobileNewBtn = document.getElementById('mobile-new-project-shortcut');
+      const emptyDetailBtn = document.getElementById('empty-detail-create-btn');
       const cancelBtn = document.getElementById('cancel-new-project-btn');
       const form = document.getElementById('new-project-form');
       const input = document.getElementById('new-project-input');
@@ -5359,6 +6004,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         if (!showing) {
           input.focus();
         }
+      });
+      if (mobileNewBtn) {
+        mobileNewBtn.addEventListener('click', openNewProjectComposer);
+      }
+      if (emptyDetailBtn) {
+        emptyDetailBtn.addEventListener('click', openNewProjectComposer);
+      }
+
+      document.querySelectorAll('#example-prompts .example-chip').forEach((chip) => {
+        chip.addEventListener('click', () => {
+          const ex = chip.getAttribute('data-example') || '';
+          if (ex && input) {
+            input.value = ex;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.focus();
+          }
+        });
       });
 
       cancelBtn.addEventListener('click', () => {
@@ -5385,14 +6047,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (res.project_id) {
             state.selectedId = res.project_id;
             state.lastBannerSignature = null;
+            state.lastListSignature = null;
           }
-          setNote('Proyecto iniciado: ' + (res.project_id || '') + '.');
+          setNote('✓ Proyecto iniciado: ' + (res.project_id || '') + '.', 'ok');
           await loadProjects();
         } catch (err) {
-          setNote('Error creando proyecto: ' + err.message);
+          setNote('Error creando proyecto: ' + err.message, 'err');
         } finally {
           submitBtn.disabled = false;
         }
+      });
+    })();
+
+    (function initMobileSwitcher() {
+      const swBtn = document.getElementById('mobile-project-switcher');
+      const sidePanel = document.getElementById('sidebar-panel');
+      if (!swBtn || !sidePanel) return;
+      swBtn.addEventListener('click', () => {
+        const collapsed = sidePanel.classList.toggle('sidebar-collapsed');
+        swBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
       });
     })();
 
@@ -5410,6 +6083,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         modal.style.display = 'none';
         pathInput.value = '';
         if (titleInput) titleInput.value = '';
+        const stEl = document.getElementById('import-inline-status');
+        if (stEl) stEl.innerHTML = '';
       }
 
       openBtn.addEventListener('click', () => {
@@ -5436,23 +6111,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             inlineTargetId: 'import-inline-status',
           },
           async () => {
-            try {
-              const res = await apiFetch('/api/projects/import', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ local_path: localPath, title }),
-              });
-              closeModal();
-              if (res.project_id) {
-                state.selectedId = res.project_id;
-                state.lastBannerSignature = null;
-                state.lastModifySignature = null;
-              }
-              setNote('Proyecto importado: ' + (res.project_id || '') + '.');
-              await loadProjects();
-            } catch (err) {
-              setNote('Error importando proyecto: ' + err.message);
+            const res = await apiFetch('/api/projects/import', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ local_path: localPath, title }),
+            });
+            closeModal();
+            if (res.project_id) {
+              state.selectedId = res.project_id;
+              state.lastBannerSignature = null;
+              state.lastModifySignature = null;
+              state.lastListSignature = null;
             }
+            setNote('✓ Proyecto importado: ' + (res.project_id || '') + '.', 'ok');
+            await loadProjects();
           }
         );
       });
@@ -5471,6 +6143,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (!state.voiceTts && 'speechSynthesis' in window) {
             try { window.speechSynthesis.cancel(); } catch (_) {}
           }
+          const msg = state.voiceTts ? 'Lectura en voz alta activada' : 'Lectura en voz alta desactivada';
+          showSettingsFeedback('✓ ' + msg);
+          setNote('✓ ' + msg, 'ok');
         });
       }
 
@@ -5491,14 +6166,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ lan_mode: desired }),
             });
-            setNote(
-              res.lan_mode
-                ? ('Acceso Wi-Fi activado' + (res.lan_ip ? (' (' + res.lan_ip + ')') : '') + '. Apaga y enciende tu app para aplicar.')
-                : 'Acceso Wi-Fi desactivado (solo 127.0.0.1).'
-            );
+            const msg = res.lan_mode
+              ? ('Acceso Wi-Fi activado' + (res.lan_ip ? (' (' + res.lan_ip + ')') : '') + '. Apaga y enciende tu app para aplicar.')
+              : 'Acceso Wi-Fi desactivado (solo 127.0.0.1).';
+            showSettingsFeedback('✓ Preferencia Wi-Fi guardada');
+            setNote('✓ ' + msg, 'ok');
           } catch (err) {
             lanToggle.checked = !desired;
-            setNote('Error cambiando acceso Wi-Fi: ' + err.message);
+            setNote('Error cambiando acceso Wi-Fi: ' + err.message, 'err');
           }
         });
       }
