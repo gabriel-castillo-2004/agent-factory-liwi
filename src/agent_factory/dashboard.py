@@ -2443,32 +2443,211 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       border: 0;
       background: #ffffff;
     }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+    .live-dot.disconnected {
+      background: var(--err);
+      box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
+      animation: none;
+    }
+    .health-label {
+      font-size: 0.78rem;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--err-bg);
+      color: var(--err);
+      border: 1px solid rgba(239, 68, 68, 0.35);
+    }
+    .segmented-control {
+      display: inline-flex;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 2px;
+      gap: 2px;
+    }
+    .seg-btn {
+      background: transparent;
+      border: 0;
+      color: var(--muted);
+      padding: 5px 12px;
+      border-radius: 6px;
+      font-size: 0.84rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .seg-btn:hover { color: var(--text); }
+    .seg-btn.active {
+      background: var(--surface);
+      color: var(--text);
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+    }
+    .settings-menu-wrap {
+      position: relative;
+    }
+    .settings-popover {
+      position: absolute;
+      top: calc(100% + 8px);
+      right: 0;
+      min-width: 260px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px;
+      box-shadow: 0 12px 28px rgba(0, 0, 0, 0.38);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      z-index: 30;
+    }
+    .settings-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 0.85rem;
+      color: var(--text);
+      cursor: pointer;
+    }
+    .live-activity-shell {
+      max-width: 1440px;
+      margin: 12px auto 0 auto;
+      padding: 0 24px;
+    }
+    .live-activity-banner {
+      padding: 10px 16px;
+      background: var(--info-bg);
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .live-activity-banner.stall {
+      background: var(--warn-bg);
+      border-color: rgba(245, 158, 11, 0.45);
+    }
+    .live-activity-main {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 240px;
+      flex: 1;
+    }
+    .live-spinner-svg {
+      width: 18px;
+      height: 18px;
+      flex-shrink: 0;
+      color: var(--accent);
+      animation: spin 0.9s linear infinite;
+    }
+    .live-activity-timer {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.84rem;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--accent);
+    }
+    .live-activity-stall {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      font-size: 0.84rem;
+      color: var(--warn);
+      font-weight: 500;
+    }
+    .inline-op-feedback {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.82rem;
+      color: var(--accent);
+    }
+    .project-card.delivered-card {
+      padding: 10px 14px;
+    }
+    .tab-section-divider {
+      margin: 22px 0 14px 0;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+    }
+    .modify-panel-card {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
   </style>
 </head>
 <body>
   <header>
     <div class="brand">
-      <span class="live-dot" title="Sincronización activa"></span>
+      <span id="server-health-dot" class="live-dot" title="Sincronización activa con el servidor"></span>
       <span>Fábrica de Proyectos</span>
+      <span id="server-health-label" class="health-label" aria-live="polite" style="display:none">Servidor desconectado</span>
       <span id="status-note" class="toast"></span>
     </div>
     <div class="controls">
-      <label class="tech-toggle" title="Permitir acceso desde celulares u otros equipos en tu red Wi-Fi local (0.0.0.0)">
-        <input id="lan-mode-toggle" type="checkbox" />
-        <span>Acceso Wi-Fi (celular)</span>
-      </label>
-      <label class="tech-toggle" title="Leer respuestas nuevas en voz alta en español">
-        <input id="voice-tts-toggle" type="checkbox" />
-        <span>Leer respuestas en voz alta</span>
-      </label>
-      <label class="tech-toggle" title="Modo técnico: alterna entre Vista Simple y Vista Desarrollador">
-        <input id="tech-mode-toggle" type="checkbox" />
-        <span id="view-mode-label">Vista Simple</span>
-        <span class="tech-mode-hint muted">(Vista Desarrollador)</span>
-      </label>
-      <button id="theme-btn" class="btn" type="button">Modo claro</button>
+      <div id="view-mode-segmented" class="segmented-control" role="group" aria-label="Modo técnico: Vista Simple o Vista Desarrollador" title="Modo técnico: alterna entre Vista Simple y Vista Desarrollador">
+        <button id="view-mode-simple" type="button" class="seg-btn active" data-view-mode="simple" aria-label="Vista Simple">Simple</button>
+        <button id="view-mode-dev" type="button" class="seg-btn" data-view-mode="dev" aria-label="Vista Desarrollador">Desarrollador</button>
+        <input id="tech-mode-toggle" type="checkbox" class="sr-only" aria-label="Modo técnico" />
+      </div>
+      <div class="settings-menu-wrap">
+        <button id="settings-menu-btn" class="btn btn-sm" type="button" aria-expanded="false" aria-controls="settings-popover">⚙️ Ajustes</button>
+        <div id="settings-popover" class="settings-popover" style="display:none">
+          <label class="settings-item" title="Permitir acceso desde celulares u otros equipos en tu red Wi-Fi local (0.0.0.0)">
+            <span>Acceso Wi-Fi (celular)</span>
+            <input id="lan-mode-toggle" type="checkbox" />
+          </label>
+          <label class="settings-item" title="Leer respuestas nuevas en voz alta en español">
+            <span>Leer respuestas en voz alta</span>
+            <input id="voice-tts-toggle" type="checkbox" />
+          </label>
+          <div class="settings-item" style="padding-top:6px; border-top:1px solid var(--border);">
+            <span>Apariencia</span>
+            <button id="theme-btn" class="btn btn-sm" type="button">Modo claro</button>
+          </div>
+        </div>
+      </div>
     </div>
   </header>
+
+  <div class="live-activity-shell">
+    <div id="live-activity-banner" class="live-activity-banner" style="display:none" role="status" aria-live="polite">
+      <div class="live-activity-main">
+        <svg class="live-spinner-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true">
+          <circle cx="12" cy="12" r="9" opacity="0.25"></circle>
+          <path d="M21 12a9 9 0 0 0-9-9" stroke-linecap="round"></path>
+        </svg>
+        <div>
+          <div id="live-activity-text" style="font-size:0.9rem; font-weight:600;">Procesando...</div>
+          <div id="live-activity-subtext" class="muted" style="font-size:0.78rem;"></div>
+        </div>
+        <span id="live-activity-timer" class="live-activity-timer">00:00s</span>
+      </div>
+      <div id="live-activity-stall" class="live-activity-stall" style="display:none">
+        <span>La operación está tardando más de lo esperado (puede seguir procesando o haberse bloqueado)</span>
+        <button id="live-activity-reload-btn" class="btn btn-sm btn-warn" type="button">Reintentar / Recargar estado</button>
+      </div>
+    </div>
+  </div>
 
   <main class="layout">
     <section class="panel">
@@ -2498,9 +2677,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <p class="muted" style="font-size:0.86rem; margin:0 0 12px 0;">Ingresa la ruta local de una carpeta existente para auditarla, ejecutarla o modificarla sin copiar archivos.</p>
         <input id="import-path-input" class="input-field" type="text" placeholder="Ej: C:\\Users\\tu-usuario\\proyectos\\mi-app" required style="margin-bottom:8px;" />
         <input id="import-title-input" class="input-field" type="text" maxlength="80" placeholder="Título opcional (si lo dejas vacío se detecta del repo)" style="margin-bottom:12px;" />
-        <div style="display:flex; justify-content:flex-end; gap:8px;">
-          <button id="cancel-import-project-btn" class="btn btn-sm" type="button">Cancelar</button>
-          <button id="submit-import-project-btn" class="btn btn-primary btn-sm" type="submit">Importar</button>
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+          <span id="import-inline-status"></span>
+          <div style="display:flex; gap:8px;">
+            <button id="cancel-import-project-btn" class="btn btn-sm" type="button">Cancelar</button>
+            <button id="submit-import-project-btn" class="btn btn-primary btn-sm" type="submit">Importar</button>
+          </div>
         </div>
       </form>
     </div>
@@ -2538,15 +2720,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div id="detail-guidance"></div>
 
             <div class="tabs">
-              <button class="tab-btn active" data-tab="spec" type="button">Resumen</button>
-              <button class="tab-btn" data-tab="plan" type="button">Plan</button>
-              <button class="tab-btn" data-tab="events" type="button">Historial</button>
-              <button id="tab-audit-btn" class="tab-btn" data-tab="audit" type="button" style="display:none">Consultar y Auditar proyecto</button>
+              <button id="tab-audit-btn" class="tab-btn" data-tab="audit" type="button" title="Consultar y Auditar proyecto" style="display:none">💬 Consultar y Auditar</button>
+              <button id="tab-modify-btn" class="tab-btn" data-tab="modify" type="button" style="display:none">✨ Pedir cambios</button>
+              <button id="tab-spec-btn" class="tab-btn active" data-tab="spec" type="button">📋 Resumen y Plan</button>
+              <button id="tab-events-btn" class="tab-btn" data-tab="events" type="button">🕒 Historial</button>
             </div>
-            <div id="tab-spec" class="tab-content"></div>
-            <div id="tab-plan" class="tab-content" style="display:none"></div>
-            <div id="tab-events" class="tab-content" style="display:none"></div>
             <div id="tab-audit" class="tab-content" style="display:none"></div>
+            <div id="tab-modify" class="tab-content" style="display:none"></div>
+            <div id="tab-spec" class="tab-content"></div>
+            <div id="tab-events" class="tab-content" style="display:none"></div>
 
             <div id="detail-secondary"></div>
           </div>
@@ -2587,13 +2769,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       previewOpen: {},
       previewRenderedUrl: {},
       diffOpen: {},
+      filesOpen: {},
+      rollbackOpen: {},
       voiceTts: false,
       lastSpokenQuestionKey: null,
       editingTitlePid: null,
       adjustOpen: {},
       phaseOpen: {},
       priorOpen: {},
+      userChoseTabByPid: {},
       lastBannerSignature: null,
+      lastModifySignature: null,
+      activeOp: null,
+      bgOpPid: null,
+      bgOpStartedAtMs: null,
+      serverConnected: true,
     };
     let statusNoteTimer = null;
 
@@ -2737,9 +2927,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.body.classList.toggle('tech-mode', on);
       const cb = document.getElementById('tech-mode-toggle');
       if (cb) cb.checked = on;
-      const modeLbl = document.getElementById('view-mode-label');
-      if (modeLbl) {
-        modeLbl.textContent = on ? 'Vista Desarrollador' : 'Vista Simple';
+      const simpleBtn = document.getElementById('view-mode-simple');
+      const devBtn = document.getElementById('view-mode-dev');
+      if (simpleBtn) {
+        simpleBtn.classList.toggle('active', !on);
+        simpleBtn.setAttribute('aria-pressed', !on ? 'true' : 'false');
+      }
+      if (devBtn) {
+        devBtn.classList.toggle('active', on);
+        devBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
       }
       try { localStorage.setItem('af_tech_mode', on ? '1' : '0'); } catch (_) {}
     }
@@ -2756,6 +2952,45 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         applyTechMode(techToggleEl.checked);
       });
     }
+    const simpleModeBtnEl = document.getElementById('view-mode-simple');
+    if (simpleModeBtnEl) {
+      simpleModeBtnEl.addEventListener('click', () => applyTechMode(false));
+    }
+    const devModeBtnEl = document.getElementById('view-mode-dev');
+    if (devModeBtnEl) {
+      devModeBtnEl.addEventListener('click', () => applyTechMode(true));
+    }
+
+    (function initSettingsPopover() {
+      const btn = document.getElementById('settings-menu-btn');
+      const pop = document.getElementById('settings-popover');
+      if (!btn || !pop) return;
+      function closeMenu() {
+        pop.style.display = 'none';
+        btn.setAttribute('aria-expanded', 'false');
+      }
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const isOpen = pop.style.display !== 'none';
+        if (isOpen) {
+          closeMenu();
+        } else {
+          pop.style.display = 'flex';
+          btn.setAttribute('aria-expanded', 'true');
+        }
+      });
+      document.addEventListener('click', (ev) => {
+        if (pop.style.display === 'none') return;
+        if (!pop.contains(ev.target) && ev.target !== btn) {
+          closeMenu();
+        }
+      });
+      document.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Escape' && pop.style.display !== 'none') {
+          closeMenu();
+        }
+      });
+    })();
 
     function renderStageSegments(stageNum, mode) {
       const stage = Math.max(1, Math.min(5, Number(stageNum || 1)));
@@ -2843,6 +3078,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     document.querySelectorAll('.tab-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
         state.activeTab = btn.dataset.tab;
+        if (state.selectedId) {
+          state.userChoseTabByPid[state.selectedId] = state.activeTab;
+        }
         renderTabs();
       });
     });
@@ -2851,13 +3089,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.querySelectorAll('.tab-btn').forEach((b) => {
         b.classList.toggle('active', b.dataset.tab === state.activeTab);
       });
-      document.getElementById('tab-spec').style.display = state.activeTab === 'spec' ? 'block' : 'none';
-      document.getElementById('tab-plan').style.display = state.activeTab === 'plan' ? 'block' : 'none';
-      document.getElementById('tab-events').style.display = state.activeTab === 'events' ? 'block' : 'none';
+      const specPane = document.getElementById('tab-spec');
+      if (specPane) specPane.style.display = state.activeTab === 'spec' ? 'block' : 'none';
+      const eventsPane = document.getElementById('tab-events');
+      if (eventsPane) eventsPane.style.display = state.activeTab === 'events' ? 'block' : 'none';
       const auditPane = document.getElementById('tab-audit');
-      if (auditPane) {
-        auditPane.style.display = state.activeTab === 'audit' ? 'block' : 'none';
-      }
+      if (auditPane) auditPane.style.display = state.activeTab === 'audit' ? 'block' : 'none';
+      const modifyPane = document.getElementById('tab-modify');
+      if (modifyPane) modifyPane.style.display = state.activeTab === 'modify' ? 'block' : 'none';
     }
 
     function speakSpanishText(rawText) {
@@ -2972,14 +3211,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           ? ' <span class="busy-pill">(en curso)</span>'
           : (pausedActive ? ' <span class="busy-pill" style="color:var(--warn)">(pausado)</span>' : '');
         const badgeCls = pausedActive ? 'badge-warn' : info.cls;
-        const segMode = (p.state === 'DELIVERED' || p.state === 'COMPLETED')
+        const isDeliveredCard = p.state === 'DELIVERED' || p.state === 'COMPLETED';
+        const segMode = isDeliveredCard
           ? 'delivered'
           : ((p.state === 'FAILED' || p.state === 'ERROR') ? 'error' : (pausedActive ? 'paused' : 'active'));
+        const stageBarHtml = isDeliveredCard ? '' : renderStageSegments(info.stage, segMode);
+        const cardExtraCls = isDeliveredCard ? ' delivered-card' : '';
         const timeHtml = p.last_event_at
           ? '<div class="muted" style="font-size:0.75rem; margin-top:4px; text-align:right;" title="' + escapeHtml(p.last_event_at) + '">' + escapeHtml(formatFriendlyTime(p.last_event_at)) + '</div>'
           : '';
         const logoUrl = escapeHtml(p.logo_url || ('/api/projects/' + encodeURIComponent(p.project_id) + '/logo'));
-        return '<div class="project-card ' + selected + '" data-id="' + escapeHtml(p.project_id) + '">' +
+        return '<div class="project-card ' + selected + cardExtraCls + '" data-id="' + escapeHtml(p.project_id) + '">' +
           '<div class="card-header">' +
             '<div class="card-title-wrap">' +
               '<img class="card-logo" src="' + logoUrl + '" alt="" />' +
@@ -2987,7 +3229,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             '</div>' +
             '<span class="badge ' + badgeCls + '">' + escapeHtml(info.cardStep || info.step) + '</span>' +
           '</div>' +
-          renderStageSegments(info.stage, segMode) +
+          stageBarHtml +
           timeHtml +
         '</div>';
       }).join('');
@@ -2996,6 +3238,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         card.addEventListener('click', () => {
           state.selectedId = card.dataset.id;
           state.lastBannerSignature = null;
+          state.lastModifySignature = null;
+          state.lastChatSig = null;
           renderProjectList();
           loadDetail(state.selectedId);
         });
@@ -3234,6 +3478,128 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       return formatDurationHuman(elapsedSecs, '0s') || '0s';
     }
 
+    function formatClockMmSs(totalSeconds) {
+      const secs = Math.max(0, Math.floor(Number(totalSeconds || 0)));
+      const mm = String(Math.floor(secs / 60)).padStart(2, '0');
+      const ss = String(secs % 60).padStart(2, '0');
+      return mm + ':' + ss + 's';
+    }
+
+    function updateServerHealth(connected) {
+      state.serverConnected = Boolean(connected);
+      const dot = document.getElementById('server-health-dot');
+      const lbl = document.getElementById('server-health-label');
+      if (dot) {
+        dot.classList.toggle('disconnected', !state.serverConnected);
+        dot.title = state.serverConnected ? 'Servidor conectado' : 'Servidor desconectado';
+      }
+      if (lbl) {
+        lbl.style.display = state.serverConnected ? 'none' : 'inline-block';
+        lbl.textContent = 'Servidor desconectado';
+      }
+    }
+
+    function renderLiveActivityBanner() {
+      const banner = document.getElementById('live-activity-banner');
+      const textEl = document.getElementById('live-activity-text');
+      const subEl = document.getElementById('live-activity-subtext');
+      const timerEl = document.getElementById('live-activity-timer');
+      const stallEl = document.getElementById('live-activity-stall');
+      if (!banner || !textEl || !subEl || !timerEl || !stallEl) return;
+
+      let label = '';
+      let subtext = '';
+      let startedAtMs = null;
+      if (state.activeOp && state.activeOp.startedAtMs) {
+        label = state.activeOp.label || 'Procesando operación...';
+        subtext = state.activeOp.subtext || '';
+        startedAtMs = state.activeOp.startedAtMs;
+      } else if (state.detail && state.detail.status && (state.detail.status.is_running || state.detail.status.busy)) {
+        const st = state.detail.status;
+        label = st.activity_summary || friendlyStateName(st.state) || 'Procesando...';
+        subtext = st.activity_detail || '';
+        const parsedMs = st.step_started_at ? Date.parse(st.step_started_at) : NaN;
+        if (isFinite(parsedMs)) {
+          startedAtMs = parsedMs;
+        } else {
+          if (state.bgOpPid !== st.project_id || !state.bgOpStartedAtMs) {
+            state.bgOpPid = st.project_id;
+            state.bgOpStartedAtMs = Date.now();
+          }
+          startedAtMs = state.bgOpStartedAtMs;
+        }
+      } else {
+        state.bgOpPid = null;
+        state.bgOpStartedAtMs = null;
+      }
+
+      if (!startedAtMs) {
+        banner.style.display = 'none';
+        banner.classList.remove('stall');
+        stallEl.style.display = 'none';
+        timerEl.textContent = '00:00s';
+        return;
+      }
+
+      const elapsedSecs = Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000));
+      banner.style.display = 'flex';
+      textEl.textContent = label;
+      subEl.textContent = subtext;
+      timerEl.textContent = formatClockMmSs(elapsedSecs);
+      const stalled = elapsedSecs >= 75;
+      banner.classList.toggle('stall', stalled);
+      stallEl.style.display = stalled ? 'flex' : 'none';
+    }
+
+    async function runTrackedOperation(opts, asyncFn) {
+      const cfg = opts || {};
+      const btn = typeof cfg.buttonEl === 'string'
+        ? document.getElementById(cfg.buttonEl)
+        : cfg.buttonEl;
+      const inlineEl = cfg.inlineTargetId ? document.getElementById(cfg.inlineTargetId) : null;
+      if (btn) btn.disabled = true;
+      if (inlineEl) {
+        inlineEl.innerHTML =
+          '<span class="inline-op-feedback">' +
+            '<span class="working-spinner" style="width:14px;height:14px;" aria-hidden="true"></span>' +
+            '<span>' + escapeHtml(cfg.label || 'Procesando...') + '</span>' +
+          '</span>';
+      }
+      state.activeOp = {
+        label: cfg.label || 'Procesando...',
+        subtext: cfg.subtext || '',
+        startedAtMs: Date.now(),
+        retryFn: cfg.retryFn || null,
+      };
+      renderLiveActivityBanner();
+      try {
+        return await asyncFn();
+      } finally {
+        state.activeOp = null;
+        renderLiveActivityBanner();
+        const inlineAfter = cfg.inlineTargetId ? document.getElementById(cfg.inlineTargetId) : null;
+        if (inlineAfter) inlineAfter.innerHTML = '';
+        const btnAfter = typeof cfg.buttonEl === 'string'
+          ? document.getElementById(cfg.buttonEl)
+          : cfg.buttonEl;
+        if (btnAfter && document.body.contains(btnAfter)) {
+          btnAfter.disabled = false;
+        }
+      }
+    }
+
+    (function initActivityReloadBtn() {
+      const reloadBtn = document.getElementById('live-activity-reload-btn');
+      if (!reloadBtn) return;
+      reloadBtn.addEventListener('click', () => {
+        state.activeOp = null;
+        state.bgOpStartedAtMs = null;
+        renderLiveActivityBanner();
+        setNote('Recargando estado del servidor...');
+        loadProjects();
+      });
+    })();
+
     function updateLiveTimers() {
       document.querySelectorAll('.live-step-timer[data-started-at]').forEach((el) => {
         const startedAt = el.getAttribute('data-started-at');
@@ -3242,6 +3608,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           el.textContent = 'Tiempo en este paso: ' + formatted;
         }
       });
+      renderLiveActivityBanner();
     }
 
     function buildGuidanceBanner(st, events) {
@@ -3410,26 +3777,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const descMsg = localApp.app_type === 'python_local'
           ? 'Proyecto local con servidor Python listo para ejecutarse en tu computadora.'
           : 'El proyecto ha sido construido y verificado exitosamente.';
-        const modifyDraft = escapeHtml((state.modifyDrafts && state.modifyDrafts[pid]) || '');
-        const filesList = (state.filesByPid && state.filesByPid[pid]) || [];
-        const selSet = new Set((state.targetFilesSelected && state.targetFilesSelected[pid]) || []);
-        const fileOptsHtml = filesList.map((fp) =>
-          '<option value="' + escapeHtml(fp) + '"' + (selSet.has(fp) ? ' selected' : '') + '>' + escapeHtml(fp) + '</option>'
-        ).join('');
-        const cps = (state.checkpointsByPid && state.checkpointsByPid[pid]) || [];
-        const validCps = cps.filter((c) => c && c.commit_sha);
-        const cpOptsHtml = validCps.map((c) => {
-          const shaShort = c.short_sha || String(c.commit_sha || '').slice(0, 7);
-          const timeLbl = formatFriendlyTime(c.delivered_at);
-          const curTag = c.is_current ? ' (actual)' : '';
-          const txt = c.version_label + curTag + (timeLbl ? (' · ' + timeLbl) : '');
-          return '<option value="' + escapeHtml(c.commit_sha) + '" title="' + escapeHtml(c.commit_sha) + '">' + escapeHtml(txt) + '</option>';
-        }).join('');
-        const rollbackDisabled = validCps.length === 0 ? ' disabled' : '';
-        const curCp = validCps.find((c) => c.is_current) || validCps[0] || null;
-        const diffInfo = (state.diffByPid && state.diffByPid[pid]) || null;
-        const diffText = diffInfo && diffInfo.diff ? diffInfo.diff : 'Sin cambios recientes registrados o sin repositorio Git.';
-        const diffOpenAttr = (state.diffOpen && state.diffOpen[pid]) ? ' open' : '';
         return '<div class="guidance-banner banner-ok">' +
           '<div class="banner-content">' +
             '<div class="banner-icon">🎉</div>' +
@@ -3442,36 +3789,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             '<div class="local-controls-row">' + localBtns + '</div>' +
             repoBtn + deployBtn +
           '</div>' +
-          '<div class="modify-box">' +
-            '<div class="modify-box-title">Pedir cambios o mejoras</div>' +
-            '<div class="input-row-with-mic">' +
-              '<textarea id="modify-project-input" class="input-field" rows="2" placeholder="Describe qué quieres mejorar, cambiar o agregar al proyecto...">' + modifyDraft + '</textarea>' +
-              '<button id="modify-mic-btn" class="btn btn-sm mic-btn" type="button" title="Dictar cambios por voz (es-MX)">🎤</button>' +
-            '</div>' +
-            '<div id="modify-target-files-wrap" class="tech-only" style="margin-top:8px;">' +
-              '<label for="modify-target-files" class="muted" style="display:block; font-size:0.78rem; margin-bottom:4px;">Archivos objetivo (opcional):</label>' +
-              '<select id="modify-target-files" class="input-field" multiple size="4">' + fileOptsHtml + '</select>' +
-            '</div>' +
-            '<div class="banner-actions">' +
-              '<button id="modify-project-btn" class="btn btn-primary btn-sm" type="button">Aplicar cambios</button>' +
-            '</div>' +
-          '</div>' +
-          '<div class="versions-box">' +
-            '<div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">' +
-              '<div class="modify-box-title" style="margin:0;">Versiones estables (Rollback)</div>' +
-              (curCp ? '<span class="model-pill tech-only">HEAD: ' + escapeHtml(curCp.short_sha || curCp.commit_sha) + '</span>' : '') +
-            '</div>' +
-            '<div class="versions-row">' +
-              '<select id="rollback-version-select" class="input-field"' + rollbackDisabled + '>' +
-                (validCps.length ? cpOptsHtml : '<option value="">Sin checkpoints Git registrados</option>') +
-              '</select>' +
-              '<button id="rollback-version-btn" class="btn btn-sm btn-warn" type="button"' + rollbackDisabled + '>Restaurar esta versión</button>' +
-            '</div>' +
-          '</div>' +
-          '<details id="git-diff-details" class="tech-details tech-only"' + diffOpenAttr + '>' +
-            '<summary>Últimos cambios (git diff)</summary>' +
-            '<pre id="git-diff-pre" class="diff-pre">' + escapeHtml(diffText) + '</pre>' +
-          '</details>' +
+          '<div id="local-inline-status"></div>' +
         '</div>';
       }
 
@@ -3913,7 +4231,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         : ((st.state === 'FAILED' || st.state === 'ERROR') ? 'error' : (pausedActive ? 'paused' : 'active'));
       const segBox = document.getElementById('detail-segments');
       if (segBox) {
-        segBox.innerHTML = renderStageSegments(info.stage, segMode);
+        segBox.style.display = segMode === 'delivered' ? 'none' : '';
+        segBox.innerHTML = segMode === 'delivered' ? '' : renderStageSegments(info.stage, segMode);
       }
       const timeBox = document.getElementById('detail-time');
       if (timeBox) {
@@ -3985,7 +4304,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         state.lastBannerSignature = bannerSig;
 
         guidanceEl.querySelectorAll('button[data-dact]').forEach((btn) => {
-          btn.addEventListener('click', () => handleAction(btn.dataset.dact, st.project_id));
+          btn.addEventListener('click', () => handleAction(btn.dataset.dact, st.project_id, btn));
         });
 
         const replyInput = document.getElementById('interview-reply-input');
@@ -4037,56 +4356,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             }
           });
         }
-
-        const modifyInput = document.getElementById('modify-project-input');
-        const modifyBtn = document.getElementById('modify-project-btn');
-        const targetSelect = document.getElementById('modify-target-files');
-        if (modifyInput) {
-          modifyInput.addEventListener('input', () => {
-            state.modifyDrafts[st.project_id] = modifyInput.value;
-          });
-        }
-        if (targetSelect) {
-          targetSelect.addEventListener('change', () => {
-            state.targetFilesSelected[st.project_id] = Array.from(targetSelect.selectedOptions).map((o) => o.value);
-          });
-        }
-        wireMicButton('modify-mic-btn', 'modify-project-input');
-        if (modifyBtn && modifyInput) {
-          modifyBtn.addEventListener('click', async () => {
-            modifyBtn.disabled = true;
-            try {
-              const selFiles = targetSelect
-                ? Array.from(targetSelect.selectedOptions).map((o) => o.value).filter(Boolean)
-                : [];
-              await submitModifyProject(st.project_id, modifyInput.value, selFiles);
-            } finally {
-              if (document.body.contains(modifyBtn)) modifyBtn.disabled = false;
-            }
-          });
-        }
-
-        const rbSelect = document.getElementById('rollback-version-select');
-        const rbBtn = document.getElementById('rollback-version-btn');
-        if (rbBtn && rbSelect) {
-          rbBtn.addEventListener('click', async () => {
-            const sha = rbSelect.value;
-            if (!sha) return;
-            rbBtn.disabled = true;
-            try {
-              await submitRollbackProject(st.project_id, sha);
-            } finally {
-              if (document.body.contains(rbBtn)) rbBtn.disabled = false;
-            }
-          });
-        }
-
-        const diffDetails = document.getElementById('git-diff-details');
-        if (diffDetails) {
-          diffDetails.addEventListener('toggle', () => {
-            state.diffOpen[st.project_id] = diffDetails.open;
-          });
-        }
       } else {
         updateLiveTimers();
       }
@@ -4100,10 +4369,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         '</div>';
 
       secEl.querySelectorAll('button[data-dact]').forEach((btn) => {
-        btn.addEventListener('click', () => handleAction(btn.dataset.dact, st.project_id));
+        btn.addEventListener('click', () => handleAction(btn.dataset.dact, st.project_id, btn));
       });
 
-      // Spec tab ("Resumen")
+      // Unified "Resumen y Plan" tab
       const spec = state.detail.spec || {};
       const fields = [];
       if (spec.objective && String(spec.objective).trim()) {
@@ -4130,17 +4399,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (Array.isArray(spec.assumptions) && spec.assumptions.length) {
         fields.push('<div class="spec-section"><h4>Supuestos</h4><ul>' + spec.assumptions.map((x) => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul></div>');
       }
-      if (!fields.length) {
-        document.getElementById('tab-spec').innerHTML = '<div class="empty-box">Aún estamos definiendo los detalles de este proyecto.</div>';
-      } else {
-        document.getElementById('tab-spec').innerHTML = fields.join('');
-      }
+      const specHtml = fields.length
+        ? fields.join('')
+        : '<div class="empty-box">Aún estamos definiendo los detalles de este proyecto.</div>';
 
-      // Plan tab ("Plan")
       const plan = state.detail.plan;
-      if (!plan) {
-        document.getElementById('tab-plan').innerHTML = '<div class="empty-box">Aún no se ha generado un Plan.</div>';
-      } else {
+      let planHtml = '<div class="empty-box">Aún no se ha generado un Plan.</div>';
+      if (plan) {
         const filesHtml = (plan.files || []).map((f) =>
           '<div class="file-card"><div class="file-path">' + escapeHtml(f.path) + '</div><div class="file-purpose">' + escapeHtml(f.purpose) + '</div>' +
           (f.contract ? '<details class="tech-details tech-only"><summary>Contrato</summary><pre>' + escapeHtml(f.contract) + '</pre></details>' : '') +
@@ -4149,7 +4414,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const testsHtml = (plan.acceptance_tests || []).map((t) =>
           '<li><strong>[' + escapeHtml(t.id) + '] (' + escapeHtml(t.type) + ')</strong>: ' + escapeHtml(t.description) + '</li>'
         ).join('');
-        document.getElementById('tab-plan').innerHTML =
+        planHtml =
           '<div class="plan-summary"><strong>Resumen:</strong> ' + escapeHtml(plan.summary) + '</div>' +
           (plan.rationale ? '<div class="plan-summary"><strong>Justificación:</strong> ' + escapeHtml(plan.rationale) + '</div>' : '') +
           '<div class="plan-meta">' +
@@ -4159,6 +4424,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           '<h4 style="margin:14px 0 8px 0;">Archivos (' + (plan.files || []).length + ')</h4>' + filesHtml +
           '<h4 style="margin:14px 0 8px 0;">Pruebas de aceptación (' + (plan.acceptance_tests || []).length + ')</h4><ul style="padding-left:20px; font-size:0.92rem;">' + testsHtml + '</ul>';
       }
+      document.getElementById('tab-spec').innerHTML =
+        specHtml +
+        '<div class="tab-section-divider">' +
+          '<h4 style="margin:0 0 12px 0; font-size:1rem;">Plan de construcción</h4>' +
+          planHtml +
+        '</div>';
 
       // Events tab ("Historial" grouped into 5 clear lifecycle phases)
       const LIFECYCLE_PHASES = [
@@ -4313,23 +4584,160 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
 
       const auditTabBtn = document.getElementById('tab-audit-btn');
-      if (auditTabBtn) {
-        if (isDelivered) {
-          auditTabBtn.style.display = '';
-          if (!state.chatLoadedFor[st.project_id]) {
-            loadProjectChatHistory(st.project_id);
-          }
-          loadProjectDevAndVersionData(st.project_id, st.last_event_at || String(events.length));
-          renderAuditChatTab(st.project_id);
-        } else {
-          auditTabBtn.style.display = 'none';
-          if (state.activeTab === 'audit') {
-            state.activeTab = 'spec';
-          }
+      const modifyTabBtn = document.getElementById('tab-modify-btn');
+      if (isDelivered) {
+        if (auditTabBtn) auditTabBtn.style.display = '';
+        if (modifyTabBtn) modifyTabBtn.style.display = '';
+        if (!(st.project_id in state.userChoseTabByPid)) {
+          state.activeTab = 'audit';
+        }
+        if (!state.chatLoadedFor[st.project_id]) {
+          loadProjectChatHistory(st.project_id);
+        }
+        loadProjectDevAndVersionData(st.project_id, st.last_event_at || String(events.length));
+        renderAuditChatTab(st.project_id);
+        renderModifyTab(st);
+      } else {
+        if (auditTabBtn) auditTabBtn.style.display = 'none';
+        if (modifyTabBtn) modifyTabBtn.style.display = 'none';
+        if (state.activeTab === 'audit' || state.activeTab === 'modify') {
+          state.activeTab = 'spec';
         }
       }
 
       renderTabs();
+      renderLiveActivityBanner();
+    }
+
+    function renderModifyTab(st) {
+      const container = document.getElementById('tab-modify');
+      if (!container || !st) return;
+      const pid = st.project_id;
+      const modifyDraft = escapeHtml((state.modifyDrafts && state.modifyDrafts[pid]) || '');
+      const filesList = (state.filesByPid && state.filesByPid[pid]) || [];
+      const selSet = new Set((state.targetFilesSelected && state.targetFilesSelected[pid]) || []);
+      const cps = (state.checkpointsByPid && state.checkpointsByPid[pid]) || [];
+      const validCps = cps.filter((c) => c && c.commit_sha);
+      const diffInfo = (state.diffByPid && state.diffByPid[pid]) || null;
+
+      const modSig = JSON.stringify([
+        pid,
+        filesList.length,
+        validCps.map((c) => c.commit_sha + ':' + Boolean(c.is_current)),
+        Boolean(diffInfo && diffInfo.diff),
+        Boolean(state.filesOpen && state.filesOpen[pid]),
+        Boolean(state.rollbackOpen && state.rollbackOpen[pid]),
+        Boolean(state.diffOpen && state.diffOpen[pid]),
+      ]);
+      if (state.lastModifySignature === modSig && container.querySelector('#modify-project-input')) {
+        return;
+      }
+      state.lastModifySignature = modSig;
+
+      const fileOptsHtml = filesList.map((fp) =>
+        '<option value="' + escapeHtml(fp) + '"' + (selSet.has(fp) ? ' selected' : '') + '>' + escapeHtml(fp) + '</option>'
+      ).join('');
+      const cpOptsHtml = validCps.map((c) => {
+        const timeLbl = formatFriendlyTime(c.delivered_at);
+        const curTag = c.is_current ? ' (actual)' : '';
+        const txt = c.version_label + curTag + (timeLbl ? (' · ' + timeLbl) : '');
+        return '<option value="' + escapeHtml(c.commit_sha) + '" title="' + escapeHtml(c.commit_sha) + '">' + escapeHtml(txt) + '</option>';
+      }).join('');
+      const rollbackDisabled = validCps.length === 0 ? ' disabled' : '';
+      const rollbackDisplay = validCps.length === 0 ? ' style="display:none"' : '';
+      const curCp = validCps.find((c) => c.is_current) || validCps[0] || null;
+      const diffText = diffInfo && diffInfo.diff ? diffInfo.diff : 'Sin cambios recientes registrados o sin repositorio Git.';
+      const filesOpenAttr = (state.filesOpen && state.filesOpen[pid]) ? ' open' : '';
+      const rollbackOpenAttr = (state.rollbackOpen && state.rollbackOpen[pid]) ? ' open' : '';
+      const diffOpenAttr = (state.diffOpen && state.diffOpen[pid]) ? ' open' : '';
+
+      container.innerHTML =
+        '<div class="modify-panel-card">' +
+          '<div class="modify-box" style="margin-top:0;">' +
+            '<div class="modify-box-title">Pedir cambios o mejoras</div>' +
+            '<div class="input-row-with-mic">' +
+              '<textarea id="modify-project-input" class="input-field" rows="3" placeholder="Describe qué quieres mejorar, cambiar o agregar al proyecto...">' + modifyDraft + '</textarea>' +
+              '<button id="modify-mic-btn" class="btn btn-sm mic-btn" type="button" title="Dictar cambios por voz (es-MX)">🎤</button>' +
+            '</div>' +
+            '<div class="banner-actions">' +
+              '<button id="modify-project-btn" class="btn btn-primary btn-sm" type="button">Aplicar cambios</button>' +
+              '<span id="modify-inline-status"></span>' +
+            '</div>' +
+          '</div>' +
+          '<details id="modify-files-details" class="tech-details tech-only"' + filesOpenAttr + '>' +
+            '<summary>Archivos objetivo (opcional)' + (selSet.size ? (' · ' + selSet.size + ' seleccionado(s)') : '') + '</summary>' +
+            '<div id="modify-target-files-wrap" style="margin-top:8px;">' +
+              '<select id="modify-target-files" class="input-field" multiple size="5">' + fileOptsHtml + '</select>' +
+            '</div>' +
+          '</details>' +
+          '<details id="rollback-details" class="tech-details tech-only"' + rollbackDisplay + rollbackOpenAttr + '>' +
+            '<summary>Versiones estables (Rollback)' + (curCp ? (' · HEAD: ' + escapeHtml(curCp.short_sha || curCp.commit_sha)) : '') + '</summary>' +
+            '<div class="versions-box" style="margin-top:8px;">' +
+              '<div class="versions-row">' +
+                '<select id="rollback-version-select" class="input-field"' + rollbackDisabled + '>' +
+                  (validCps.length ? cpOptsHtml : '<option value="">Sin checkpoints Git registrados</option>') +
+                '</select>' +
+                '<button id="rollback-version-btn" class="btn btn-sm btn-warn" type="button"' + rollbackDisabled + '>Restaurar esta versión</button>' +
+              '</div>' +
+            '</div>' +
+          '</details>' +
+          '<details id="git-diff-details" class="tech-details tech-only"' + diffOpenAttr + '>' +
+            '<summary>Últimos cambios (git diff)</summary>' +
+            '<pre id="git-diff-pre" class="diff-pre">' + escapeHtml(diffText) + '</pre>' +
+          '</details>' +
+        '</div>';
+
+      const modifyInput = document.getElementById('modify-project-input');
+      const modifyBtn = document.getElementById('modify-project-btn');
+      const targetSelect = document.getElementById('modify-target-files');
+      if (modifyInput) {
+        modifyInput.addEventListener('input', () => {
+          state.modifyDrafts[pid] = modifyInput.value;
+        });
+      }
+      if (targetSelect) {
+        targetSelect.addEventListener('change', () => {
+          state.targetFilesSelected[pid] = Array.from(targetSelect.selectedOptions).map((o) => o.value);
+        });
+      }
+      wireMicButton('modify-mic-btn', 'modify-project-input');
+      if (modifyBtn && modifyInput) {
+        modifyBtn.addEventListener('click', async () => {
+          const selFiles = targetSelect
+            ? Array.from(targetSelect.selectedOptions).map((o) => o.value).filter(Boolean)
+            : [];
+          await submitModifyProject(pid, modifyInput.value, selFiles, modifyBtn);
+        });
+      }
+
+      const rbSelect = document.getElementById('rollback-version-select');
+      const rbBtn = document.getElementById('rollback-version-btn');
+      if (rbBtn && rbSelect) {
+        rbBtn.addEventListener('click', async () => {
+          const sha = rbSelect.value;
+          if (!sha) return;
+          await submitRollbackProject(pid, sha, rbBtn);
+        });
+      }
+
+      const filesDetails = document.getElementById('modify-files-details');
+      if (filesDetails) {
+        filesDetails.addEventListener('toggle', () => {
+          state.filesOpen[pid] = filesDetails.open;
+        });
+      }
+      const rbDetails = document.getElementById('rollback-details');
+      if (rbDetails) {
+        rbDetails.addEventListener('toggle', () => {
+          state.rollbackOpen[pid] = rbDetails.open;
+        });
+      }
+      const diffDetails = document.getElementById('git-diff-details');
+      if (diffDetails) {
+        diffDetails.addEventListener('toggle', () => {
+          state.diffOpen[pid] = diffDetails.open;
+        });
+      }
     }
 
     function renderAuditChatTab(pid) {
@@ -4363,6 +4771,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         : '<div class="muted" style="font-size:0.86rem;">Consulta código, solicita una auditoría de solo lectura o genera documentación en Markdown sin alterar tus archivos.</div>';
 
       container.innerHTML =
+        '<div class="muted" style="font-size:0.84rem; margin-bottom:10px;"><strong>Consultar y Auditar proyecto</strong> — Inspección de solo lectura y generación de documentación.</div>' +
         '<div class="audit-toolbar">' +
           '<button id="audit-quick-audit-btn" class="btn btn-sm" type="button">🔍 Auditar código</button>' +
           '<button id="audit-quick-explain-btn" class="btn btn-sm" type="button">📖 Explicar funcionamiento</button>' +
@@ -4375,6 +4784,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         '</div>' +
         '<div class="banner-actions">' +
           '<button id="audit-chat-send-btn" class="btn btn-primary btn-sm" type="button">Enviar consulta</button>' +
+          '<span id="audit-inline-status"></span>' +
         '</div>';
 
       const threadEl = document.getElementById('audit-chat-history');
@@ -4395,18 +4805,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const quickExplainBtn = document.getElementById('audit-quick-explain-btn');
       const quickDocBtn = document.getElementById('audit-quick-doc-btn');
       if (quickAuditBtn) {
-        quickAuditBtn.addEventListener('click', () => submitProjectChat(pid, '', 'audit'));
+        quickAuditBtn.addEventListener('click', () => submitProjectChat(pid, '', 'audit', quickAuditBtn));
       }
       if (quickExplainBtn) {
         quickExplainBtn.addEventListener('click', () =>
-          submitProjectChat(pid, 'Explica cómo funciona este proyecto, sus archivos clave y cómo utilizarlo.', 'chat')
+          submitProjectChat(pid, 'Explica cómo funciona este proyecto, sus archivos clave y cómo utilizarlo.', 'chat', quickExplainBtn)
         );
       }
       if (quickDocBtn) {
-        quickDocBtn.addEventListener('click', () => submitProjectChat(pid, '', 'document'));
+        quickDocBtn.addEventListener('click', () => submitProjectChat(pid, '', 'document', quickDocBtn));
       }
       if (sendBtn && inputEl) {
-        sendBtn.addEventListener('click', () => submitProjectChat(pid, inputEl.value, 'chat'));
+        sendBtn.addEventListener('click', () => submitProjectChat(pid, inputEl.value, 'chat', sendBtn));
       }
 
       container.querySelectorAll('button[data-audit-dl]').forEach((btn) => {
@@ -4428,6 +4838,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             ? String(entry.suggested_changes).trim()
             : String(entry.content || '').trim();
           state.modifyDrafts[pid] = textToApply;
+          state.activeTab = 'modify';
+          state.userChoseTabByPid[pid] = 'modify';
+          renderTabs();
           const modifyBox = document.getElementById('modify-project-input');
           if (modifyBox) {
             modifyBox.value = textToApply;
@@ -4435,7 +4848,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             modifyBox.focus();
             modifyBox.scrollIntoView({ behavior: 'smooth', block: 'center' });
           }
-          setNote('Hallazgos copiados al panel "Pedir cambios o mejoras". Revisa y pulsa Aplicar cambios si deseas ejecutarlos.');
+          setNote('Hallazgos copiados al panel "Pedir cambios". Revisa y pulsa Aplicar cambios si deseas ejecutarlos.');
         });
       });
     }
@@ -4453,44 +4866,54 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       } catch (_) {}
     }
 
-    async function submitProjectChat(pid, rawMessage, mode) {
+    async function submitProjectChat(pid, rawMessage, mode, triggerBtn) {
       const msg = String(rawMessage || '').trim();
       if (mode === 'chat' && !msg) {
         setNote('Escribe una pregunta para consultar el proyecto.');
         return;
       }
-      const sendBtn = document.getElementById('audit-chat-send-btn');
-      if (sendBtn) sendBtn.disabled = true;
-      setNote('Analizando código del proyecto (solo lectura)...');
-      try {
-        const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: msg, mode: mode || 'chat' }),
-        });
-        if (mode === 'chat') {
-          state.chatDrafts[pid] = '';
+      const modeLabel = mode === 'audit'
+        ? 'Analizando archivos del repositorio (auditoría)...'
+        : (mode === 'document'
+          ? 'Analizando archivos del repositorio para documentar...'
+          : 'Analizando archivos del repositorio...');
+      await runTrackedOperation(
+        {
+          label: modeLabel,
+          subtext: 'Lectura segura del código sin alterar archivos.',
+          buttonEl: triggerBtn || 'audit-chat-send-btn',
+          inlineTargetId: 'audit-inline-status',
+        },
+        async () => {
+          try {
+            const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/chat', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ message: msg, mode: mode || 'chat' }),
+            });
+            if (mode === 'chat') {
+              state.chatDrafts[pid] = '';
+            }
+            state.chatHistories[pid] = Array.isArray(res.history) ? res.history : [];
+            state.chatLoadedFor[pid] = true;
+            state.lastChatSig = null;
+            renderAuditChatTab(pid);
+            if (res && res.reply) {
+              speakSpanishText(res.reply);
+            }
+            setNote('Respuesta generada.');
+          } catch (err) {
+            setNote('Error en chat auditor: ' + err.message);
+          }
         }
-        state.chatHistories[pid] = Array.isArray(res.history) ? res.history : [];
-        state.chatLoadedFor[pid] = true;
-        state.lastChatSig = null;
-        renderAuditChatTab(pid);
-        if (res && res.reply) {
-          speakSpanishText(res.reply);
-        }
-        setNote('Respuesta generada.');
-      } catch (err) {
-        setNote('Error en chat auditor: ' + err.message);
-      } finally {
-        const curBtn = document.getElementById('audit-chat-send-btn');
-        if (curBtn) curBtn.disabled = false;
-      }
+      );
     }
 
     async function loadDetail(pid) {
       if (!pid) return;
       try {
         state.detail = await apiFetch('/api/projects/' + encodeURIComponent(pid));
+        updateServerHealth(true);
         renderDetail();
       } catch (err) {
         state.detail = null;
@@ -4502,6 +4925,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     async function loadProjects() {
       try {
         const data = await apiFetch('/api/projects');
+        updateServerHealth(true);
         state.projects = data.projects || [];
         if (state.selectedId && !state.projects.some((p) => p.project_id === state.selectedId)) {
           state.selectedId = null;
@@ -4517,6 +4941,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           renderDetail();
         }
       } catch (err) {
+        updateServerHealth(false);
         setNote('Error de conexión: ' + err.message);
       }
     }
@@ -4571,8 +4996,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           state.diffByPid[pid] = diffRes;
         }
         if (state.detail && state.detail.project_id === pid) {
-          state.lastBannerSignature = null;
-          renderDetail();
+          state.lastModifySignature = null;
+          renderModifyTab(state.detail.status);
         }
       } catch (_) {}
     }
@@ -4634,60 +5059,81 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    async function submitModifyProject(pid, rawInstructions, targetFiles) {
+    async function submitModifyProject(pid, rawInstructions, targetFiles, triggerBtn) {
       const instructions = (rawInstructions || '').trim();
       if (!instructions) {
         setNote('Describe qué cambios o mejoras deseas aplicar.');
         return;
       }
-      try {
-        const bodyPayload = { instructions };
-        if (Array.isArray(targetFiles) && targetFiles.length) {
-          bodyPayload.target_files = targetFiles;
+      await runTrackedOperation(
+        {
+          label: 'Aplicando cambios y ejecutando pruebas...',
+          subtext: 'El agente modificará el repositorio y correrá la verificación automática.',
+          buttonEl: triggerBtn || 'modify-project-btn',
+          inlineTargetId: 'modify-inline-status',
+        },
+        async () => {
+          try {
+            const bodyPayload = { instructions };
+            if (Array.isArray(targetFiles) && targetFiles.length) {
+              bodyPayload.target_files = targetFiles;
+            }
+            await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/modify', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(bodyPayload),
+            });
+            delete state.modifyDrafts[pid];
+            delete state.targetFilesSelected[pid];
+            delete state.devMetaLoadedSig[pid];
+            state.lastBannerSignature = null;
+            state.lastModifySignature = null;
+            setNote('Cambios en curso para ' + pid + '.');
+            await loadProjects();
+          } catch (err) {
+            setNote('Error aplicando cambios: ' + err.message);
+          }
         }
-        await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/modify', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(bodyPayload),
-        });
-        delete state.modifyDrafts[pid];
-        delete state.targetFilesSelected[pid];
-        delete state.devMetaLoadedSig[pid];
-        setNote('Cambios en curso para ' + pid + '.');
-        state.lastBannerSignature = null;
-        await loadProjects();
-      } catch (err) {
-        setNote('Error aplicando cambios: ' + err.message);
-      }
+      );
     }
 
-    async function submitRollbackProject(pid, commitSha) {
+    async function submitRollbackProject(pid, commitSha, triggerBtn) {
       if (!commitSha) return;
       if (!window.confirm('¿Deseas restaurar "' + pid + '" a esta versión estable y volver a verificar las pruebas?')) {
         return;
       }
-      setNote('Restaurando versión estable y ejecutando pruebas...');
-      try {
-        const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/rollback', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ commit_sha: commitSha }),
-        });
-        if (res && Array.isArray(res.checkpoints)) {
-          state.checkpointsByPid[pid] = res.checkpoints;
+      await runTrackedOperation(
+        {
+          label: 'Restaurando versión estable y ejecutando pruebas...',
+          subtext: 'Verificando que el proyecto pase pruebas tras el rollback.',
+          buttonEl: triggerBtn || 'rollback-version-btn',
+          inlineTargetId: 'modify-inline-status',
+        },
+        async () => {
+          try {
+            const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/rollback', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ commit_sha: commitSha }),
+            });
+            if (res && Array.isArray(res.checkpoints)) {
+              state.checkpointsByPid[pid] = res.checkpoints;
+            }
+            delete state.devMetaLoadedSig[pid];
+            state.previewOpen[pid] = false;
+            delete state.previewRenderedUrl[pid];
+            state.lastBannerSignature = null;
+            state.lastModifySignature = null;
+            setNote('Versión restaurada con éxito para ' + pid + '.');
+            await loadProjects();
+          } catch (err) {
+            setNote('Error restaurando versión: ' + err.message);
+          }
         }
-        delete state.devMetaLoadedSig[pid];
-        state.previewOpen[pid] = false;
-        delete state.previewRenderedUrl[pid];
-        setNote('Versión restaurada con éxito para ' + pid + '.');
-        state.lastBannerSignature = null;
-        await loadProjects();
-      } catch (err) {
-        setNote('Error restaurando versión: ' + err.message);
-      }
+      );
     }
 
-    async function handleAction(action, pid) {
+    async function handleAction(action, pid, triggerBtn) {
       try {
         if (action === 'toggle-preview') {
           state.previewOpen[pid] = !Boolean(state.previewOpen[pid]);
@@ -4725,9 +5171,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           });
           setNote('Reconstrucción desde cero iniciada para ' + pid + '.');
         } else if (action === 'local-start') {
-          const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/start', { method: 'POST' });
-          const url = res.local_app && res.local_app.url ? res.local_app.url : '';
-          setNote(url ? ('App encendida en ' + url) : ('App encendida para ' + pid));
+          await runTrackedOperation(
+            {
+              label: 'Preparando entorno virtual e instalando dependencias...',
+              subtext: 'Iniciando servidor local y verificando respuesta HTTP...',
+              buttonEl: triggerBtn,
+              inlineTargetId: 'local-inline-status',
+            },
+            async () => {
+              const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/start', { method: 'POST' });
+              const url = res.local_app && res.local_app.url ? res.local_app.url : '';
+              setNote(url ? ('App encendida en ' + url) : ('App encendida para ' + pid));
+              state.lastBannerSignature = null;
+              await loadProjects();
+            }
+          );
+          return;
         } else if (action === 'local-stop') {
           state.previewOpen[pid] = false;
           delete state.previewRenderedUrl[pid];
@@ -4969,25 +5428,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           setNote('Ingresa la ruta de la carpeta local a importar.');
           return;
         }
-        submitBtn.disabled = true;
-        try {
-          const res = await apiFetch('/api/projects/import', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ local_path: localPath, title }),
-          });
-          closeModal();
-          if (res.project_id) {
-            state.selectedId = res.project_id;
-            state.lastBannerSignature = null;
+        await runTrackedOperation(
+          {
+            label: 'Analizando archivos del repositorio e importando...',
+            subtext: 'Registrando carpeta local en la fábrica.',
+            buttonEl: submitBtn,
+            inlineTargetId: 'import-inline-status',
+          },
+          async () => {
+            try {
+              const res = await apiFetch('/api/projects/import', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ local_path: localPath, title }),
+              });
+              closeModal();
+              if (res.project_id) {
+                state.selectedId = res.project_id;
+                state.lastBannerSignature = null;
+                state.lastModifySignature = null;
+              }
+              setNote('Proyecto importado: ' + (res.project_id || '') + '.');
+              await loadProjects();
+            } catch (err) {
+              setNote('Error importando proyecto: ' + err.message);
+            }
           }
-          setNote('Proyecto importado: ' + (res.project_id || '') + '.');
-          await loadProjects();
-        } catch (err) {
-          setNote('Error importando proyecto: ' + err.message);
-        } finally {
-          submitBtn.disabled = false;
-        }
+        );
       });
     })();
 

@@ -3382,6 +3382,102 @@ def test_dashboard_rollback_resets_cleanly_when_post_rollback_tests_fail(
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_ux_redesign_progress_timer_header_and_four_tabs(tmp_path: Path) -> None:
+    """UX redesign exposes live timer banner, heartbeat dot, clean header menu, and 4 unified tabs."""
+    store = SqliteEventStore(db_path=tmp_path / "ux_redesign.db")
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_ux")
+    pid = "ux-app"
+    now = datetime(2026, 4, 20, 12, 0, tzinfo=UTC)
+    plan_dict = _plan_payload("UX App Plan")
+    plan_hash = Plan.model_validate(plan_dict).compute_hash()
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "UX App", "objective": "Probar UX", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+        create_event(pid, EventType.PROJECT_DELIVERED, {"repo_url": "https://github.com/acme/ux-app", "deploy_url": "", "version_label": "v1"}, at=now),
+    ):
+        store.append(ev)
+
+    orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        workspace_manager=ws_mgr,
+    )
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            assert html_resp.status == 200
+            html = html_resp.read().decode("utf-8")
+
+        # 1. Global live activity banner + timer + 75s stall detection + heartbeat dot
+        for marker in (
+            'id="live-activity-banner"',
+            'id="live-activity-timer"',
+            "live-spinner-svg",
+            "00:00s",
+            "Reintentar / Recargar estado",
+            "puede seguir procesando o haberse bloqueado",
+            'id="server-health-dot"',
+            "Servidor desconectado",
+        ):
+            assert marker in html
+
+        # 2. Clean minimalist header without duplicate developer label + settings dropdown
+        assert "Vista Desarrollador (Vista Desarrollador)" not in html
+        for marker in (
+            'id="view-mode-segmented"',
+            'id="settings-menu-btn"',
+            'id="settings-popover"',
+            "Ajustes",
+        ):
+            assert marker in html
+
+        # 3. Unified 4 tabs (Consultar y Auditar, Pedir cambios, Resumen y Plan, Historial)
+        for tab_marker in (
+            'id="tab-audit-btn"',
+            'id="tab-modify-btn"',
+            "Consultar y Auditar",
+            "Pedir cambios",
+            "Resumen y Plan",
+            "Historial",
+            'id="tab-modify"',
+        ):
+            assert tab_marker in html
+
+        # Exactly 4 tab buttons in .tabs bar
+        tabs_start = html.index('<div class="tabs">')
+        tabs_end = html.index("</div>", tabs_start)
+        tabs_block = html[tabs_start:tabs_end]
+        assert tabs_block.count('class="tab-btn') == 4
+        assert 'data-tab="audit"' in tabs_block
+        assert 'data-tab="modify"' in tabs_block
+        assert 'data-tab="spec"' in tabs_block
+        assert 'data-tab="events"' in tabs_block
+        assert 'data-tab="plan"' not in tabs_block
+        assert tabs_block.index("tab-audit-btn") < tabs_block.index("tab-modify-btn")
+
+        # 4. DELIVERED top banner stays compact without modify/rollback forms inline
+        fn_start = html.index("function buildGuidanceBanner(")
+        fn_end = html.index("function renderDetail()", fn_start)
+        delivered_block = html[fn_start:fn_end].split("st.state === 'DELIVERED'", 1)[1]
+        assert 'id="modify-project-input"' not in delivered_block
+        assert 'id="rollback-version-select"' not in delivered_block
+        assert 'id="git-diff-details"' not in delivered_block
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+
 
 
 
