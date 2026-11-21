@@ -3581,6 +3581,162 @@ def test_dashboard_blocks_b0_b1_b2_b3_a11y_responsive_feedback_and_simple_mode(
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_blocks_b4_b5_b6_audit_index_markdown_dev_ergonomics_and_aria(
+    tmp_path: Path,
+) -> None:
+    """Blocks B4-B6: versioned audit chat persistence, audit index + XSS-safe Markdown, dev diff/files/timeline, and WAI-ARIA."""
+    store = SqliteEventStore(db_path=tmp_path / "blocks_b4_b6.db")
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_b4_b6")
+    pid = "b4-b6-app"
+    now = datetime(2026, 4, 21, 11, 0, tzinfo=UTC)
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / "index.html").write_text("<h1>Hola</h1>\n", encoding="utf-8")
+
+    sha_v3 = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+    plan_dict = _plan_payload("Plan B4-B6")
+    plan_hash = Plan.model_validate(plan_dict).compute_hash()
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "App B4-B6", "objective": "Auditar y ARIA", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+        create_event(pid, EventType.PROJECT_DELIVERED, {"repo_url": "", "deploy_url": "", "commit_sha": sha_v3, "version_label": "v3"}, at=now),
+    ):
+        store.append(ev)
+
+    chats_dir = tmp_path / "chats"
+    chats_dir.mkdir(parents=True)
+    # Seed legacy entry without commit_sha / version_label to verify backwards compatibility
+    (chats_dir / f"{pid}.json").write_text(
+        json.dumps([
+            {
+                "id": "old-msg-1",
+                "role": "assistant",
+                "mode": "document",
+                "content": "# Doc antiguo\nTexto previo",
+                "document_title": "old-doc.md",
+                "created_at": now.isoformat(),
+            }
+        ]),
+        encoding="utf-8",
+    )
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "reply": "# Informe de Auditoría\n\n<script>alert('xss')</script>\n\n## Hallazgos\n- Revisar **seguridad** en `index.html`.",
+                "suggested_changes": "Escapar salidas HTML.",
+                "document_title": "b4-b6-audit.md",
+            }
+        ]
+    )
+    orch = Orchestrator(store=store, llm=llm, workspace_manager=ws_mgr)
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        workspace_manager=ws_mgr,
+        chats_dir=chats_dir,
+    )
+    try:
+        # 1. POST /chat persists commit_sha and version_label and GET /chat returns both + legacy compatibility
+        p_code, p_res = _http_json(
+            f"{base_url}/api/projects/{pid}/chat",
+            method="POST",
+            body={"message": "", "mode": "audit"},
+        )
+        assert p_code == 200
+        assert p_res["commit_sha"] == sha_v3
+        assert p_res["version_label"] == "v3"
+        assert p_res["history"][-1]["commit_sha"] == sha_v3
+        assert p_res["history"][-1]["version_label"] == "v3"
+
+        g_code, g_res = _http_json(f"{base_url}/api/projects/{pid}/chat")
+        assert g_code == 200
+        msgs = g_res["messages"]
+        assert len(msgs) == 3
+        assert msgs[0]["id"] == "old-msg-1"
+        assert msgs[0].get("commit_sha", "") == ""
+        assert msgs[1]["commit_sha"] == sha_v3
+        assert msgs[1]["version_label"] == "v3"
+        assert msgs[2]["commit_sha"] == sha_v3
+        assert msgs[2]["version_label"] == "v3"
+
+        # Verify persisted JSON on disk also contains commit_sha and version_label
+        saved_json = json.loads((chats_dir / f"{pid}.json").read_text(encoding="utf-8"))
+        assert saved_json[-1]["commit_sha"] == sha_v3
+        assert saved_json[-1]["version_label"] == "v3"
+
+        # 2. HTML UI checks for B4, B5, B6 (zero external links / CDN)
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            assert html_resp.status == 200
+            html = html_resp.read().decode("utf-8")
+
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+
+        # B4: Audit index, sub-views, readonly modify notice, TOC, and XSS-safe renderSafeMarkdown
+        for b4_marker in (
+            'id="audit-index"',
+            "Auditorías y documentos",
+            "Preguntas",
+            "Volver al índice",
+            "Disponible al terminar los cambios",
+            "function renderSafeMarkdown(",
+        ):
+            assert b4_marker in html
+
+        md_fn_start = html.index("function renderSafeMarkdown(")
+        md_fn_end = html.index("function renderAuditChatTab(", md_fn_start)
+        md_fn_body = html[md_fn_start:md_fn_end]
+        assert "escapeHtml(" in md_fn_body
+
+        # B5: Dev ergonomics — searchable file picker, colored per-file diff, vertical versions timeline
+        for b5_marker in (
+            'id="target-files-search"',
+            ".diff-line-add",
+            ".diff-line-del",
+            ".diff-line-hunk",
+            'id="versions-timeline"',
+            "Copiar ruta",
+            "Copiar hash",
+        ):
+            assert b5_marker in html
+
+        # B6: WAI-ARIA tablist/tab/tabpanel + arrows, dialog aria-modal + focus trap, clock aria-hidden
+        for b6_marker in (
+            'role="tablist"',
+            'role="tab"',
+            'role="tabpanel"',
+            "aria-selected",
+            "aria-controls",
+            "ArrowRight",
+            "ArrowLeft",
+            'role="dialog"',
+            'aria-modal="true"',
+            "trapDialogFocus",
+        ):
+            assert b6_marker in html
+
+        # Timer element must be aria-hidden and NOT inside an aria-live ancestor
+        banner_start = html.index('id="live-activity-banner"')
+        banner_end = html.index('id="live-activity-stall"', banner_start)
+        banner_snippet = html[banner_start:banner_end]
+        assert 'id="live-activity-timer"' in banner_snippet
+        assert 'aria-hidden="true"' in banner_snippet[banner_snippet.index('id="live-activity-timer"'):]
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+
 
 
 

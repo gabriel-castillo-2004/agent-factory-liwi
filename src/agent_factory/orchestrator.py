@@ -1117,6 +1117,8 @@ class Orchestrator:
                 item[str(k)] = (
                     redact_secrets(v, extra_secrets=extra_secrets) if isinstance(v, str) else v
                 )
+            item.setdefault("commit_sha", "")
+            item.setdefault("version_label", "")
             cleaned.append(item)
         return cleaned
 
@@ -1273,6 +1275,10 @@ class Orchestrator:
         if not clean_doc_title.lower().endswith(".md"):
             clean_doc_title = f"{clean_doc_title}.md"
 
+        checkpoints = self.list_project_checkpoints(project_id, extra_secrets=extra_secrets)
+        current_sha = str(checkpoints[0].get("commit_sha") or "") if checkpoints else ""
+        current_version = str(checkpoints[0].get("version_label") or "") if checkpoints else ""
+
         now_iso = self._now().isoformat()
         updated_history = [
             *history,
@@ -1281,6 +1287,8 @@ class Orchestrator:
                 "role": "user",
                 "mode": clean_mode,
                 "content": clean_msg,
+                "commit_sha": current_sha,
+                "version_label": current_version,
                 "created_at": now_iso,
             },
             {
@@ -1290,6 +1298,8 @@ class Orchestrator:
                 "content": clean_reply,
                 "suggested_changes": clean_suggested,
                 "document_title": clean_doc_title,
+                "commit_sha": current_sha,
+                "version_label": current_version,
                 "created_at": now_iso,
             },
         ][-50:]
@@ -1308,6 +1318,8 @@ class Orchestrator:
             "reply": clean_reply,
             "suggested_changes": clean_suggested,
             "document_title": clean_doc_title,
+            "commit_sha": current_sha,
+            "version_label": current_version,
             "context_chars": len(code_ctx),
             "history": updated_history,
         }

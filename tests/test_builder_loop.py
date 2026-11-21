@@ -2832,6 +2832,79 @@ def test_build_worker_records_commit_sha_and_version_label_on_project_delivered(
     assert delivered_events2[1].payload.get("version_label") == "v2"
 
 
+def test_orchestrator_chat_persists_current_commit_sha_and_version_retroactively(
+    tmp_path: Path,
+) -> None:
+    """Orchestrator.chat_with_project stamps current commit_sha & version_label while reading legacy chats safely."""
+    import json
+
+    from agent_factory.adapters.sqlite_store import SqliteEventStore
+    from agent_factory.domain.events import create_event
+    from agent_factory.domain.models import Plan
+
+    pid = "proj-chat-ver"
+    now = datetime(2026, 4, 21, 10, 0, tzinfo=UTC)
+    store = SqliteEventStore(str(tmp_path / "chat_ver.db"))
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_chat_ver")
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / "app.py").write_text("print('ok')\n", encoding="utf-8")
+
+    plan_dict = {
+        "summary": "App versionada",
+        "rationale": "Simple",
+        "template_id": "static-web",
+        "deployment_target": "github-pages",
+        "files": [{"path": "app.py", "purpose": "Main", "contract": "Python"}],
+        "acceptance_tests": [{"id": "AT-01", "description": "Corre", "type": "unit"}],
+        "estimated_cost": "low",
+    }
+    plan_hash = Plan.model_validate(plan_dict).compute_hash()
+    sha_v2 = "1234567890abcdef1234567890abcdef12345678"
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "Ver", "objective": "Obj", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+        create_event(pid, EventType.PROJECT_DELIVERED, {"repo_url": "", "deploy_url": "", "commit_sha": sha_v2, "version_label": "v2"}, at=now),
+    ):
+        store.append(ev)
+
+    chats_dir = tmp_path / "chats"
+    chats_dir.mkdir(parents=True)
+    # Seed legacy message without commit_sha or version_label
+    (chats_dir / f"{pid}.json").write_text(
+        json.dumps([{"id": "legacy-1", "role": "assistant", "mode": "chat", "content": "Viejo", "created_at": now.isoformat()}]),
+        encoding="utf-8",
+    )
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "reply": "# Auditoría\nTodo bien.",
+                "suggested_changes": "Nada urgente.",
+                "document_title": "audit-v2.md",
+            }
+        ]
+    )
+    orch = Orchestrator(store=store, llm=llm, workspace_manager=ws_mgr)
+    res = orch.chat_with_project(pid, "", mode="audit", chats_dir=chats_dir)
+    assert res["commit_sha"] == sha_v2
+    assert res["version_label"] == "v2"
+
+    hist = orch.get_project_chat_history(pid, chats_dir=chats_dir)
+    assert len(hist) == 3
+    assert hist[0]["id"] == "legacy-1"
+    assert hist[0].get("commit_sha", "") == ""
+    assert hist[1]["commit_sha"] == sha_v2
+    assert hist[1]["version_label"] == "v2"
+    assert hist[2]["commit_sha"] == sha_v2
+    assert hist[2]["version_label"] == "v2"
+    store.close()
+
+
+
 
 
 

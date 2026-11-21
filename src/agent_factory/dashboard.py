@@ -2853,6 +2853,348 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
       .project-card:hover { transform: none; }
     }
+    /* B4: Audit Index & Safe Markdown Reader */
+    .audit-subtabs {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 8px;
+    }
+    .audit-subtab {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 5px 12px;
+      border-radius: 999px;
+      font-size: var(--fs-sm);
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .audit-subtab.active {
+      background: var(--info-bg);
+      color: var(--accent);
+      border-color: var(--accent);
+    }
+    .audit-filters {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+    .audit-filter-btn {
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: var(--fs-xs);
+      cursor: pointer;
+    }
+    .audit-filter-btn.active {
+      background: var(--accent);
+      color: var(--btn-primary-fg);
+      border-color: var(--accent);
+      font-weight: 600;
+    }
+    #audit-index {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .audit-card {
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
+      border-radius: 10px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .audit-card-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .audit-card-excerpt {
+      font-size: var(--fs-sm);
+      color: var(--muted);
+      line-height: 1.45;
+    }
+    .audit-reader {
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
+      border-radius: 10px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .audit-reader-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    .audit-toc {
+      border: 1px solid var(--border);
+      background: var(--surface);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: var(--fs-xs);
+    }
+    .audit-toc ul {
+      margin: 4px 0 0 0;
+      padding-left: 16px;
+    }
+    .audit-toc a {
+      color: var(--accent);
+      cursor: pointer;
+    }
+    .readonly-mod-notice {
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: var(--warn-bg);
+      border: 1px solid rgba(245, 158, 11, 0.4);
+      color: var(--warn);
+      font-size: var(--fs-sm);
+      font-weight: 600;
+      margin-bottom: 10px;
+    }
+    .md-body {
+      font-size: var(--fs-base);
+      line-height: 1.55;
+      word-break: break-word;
+    }
+    .md-body h1, .md-body h2, .md-body h3 {
+      margin: 12px 0 6px 0;
+      color: var(--text);
+      line-height: 1.3;
+    }
+    .md-body h1 { font-size: 1.15rem; }
+    .md-body h2 { font-size: 1.02rem; }
+    .md-body h3 { font-size: 0.95rem; }
+    .md-body p { margin: 6px 0; }
+    .md-body ul, .md-body ol { margin: 6px 0; padding-left: 20px; }
+    .md-body blockquote {
+      margin: 8px 0;
+      padding: 6px 12px;
+      border-left: 3px solid var(--accent);
+      background: var(--surface);
+      color: var(--muted);
+    }
+    .md-body code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.82rem;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+    }
+    .md-code-wrap {
+      margin: 8px 0;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      background: var(--bg);
+    }
+    .md-code-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 4px 10px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      font-size: var(--fs-xs);
+      color: var(--muted);
+    }
+    .md-code-wrap pre {
+      margin: 0;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      white-space: pre;
+      overflow-x: auto;
+      word-break: normal;
+    }
+    .md-code-wrap pre code {
+      border: 0;
+      background: transparent;
+      padding: 0;
+    }
+    .md-table-wrap { overflow-x: auto; margin: 8px 0; }
+    .md-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: var(--fs-sm);
+    }
+    .md-table th, .md-table td {
+      border: 1px solid var(--border);
+      padding: 6px 8px;
+      text-align: left;
+    }
+    .md-table th { background: var(--surface); }
+    /* B5: Developer Ergonomics (File Picker, Diff Viewer, Versions Timeline) */
+    .target-picker {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .target-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .target-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--info-bg);
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      color: var(--accent);
+      font-size: var(--fs-xs);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .target-chip button {
+      background: transparent;
+      border: 0;
+      color: inherit;
+      cursor: pointer;
+      padding: 0 2px;
+      font-weight: 700;
+    }
+    .target-checklist {
+      max-height: 220px;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+      padding: 8px;
+    }
+    .target-folder-group { margin-bottom: 8px; }
+    .target-folder-title {
+      font-size: var(--fs-xs);
+      font-weight: 700;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .file-check-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 3px 4px;
+      font-size: var(--fs-xs);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      cursor: pointer;
+    }
+    .file-check-row:hover { background: var(--surface); border-radius: 4px; }
+    .diff-file-card {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+      margin-top: 8px;
+      overflow: hidden;
+    }
+    .diff-file-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 7px 10px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+      font-size: var(--fs-xs);
+    }
+    .diff-stats {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+    }
+    .diff-add-stat { color: var(--ok); font-weight: 700; }
+    .diff-del-stat { color: var(--err); font-weight: 700; }
+    .diff-lines-scroll {
+      overflow-x: auto;
+      max-height: 280px;
+      overflow-y: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.77rem;
+      line-height: 1.45;
+      padding: 6px 0;
+    }
+    .diff-line {
+      white-space: pre;
+      padding: 0 10px;
+      min-width: max-content;
+    }
+    .diff-line-add {
+      background: rgba(34, 197, 94, 0.14);
+      color: var(--ok);
+    }
+    .diff-line-del {
+      background: rgba(239, 68, 68, 0.14);
+      color: var(--err);
+    }
+    .diff-line-hunk {
+      background: var(--info-bg);
+      color: var(--accent);
+      font-weight: 600;
+    }
+    #versions-timeline {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 6px 0 6px 14px;
+      border-left: 2px solid var(--border);
+      margin-top: 8px;
+    }
+    .version-node {
+      position: relative;
+      padding-left: 10px;
+    }
+    .version-dot {
+      position: absolute;
+      left: -21px;
+      top: 10px;
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: var(--border);
+      border: 2px solid var(--surface);
+    }
+    .version-node.current .version-dot { background: var(--ok); }
+    .version-card {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface-alt);
+      padding: 9px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .version-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .version-actions {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
   </style>
 </head>
 <body>
@@ -2891,19 +3233,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </header>
 
   <div class="live-activity-shell">
-    <div id="live-activity-banner" class="live-activity-banner" style="display:none" role="status" aria-live="polite">
+    <div id="live-activity-banner" class="live-activity-banner" style="display:none">
       <div class="live-activity-main">
         <svg class="live-spinner-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true">
           <circle cx="12" cy="12" r="9" opacity="0.25"></circle>
           <path d="M21 12a9 9 0 0 0-9-9" stroke-linecap="round"></path>
         </svg>
-        <div>
+        <div role="status" aria-live="polite" aria-atomic="true">
           <div id="live-activity-text" style="font-size:0.9rem; font-weight:600;">Procesando...</div>
           <div id="live-activity-subtext" class="muted" style="font-size:0.78rem;"></div>
         </div>
-        <span id="live-activity-timer" class="live-activity-timer">00:00s</span>
+        <span id="live-activity-timer" class="live-activity-timer" aria-hidden="true">00:00s</span>
       </div>
-      <div id="live-activity-stall" class="live-activity-stall" style="display:none">
+      <div id="live-activity-stall" class="live-activity-stall" style="display:none" role="alert">
         <span>La operación está tardando más de lo esperado (puede seguir procesando o haberse bloqueado)</span>
         <button id="live-activity-reload-btn" class="btn btn-sm btn-warn" type="button">Reintentar / Recargar estado</button>
       </div>
@@ -2945,9 +3287,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
     </section>
 
-    <div id="import-project-modal" class="modal-backdrop" style="display:none">
+    <div id="import-project-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="import-modal-title" style="display:none">
       <form id="import-project-form" class="modal-card">
-        <h3 style="margin:0 0 8px 0;">Importar proyecto de esta computadora</h3>
+        <h3 id="import-modal-title" style="margin:0 0 8px 0;">Importar proyecto de esta computadora</h3>
         <p class="muted" style="font-size:0.86rem; margin:0 0 12px 0;">Ingresa la ruta local de una carpeta existente para auditarla, ejecutarla o modificarla sin copiar archivos.</p>
         <input id="import-path-input" class="input-field" type="text" placeholder="Ej: C:\\Users\\tu-usuario\\proyectos\\mi-app" required style="margin-bottom:8px;" />
         <input id="import-title-input" class="input-field" type="text" maxlength="80" placeholder="Título opcional (si lo dejas vacío se detecta del repo)" style="margin-bottom:12px;" />
@@ -3001,16 +3343,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
             <div id="detail-guidance"></div>
 
-            <div class="tabs">
-              <button id="tab-audit-btn" class="tab-btn" data-tab="audit" type="button" title="Consultar y Auditar proyecto" style="display:none">💬 Consultar y Auditar</button>
-              <button id="tab-modify-btn" class="tab-btn" data-tab="modify" type="button" style="display:none">✨ Pedir cambios</button>
-              <button id="tab-spec-btn" class="tab-btn active" data-tab="spec" type="button">📋 Resumen y Plan</button>
-              <button id="tab-events-btn" class="tab-btn" data-tab="events" type="button">🕒 Historial</button>
+            <div role="tablist" aria-label="Secciones del proyecto">
+              <div class="tabs">
+                <button id="tab-audit-btn" class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-audit" tabindex="-1" data-tab="audit" type="button" title="Consultar y Auditar proyecto" style="display:none">💬 Consultar y Auditar</button>
+                <button id="tab-modify-btn" class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-modify" tabindex="-1" data-tab="modify" type="button" style="display:none">✨ Pedir cambios</button>
+                <button id="tab-spec-btn" class="tab-btn active" role="tab" aria-selected="true" aria-controls="tab-spec" tabindex="0" data-tab="spec" type="button">📋 Resumen y Plan</button>
+                <button id="tab-events-btn" class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-events" tabindex="-1" data-tab="events" type="button">🕒 Historial</button>
+              </div>
             </div>
-            <div id="tab-audit" class="tab-content" style="display:none"></div>
-            <div id="tab-modify" class="tab-content" style="display:none"></div>
-            <div id="tab-spec" class="tab-content"></div>
-            <div id="tab-events" class="tab-content" style="display:none"></div>
+            <div id="tab-audit" class="tab-content" role="tabpanel" aria-labelledby="tab-audit-btn" style="display:none"></div>
+            <div id="tab-modify" class="tab-content" role="tabpanel" aria-labelledby="tab-modify-btn" style="display:none"></div>
+            <div id="tab-spec" class="tab-content" role="tabpanel" aria-labelledby="tab-spec-btn"></div>
+            <div id="tab-events" class="tab-content" role="tabpanel" aria-labelledby="tab-events-btn" style="display:none"></div>
 
             <div id="detail-secondary"></div>
           </div>
@@ -3030,7 +3374,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </section>
   </main>
 
-  <div id="confirm-action-modal" class="modal-backdrop" style="display:none">
+  <div id="confirm-action-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title" style="display:none">
     <div class="modal-card" style="max-width:440px;">
       <h3 id="confirm-modal-title" style="margin:0 0 8px 0;">Confirmar acción</h3>
       <p id="confirm-modal-body" class="muted" style="font-size:var(--fs-sm); margin:0 0 16px 0;"></p>
@@ -3075,6 +3419,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       phaseOpen: {},
       priorOpen: {},
       userChoseTabByPid: {},
+      auditSubTabByPid: {},
+      auditFilterByPid: {},
+      selectedAuditMsgIdByPid: {},
+      targetFilesQueryByPid: {},
       interviewPendingByPid: {},
       lastBannerSignature: null,
       lastModifySignature: null,
@@ -3258,6 +3606,63 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }, 2500);
     }
 
+    async function copyToClipboard(text, okMsg) {
+      const value = String(text || '');
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(value);
+        } else {
+          const tmp = document.createElement('textarea');
+          tmp.value = value;
+          document.body.appendChild(tmp);
+          tmp.select();
+          document.execCommand('copy');
+          document.body.removeChild(tmp);
+        }
+        setNote(okMsg || '✓ Copiado al portapapeles.', 'ok');
+      } catch (err) {
+        setNote('No se pudo copiar: ' + err.message, 'err');
+      }
+    }
+
+    function trapDialogFocus(dialogEl, onClose) {
+      if (!dialogEl) return () => {};
+      const openerEl = document.activeElement && document.activeElement.focus ? document.activeElement : null;
+      function getFocusable() {
+        return Array.from(
+          dialogEl.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])')
+        ).filter((el) => el.offsetParent !== null || el === document.activeElement);
+      }
+      function onKeyDown(ev) {
+        if (dialogEl.style.display === 'none') return;
+        if (ev.key === 'Escape') {
+          ev.preventDefault();
+          if (typeof onClose === 'function') onClose();
+          return;
+        }
+        if (ev.key === 'Tab') {
+          const items = getFocusable();
+          if (!items.length) return;
+          const first = items[0];
+          const last = items[items.length - 1];
+          if (ev.shiftKey && document.activeElement === first) {
+            ev.preventDefault();
+            last.focus();
+          } else if (!ev.shiftKey && document.activeElement === last) {
+            ev.preventDefault();
+            first.focus();
+          }
+        }
+      }
+      document.addEventListener('keydown', onKeyDown);
+      return function release() {
+        document.removeEventListener('keydown', onKeyDown);
+        if (openerEl && document.body.contains(openerEl)) {
+          try { openerEl.focus(); } catch (_) {}
+        }
+      };
+    }
+
     function askCustomConfirm(opts) {
       const cfg = opts || {};
       const modal = document.getElementById('confirm-action-modal');
@@ -3272,9 +3677,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       bodyEl.textContent = cfg.body || '';
       okBtn.textContent = cfg.confirmLabel || 'Confirmar';
       modal.style.display = 'flex';
-      okBtn.focus();
       return new Promise((resolve) => {
         let settled = false;
+        let releaseTrap = null;
         function finish(val) {
           if (settled) return;
           settled = true;
@@ -3282,17 +3687,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           okBtn.removeEventListener('click', onOk);
           cancelBtn.removeEventListener('click', onCancel);
           modal.removeEventListener('click', onBackdrop);
-          document.removeEventListener('keydown', onKey);
+          if (releaseTrap) releaseTrap();
           resolve(val);
         }
         function onOk() { finish(true); }
         function onCancel() { finish(false); }
         function onBackdrop(ev) { if (ev.target === modal) finish(false); }
-        function onKey(ev) { if (ev.key === 'Escape') finish(false); }
+        releaseTrap = trapDialogFocus(modal, onCancel);
         okBtn.addEventListener('click', onOk);
         cancelBtn.addEventListener('click', onCancel);
         modal.addEventListener('click', onBackdrop);
-        document.addEventListener('keydown', onKey);
+        okBtn.focus();
       });
     }
 
@@ -3501,7 +3906,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       return 'El proceso se detuvo por un inconveniente técnico. Puedes volver a intentarlo con un clic.';
     }
 
-    document.querySelectorAll('.tab-btn').forEach((btn) => {
+    const tabButtonsList = Array.from(document.querySelectorAll('.tab-btn'));
+    tabButtonsList.forEach((btn) => {
       btn.addEventListener('click', () => {
         state.activeTab = btn.dataset.tab;
         if (state.selectedId) {
@@ -3509,11 +3915,35 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
         renderTabs();
       });
+      btn.addEventListener('keydown', (ev) => {
+        const visibleTabs = tabButtonsList.filter((b) => b.style.display !== 'none');
+        if (!visibleTabs.length) return;
+        const curIdx = visibleTabs.indexOf(btn);
+        if (curIdx < 0) return;
+        let nextIdx = -1;
+        if (ev.key === 'ArrowRight') nextIdx = (curIdx + 1) % visibleTabs.length;
+        else if (ev.key === 'ArrowLeft') nextIdx = (curIdx - 1 + visibleTabs.length) % visibleTabs.length;
+        else if (ev.key === 'Home') nextIdx = 0;
+        else if (ev.key === 'End') nextIdx = visibleTabs.length - 1;
+        if (nextIdx >= 0) {
+          ev.preventDefault();
+          const targetBtn = visibleTabs[nextIdx];
+          state.activeTab = targetBtn.dataset.tab;
+          if (state.selectedId) {
+            state.userChoseTabByPid[state.selectedId] = state.activeTab;
+          }
+          renderTabs();
+          targetBtn.focus();
+        }
+      });
     });
 
     function renderTabs() {
       document.querySelectorAll('.tab-btn').forEach((b) => {
-        b.classList.toggle('active', b.dataset.tab === state.activeTab);
+        const isActive = b.dataset.tab === state.activeTab;
+        b.classList.toggle('active', isActive);
+        b.setAttribute('aria-selected', isActive ? 'true' : 'false');
+        b.setAttribute('tabindex', isActive ? '0' : '-1');
       });
       const specPane = document.getElementById('tab-spec');
       if (specPane) specPane.style.display = state.activeTab === 'spec' ? 'block' : 'none';
@@ -4204,7 +4634,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           : '';
         const elapsedText = st.step_started_at ? formatHandoffElapsed(st.project_id, st.step_started_at) : '';
         const timerPill = st.step_started_at
-          ? '<span class="model-pill live-step-timer" data-pid="' + escapeHtml(st.project_id) + '" data-started-at="' + escapeHtml(st.step_started_at) + '">Tiempo en este paso: ' + escapeHtml(elapsedText || '0s') + '</span>'
+          ? '<span class="model-pill live-step-timer" aria-hidden="true" data-pid="' + escapeHtml(st.project_id) + '" data-started-at="' + escapeHtml(st.step_started_at) + '">Tiempo en este paso: ' + escapeHtml(elapsedText || '0s') + '</span>'
           : '';
         return '<div class="guidance-banner banner-info">' +
           '<div class="banner-content">' +
@@ -5166,7 +5596,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         const copyDiagBtn = document.getElementById('copy-diag-btn');
         if (copyDiagBtn) {
-          copyDiagBtn.addEventListener('click', async () => {
+          copyDiagBtn.addEventListener('click', () => {
             const diagPayload = JSON.stringify({
               project_id: st.project_id,
               state: st.state,
@@ -5177,39 +5607,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               events_count: events.length,
               events: events,
             }, null, 2);
-            try {
-              if (navigator.clipboard && navigator.clipboard.writeText) {
-                await navigator.clipboard.writeText(diagPayload);
-              } else {
-                const tmp = document.createElement('textarea');
-                tmp.value = diagPayload;
-                document.body.appendChild(tmp);
-                tmp.select();
-                document.execCommand('copy');
-                document.body.removeChild(tmp);
-              }
-              setNote('Diagnóstico copiado al portapapeles.', 'ok');
-            } catch (err) {
-              setNote('No se pudo copiar el diagnóstico: ' + err.message, 'err');
-            }
+            copyToClipboard(diagPayload, '✓ Diagnóstico copiado al portapapeles.');
           });
         }
       }
 
+      const wasDeliveredBefore = isDelivered || events.some((ev) =>
+        ev && (ev.type === 'PROJECT_DELIVERED' || ev.type === 'PROJECT_COMPLETED' || ev.type === 'COMPLETED')
+      );
+      const readOnlyAuditModifying = wasDeliveredBefore && !isDelivered;
       const auditTabBtn = document.getElementById('tab-audit-btn');
       const modifyTabBtn = document.getElementById('tab-modify-btn');
-      if (isDelivered) {
+      if (isDelivered || readOnlyAuditModifying) {
         if (auditTabBtn) auditTabBtn.style.display = '';
-        if (modifyTabBtn) modifyTabBtn.style.display = '';
-        if (!(st.project_id in state.userChoseTabByPid)) {
+        if (modifyTabBtn) modifyTabBtn.style.display = isDelivered ? '' : 'none';
+        if (isDelivered && !(st.project_id in state.userChoseTabByPid)) {
           state.activeTab = 'audit';
+        } else if (!isDelivered && state.activeTab === 'modify') {
+          state.activeTab = 'spec';
         }
         if (!state.chatLoadedFor[st.project_id]) {
           loadProjectChatHistory(st.project_id);
         }
         loadProjectDevAndVersionData(st.project_id, st.last_event_at || String(events.length));
-        renderAuditChatTab(st.project_id);
-        renderModifyTab(st);
+        renderAuditChatTab(st.project_id, readOnlyAuditModifying);
+        if (isDelivered) {
+          renderModifyTab(st);
+        }
       } else {
         if (auditTabBtn) auditTabBtn.style.display = 'none';
         if (modifyTabBtn) modifyTabBtn.style.display = 'none';
@@ -5222,13 +5646,96 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       renderLiveActivityBanner();
     }
 
+    function parseUnifiedDiffFiles(rawDiff) {
+      const text = String(rawDiff || '').replace(/\\r\\n?/g, '\\n').trim();
+      if (!text) return [];
+      const rawChunks = text.split(/^diff --git /m).filter((c) => c.trim());
+      if (!text.startsWith('diff --git ') && rawChunks.length === 1) {
+        const lines = text.split('\\n');
+        let adds = 0;
+        let dels = 0;
+        lines.forEach((l) => {
+          if (l.startsWith('+') && !l.startsWith('+++')) adds++;
+          else if (l.startsWith('-') && !l.startsWith('---')) dels++;
+        });
+        return [{ path: 'Cambios recientes', adds, dels, lines }];
+      }
+      return rawChunks.map((chunk) => {
+        const lines = ('diff --git ' + chunk).split('\\n');
+        let filePath = 'archivo';
+        const hdrMatch = /^diff --git a\\/([^\\n]+?) b\\/([^\\n]+)$/.exec(lines[0] || '');
+        if (hdrMatch && hdrMatch[2]) {
+          filePath = hdrMatch[2];
+        } else {
+          const plusLine = lines.find((l) => l.startsWith('+++ b/'));
+          if (plusLine) filePath = plusLine.slice(6).trim();
+        }
+        let adds = 0;
+        let dels = 0;
+        lines.forEach((l) => {
+          if (l.startsWith('+') && !l.startsWith('+++')) adds++;
+          else if (l.startsWith('-') && !l.startsWith('---')) dels++;
+        });
+        return { path: filePath, adds, dels, lines };
+      });
+    }
+
+    function renderDiffLineHtml(line) {
+      let cls = 'diff-line';
+      if (line.startsWith('+') && !line.startsWith('+++')) cls += ' diff-line-add';
+      else if (line.startsWith('-') && !line.startsWith('---')) cls += ' diff-line-del';
+      else if (line.startsWith('@@')) cls += ' diff-line-hunk';
+      return '<div class="' + cls + '">' + (line ? escapeHtml(line) : ' ') + '</div>';
+    }
+
+    function buildTargetFilesGroupsHtml(filesList, selSet, query) {
+      const q = String(query || '').trim().toLowerCase();
+      const filtered = q
+        ? filesList.filter((fp) => fp.toLowerCase().indexOf(q) >= 0)
+        : filesList;
+      if (!filtered.length) {
+        return '<div class="muted" style="font-size:var(--fs-xs); padding:4px;">Sin archivos que coincidan con "' + escapeHtml(query) + '".</div>';
+      }
+      const groups = {};
+      filtered.forEach((fp) => {
+        const slash = fp.lastIndexOf('/');
+        const folder = slash >= 0 ? fp.slice(0, slash) : '(raíz)';
+        if (!groups[folder]) groups[folder] = [];
+        groups[folder].push(fp);
+      });
+      return Object.keys(groups).sort().map((folder) => {
+        const rows = groups[folder].map((fp) =>
+          '<label class="file-check-row">' +
+            '<input type="checkbox" data-target-file-cb="' + escapeHtml(fp) + '"' + (selSet.has(fp) ? ' checked' : '') + ' />' +
+            '<span>' + escapeHtml(fp) + '</span>' +
+          '</label>'
+        ).join('');
+        return '<div class="target-folder-group">' +
+          '<div class="target-folder-title">📁 ' + escapeHtml(folder) + '</div>' +
+          rows +
+        '</div>';
+      }).join('');
+    }
+
+    function buildTargetChipsHtml(selArr) {
+      if (!selArr.length) return '';
+      return selArr.map((fp) =>
+        '<span class="target-chip">' +
+          '<span>' + escapeHtml(fp) + '</span>' +
+          '<button type="button" data-remove-target-file="' + escapeHtml(fp) + '" aria-label="Quitar ' + escapeHtml(fp) + '">✕</button>' +
+        '</span>'
+      ).join('');
+    }
+
     function renderModifyTab(st) {
       const container = document.getElementById('tab-modify');
       if (!container || !st) return;
       const pid = st.project_id;
       const modifyDraft = escapeHtml((state.modifyDrafts && state.modifyDrafts[pid]) || '');
       const filesList = (state.filesByPid && state.filesByPid[pid]) || [];
-      const selSet = new Set((state.targetFilesSelected && state.targetFilesSelected[pid]) || []);
+      const selArr = (state.targetFilesSelected && state.targetFilesSelected[pid]) || [];
+      const selSet = new Set(selArr);
+      const fileQuery = (state.targetFilesQueryByPid && state.targetFilesQueryByPid[pid]) || '';
       const cps = (state.checkpointsByPid && state.checkpointsByPid[pid]) || [];
       const validCps = cps.filter((c) => c && c.commit_sha);
       const diffInfo = (state.diffByPid && state.diffByPid[pid]) || null;
@@ -5236,8 +5743,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const modSig = JSON.stringify([
         pid,
         filesList.length,
+        selArr,
         validCps.map((c) => c.commit_sha + ':' + Boolean(c.is_current)),
-        Boolean(diffInfo && diffInfo.diff),
+        diffInfo && diffInfo.diff ? diffInfo.diff.length : 0,
         Boolean(state.filesOpen && state.filesOpen[pid]),
         Boolean(state.rollbackOpen && state.rollbackOpen[pid]),
         Boolean(state.diffOpen && state.diffOpen[pid]),
@@ -5250,17 +5758,65 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const fileOptsHtml = filesList.map((fp) =>
         '<option value="' + escapeHtml(fp) + '"' + (selSet.has(fp) ? ' selected' : '') + '>' + escapeHtml(fp) + '</option>'
       ).join('');
-      const cpOptsHtml = validCps.map((c) => {
-        const timeLbl = formatFriendlyTime(c.delivered_at);
-        const curTag = c.is_current ? ' (actual)' : '';
-        const txt = c.version_label + curTag + (timeLbl ? (' · ' + timeLbl) : '');
-        return '<option value="' + escapeHtml(c.commit_sha) + '" title="' + escapeHtml(c.commit_sha) + '">' + escapeHtml(txt) + '</option>';
-      }).join('');
-      const rollbackDisabled = validCps.length === 0 ? ' disabled' : '';
       const rollbackDisplay = validCps.length === 0 ? ' style="display:none"' : '';
       const curCp = validCps.find((c) => c.is_current) || validCps[0] || null;
       const prevCp = validCps.find((c) => !c.is_current && (!curCp || c.commit_sha !== curCp.commit_sha)) || null;
-      const diffText = diffInfo && diffInfo.diff ? diffInfo.diff : 'Sin cambios recientes registrados o sin repositorio Git.';
+      const curShaShort = (curCp && (curCp.short_sha || String(curCp.commit_sha).slice(0, 7))) || '';
+      const diffFiles = diffInfo && diffInfo.diff ? parseUnifiedDiffFiles(diffInfo.diff) : [];
+      const diffViewerHtml = diffFiles.length
+        ? diffFiles.map((df) =>
+            '<details class="diff-file-card" open>' +
+              '<summary class="diff-file-head">' +
+                '<span class="diff-stats">' +
+                  '<strong>' + escapeHtml(df.path) + '</strong>' +
+                  '<span class="diff-add-stat">+' + df.adds + '</span>' +
+                  '<span class="diff-del-stat">−' + df.dels + '</span>' +
+                '</span>' +
+                '<span style="display:inline-flex; gap:6px;">' +
+                  '<button type="button" class="btn btn-sm" data-copy-diff-path="' + escapeHtml(df.path) + '">Copiar ruta</button>' +
+                  (curShaShort ? '<button type="button" class="btn btn-sm" data-copy-diff-hash="' + escapeHtml(curShaShort) + '">Copiar hash</button>' : '') +
+                '</span>' +
+              '</summary>' +
+              '<div class="diff-lines-scroll">' + df.lines.map(renderDiffLineHtml).join('') + '</div>' +
+            '</details>'
+          ).join('')
+        : '<div class="muted" style="font-size:var(--fs-xs); padding:8px 0;">Sin cambios recientes registrados o sin repositorio Git.</div>';
+
+      const timelineHtml = validCps.length
+        ? validCps.map((c) => {
+            const shaShort = c.short_sha || String(c.commit_sha || '').slice(0, 7);
+            const timeLbl = formatFriendlyTime(c.delivered_at);
+            const rbTag = c.rollback_from
+              ? '<span class="model-pill">Restaurado desde ' + escapeHtml(String(c.rollback_from).slice(0, 7)) + '</span>'
+              : '';
+            const curBadge = c.is_current
+              ? '<span class="badge badge-ok">Actual</span>'
+              : '';
+            const restoreBtnHtml = c.is_current
+              ? '<button class="btn btn-sm" type="button" disabled title="Versión actual en uso">Restaurar esta versión</button>'
+              : '<button class="btn btn-sm btn-warn" type="button" data-rollback-sha="' + escapeHtml(c.commit_sha) + '">Restaurar esta versión</button>';
+            return '<div class="version-node' + (c.is_current ? ' current' : '') + '">' +
+              '<div class="version-dot"></div>' +
+              '<div class="version-card">' +
+                '<div class="version-head">' +
+                  '<span style="display:inline-flex; align-items:center; gap:6px; flex-wrap:wrap;">' +
+                    '<strong>' + escapeHtml(c.version_label) + '</strong>' +
+                    curBadge +
+                    rbTag +
+                  '</span>' +
+                  '<span class="muted" style="font-size:var(--fs-xs);">' + escapeHtml(timeLbl) + '</span>' +
+                '</div>' +
+                (c.summary ? '<div class="muted" style="font-size:var(--fs-xs);">' + escapeHtml(c.summary) + '</div>' : '') +
+                '<div class="version-actions">' +
+                  '<code class="file-chip">' + escapeHtml(shaShort) + '</code>' +
+                  '<button class="btn btn-sm" type="button" data-copy-version-sha="' + escapeHtml(shaShort) + '">Copiar hash</button>' +
+                  restoreBtnHtml +
+                '</div>' +
+              '</div>' +
+            '</div>';
+          }).join('')
+        : '<div class="muted" style="font-size:var(--fs-xs);">Sin checkpoints Git registrados.</div>';
+
       const filesOpenAttr = (state.filesOpen && state.filesOpen[pid]) ? ' open' : '';
       const rollbackOpenAttr = (state.rollbackOpen && state.rollbackOpen[pid]) ? ' open' : '';
       const diffOpenAttr = (state.diffOpen && state.diffOpen[pid]) ? ' open' : '';
@@ -5289,38 +5845,93 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           simpleRbHtml +
           '<details id="modify-files-details" class="tech-details tech-only"' + filesOpenAttr + '>' +
             '<summary>Archivos objetivo (opcional)' + (selSet.size ? (' · ' + selSet.size + ' seleccionado(s)') : '') + '</summary>' +
-            '<div id="modify-target-files-wrap" style="margin-top:8px;">' +
-              '<select id="modify-target-files" class="input-field" multiple size="5">' + fileOptsHtml + '</select>' +
+            '<div id="modify-target-files-wrap" class="target-picker">' +
+              '<input id="target-files-search" class="input-field" type="search" placeholder="Buscar archivos por nombre o carpeta..." value="' + escapeHtml(fileQuery) + '" />' +
+              '<div id="target-files-chips" class="target-chips">' + buildTargetChipsHtml(selArr) + '</div>' +
+              '<div id="target-files-checklist" class="target-checklist">' + buildTargetFilesGroupsHtml(filesList, selSet, fileQuery) + '</div>' +
+              '<select id="modify-target-files" class="sr-only" multiple tabindex="-1" aria-hidden="true">' + fileOptsHtml + '</select>' +
             '</div>' +
           '</details>' +
           '<details id="rollback-details" class="tech-details tech-only"' + rollbackDisplay + rollbackOpenAttr + '>' +
-            '<summary>Versiones estables (Rollback)' + (curCp ? (' · HEAD: ' + escapeHtml(curCp.short_sha || curCp.commit_sha)) : '') + '</summary>' +
-            '<div class="versions-panel" style="margin-top:8px;">' +
-              '<div class="versions-row">' +
-                '<select id="rollback-version-select" class="input-field"' + rollbackDisabled + '>' +
-                  (validCps.length ? cpOptsHtml : '<option value="">Sin checkpoints Git registrados</option>') +
-                '</select>' +
-                '<button id="rollback-version-btn" class="btn btn-sm btn-warn" type="button"' + rollbackDisabled + '>Restaurar esta versión</button>' +
-              '</div>' +
-            '</div>' +
+            '<summary>Versiones estables (Rollback)' + (curShaShort ? (' · HEAD: ' + escapeHtml(curShaShort)) : '') + '</summary>' +
+            '<div id="versions-timeline">' + timelineHtml + '</div>' +
           '</details>' +
           '<details id="git-diff-details" class="tech-details tech-only"' + diffOpenAttr + '>' +
             '<summary>Últimos cambios (git diff)</summary>' +
-            '<pre id="git-diff-pre" class="diff-pre">' + escapeHtml(diffText) + '</pre>' +
+            '<div id="git-diff-viewer">' + diffViewerHtml + '</div>' +
           '</details>' +
         '</div>';
 
       const modifyInput = document.getElementById('modify-project-input');
       const modifyBtn = document.getElementById('modify-project-btn');
       const targetSelect = document.getElementById('modify-target-files');
+      const searchInput = document.getElementById('target-files-search');
+      const chipsWrap = document.getElementById('target-files-chips');
+      const checklistEl = document.getElementById('target-files-checklist');
+
+      function syncTargetFilesSelection(nextArr) {
+        const deduped = Array.from(new Set(nextArr.filter(Boolean)));
+        state.targetFilesSelected[pid] = deduped;
+        const nextSet = new Set(deduped);
+        if (targetSelect) {
+          Array.from(targetSelect.options).forEach((opt) => {
+            opt.selected = nextSet.has(opt.value);
+          });
+        }
+        if (chipsWrap) {
+          chipsWrap.innerHTML = buildTargetChipsHtml(deduped);
+          chipsWrap.querySelectorAll('button[data-remove-target-file]').forEach((rmBtn) => {
+            rmBtn.addEventListener('click', () => {
+              const targetFp = rmBtn.getAttribute('data-remove-target-file');
+              syncTargetFilesSelection((state.targetFilesSelected[pid] || []).filter((x) => x !== targetFp));
+            });
+          });
+        }
+        if (checklistEl) {
+          checklistEl.querySelectorAll('input[data-target-file-cb]').forEach((cb) => {
+            cb.checked = nextSet.has(cb.getAttribute('data-target-file-cb'));
+          });
+        }
+        const detSum = container.querySelector('#modify-files-details > summary');
+        if (detSum) {
+          detSum.textContent = 'Archivos objetivo (opcional)' + (deduped.length ? (' · ' + deduped.length + ' seleccionado(s)') : '');
+        }
+      }
+
+      function wireChecklistInputs() {
+        if (!checklistEl) return;
+        checklistEl.querySelectorAll('input[data-target-file-cb]').forEach((cb) => {
+          cb.addEventListener('change', () => {
+            const fp = cb.getAttribute('data-target-file-cb');
+            const cur = state.targetFilesSelected[pid] || [];
+            if (cb.checked) {
+              syncTargetFilesSelection([...cur, fp]);
+            } else {
+              syncTargetFilesSelection(cur.filter((x) => x !== fp));
+            }
+          });
+        });
+      }
+      wireChecklistInputs();
+      if (chipsWrap) {
+        chipsWrap.querySelectorAll('button[data-remove-target-file]').forEach((rmBtn) => {
+          rmBtn.addEventListener('click', () => {
+            const targetFp = rmBtn.getAttribute('data-remove-target-file');
+            syncTargetFilesSelection((state.targetFilesSelected[pid] || []).filter((x) => x !== targetFp));
+          });
+        });
+      }
+      if (searchInput && checklistEl) {
+        searchInput.addEventListener('input', () => {
+          state.targetFilesQueryByPid[pid] = searchInput.value;
+          const curSet = new Set((state.targetFilesSelected && state.targetFilesSelected[pid]) || []);
+          checklistEl.innerHTML = buildTargetFilesGroupsHtml(filesList, curSet, searchInput.value);
+          wireChecklistInputs();
+        });
+      }
       if (modifyInput) {
         modifyInput.addEventListener('input', () => {
           state.modifyDrafts[pid] = modifyInput.value;
-        });
-      }
-      if (targetSelect) {
-        targetSelect.addEventListener('change', () => {
-          state.targetFilesSelected[pid] = Array.from(targetSelect.selectedOptions).map((o) => o.value);
         });
       }
       wireMicButton('modify-mic-btn', 'modify-project-input');
@@ -5328,20 +5939,37 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         modifyBtn.addEventListener('click', async () => {
           const selFiles = targetSelect
             ? Array.from(targetSelect.selectedOptions).map((o) => o.value).filter(Boolean)
-            : [];
+            : (state.targetFilesSelected[pid] || []);
           await submitModifyProject(pid, modifyInput.value, selFiles, modifyBtn);
         });
       }
 
-      const rbSelect = document.getElementById('rollback-version-select');
-      const rbBtn = document.getElementById('rollback-version-btn');
-      if (rbBtn && rbSelect) {
-        rbBtn.addEventListener('click', async () => {
-          const sha = rbSelect.value;
+      container.querySelectorAll('button[data-rollback-sha]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const sha = btn.getAttribute('data-rollback-sha');
           if (!sha) return;
-          await submitRollbackProject(pid, sha, rbBtn);
+          await submitRollbackProject(pid, sha, btn);
         });
-      }
+      });
+      container.querySelectorAll('button[data-copy-version-sha]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          copyToClipboard(btn.getAttribute('data-copy-version-sha'), '✓ Hash copiado al portapapeles.');
+        });
+      });
+      container.querySelectorAll('button[data-copy-diff-path]').forEach((btn) => {
+        btn.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          copyToClipboard(btn.getAttribute('data-copy-diff-path'), '✓ Ruta copiada al portapapeles.');
+        });
+      });
+      container.querySelectorAll('button[data-copy-diff-hash]').forEach((btn) => {
+        btn.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          copyToClipboard(btn.getAttribute('data-copy-diff-hash'), '✓ Hash copiado al portapapeles.');
+        });
+      });
       const simpleRbBtn = document.getElementById('simple-rollback-btn');
       if (simpleRbBtn) {
         simpleRbBtn.addEventListener('click', async () => {
@@ -5371,82 +5999,461 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    function renderAuditChatTab(pid) {
+    function formatSafeInlineMd(escapedLine) {
+      const codeSpans = [];
+      let s = String(escapedLine || '').replace(/`([^`]+)`/g, (_m, inner) => {
+        const tok = '@@AF_ICODE_' + codeSpans.length + '@@';
+        codeSpans.push('<code>' + inner + '</code>');
+        return tok;
+      });
+      s = s.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
+      s = s.replace(/\\*([^*]+)\\*/g, '<em>$1</em>');
+      codeSpans.forEach((html, idx) => {
+        s = s.replace('@@AF_ICODE_' + idx + '@@', html);
+      });
+      return s;
+    }
+
+    function renderSafeMarkdown(mdText) {
+      const normalized = String(mdText || '').replace(/\\r\\n?/g, '\\n');
+      const codeBlocks = [];
+      const withoutFences = normalized.replace(/```([a-zA-Z0-9_-]*)\\n([\\s\\S]*?)```/g, (_m, lang, code) => {
+        const idx = codeBlocks.length;
+        codeBlocks.push({ lang: String(lang || '').trim() || 'código', raw: code });
+        return '\\n@@AF_FCODE_' + idx + '@@\\n';
+      });
+      const escaped = escapeHtml(withoutFences);
+      const lines = escaped.split('\\n');
+      const toc = [];
+      const out = [];
+      let inUl = false;
+      let inOl = false;
+      let paraBuf = [];
+      let hCounter = 0;
+
+      function flushPara() {
+        if (!paraBuf.length) return;
+        out.push('<p>' + paraBuf.map(formatSafeInlineMd).join('<br>') + '</p>');
+        paraBuf = [];
+      }
+      function closeLists() {
+        if (inUl) { out.push('</ul>'); inUl = false; }
+        if (inOl) { out.push('</ol>'); inOl = false; }
+      }
+      function isTableRow(ln) {
+        const t = String(ln || '').trim();
+        return t.startsWith('|') && t.endsWith('|') && t.indexOf('|', 1) >= 0;
+      }
+      function isTableSep(ln) {
+        return /^\\|(?:\\s*:?-{2,}:?\\s*\\|)+$/.test(String(ln || '').trim());
+      }
+      function splitCells(ln) {
+        return String(ln || '').trim().slice(1, -1).split('|').map((c) => formatSafeInlineMd(c.trim()));
+      }
+
+      for (let i = 0; i < lines.length; i++) {
+        const rawLine = lines[i];
+        const trimmed = rawLine.trim();
+        const fenceMatch = /^@@AF_FCODE_(\\d+)@@$/.exec(trimmed);
+        if (fenceMatch) {
+          flushPara();
+          closeLists();
+          out.push(trimmed);
+          continue;
+        }
+        if (!trimmed) {
+          flushPara();
+          closeLists();
+          continue;
+        }
+        if (/^-{3,}$/.test(trimmed)) {
+          flushPara();
+          closeLists();
+          out.push('<hr style="border:0;border-top:1px solid var(--border);margin:10px 0;">');
+          continue;
+        }
+        if (i + 1 < lines.length && isTableRow(trimmed) && isTableSep(lines[i + 1])) {
+          flushPara();
+          closeLists();
+          const headers = splitCells(trimmed).map((c) => '<th>' + c + '</th>').join('');
+          const bodyRows = [];
+          i += 2;
+          while (i < lines.length && isTableRow(lines[i])) {
+            bodyRows.push('<tr>' + splitCells(lines[i]).map((c) => '<td>' + c + '</td>').join('') + '</tr>');
+            i++;
+          }
+          i--;
+          out.push(
+            '<div class="md-table-wrap"><table class="md-table"><thead><tr>' +
+              headers +
+            '</tr></thead><tbody>' +
+              bodyRows.join('') +
+            '</tbody></table></div>'
+          );
+          continue;
+        }
+        const hMatch = /^(#{1,3})\\s+(.*)$/.exec(trimmed);
+        if (hMatch) {
+          flushPara();
+          closeLists();
+          const lvl = hMatch[1].length;
+          const hId = 'md-h-' + (hCounter++);
+          const cleanText = hMatch[2].trim();
+          if (lvl === 2 || lvl === 3) {
+            toc.push({ level: lvl, text: cleanText, id: hId });
+          }
+          out.push('<h' + lvl + ' id="' + hId + '">' + formatSafeInlineMd(cleanText) + '</h' + lvl + '>');
+          continue;
+        }
+        const bqMatch = /^&gt;\\s?(.*)$/.exec(trimmed);
+        if (bqMatch) {
+          flushPara();
+          closeLists();
+          out.push('<blockquote>' + formatSafeInlineMd(bqMatch[1]) + '</blockquote>');
+          continue;
+        }
+        const ulMatch = /^[-*]\\s+(.*)$/.exec(trimmed);
+        if (ulMatch) {
+          flushPara();
+          if (inOl) { out.push('</ol>'); inOl = false; }
+          if (!inUl) { out.push('<ul>'); inUl = true; }
+          out.push('<li>' + formatSafeInlineMd(ulMatch[1]) + '</li>');
+          continue;
+        }
+        const olMatch = /^\\d+\\.\\s+(.*)$/.exec(trimmed);
+        if (olMatch) {
+          flushPara();
+          if (inUl) { out.push('</ul>'); inUl = false; }
+          if (!inOl) { out.push('<ol>'); inOl = true; }
+          out.push('<li>' + formatSafeInlineMd(olMatch[1]) + '</li>');
+          continue;
+        }
+        closeLists();
+        paraBuf.push(trimmed);
+      }
+      flushPara();
+      closeLists();
+
+      let html = out.join('');
+      codeBlocks.forEach((cb, idx) => {
+        const blockHtml =
+          '<div class="md-code-wrap">' +
+            '<div class="md-code-head">' +
+              '<span>' + escapeHtml(cb.lang) + '</span>' +
+              '<button type="button" class="btn btn-sm md-copy-btn" data-md-code-idx="' + idx + '">Copiar</button>' +
+            '</div>' +
+            '<pre><code>' + escapeHtml(cb.raw) + '</code></pre>' +
+          '</div>';
+        html = html.replace('@@AF_FCODE_' + idx + '@@', blockHtml);
+      });
+      return { html: '<div class="md-body">' + html + '</div>', toc, codeBlocks };
+    }
+
+    function inferAuditVersionBadge(entry, cps) {
+      let ver = entry && entry.version_label ? String(entry.version_label) : '';
+      let sha = entry && entry.commit_sha ? String(entry.commit_sha) : '';
+      if (!ver && !sha && Array.isArray(cps) && cps.length && entry && entry.created_at) {
+        const msgMs = Date.parse(entry.created_at);
+        if (isFinite(msgMs)) {
+          const matchCp = cps.find((c) => {
+            const cMs = c && c.delivered_at ? Date.parse(c.delivered_at) : NaN;
+            return isFinite(cMs) && cMs <= msgMs + 5000;
+          }) || cps[0];
+          if (matchCp) {
+            ver = matchCp.version_label || '';
+            sha = matchCp.commit_sha || '';
+          }
+        }
+      }
+      const shortSha = sha ? sha.slice(0, 7) : '';
+      if (ver && shortSha) return ver + ' · ' + shortSha;
+      return ver || shortSha || '';
+    }
+
+    function extractMarkdownExcerpt(mdText, maxLen) {
+      const clean = String(mdText || '')
+        .replace(/```[\\s\\S]*?```/g, ' ')
+        .replace(/^#+\\s+/gm, '')
+        .replace(/[*`>_-]/g, ' ')
+        .replace(/\\s+/g, ' ')
+        .trim();
+      const limit = maxLen || 130;
+      if (clean.length <= limit) return clean;
+      return clean.slice(0, limit - 1).trimEnd() + '…';
+    }
+
+    function renderAuditChatTab(pid, readOnlyModifying) {
       const container = document.getElementById('tab-audit');
       if (!container) return;
+      const st = state.detail && state.detail.status;
+      const isReadOnly = Boolean(
+        readOnlyModifying !== undefined
+          ? readOnlyModifying
+          : (st && st.state !== 'DELIVERED' && st.state !== 'COMPLETED')
+      );
       const msgs = state.chatHistories[pid] || [];
       const draft = state.chatDrafts[pid] || '';
-      const chatSig = pid + ':' + JSON.stringify(msgs.map((m) => [m.id, m.role, m.content]));
-      if (state.lastChatSig === chatSig && container.querySelector('#audit-chat-input')) {
+      const cps = (state.checkpointsByPid && state.checkpointsByPid[pid]) || [];
+      const reportEntries = msgs
+        .map((m, idx) => ({ entry: m, origIdx: idx }))
+        .filter((x) => x.entry && x.entry.role === 'assistant' && (x.entry.mode === 'audit' || x.entry.mode === 'document'))
+        .reverse();
+      const chatEntries = msgs
+        .map((m, idx) => ({ entry: m, origIdx: idx }))
+        .filter((x) => {
+          const m = x.entry;
+          if (!m) return false;
+          if (m.mode === 'chat') return true;
+          return m.role === 'user' && (m.mode === 'audit' || m.mode === 'document');
+        });
+      const activeSub = (state.auditSubTabByPid && state.auditSubTabByPid[pid]) || 'index';
+      const activeFilter = (state.auditFilterByPid && state.auditFilterByPid[pid]) || 'all';
+      const selectedReportId = (state.selectedAuditMsgIdByPid && state.selectedAuditMsgIdByPid[pid]) || null;
+
+      const chatSig = JSON.stringify([
+        pid,
+        isReadOnly,
+        activeSub,
+        activeFilter,
+        selectedReportId,
+        cps.length,
+        msgs.map((m) => [m.id, m.role, m.mode, m.content, m.commit_sha, m.version_label]),
+      ]);
+      if (state.lastChatSig === chatSig && container.querySelector('#audit-index')) {
         return;
       }
       state.lastChatSig = chatSig;
 
-      const msgsHtml = msgs.length
-        ? msgs.map((m, idx) => {
+      const disabledAttr = isReadOnly ? ' disabled' : '';
+      const readonlyNoticeHtml = isReadOnly
+        ? '<div class="readonly-mod-notice">Modo solo lectura · Disponible al terminar los cambios</div>'
+        : '';
+
+      const allCodeBlocks = [];
+
+      let indexBodyHtml = '';
+      const openReportItem = selectedReportId
+        ? reportEntries.find((r) => (r.entry.id || String(r.origIdx)) === selectedReportId)
+        : null;
+
+      if (openReportItem) {
+        const rep = openReportItem.entry;
+        const typeLabel = rep.mode === 'audit' ? '🔍 Auditoría' : '📄 Documento .md';
+        const verStr = inferAuditVersionBadge(rep, cps);
+        const parsed = renderSafeMarkdown(rep.content || '');
+        const baseCodeOffset = allCodeBlocks.length;
+        parsed.codeBlocks.forEach((cb) => allCodeBlocks.push(cb));
+        let readerHtml = parsed.html;
+        if (baseCodeOffset > 0) {
+          readerHtml = readerHtml.replace(/data-md-code-idx="(\\d+)"/g, (_m, n) =>
+            'data-md-code-idx="' + (Number(n) + baseCodeOffset) + '"'
+          );
+        }
+        const tocHtml = parsed.toc.length
+          ? '<div class="audit-toc"><strong>Tabla de contenido</strong><ul>' +
+              parsed.toc.map((t) =>
+                '<li style="margin-left:' + (t.level === 3 ? '14px' : '0') + ';">' +
+                  '<a href="#' + escapeHtml(t.id) + '" data-toc-jump="' + escapeHtml(t.id) + '">' + escapeHtml(t.text) + '</a>' +
+                '</li>'
+              ).join('') +
+            '</ul></div>'
+          : '';
+        indexBodyHtml =
+          '<div class="audit-reader">' +
+            '<div class="audit-reader-bar">' +
+              '<div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">' +
+                '<button id="audit-reader-back-btn" class="btn btn-sm" type="button">← Volver al índice</button>' +
+                '<span class="badge badge-info">' + escapeHtml(typeLabel) + '</span>' +
+                (verStr ? '<span class="model-pill">' + escapeHtml(verStr) + '</span>' : '') +
+                '<span class="muted" style="font-size:var(--fs-xs);">' + escapeHtml(formatFriendlyTime(rep.created_at)) + '</span>' +
+              '</div>' +
+              '<div style="display:flex; gap:6px; flex-wrap:wrap;">' +
+                '<button class="btn btn-sm" type="button" data-audit-dl="' + openReportItem.origIdx + '">Descargar .md</button>' +
+                '<button class="btn btn-sm" type="button" data-audit-apply="' + openReportItem.origIdx + '"' + disabledAttr + '>Enviar hallazgos a Aplicar cambios</button>' +
+              '</div>' +
+            '</div>' +
+            tocHtml +
+            readerHtml +
+          '</div>';
+      } else {
+        const filteredReports = reportEntries.filter((r) =>
+          activeFilter === 'all' ? true : (r.entry.mode === activeFilter)
+        );
+        const filtersHtml =
+          '<div class="audit-filters">' +
+            '<button type="button" class="audit-filter-btn' + (activeFilter === 'all' ? ' active' : '') + '" data-audit-filter="all">Todas (' + reportEntries.length + ')</button>' +
+            '<button type="button" class="audit-filter-btn' + (activeFilter === 'audit' ? ' active' : '') + '" data-audit-filter="audit">Auditorías</button>' +
+            '<button type="button" class="audit-filter-btn' + (activeFilter === 'document' ? ' active' : '') + '" data-audit-filter="document">Documentos</button>' +
+          '</div>';
+        const cardsHtml = filteredReports.length
+          ? filteredReports.map((r) => {
+              const rep = r.entry;
+              const repKey = rep.id || String(r.origIdx);
+              const typeLabel = rep.mode === 'audit' ? '🔍 Auditoría' : '📄 Documento .md';
+              const verStr = inferAuditVersionBadge(rep, cps);
+              const excerpt = extractMarkdownExcerpt(rep.content || '', 130);
+              return '<div class="audit-card">' +
+                '<div class="audit-card-head">' +
+                  '<div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">' +
+                    '<span class="badge badge-info">' + escapeHtml(typeLabel) + '</span>' +
+                    (verStr ? '<span class="model-pill">' + escapeHtml(verStr) + '</span>' : '') +
+                    '<span class="muted" style="font-size:var(--fs-xs);">' + escapeHtml(formatFriendlyTime(rep.created_at)) + '</span>' +
+                  '</div>' +
+                  '<div style="display:flex; gap:6px; flex-wrap:wrap;">' +
+                    '<button class="btn btn-primary btn-sm" type="button" data-open-report="' + escapeHtml(repKey) + '">Ver</button>' +
+                    '<button class="btn btn-sm" type="button" data-audit-dl="' + r.origIdx + '">Descargar .md</button>' +
+                  '</div>' +
+                '</div>' +
+                '<div class="audit-card-excerpt">' + escapeHtml(excerpt || 'Sin extracto disponible.') + '</div>' +
+              '</div>';
+            }).join('')
+          : '<div class="empty-box" style="padding:18px;">Aún no hay auditorías ni documentos generados. Usa «🔍 Auditar código» o «📄 Generar documento (.md)».</div>';
+        indexBodyHtml = filtersHtml + cardsHtml;
+      }
+
+      const chatMsgsHtml = chatEntries.length
+        ? chatEntries.map((item) => {
+            const m = item.entry;
+            const idx = item.origIdx;
             const isUser = m.role === 'user';
             const modeLabel = m.mode === 'audit' ? 'Auditoría' : (m.mode === 'document' ? 'Documento .md' : 'Consulta');
             const who = isUser ? ('Tú · ' + modeLabel) : ('Auditor · ' + modeLabel);
+            const verStr = inferAuditVersionBadge(m, cps);
+            let bodyHtml = '';
+            if (isUser) {
+              bodyHtml = '<div class="audit-msg-body">' + escapeHtml(m.content || '') + '</div>';
+            } else {
+              const parsed = renderSafeMarkdown(m.content || '');
+              const baseOffset = allCodeBlocks.length;
+              parsed.codeBlocks.forEach((cb) => allCodeBlocks.push(cb));
+              bodyHtml = parsed.html.replace(/data-md-code-idx="(\\d+)"/g, (_mt, n) =>
+                'data-md-code-idx="' + (Number(n) + baseOffset) + '"'
+              );
+            }
             const actionsHtml = !isUser
               ? '<div class="audit-msg-actions">' +
                   '<button class="btn btn-sm" type="button" data-audit-dl="' + idx + '">Descargar .md</button>' +
-                  '<button class="btn btn-sm" type="button" data-audit-apply="' + idx + '">Enviar hallazgos a Aplicar cambios</button>' +
+                  '<button class="btn btn-sm" type="button" data-audit-apply="' + idx + '"' + disabledAttr + '>Enviar hallazgos a Aplicar cambios</button>' +
                 '</div>'
               : '';
             return '<div class="audit-msg ' + (isUser ? 'user' : 'assistant') + '">' +
-              '<div class="audit-msg-head"><span><strong>' + escapeHtml(who) + '</strong></span><span>' + escapeHtml(formatFriendlyTime(m.created_at)) + '</span></div>' +
-              '<div class="audit-msg-body">' + escapeHtml(m.content || '') + '</div>' +
+              '<div class="audit-msg-head">' +
+                '<span style="display:inline-flex; gap:6px; align-items:center; flex-wrap:wrap;"><strong>' + escapeHtml(who) + '</strong>' +
+                  (verStr ? '<span class="model-pill">' + escapeHtml(verStr) + '</span>' : '') +
+                '</span>' +
+                '<span>' + escapeHtml(formatFriendlyTime(m.created_at)) + '</span>' +
+              '</div>' +
+              bodyHtml +
               actionsHtml +
             '</div>';
           }).join('')
         : '<div class="muted" style="font-size:0.86rem;">Consulta código, solicita una auditoría de solo lectura o genera documentación en Markdown sin alterar tus archivos.</div>';
 
+      const placeholderTxt = isReadOnly
+        ? 'Disponible al terminar los cambios...'
+        : 'Haz una pregunta sobre el proyecto, su arquitectura o posibles mejoras...';
+
       container.innerHTML =
         '<div class="muted" style="font-size:0.84rem; margin-bottom:10px;"><strong>Consultar y Auditar proyecto</strong> — Inspección de solo lectura y generación de documentación.</div>' +
+        readonlyNoticeHtml +
         '<div class="audit-toolbar">' +
-          '<button id="audit-quick-audit-btn" class="btn btn-sm" type="button">🔍 Auditar código</button>' +
-          '<button id="audit-quick-explain-btn" class="btn btn-sm" type="button">📖 Explicar funcionamiento</button>' +
-          '<button id="audit-quick-doc-btn" class="btn btn-sm" type="button">📄 Generar documento (.md)</button>' +
+          '<button id="audit-quick-audit-btn" class="btn btn-sm" type="button"' + disabledAttr + '>🔍 Auditar código</button>' +
+          '<button id="audit-quick-explain-btn" class="btn btn-sm" type="button"' + disabledAttr + '>📖 Explicar funcionamiento</button>' +
+          '<button id="audit-quick-doc-btn" class="btn btn-sm" type="button"' + disabledAttr + '>📄 Generar documento (.md)</button>' +
         '</div>' +
-        '<div id="audit-chat-history" class="audit-thread">' + msgsHtml + '</div>' +
-        '<div class="input-row-with-mic">' +
-          '<textarea id="audit-chat-input" class="input-field" rows="2" placeholder="Haz una pregunta sobre el proyecto, su arquitectura o posibles mejoras...">' + escapeHtml(draft) + '</textarea>' +
-          '<button id="audit-chat-mic-btn" class="btn btn-sm mic-btn" type="button" title="Dictar consulta por voz (es-MX)">🎤</button>' +
+        '<div class="audit-subtabs">' +
+          '<button type="button" class="audit-subtab' + (activeSub === 'index' ? ' active' : '') + '" data-audit-sub="index">📑 Auditorías y documentos (' + reportEntries.length + ')</button>' +
+          '<button type="button" class="audit-subtab' + (activeSub === 'questions' ? ' active' : '') + '" data-audit-sub="questions">💬 Preguntas (' + chatEntries.length + ')</button>' +
         '</div>' +
-        '<div class="banner-actions">' +
-          '<button id="audit-chat-send-btn" class="btn btn-primary btn-sm" type="button">Enviar consulta</button>' +
-          '<span id="audit-inline-status"></span>' +
+        '<div id="audit-index" style="display:' + (activeSub === 'index' ? 'flex' : 'none') + ';">' + indexBodyHtml + '</div>' +
+        '<div id="audit-questions-pane" style="display:' + (activeSub === 'questions' ? 'block' : 'none') + ';">' +
+          '<div id="audit-chat-history" class="audit-thread">' + chatMsgsHtml + '</div>' +
+          '<div class="input-row-with-mic">' +
+            '<textarea id="audit-chat-input" class="input-field" rows="2" placeholder="' + escapeHtml(placeholderTxt) + '"' + disabledAttr + '>' + escapeHtml(draft) + '</textarea>' +
+            '<button id="audit-chat-mic-btn" class="btn btn-sm mic-btn" type="button" title="Dictar consulta por voz (es-MX)"' + disabledAttr + '>🎤</button>' +
+          '</div>' +
+          '<div class="banner-actions">' +
+            '<button id="audit-chat-send-btn" class="btn btn-primary btn-sm" type="button"' + disabledAttr + '>Enviar consulta</button>' +
+            '<span id="audit-inline-status"></span>' +
+          '</div>' +
         '</div>';
 
       const threadEl = document.getElementById('audit-chat-history');
-      if (threadEl) {
+      if (threadEl && activeSub === 'questions') {
         threadEl.scrollTop = threadEl.scrollHeight;
       }
 
       const inputEl = document.getElementById('audit-chat-input');
       const sendBtn = document.getElementById('audit-chat-send-btn');
-      if (inputEl) {
+      if (inputEl && !isReadOnly) {
         inputEl.addEventListener('input', () => {
           state.chatDrafts[pid] = inputEl.value;
         });
       }
-      wireMicButton('audit-chat-mic-btn', 'audit-chat-input');
+      if (!isReadOnly) {
+        wireMicButton('audit-chat-mic-btn', 'audit-chat-input');
+      }
+
+      container.querySelectorAll('button[data-audit-sub]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          state.auditSubTabByPid[pid] = btn.getAttribute('data-audit-sub');
+          state.lastChatSig = null;
+          renderAuditChatTab(pid, isReadOnly);
+        });
+      });
+      container.querySelectorAll('button[data-audit-filter]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          state.auditFilterByPid[pid] = btn.getAttribute('data-audit-filter');
+          state.lastChatSig = null;
+          renderAuditChatTab(pid, isReadOnly);
+        });
+      });
+      container.querySelectorAll('button[data-open-report]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          state.selectedAuditMsgIdByPid[pid] = btn.getAttribute('data-open-report');
+          state.lastChatSig = null;
+          renderAuditChatTab(pid, isReadOnly);
+        });
+      });
+      const backBtn = document.getElementById('audit-reader-back-btn');
+      if (backBtn) {
+        backBtn.addEventListener('click', () => {
+          delete state.selectedAuditMsgIdByPid[pid];
+          state.lastChatSig = null;
+          renderAuditChatTab(pid, isReadOnly);
+        });
+      }
+      container.querySelectorAll('a[data-toc-jump]').forEach((link) => {
+        link.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          const targetId = link.getAttribute('data-toc-jump');
+          const el = targetId ? document.getElementById(targetId) : null;
+          if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        });
+      });
+      container.querySelectorAll('button.md-copy-btn[data-md-code-idx]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const idx = Number(btn.getAttribute('data-md-code-idx'));
+          const entry = allCodeBlocks[idx];
+          if (entry) copyToClipboard(entry.raw, '✓ Bloque de código copiado.');
+        });
+      });
 
       const quickAuditBtn = document.getElementById('audit-quick-audit-btn');
       const quickExplainBtn = document.getElementById('audit-quick-explain-btn');
       const quickDocBtn = document.getElementById('audit-quick-doc-btn');
-      if (quickAuditBtn) {
+      if (quickAuditBtn && !isReadOnly) {
         quickAuditBtn.addEventListener('click', () => submitProjectChat(pid, '', 'audit', quickAuditBtn));
       }
-      if (quickExplainBtn) {
+      if (quickExplainBtn && !isReadOnly) {
         quickExplainBtn.addEventListener('click', () =>
           submitProjectChat(pid, 'Explica cómo funciona este proyecto, sus archivos clave y cómo utilizarlo.', 'chat', quickExplainBtn)
         );
       }
-      if (quickDocBtn) {
+      if (quickDocBtn && !isReadOnly) {
         quickDocBtn.addEventListener('click', () => submitProjectChat(pid, '', 'document', quickDocBtn));
       }
-      if (sendBtn && inputEl) {
+      if (sendBtn && inputEl && !isReadOnly) {
         sendBtn.addEventListener('click', () => submitProjectChat(pid, inputEl.value, 'chat', sendBtn));
       }
 
@@ -5462,6 +6469,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       container.querySelectorAll('button[data-audit-apply]').forEach((btn) => {
         btn.addEventListener('click', () => {
+          if (isReadOnly) {
+            setNote('Disponible al terminar los cambios.');
+            return;
+          }
           const idx = Number(btn.getAttribute('data-audit-apply'));
           const entry = msgs[idx];
           if (!entry) return;
@@ -5492,12 +6503,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         state.chatHistories[pid] = Array.isArray(res.messages) ? res.messages : [];
         state.lastChatSig = null;
         if (state.detail && state.detail.project_id === pid) {
-          renderAuditChatTab(pid);
+          const st = state.detail.status;
+          const ro = Boolean(st && st.state !== 'DELIVERED' && st.state !== 'COMPLETED');
+          renderAuditChatTab(pid, ro);
         }
       } catch (_) {}
     }
 
     async function submitProjectChat(pid, rawMessage, mode, triggerBtn) {
+      const curSt = state.detail && state.detail.status;
+      if (curSt && curSt.state !== 'DELIVERED' && curSt.state !== 'COMPLETED') {
+        setNote('Disponible al terminar los cambios.');
+        return;
+      }
       const msg = String(rawMessage || '').trim();
       if (mode === 'chat' && !msg) {
         setNote('Escribe una pregunta para consultar el proyecto.');
@@ -5524,11 +6542,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           });
           if (mode === 'chat') {
             state.chatDrafts[pid] = '';
+            state.auditSubTabByPid[pid] = 'questions';
+          } else {
+            state.auditSubTabByPid[pid] = 'index';
+            const hist = Array.isArray(res.history) ? res.history : [];
+            const lastRep = hist.slice().reverse().find((x) => x && x.role === 'assistant');
+            if (lastRep && lastRep.id) {
+              state.selectedAuditMsgIdByPid[pid] = lastRep.id;
+            }
           }
           state.chatHistories[pid] = Array.isArray(res.history) ? res.history : [];
           state.chatLoadedFor[pid] = true;
           state.lastChatSig = null;
-          renderAuditChatTab(pid);
+          renderAuditChatTab(pid, false);
           if (res && res.reply) {
             speakSpanishText(res.reply);
           }
@@ -5651,6 +6677,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (!shouldShow) {
         splitEl.classList.remove('preview-open');
         panelEl.style.display = 'none';
+        panelEl.removeAttribute('role');
+        panelEl.removeAttribute('aria-modal');
+        if (state.releasePreviewTrap) {
+          state.releasePreviewTrap();
+          state.releasePreviewTrap = null;
+        }
         if (pid && state.previewOpen[pid] && !localApp.running) {
           state.previewOpen[pid] = false;
           delete state.previewRenderedUrl[pid];
@@ -5661,6 +6693,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       splitEl.classList.add('preview-open');
       panelEl.style.display = 'flex';
+      if (window.innerWidth < 1280) {
+        panelEl.setAttribute('role', 'dialog');
+        panelEl.setAttribute('aria-modal', 'true');
+        panelEl.setAttribute('aria-label', 'Vista previa visual');
+        if (!state.releasePreviewTrap) {
+          state.releasePreviewTrap = trapDialogFocus(panelEl, () => {
+            if (closeBtn) closeBtn.click();
+          });
+        }
+      } else {
+        panelEl.removeAttribute('role');
+        panelEl.removeAttribute('aria-modal');
+        if (state.releasePreviewTrap) {
+          state.releasePreviewTrap();
+          state.releasePreviewTrap = null;
+        }
+      }
       if (openLink) openLink.href = localApp.url;
       if (state.previewRenderedUrl[pid] !== localApp.url) {
         state.previewRenderedUrl[pid] = localApp.url;
@@ -6079,16 +7128,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const submitBtn = document.getElementById('submit-import-project-btn');
       if (!openBtn || !modal || !form || !pathInput || !cancelBtn || !submitBtn) return;
 
+      let releaseModalTrap = null;
       function closeModal() {
         modal.style.display = 'none';
         pathInput.value = '';
         if (titleInput) titleInput.value = '';
         const stEl = document.getElementById('import-inline-status');
         if (stEl) stEl.innerHTML = '';
+        if (releaseModalTrap) {
+          releaseModalTrap();
+          releaseModalTrap = null;
+        }
       }
 
       openBtn.addEventListener('click', () => {
         modal.style.display = 'flex';
+        releaseModalTrap = trapDialogFocus(modal, closeModal);
         pathInput.focus();
       });
       cancelBtn.addEventListener('click', closeModal);
