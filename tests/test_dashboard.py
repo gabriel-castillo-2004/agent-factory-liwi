@@ -3736,6 +3736,157 @@ def test_dashboard_blocks_b4_b5_b6_audit_index_markdown_dev_ergonomics_and_aria(
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_second_audit_fixes_layers_mobile_md_dev_aria(
+    tmp_path: Path,
+) -> None:
+    """Second audit P0-P2 fixes: opaque banner layers, mobile padding/ellipsis, callback MD ($$/$&), B5 signature/diff, and ARIA."""
+    store = SqliteEventStore(db_path=tmp_path / "audit2_fixes.db")
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_audit2")
+    pid = "audit2-app"
+    now = datetime(2026, 4, 22, 12, 0, tzinfo=UTC)
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / "index.html").write_text("<h1>Audit2</h1>\n", encoding="utf-8")
+
+    plan_dict = _plan_payload("Plan Audit2")
+    plan_hash = Plan.model_validate(plan_dict).compute_hash()
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "App Audit2", "objective": "Validar parches P0-P2", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+        create_event(pid, EventType.PROJECT_DELIVERED, {"repo_url": "", "deploy_url": "", "commit_sha": "deadbeef1234", "version_label": "v1"}, at=now),
+    ):
+        store.append(ev)
+
+    md_with_dollar_patterns = (
+        "#### Nivel 4 con código\n\n"
+        "Inline con patrones especiales: `echo $$ y $& sin alterar`.\n\n"
+        "```c++   \n"
+        'const char* pattern = "$$ y $& intactos";\n'
+        "```\n"
+    )
+    llm = FakeLLM(
+        responses=[
+            {
+                "reply": md_with_dollar_patterns,
+                "suggested_changes": "Mantener patrones intactos.",
+                "document_title": "audit2-dollar-patterns.md",
+            }
+        ]
+    )
+    orch = Orchestrator(store=store, llm=llm, workspace_manager=ws_mgr)
+    chats_dir = tmp_path / "chats_audit2"
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        workspace_manager=ws_mgr,
+        chats_dir=chats_dir,
+    )
+    try:
+        # 0. Verify Markdown audit payload containing $$ and $& and #### round-trips cleanly
+        p_code, p_res = _http_json(
+            f"{base_url}/api/projects/{pid}/chat",
+            method="POST",
+            body={"message": "", "mode": "audit"},
+        )
+        assert p_code == 200
+        assert "$$ y $& intactos" in p_res["reply"]
+        assert "#### Nivel 4 con código" in p_res["reply"]
+
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            assert html_resp.status == 200
+            html = html_resp.read().decode("utf-8")
+
+        # Never introduce external CDNs or https:// links
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+
+        # 1. P0 · Opaque layered background & stacking order on sticky banner / header / preview
+        hdr_start = html.index("header {")
+        hdr_end = html.index("}", hdr_start)
+        assert "z-index: 30;" in html[hdr_start:hdr_end]
+
+        shell_start = html.index(".live-activity-shell {")
+        shell_end = html.index("}", shell_start)
+        shell_css = html[shell_start:shell_end]
+        assert "top: 56px;" in shell_css
+        assert "z-index: 20;" in shell_css
+
+        banner_css_start = html.index(".live-activity-banner {")
+        stall_css_end = html.index("}", html.index(".live-activity-banner.stall {"))
+        banner_css = html[banner_css_start:stall_css_end]
+        assert "linear-gradient(var(--info-bg), var(--info-bg)), var(--surface)" in banner_css
+        assert "linear-gradient(var(--warn-bg), var(--warn-bg)), var(--surface)" in banner_css
+        assert "backdrop-filter: blur(10px)" in banner_css
+        assert "has-live-banner" in html
+
+        # 2. P0 · Mobile 360px bottom clearance & switcher ellipsis
+        mob_start = html.index("@media (max-width: 600px)")
+        mob_end = html.index("@media (pointer: coarse)", mob_start)
+        mob_css = html[mob_start:mob_end]
+        assert "padding-bottom: 92px;" in mob_css
+
+        sw_css_start = html.index("#mobile-project-switcher")
+        sw_css_end = html.index("}", sw_css_start)
+        sw_css = html[sw_css_start:sw_css_end]
+        assert "overflow: hidden;" in sw_css
+        assert "text-overflow: ellipsis;" in sw_css
+        assert "white-space: nowrap;" in sw_css
+
+        # 3. P1 · B5 syncTargetFilesSelection updates lastModifySignature & parseUnifiedDiffFiles supports quotes/rename/binary
+        sync_start = html.index("function syncTargetFilesSelection(")
+        sync_end = html.index("function wireChecklistInputs(", sync_start)
+        sync_body = html[sync_start:sync_end]
+        assert "state.lastModifySignature = computeModifySignature(pid);" in sync_body
+
+        diff_start = html.index("function parseUnifiedDiffFiles(")
+        diff_end = html.index("function renderDiffLineHtml(", diff_start)
+        diff_body = html[diff_start:diff_end]
+        assert "rename from " in diff_body
+        assert "rename to " in diff_body
+        assert "Binary files" in diff_body
+        assert "unquoteGitDiffPath" in diff_body
+
+        # 4. P1 · B4 renderSafeMarkdown & formatSafeInlineMd use callback replacement for $$ / $&, #{1,6}, c++, and renderModifyTab mount
+        inline_md_start = html.index("function formatSafeInlineMd(")
+        inline_md_end = html.index("function renderSafeMarkdown(", inline_md_start)
+        inline_md_body = html[inline_md_start:inline_md_end]
+        assert "() => html" in inline_md_body
+
+        md_start = html.index("function renderSafeMarkdown(")
+        md_end = html.index("function inferAuditVersionBadge(", md_start)
+        md_body = html[md_start:md_end]
+        assert "() => blockHtml" in md_body
+        assert "#{1,6}" in md_body
+        assert "replace('@@AF_FCODE_' + idx + '@@', blockHtml)" not in md_body
+
+        apply_start = html.index('button[data-audit-apply]')
+        apply_end = html.index("async function loadProjectChatHistory(", apply_start)
+        apply_body = html[apply_start:apply_end]
+        assert "renderModifyTab(" in apply_body
+
+        # 5. P2 · ARIA role="presentation" on .tabs & strengthened trapDialogFocus
+        assert "document.querySelectorAll('.tabs')" in html
+        assert "'role', 'presentation'" in html
+
+        trap_start = html.index("function trapDialogFocus(")
+        trap_end = html.index("function askCustomConfirm(", trap_start)
+        trap_body = html[trap_start:trap_end]
+        assert "!dialogEl.contains(document.activeElement)" in trap_body
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+
 
 
 

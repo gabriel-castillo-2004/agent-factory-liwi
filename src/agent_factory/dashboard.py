@@ -1496,7 +1496,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       background: var(--surface);
       position: sticky;
       top: 0;
-      z-index: 10;
+      z-index: 30;
     }
     .brand {
       display: flex;
@@ -2448,6 +2448,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       flex-direction: column;
       position: sticky;
       top: 72px;
+      z-index: 1;
+    }
+    @media (min-width: 1280px) {
+      body.has-live-banner .preview-card {
+        top: 126px;
+      }
     }
     .preview-toolbar {
       display: flex;
@@ -2547,12 +2553,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       margin: 12px auto 0 auto;
       padding: 0 24px;
       position: sticky;
-      top: 62px;
-      z-index: 9;
+      top: 56px;
+      z-index: 20;
     }
     .live-activity-banner {
       padding: 10px 16px;
-      background: var(--info-bg);
+      background: linear-gradient(var(--info-bg), var(--info-bg)), var(--surface);
+      -webkit-backdrop-filter: blur(10px);
+      backdrop-filter: blur(10px);
+      box-shadow: 0 8px 22px rgba(0, 0, 0, 0.28);
       border: 1px solid rgba(56, 189, 248, 0.35);
       border-radius: 10px;
       display: flex;
@@ -2562,7 +2571,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       gap: 12px;
     }
     .live-activity-banner.stall {
-      background: var(--warn-bg);
+      background: linear-gradient(var(--warn-bg), var(--warn-bg)), var(--surface);
       border-color: rgba(245, 158, 11, 0.45);
     }
     .live-activity-main {
@@ -2627,14 +2636,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       align-items: center;
       justify-content: space-between;
       gap: var(--sp-2);
+      min-width: 0;
     }
-    .mobile-switcher-btn {
-      flex: 1;
-      justify-content: space-between;
+    .mobile-switcher-btn,
+    #mobile-project-switcher {
+      display: block;
+      flex: 1 1 auto;
+      min-width: 0;
+      max-width: 100%;
       text-align: left;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+      line-height: 1.6;
     }
     .badge-short { display: none; }
     .example-prompts {
@@ -2776,6 +2790,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
     @media (max-width: 600px) {
+      .layout {
+        padding-bottom: 92px;
+      }
       header {
         padding: 10px 14px;
         gap: 8px;
@@ -2972,7 +2989,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       line-height: 1.55;
       word-break: break-word;
     }
-    .md-body h1, .md-body h2, .md-body h3 {
+    .md-body h1, .md-body h2, .md-body h3, .md-body h4, .md-body h5, .md-body h6 {
       margin: 12px 0 6px 0;
       color: var(--text);
       line-height: 1.3;
@@ -2980,6 +2997,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .md-body h1 { font-size: 1.15rem; }
     .md-body h2 { font-size: 1.02rem; }
     .md-body h3 { font-size: 0.95rem; }
+    .md-body h4, .md-body h5, .md-body h6 { font-size: 0.88rem; }
     .md-body p { margin: 6px 0; }
     .md-body ul, .md-body ol { margin: 6px 0; padding-left: 20px; }
     .md-body blockquote {
@@ -3645,6 +3663,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (!items.length) return;
           const first = items[0];
           const last = items[items.length - 1];
+          if (!dialogEl.contains(document.activeElement)) {
+            ev.preventDefault();
+            first.focus();
+            return;
+          }
           if (ev.shiftKey && document.activeElement === first) {
             ev.preventDefault();
             last.focus();
@@ -3906,6 +3929,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       return 'El proceso se detuvo por un inconveniente técnico. Puedes volver a intentarlo con un clic.';
     }
 
+    document.querySelectorAll('.tabs').forEach((tabsEl) => {
+      tabsEl.setAttribute('role', 'presentation');
+    });
     const tabButtonsList = Array.from(document.querySelectorAll('.tab-btn'));
     tabButtonsList.forEach((btn) => {
       btn.addEventListener('click', () => {
@@ -4486,6 +4512,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           banner.style.display = 'none';
           banner.classList.remove('stall');
           stallEl.style.display = 'none';
+          document.body.classList.remove('has-live-banner');
           return;
         }
       } else {
@@ -4497,12 +4524,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         banner.style.display = 'none';
         banner.classList.remove('stall');
         stallEl.style.display = 'none';
+        document.body.classList.remove('has-live-banner');
         timerEl.textContent = '00:00s';
         return;
       }
 
       const elapsedSecs = Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000));
       banner.style.display = 'flex';
+      document.body.classList.add('has-live-banner');
       textEl.textContent = label;
       subEl.textContent = subtext;
       timerEl.textContent = formatClockMmSs(elapsedSecs);
@@ -5646,6 +5675,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       renderLiveActivityBanner();
     }
 
+    function unquoteGitDiffPath(raw) {
+      let p = String(raw || '').trim();
+      if (p.length >= 2 && p.startsWith('"') && p.endsWith('"')) {
+        p = p.slice(1, -1).split('\\\\"').join('"');
+      }
+      if (p.startsWith('a/') || p.startsWith('b/')) {
+        p = p.slice(2);
+      }
+      return p;
+    }
+
     function parseUnifiedDiffFiles(rawDiff) {
       const text = String(rawDiff || '').replace(/\\r\\n?/g, '\\n').trim();
       if (!text) return [];
@@ -5658,17 +5698,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (l.startsWith('+') && !l.startsWith('+++')) adds++;
           else if (l.startsWith('-') && !l.startsWith('---')) dels++;
         });
-        return [{ path: 'Cambios recientes', adds, dels, lines }];
+        return [{ path: 'Cambios recientes', adds, dels, lines, isRenamed: false, isBinary: false, tag: '', renameFrom: '' }];
       }
       return rawChunks.map((chunk) => {
         const lines = ('diff --git ' + chunk).split('\\n');
+        const hdr = lines[0] || '';
         let filePath = 'archivo';
-        const hdrMatch = /^diff --git a\\/([^\\n]+?) b\\/([^\\n]+)$/.exec(lines[0] || '');
-        if (hdrMatch && hdrMatch[2]) {
-          filePath = hdrMatch[2];
+        const renameFromLine = lines.find((l) => l.startsWith('rename from '));
+        const renameToLine = lines.find((l) => l.startsWith('rename to '));
+        const renameFrom = renameFromLine ? unquoteGitDiffPath(renameFromLine.slice(12)) : '';
+        const renameTo = renameToLine ? unquoteGitDiffPath(renameToLine.slice(10)) : '';
+        const isRenamed = Boolean(renameFrom || renameTo);
+        const isBinary = lines.some((l) => /^Binary files .+ differ$/i.test(l.trim()) || l.trim() === 'GIT binary patch');
+        const quotedHdrMatch = /^diff --git ("a\\/[^"]+"|a\\/\\S+) ("b\\/[^"]+"|b\\/\\S+)$/.exec(hdr);
+        const hdrMatch = quotedHdrMatch || /^diff --git a\\/([^\\n]+?) b\\/([^\\n]+)$/.exec(hdr);
+        if (renameTo) {
+          filePath = renameTo;
         } else {
-          const plusLine = lines.find((l) => l.startsWith('+++ b/'));
-          if (plusLine) filePath = plusLine.slice(6).trim();
+          const plusLine = lines.find((l) => l.startsWith('+++ ') && l !== '+++ /dev/null');
+          const minusLine = lines.find((l) => l.startsWith('--- ') && l !== '--- /dev/null');
+          if (plusLine) {
+            filePath = unquoteGitDiffPath(plusLine.slice(4));
+          } else if (hdrMatch && hdrMatch[2]) {
+            filePath = unquoteGitDiffPath(hdrMatch[2]);
+          } else if (minusLine) {
+            filePath = unquoteGitDiffPath(minusLine.slice(4));
+          }
         }
         let adds = 0;
         let dels = 0;
@@ -5676,7 +5731,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (l.startsWith('+') && !l.startsWith('+++')) adds++;
           else if (l.startsWith('-') && !l.startsWith('---')) dels++;
         });
-        return { path: filePath, adds, dels, lines };
+        const tags = [];
+        if (isRenamed) tags.push('Renombrado');
+        if (isBinary) tags.push('Binario');
+        return { path: filePath, adds, dels, lines, isRenamed, isBinary, tag: tags.join(' · '), renameFrom };
       });
     }
 
@@ -5727,6 +5785,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       ).join('');
     }
 
+    function computeModifySignature(pid) {
+      const filesList = (state.filesByPid && state.filesByPid[pid]) || [];
+      const selArr = (state.targetFilesSelected && state.targetFilesSelected[pid]) || [];
+      const cps = (state.checkpointsByPid && state.checkpointsByPid[pid]) || [];
+      const validCps = cps.filter((c) => c && c.commit_sha);
+      const diffInfo = (state.diffByPid && state.diffByPid[pid]) || null;
+      return JSON.stringify([
+        pid,
+        filesList.length,
+        selArr,
+        validCps.map((c) => c.commit_sha + ':' + Boolean(c.is_current)),
+        diffInfo && diffInfo.diff ? diffInfo.diff.length : 0,
+        Boolean(state.filesOpen && state.filesOpen[pid]),
+        Boolean(state.rollbackOpen && state.rollbackOpen[pid]),
+        Boolean(state.diffOpen && state.diffOpen[pid]),
+      ]);
+    }
+
     function renderModifyTab(st) {
       const container = document.getElementById('tab-modify');
       if (!container || !st) return;
@@ -5740,16 +5816,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const validCps = cps.filter((c) => c && c.commit_sha);
       const diffInfo = (state.diffByPid && state.diffByPid[pid]) || null;
 
-      const modSig = JSON.stringify([
-        pid,
-        filesList.length,
-        selArr,
-        validCps.map((c) => c.commit_sha + ':' + Boolean(c.is_current)),
-        diffInfo && diffInfo.diff ? diffInfo.diff.length : 0,
-        Boolean(state.filesOpen && state.filesOpen[pid]),
-        Boolean(state.rollbackOpen && state.rollbackOpen[pid]),
-        Boolean(state.diffOpen && state.diffOpen[pid]),
-      ]);
+      const modSig = computeModifySignature(pid);
       if (state.lastModifySignature === modSig && container.querySelector('#modify-project-input')) {
         return;
       }
@@ -5764,13 +5831,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const curShaShort = (curCp && (curCp.short_sha || String(curCp.commit_sha).slice(0, 7))) || '';
       const diffFiles = diffInfo && diffInfo.diff ? parseUnifiedDiffFiles(diffInfo.diff) : [];
       const diffViewerHtml = diffFiles.length
-        ? diffFiles.map((df) =>
-            '<details class="diff-file-card" open>' +
+        ? diffFiles.map((df) => {
+            const tagHtml = df.tag ? '<span class="model-pill">' + escapeHtml(df.tag) + '</span>' : '';
+            const renameSubHtml = df.renameFrom && df.renameFrom !== df.path
+              ? '<span class="muted">(' + escapeHtml(df.renameFrom) + ' → ' + escapeHtml(df.path) + ')</span>'
+              : '';
+            const statsHtml = df.isBinary
+              ? '<span class="muted">Archivo binario</span>'
+              : '<span class="diff-add-stat">+' + df.adds + '</span>' +
+                '<span class="diff-del-stat">−' + df.dels + '</span>';
+            return '<details class="diff-file-card" open>' +
               '<summary class="diff-file-head">' +
                 '<span class="diff-stats">' +
                   '<strong>' + escapeHtml(df.path) + '</strong>' +
-                  '<span class="diff-add-stat">+' + df.adds + '</span>' +
-                  '<span class="diff-del-stat">−' + df.dels + '</span>' +
+                  renameSubHtml +
+                  tagHtml +
+                  statsHtml +
                 '</span>' +
                 '<span style="display:inline-flex; gap:6px;">' +
                   '<button type="button" class="btn btn-sm" data-copy-diff-path="' + escapeHtml(df.path) + '">Copiar ruta</button>' +
@@ -5778,8 +5854,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 '</span>' +
               '</summary>' +
               '<div class="diff-lines-scroll">' + df.lines.map(renderDiffLineHtml).join('') + '</div>' +
-            '</details>'
-          ).join('')
+            '</details>';
+          }).join('')
         : '<div class="muted" style="font-size:var(--fs-xs); padding:8px 0;">Sin cambios recientes registrados o sin repositorio Git.</div>';
 
       const timelineHtml = validCps.length
@@ -5872,6 +5948,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       function syncTargetFilesSelection(nextArr) {
         const deduped = Array.from(new Set(nextArr.filter(Boolean)));
         state.targetFilesSelected[pid] = deduped;
+        state.lastModifySignature = computeModifySignature(pid);
         const nextSet = new Set(deduped);
         if (targetSelect) {
           Array.from(targetSelect.options).forEach((opt) => {
@@ -5983,18 +6060,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (filesDetails) {
         filesDetails.addEventListener('toggle', () => {
           state.filesOpen[pid] = filesDetails.open;
+          state.lastModifySignature = computeModifySignature(pid);
         });
       }
       const rbDetails = document.getElementById('rollback-details');
       if (rbDetails) {
         rbDetails.addEventListener('toggle', () => {
           state.rollbackOpen[pid] = rbDetails.open;
+          state.lastModifySignature = computeModifySignature(pid);
         });
       }
       const diffDetails = document.getElementById('git-diff-details');
       if (diffDetails) {
         diffDetails.addEventListener('toggle', () => {
           state.diffOpen[pid] = diffDetails.open;
+          state.lastModifySignature = computeModifySignature(pid);
         });
       }
     }
@@ -6009,7 +6089,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       s = s.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
       s = s.replace(/\\*([^*]+)\\*/g, '<em>$1</em>');
       codeSpans.forEach((html, idx) => {
-        s = s.replace('@@AF_ICODE_' + idx + '@@', html);
+        s = s.replace('@@AF_ICODE_' + idx + '@@', () => html);
       });
       return s;
     }
@@ -6017,7 +6097,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     function renderSafeMarkdown(mdText) {
       const normalized = String(mdText || '').replace(/\\r\\n?/g, '\\n');
       const codeBlocks = [];
-      const withoutFences = normalized.replace(/```([a-zA-Z0-9_-]*)\\n([\\s\\S]*?)```/g, (_m, lang, code) => {
+      const withoutFences = normalized.replace(/```([^\\n`]*?)[ \\t]*\\n([\\s\\S]*?)```/g, (_m, lang, code) => {
         const idx = codeBlocks.length;
         codeBlocks.push({ lang: String(lang || '').trim() || 'código', raw: code });
         return '\\n@@AF_FCODE_' + idx + '@@\\n';
@@ -6092,7 +6172,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           );
           continue;
         }
-        const hMatch = /^(#{1,3})\\s+(.*)$/.exec(trimmed);
+        const hMatch = /^(#{1,6})\\s+(.*)$/.exec(trimmed);
         if (hMatch) {
           flushPara();
           closeLists();
@@ -6117,7 +6197,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           flushPara();
           if (inOl) { out.push('</ol>'); inOl = false; }
           if (!inUl) { out.push('<ul>'); inUl = true; }
-          out.push('<li>' + formatSafeInlineMd(ulMatch[1]) + '</li>');
+          const leadSpaces = (rawLine.match(/^ */) || [''])[0].length;
+          const liStyle = leadSpaces >= 2 ? ' style="margin-left:' + Math.min(48, Math.floor(leadSpaces / 2) * 16) + 'px;"' : '';
+          out.push('<li' + liStyle + '>' + formatSafeInlineMd(ulMatch[1]) + '</li>');
           continue;
         }
         const olMatch = /^\\d+\\.\\s+(.*)$/.exec(trimmed);
@@ -6125,7 +6207,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           flushPara();
           if (inUl) { out.push('</ul>'); inUl = false; }
           if (!inOl) { out.push('<ol>'); inOl = true; }
-          out.push('<li>' + formatSafeInlineMd(olMatch[1]) + '</li>');
+          const leadSpaces = (rawLine.match(/^ */) || [''])[0].length;
+          const liStyle = leadSpaces >= 2 ? ' style="margin-left:' + Math.min(48, Math.floor(leadSpaces / 2) * 16) + 'px;"' : '';
+          out.push('<li' + liStyle + '>' + formatSafeInlineMd(olMatch[1]) + '</li>');
           continue;
         }
         closeLists();
@@ -6144,7 +6228,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             '</div>' +
             '<pre><code>' + escapeHtml(cb.raw) + '</code></pre>' +
           '</div>';
-        html = html.replace('@@AF_FCODE_' + idx + '@@', blockHtml);
+        html = html.replace('@@AF_FCODE_' + idx + '@@', () => blockHtml);
       });
       return { html: '<div class="md-body">' + html + '</div>', toc, codeBlocks };
     }
@@ -6483,7 +6567,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           state.activeTab = 'modify';
           state.userChoseTabByPid[pid] = 'modify';
           renderTabs();
-          const modifyBox = document.getElementById('modify-project-input');
+          let modifyBox = document.getElementById('modify-project-input');
+          if (!modifyBox && state.detail && state.detail.status) {
+            state.lastModifySignature = null;
+            renderModifyTab(state.detail.status);
+            modifyBox = document.getElementById('modify-project-input');
+          }
           if (modifyBox) {
             modifyBox.value = textToApply;
             modifyBox.dispatchEvent(new Event('input', { bubbles: true }));
