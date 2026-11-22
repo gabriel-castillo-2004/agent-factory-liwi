@@ -27,6 +27,7 @@ from agent_factory.orchestrator import (
     ApprovalError,
     Orchestrator,
     synthesize_project_title,
+    validate_chat_entry_id,
 )
 from agent_factory.ports.code_agent import CodeAgentError
 from agent_factory.ports.llm import LLMError
@@ -952,7 +953,64 @@ class DashboardController:
                 workspace_manager=ws_mgr,
                 extra_secrets=self.secrets_to_redact,
             )
-        except LLMError as exc:
+        except (LLMError, CommandTimeoutError, TimeoutError) as exc:
+            clean_err = redact_secrets(str(exc), extra_secrets=self.secrets_to_redact)
+            raise ProjectConflictError(clean_err) from None
+        return _scrub_value(result, self.secrets_to_redact)
+
+    def delete_project_chat_entry(
+        self,
+        project_id: str,
+        entry_id: str,
+    ) -> dict[str, Any]:
+        """Delete a single persisted audit, document, or chat entry by entry_id (INV-22)."""
+        validate_project_id(project_id)
+        clean_entry_id = validate_chat_entry_id(entry_id)
+        if not self.orchestrator.store.get_events(project_id):
+            raise ProjectNotFoundError(f"Project '{project_id}' not found")
+        deleted = self.orchestrator.delete_project_chat_entry(
+            project_id,
+            clean_entry_id,
+            chats_dir=self.chats_dir,
+        )
+        if not deleted:
+            raise ProjectNotFoundError(
+                f"Chat entry '{clean_entry_id}' not found for project '{project_id}'"
+            )
+        remaining = self.orchestrator.get_project_chat_history(
+            project_id,
+            chats_dir=self.chats_dir,
+            extra_secrets=self.secrets_to_redact,
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "deleted_id": clean_entry_id,
+            "messages": _scrub_value(remaining, self.secrets_to_redact),
+        }
+
+    def retry_project_chat_entry(
+        self,
+        project_id: str,
+        entry_id: str,
+    ) -> dict[str, Any]:
+        """Retry an existing audit, document, or chat entry updating it in place (INV-19, INV-22)."""
+        validate_project_id(project_id)
+        clean_entry_id = validate_chat_entry_id(entry_id)
+        if not self.orchestrator.store.get_events(project_id):
+            raise ProjectNotFoundError(f"Project '{project_id}' not found")
+        ws_mgr = self._sync_external_workspace(project_id)
+        try:
+            result = self.orchestrator.retry_project_chat_entry(
+                project_id,
+                clean_entry_id,
+                chats_dir=self.chats_dir,
+                workspace_manager=ws_mgr,
+                extra_secrets=self.secrets_to_redact,
+            )
+        except LookupError as exc:
+            raise ProjectNotFoundError(str(exc)) from None
+        except (LLMError, CommandTimeoutError, TimeoutError, RuntimeError) as exc:
             clean_err = redact_secrets(str(exc), extra_secrets=self.secrets_to_redact)
             raise ProjectConflictError(clean_err) from None
         return _scrub_value(result, self.secrets_to_redact)
@@ -2941,6 +2999,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       color: var(--muted);
       line-height: 1.45;
     }
+    .audit-card-diag {
+      font-size: var(--fs-xs);
+      line-height: 1.45;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid rgba(245, 158, 11, 0.4);
+      background: var(--warn-bg);
+      color: var(--text);
+      word-break: break-word;
+    }
+    .audit-card-diag.diag-err {
+      border-color: rgba(239, 68, 68, 0.45);
+      background: var(--err-bg);
+    }
+    .audit-card-diag.diag-live {
+      border-color: rgba(56, 189, 248, 0.4);
+      background: var(--info-bg);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
     .audit-reader {
       border: 1px solid var(--border);
       background: var(--surface-alt);
@@ -4068,7 +4147,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     function resolveFetchTimeoutMs(url, explicitMs) {
       if (typeof explicitMs === 'number' && explicitMs > 0) return explicitMs;
       const u = String(url || '');
-      if (u.indexOf('/chat') >= 0) return 180000;
+      if (u.indexOf('/chat') >= 0) return 250000;
       if (/\\/(start|modify|rollback|import)\\b/.test(u)) return 120000;
       return 30000;
     }
@@ -5655,7 +5734,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         } else if (!isDelivered && state.activeTab === 'modify') {
           state.activeTab = 'spec';
         }
-        if (!state.chatLoadedFor[st.project_id]) {
+        const hasRunningAudit = (state.chatHistories[st.project_id] || []).some(
+          (m) => m && m.status === 'running'
+        );
+        if (!state.chatLoadedFor[st.project_id] || (hasRunningAudit && !state.activeOp)) {
           loadProjectChatHistory(st.project_id);
         }
         loadProjectDevAndVersionData(st.project_id, st.last_event_at || String(events.length));
@@ -6266,6 +6348,61 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       return clean.slice(0, limit - 1).trimEnd() + '…';
     }
 
+    function renderAuditStatusBadge(entry) {
+      const st = String((entry && entry.status) || 'completed');
+      if (st === 'running') {
+        return '<span class="badge badge-info">⏳ En curso</span>';
+      }
+      if (st === 'timed_out' || st === 'interrupted') {
+        return '<span class="badge badge-warn">⚠️ Tiempo agotado / Interrumpida</span>';
+      }
+      if (st === 'failed') {
+        return '<span class="badge badge-err">❌ Error</span>';
+      }
+      return '<span class="badge badge-ok">✅ Completada</span>';
+    }
+
+    function renderAuditDiagnosticHtml(entry) {
+      if (!entry) return '';
+      const st = String(entry.status || 'completed');
+      const stage = String(entry.stage_label || '').trim();
+      const errDetail = String(entry.error_detail || '').trim();
+      if (st === 'running') {
+        return '<div class="audit-card-diag diag-live">' +
+          '<span class="working-spinner" style="width:14px;height:14px;" aria-hidden="true"></span>' +
+          '<span><strong>Etapa actual:</strong> ' + escapeHtml(stage || '1/3 Leyendo archivos del repositorio') + '</span>' +
+        '</div>';
+      }
+      if (st === 'timed_out' || st === 'interrupted' || st === 'failed') {
+        const cls = st === 'failed' ? 'audit-card-diag diag-err' : 'audit-card-diag';
+        return '<div class="' + cls + '">' +
+          '<div><strong>Se detuvo en:</strong> ' + escapeHtml(stage || 'Etapa desconocida') + '</div>' +
+          (errDetail ? '<div style="margin-top:4px;">' + escapeHtml(errDetail) + '</div>' : '') +
+        '</div>';
+      }
+      return '';
+    }
+
+    function buildAuditMetaBadgesHtml(rep, cps) {
+      const typeLabel = rep.mode === 'audit' ? '🔍 Auditoría' : '📄 Documento .md';
+      const statusBadgeHtml = renderAuditStatusBadge(rep);
+      const stagePillHtml = rep.stage_label
+        ? '<span class="model-pill">' + escapeHtml(rep.stage_label) + '</span>'
+        : '';
+      const verStr = inferAuditVersionBadge(rep, cps);
+      const verPillHtml = verStr ? '<span class="model-pill">' + escapeHtml(verStr) + '</span>' : '';
+      const durPillHtml = typeof rep.duration_seconds === 'number'
+        ? '<span class="duration-pill">' + escapeHtml(formatDurationHuman(rep.duration_seconds, '< 1s')) + '</span>'
+        : '';
+      const timeHtml = '<span class="muted" style="font-size:var(--fs-xs);">' + escapeHtml(formatFriendlyTime(rep.created_at)) + '</span>';
+      return '<span class="badge badge-info">' + escapeHtml(typeLabel) + '</span>' +
+        statusBadgeHtml +
+        stagePillHtml +
+        verPillHtml +
+        durPillHtml +
+        timeHtml;
+    }
+
     function renderAuditChatTab(pid, readOnlyModifying) {
       const container = document.getElementById('tab-audit');
       if (!container) return;
@@ -6301,7 +6438,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         activeFilter,
         selectedReportId,
         cps.length,
-        msgs.map((m) => [m.id, m.role, m.mode, m.content, m.commit_sha, m.version_label]),
+        msgs.map((m) => [
+          m.id,
+          m.role,
+          m.mode,
+          m.content,
+          m.status,
+          m.stage_label,
+          m.error_detail,
+          m.duration_seconds,
+          m.commit_sha,
+          m.version_label,
+        ]),
       ]);
       if (state.lastChatSig === chatSig && container.querySelector('#audit-index')) {
         return;
@@ -6322,9 +6470,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       if (openReportItem) {
         const rep = openReportItem.entry;
-        const typeLabel = rep.mode === 'audit' ? '🔍 Auditoría' : '📄 Documento .md';
-        const verStr = inferAuditVersionBadge(rep, cps);
-        const parsed = renderSafeMarkdown(rep.content || '');
+        const repId = rep.id ? String(rep.id) : '';
+        const repStatus = String(rep.status || 'completed');
+        const hasContent = Boolean(rep.content && String(rep.content).trim());
+        const diagHtml = renderAuditDiagnosticHtml(rep);
+        const parsed = hasContent ? renderSafeMarkdown(rep.content || '') : { html: '', toc: [], codeBlocks: [] };
         const baseCodeOffset = allCodeBlocks.length;
         parsed.codeBlocks.forEach((cb) => allCodeBlocks.push(cb));
         let readerHtml = parsed.html;
@@ -6342,20 +6492,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               ).join('') +
             '</ul></div>'
           : '';
+        const retryReaderBtn = (repId && repStatus !== 'running')
+          ? '<button class="btn btn-sm" type="button" data-audit-retry="' + escapeHtml(repId) + '"' + disabledAttr + '>🔄 Reintentar</button>'
+          : '';
+        const delReaderBtn = repId
+          ? '<button class="btn btn-subtle-danger btn-sm" type="button" data-audit-delete="' + escapeHtml(repId) + '">🗑️ Eliminar</button>'
+          : '';
         indexBodyHtml =
           '<div class="audit-reader">' +
             '<div class="audit-reader-bar">' +
               '<div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">' +
                 '<button id="audit-reader-back-btn" class="btn btn-sm" type="button">← Volver al índice</button>' +
-                '<span class="badge badge-info">' + escapeHtml(typeLabel) + '</span>' +
-                (verStr ? '<span class="model-pill">' + escapeHtml(verStr) + '</span>' : '') +
-                '<span class="muted" style="font-size:var(--fs-xs);">' + escapeHtml(formatFriendlyTime(rep.created_at)) + '</span>' +
+                buildAuditMetaBadgesHtml(rep, cps) +
               '</div>' +
               '<div style="display:flex; gap:6px; flex-wrap:wrap;">' +
-                '<button class="btn btn-sm" type="button" data-audit-dl="' + openReportItem.origIdx + '">Descargar .md</button>' +
-                '<button class="btn btn-sm" type="button" data-audit-apply="' + openReportItem.origIdx + '"' + disabledAttr + '>Enviar hallazgos a Aplicar cambios</button>' +
+                (hasContent ? '<button class="btn btn-sm" type="button" data-audit-dl="' + openReportItem.origIdx + '">Descargar .md</button>' : '') +
+                (hasContent ? '<button class="btn btn-sm" type="button" data-audit-apply="' + openReportItem.origIdx + '"' + disabledAttr + '>Enviar hallazgos a Aplicar cambios</button>' : '') +
+                retryReaderBtn +
+                delReaderBtn +
               '</div>' +
             '</div>' +
+            diagHtml +
             tocHtml +
             readerHtml +
           '</div>';
@@ -6373,22 +6530,37 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           ? filteredReports.map((r) => {
               const rep = r.entry;
               const repKey = rep.id || String(r.origIdx);
-              const typeLabel = rep.mode === 'audit' ? '🔍 Auditoría' : '📄 Documento .md';
-              const verStr = inferAuditVersionBadge(rep, cps);
+              const repId = rep.id ? String(rep.id) : '';
+              const repStatus = String(rep.status || 'completed');
+              const hasContent = Boolean(rep.content && String(rep.content).trim());
+              const diagHtml = renderAuditDiagnosticHtml(rep);
               const excerpt = extractMarkdownExcerpt(rep.content || '', 130);
+              const retryBtnHtml = (repId && repStatus !== 'running')
+                ? '<button class="btn btn-sm" type="button" data-audit-retry="' + escapeHtml(repId) + '"' + disabledAttr + '>🔄 Reintentar</button>'
+                : '';
+              const delBtnHtml = repId
+                ? '<button class="btn btn-subtle-danger btn-sm" type="button" data-audit-delete="' + escapeHtml(repId) + '">🗑️ Eliminar</button>'
+                : '';
+              const dlBtnHtml = hasContent
+                ? '<button class="btn btn-sm" type="button" data-audit-dl="' + r.origIdx + '">Descargar .md</button>'
+                : '';
+              const openBtnHtml = repStatus !== 'running'
+                ? '<button class="btn btn-primary btn-sm" type="button" data-open-report="' + escapeHtml(repKey) + '">Ver</button>'
+                : '';
               return '<div class="audit-card">' +
                 '<div class="audit-card-head">' +
                   '<div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">' +
-                    '<span class="badge badge-info">' + escapeHtml(typeLabel) + '</span>' +
-                    (verStr ? '<span class="model-pill">' + escapeHtml(verStr) + '</span>' : '') +
-                    '<span class="muted" style="font-size:var(--fs-xs);">' + escapeHtml(formatFriendlyTime(rep.created_at)) + '</span>' +
+                    buildAuditMetaBadgesHtml(rep, cps) +
                   '</div>' +
                   '<div style="display:flex; gap:6px; flex-wrap:wrap;">' +
-                    '<button class="btn btn-primary btn-sm" type="button" data-open-report="' + escapeHtml(repKey) + '">Ver</button>' +
-                    '<button class="btn btn-sm" type="button" data-audit-dl="' + r.origIdx + '">Descargar .md</button>' +
+                    openBtnHtml +
+                    dlBtnHtml +
+                    retryBtnHtml +
+                    delBtnHtml +
                   '</div>' +
                 '</div>' +
-                '<div class="audit-card-excerpt">' + escapeHtml(excerpt || 'Sin extracto disponible.') + '</div>' +
+                diagHtml +
+                (excerpt ? '<div class="audit-card-excerpt">' + escapeHtml(excerpt) + '</div>' : '') +
               '</div>';
             }).join('')
           : '<div class="empty-box" style="padding:18px;">Aún no hay auditorías ni documentos generados. Usa «🔍 Auditar código» o «📄 Generar documento (.md)».</div>';
@@ -6582,14 +6754,40 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           setNote('Hallazgos copiados al panel "Pedir cambios". Revisa y pulsa Aplicar cambios si deseas ejecutarlos.');
         });
       });
+
+      container.querySelectorAll('button[data-audit-retry]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const entryId = btn.getAttribute('data-audit-retry');
+          if (!entryId) return;
+          retryProjectChatEntry(pid, entryId, btn);
+        });
+      });
+
+      container.querySelectorAll('button[data-audit-delete]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const entryId = btn.getAttribute('data-audit-delete');
+          if (!entryId) return;
+          deleteProjectChatEntry(pid, entryId, btn);
+        });
+      });
     }
 
-    async function loadProjectChatHistory(pid) {
+    async function loadProjectChatHistory(pid, onlyIfServerUpdated) {
       if (!pid) return;
       state.chatLoadedFor[pid] = true;
       try {
         const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/chat');
-        state.chatHistories[pid] = Array.isArray(res.messages) ? res.messages : [];
+        const serverMsgs = Array.isArray(res.messages) ? res.messages : [];
+        if (onlyIfServerUpdated) {
+          const hasLiveServer = serverMsgs.some((m) => m && m.status === 'running');
+          const curNonOpt = (state.chatHistories[pid] || []).filter(
+            (m) => m && !String(m.id || '').startsWith('optimistic-')
+          );
+          if (!hasLiveServer && serverMsgs.length <= curNonOpt.length) {
+            return;
+          }
+        }
+        state.chatHistories[pid] = serverMsgs;
         state.lastChatSig = null;
         if (state.detail && state.detail.project_id === pid) {
           const st = state.detail.status;
@@ -6597,6 +6795,92 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           renderAuditChatTab(pid, ro);
         }
       } catch (_) {}
+    }
+
+    async function retryProjectChatEntry(pid, entryId, triggerBtn) {
+      if (!pid || !entryId) return;
+      const curSt = state.detail && state.detail.status;
+      if (curSt && curSt.state !== 'DELIVERED' && curSt.state !== 'COMPLETED') {
+        setNote('Disponible al terminar los cambios.');
+        return;
+      }
+      state.auditSubTabByPid[pid] = 'index';
+      delete state.selectedAuditMsgIdByPid[pid];
+      const existingList = Array.isArray(state.chatHistories[pid]) ? state.chatHistories[pid].slice() : [];
+      state.chatHistories[pid] = existingList.map((m) =>
+        m && m.id === entryId
+          ? Object.assign({}, m, {
+              status: 'running',
+              stage_label: '1/3 Leyendo archivos del repositorio',
+              error_detail: '',
+            })
+          : m
+      );
+      state.lastChatSig = null;
+      renderAuditChatTab(pid, false);
+
+      const pollTimer = setInterval(() => {
+        loadProjectChatHistory(pid, true);
+      }, 1500);
+      try {
+        await runTrackedOperation(
+          {
+            pid,
+            label: 'Reintentando auditoría o documento...',
+            subtext: 'Lectura segura del código sin alterar archivos.',
+            buttonEl: triggerBtn || 'audit-quick-audit-btn',
+            inlineTargetId: 'audit-inline-status',
+          },
+          async () => {
+            const res = await apiFetch(
+              '/api/projects/' + encodeURIComponent(pid) + '/chat/' + encodeURIComponent(entryId) + '/retry',
+              { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }
+            );
+            state.chatHistories[pid] = Array.isArray(res.history) ? res.history : [];
+            state.chatLoadedFor[pid] = true;
+            state.selectedAuditMsgIdByPid[pid] = entryId;
+            state.lastChatSig = null;
+            renderAuditChatTab(pid, false);
+            if (res && res.reply) {
+              speakSpanishText(res.reply);
+            }
+            setNote('✓ Reintento completado.', 'ok');
+          }
+        );
+      } finally {
+        clearInterval(pollTimer);
+        await loadProjectChatHistory(pid);
+      }
+    }
+
+    async function deleteProjectChatEntry(pid, entryId, triggerBtn) {
+      if (!pid || !entryId) return;
+      const confirmed = await askCustomConfirm({
+        title: 'Eliminar registro del historial',
+        body: '¿Deseas eliminar esta auditoría o documento del historial persistido? Esta acción no se puede deshacer.',
+        confirmLabel: 'Sí, eliminar',
+      });
+      if (!confirmed) return;
+      if (triggerBtn) triggerBtn.disabled = true;
+      try {
+        const res = await apiFetch(
+          '/api/projects/' + encodeURIComponent(pid) + '/chat/' + encodeURIComponent(entryId),
+          { method: 'DELETE' }
+        );
+        if (state.selectedAuditMsgIdByPid[pid] === entryId) {
+          delete state.selectedAuditMsgIdByPid[pid];
+        }
+        state.chatHistories[pid] = Array.isArray(res.messages) ? res.messages : [];
+        state.lastChatSig = null;
+        renderAuditChatTab(pid, false);
+        setNote('✓ Registro eliminado.', 'ok');
+      } catch (err) {
+        setNote('Error eliminando registro: ' + err.message, 'err');
+      } finally {
+        if (triggerBtn && document.body.contains(triggerBtn)) {
+          triggerBtn.disabled = false;
+        }
+      }
     }
 
     async function submitProjectChat(pid, rawMessage, mode, triggerBtn) {
@@ -6610,46 +6894,76 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         setNote('Escribe una pregunta para consultar el proyecto.');
         return;
       }
+      const isReportMode = mode === 'audit' || mode === 'document';
+      if (isReportMode) {
+        state.auditSubTabByPid[pid] = 'index';
+        delete state.selectedAuditMsgIdByPid[pid];
+        const prevList = Array.isArray(state.chatHistories[pid])
+          ? state.chatHistories[pid].filter((m) => m && !String(m.id || '').startsWith('optimistic-'))
+          : [];
+        prevList.push({
+          id: 'optimistic-' + Date.now(),
+          role: 'assistant',
+          mode,
+          content: '',
+          status: 'running',
+          stage_label: '1/3 Leyendo archivos del repositorio',
+          created_at: new Date().toISOString(),
+        });
+        state.chatHistories[pid] = prevList;
+        state.lastChatSig = null;
+        renderAuditChatTab(pid, false);
+      }
       const modeLabel = mode === 'audit'
         ? 'Analizando archivos del repositorio (auditoría)...'
         : (mode === 'document'
           ? 'Analizando archivos del repositorio para documentar...'
           : 'Analizando archivos del repositorio...');
-      await runTrackedOperation(
-        {
-          pid,
-          label: modeLabel,
-          subtext: 'Lectura segura del código sin alterar archivos.',
-          buttonEl: triggerBtn || 'audit-chat-send-btn',
-          inlineTargetId: 'audit-inline-status',
-        },
-        async () => {
-          const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/chat', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: msg, mode: mode || 'chat' }),
-          });
-          if (mode === 'chat') {
-            state.chatDrafts[pid] = '';
-            state.auditSubTabByPid[pid] = 'questions';
-          } else {
-            state.auditSubTabByPid[pid] = 'index';
-            const hist = Array.isArray(res.history) ? res.history : [];
-            const lastRep = hist.slice().reverse().find((x) => x && x.role === 'assistant');
-            if (lastRep && lastRep.id) {
-              state.selectedAuditMsgIdByPid[pid] = lastRep.id;
+      const pollTimer = isReportMode
+        ? setInterval(() => { loadProjectChatHistory(pid, true); }, 1500)
+        : null;
+      try {
+        await runTrackedOperation(
+          {
+            pid,
+            label: modeLabel,
+            subtext: 'Lectura segura del código sin alterar archivos.',
+            buttonEl: triggerBtn || 'audit-chat-send-btn',
+            inlineTargetId: 'audit-inline-status',
+          },
+          async () => {
+            const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/chat', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ message: msg, mode: mode || 'chat' }),
+            });
+            if (mode === 'chat') {
+              state.chatDrafts[pid] = '';
+              state.auditSubTabByPid[pid] = 'questions';
+            } else {
+              state.auditSubTabByPid[pid] = 'index';
+              const hist = Array.isArray(res.history) ? res.history : [];
+              const lastRep = hist.slice().reverse().find((x) => x && x.role === 'assistant');
+              if (lastRep && lastRep.id) {
+                state.selectedAuditMsgIdByPid[pid] = lastRep.id;
+              }
             }
+            state.chatHistories[pid] = Array.isArray(res.history) ? res.history : [];
+            state.chatLoadedFor[pid] = true;
+            state.lastChatSig = null;
+            renderAuditChatTab(pid, false);
+            if (res && res.reply) {
+              speakSpanishText(res.reply);
+            }
+            setNote('✓ Respuesta generada.', 'ok');
           }
-          state.chatHistories[pid] = Array.isArray(res.history) ? res.history : [];
-          state.chatLoadedFor[pid] = true;
-          state.lastChatSig = null;
-          renderAuditChatTab(pid, false);
-          if (res && res.reply) {
-            speakSpanishText(res.reply);
-          }
-          setNote('✓ Respuesta generada.', 'ok');
+        );
+      } finally {
+        if (pollTimer) clearInterval(pollTimer);
+        if (isReportMode) {
+          await loadProjectChatHistory(pid);
         }
-      );
+      }
     }
 
     async function loadDetail(pid) {
@@ -7522,6 +7836,42 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         # Reject multi-segment or path-traversal attempts (e.g., ../etc) as invalid project_id
         return urllib.parse.unquote(rest), None
 
+    def _send_controller_json(self, fn: Callable[[], dict[str, Any]]) -> None:
+        try:
+            result = fn()
+        except (ValueError, TypeError, SandboxViolationError) as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except ProjectNotFoundError as exc:
+            self._send_json(404, {"error": str(exc)})
+            return
+        except ProjectConflictError as exc:
+            self._send_json(409, {"error": str(exc)})
+            return
+        self._send_json(200, result)
+
+    def _parse_project_chat_entry_route(self) -> tuple[str | None, str | None, str | None]:
+        """Parse /api/projects/<project_id>/chat/<entry_id>[/retry] safely (INV-22)."""
+        raw_path = urllib.parse.urlsplit(self.path).path
+        prefix = "/api/projects/"
+        if not raw_path.startswith(prefix):
+            return None, None, None
+        rest = raw_path[len(prefix) :]
+        parts = rest.split("/")
+        if len(parts) == 3 and parts[1] == "chat":
+            return (
+                urllib.parse.unquote(parts[0]),
+                urllib.parse.unquote(parts[2]),
+                None,
+            )
+        if len(parts) == 4 and parts[1] == "chat" and parts[3] == "retry":
+            return (
+                urllib.parse.unquote(parts[0]),
+                urllib.parse.unquote(parts[2]),
+                "retry",
+            )
+        return None, None, None
+
     def do_GET(self) -> None:
         path = urllib.parse.urlsplit(self.path).path
         ctrl = self.server.controller
@@ -7620,6 +7970,14 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(400, {"error": str(exc)})
                 return
             self._send_json(200, result)
+            return
+
+        chat_pid, chat_entry_id, chat_subact = self._parse_project_chat_entry_route()
+        if chat_pid is not None and chat_entry_id is not None and chat_subact == "retry":
+            self._drain_body()
+            self._send_controller_json(
+                lambda: ctrl.retry_project_chat_entry(chat_pid, chat_entry_id)
+            )
             return
 
         pid, action = self._parse_project_route()
@@ -7731,6 +8089,14 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         self._drain_body()
         ctrl = self.server.controller
+
+        chat_pid, chat_entry_id, chat_subact = self._parse_project_chat_entry_route()
+        if chat_pid is not None and chat_entry_id is not None and chat_subact is None:
+            self._send_controller_json(
+                lambda: ctrl.delete_project_chat_entry(chat_pid, chat_entry_id)
+            )
+            return
+
         pid, action = self._parse_project_route()
 
         if pid is None or action is not None:

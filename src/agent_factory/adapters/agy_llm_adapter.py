@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
@@ -27,10 +28,6 @@ logger = logging.getLogger(__name__)
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\r?\n?(.*?)\r?\n?```", re.DOTALL | re.IGNORECASE)
 MAX_CLI_ARG_PROMPT_CHARS = 6000
-_STDIN_PROMPT_INSTRUCTION = (
-    "Follow all instructions, repository context, and JSON formatting rules "
-    "provided via standard input (stdin)."
-)
 
 
 def _extract_schema_dict(schema: type[BaseModel] | dict[str, Any] | None) -> dict[str, Any] | None:
@@ -284,8 +281,10 @@ class AgyLLMAdapter:
         prompt: str,
         active_model: str | None,
         clean_env: dict[str, str],
+        timeout_seconds: float | None = None,
     ) -> CommandResult:
-        """Execute CLI keeping prompts <=6,000 chars inline and piping longer prompts via stdin or temp file."""
+        """Execute CLI keeping prompts <=6,000 chars inline and using a UTF-8 temp file in -p for longer prompts."""
+        eff_timeout = self.timeout_seconds if timeout_seconds is None else float(timeout_seconds)
         if len(prompt) <= MAX_CLI_ARG_PROMPT_CHARS:
             command = list(self.cli_command) + ["-p", prompt]
             if active_model:
@@ -293,24 +292,9 @@ class AgyLLMAdapter:
             return self.runner.run(
                 command=command,
                 cwd=self.cwd,
-                timeout_seconds=self.timeout_seconds,
+                timeout_seconds=eff_timeout,
                 env=clean_env,
             )
-
-        command = list(self.cli_command) + ["-p", _STDIN_PROMPT_INSTRUCTION]
-        if active_model:
-            command.extend(["--model", active_model])
-        try:
-            return self.runner.run(
-                command=command,
-                cwd=self.cwd,
-                timeout_seconds=self.timeout_seconds,
-                env=clean_env,
-                input=prompt,
-            )
-        except TypeError as exc:
-            if "input" not in str(exc):
-                raise
 
         tmp_file_path: Path | None = None
         try:
@@ -325,14 +309,14 @@ class AgyLLMAdapter:
                 tmp_file_path = Path(tmp_file.name)
             file_command = list(self.cli_command) + [
                 "-p",
-                f"Read and execute all instructions from UTF-8 file: {tmp_file_path}",
+                f"Lee y sigue exactamente las instrucciones y el contexto del archivo: {tmp_file_path}",
             ]
             if active_model:
                 file_command.extend(["--model", active_model])
             return self.runner.run(
                 command=file_command,
                 cwd=self.cwd,
-                timeout_seconds=self.timeout_seconds,
+                timeout_seconds=eff_timeout,
                 env=clean_env,
             )
         finally:
@@ -343,6 +327,8 @@ class AgyLLMAdapter:
         self,
         messages: list[dict[str, str]],
         schema: type[BaseModel] | dict[str, Any] | None = None,
+        *,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         """Invoke `agy` CLI with combined prompt and bounded model fallback retries (INV-02, INV-18)."""
         prompt = _build_combined_prompt(messages, schema=schema)
@@ -371,6 +357,7 @@ class AgyLLMAdapter:
                     prompt=prompt,
                     active_model=active_model,
                     clean_env=clean_env,
+                    timeout_seconds=timeout_seconds,
                 )
             except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
                 run_error = f"agy CLI execution failed: {exc}"
@@ -420,6 +407,16 @@ class AgyLLMAdapter:
 
         self._raise_error("agy CLI exhausted all model retry attempts")
 
+    def generate(
+        self,
+        messages: list[dict[str, str]],
+        schema: type[BaseModel] | dict[str, Any] | None = None,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """Execute completion supporting per-call timeout_seconds override."""
+        return self.complete(messages, schema=schema, timeout_seconds=timeout_seconds)
+
 
 class FallbackLLMAdapter:
     """Composite LLM adapter trying primary first and switching to fallback on LLMError."""
@@ -440,18 +437,60 @@ class FallbackLLMAdapter:
             self.primary, "model_resolver", None
         )
 
+    @staticmethod
+    def _invoke_with_optional_timeout(
+        target: LLM,
+        messages: list[dict[str, str]],
+        schema: type[BaseModel] | dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        if timeout_seconds is not None:
+            try:
+                sig = inspect.signature(target.complete)
+                if "timeout_seconds" in sig.parameters:
+                    return target.complete(
+                        messages,
+                        schema=schema,
+                        timeout_seconds=timeout_seconds,
+                    )
+            except (TypeError, ValueError):
+                pass
+        return target.complete(messages, schema=schema)
+
     def complete(
         self,
         messages: list[dict[str, str]],
         schema: type[BaseModel] | dict[str, Any] | None = None,
+        *,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         """Call primary.complete(...) and delegate to fallback.complete(...) on LLMError."""
         primary_failed = False
         try:
-            return self.primary.complete(messages, schema=schema)
+            return self._invoke_with_optional_timeout(
+                self.primary,
+                messages,
+                schema=schema,
+                timeout_seconds=timeout_seconds,
+            )
         except LLMError:
             primary_failed = True
 
         if primary_failed:
-            return self.fallback.complete(messages, schema=schema)
+            return self._invoke_with_optional_timeout(
+                self.fallback,
+                messages,
+                schema=schema,
+                timeout_seconds=timeout_seconds,
+            )
         return {}
+
+    def generate(
+        self,
+        messages: list[dict[str, str]],
+        schema: type[BaseModel] | dict[str, Any] | None = None,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """Execute composite completion supporting per-call timeout_seconds override."""
+        return self.complete(messages, schema=schema, timeout_seconds=timeout_seconds)

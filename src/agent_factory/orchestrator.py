@@ -1,7 +1,9 @@
 """State machine orchestrator, approval gate, and circuit breaker (INV-05, INV-17)."""
 
+import inspect
 import json
 import logging
+import os
 import re
 import tempfile
 import threading
@@ -45,6 +47,7 @@ from agent_factory.inbox import Inbox
 from agent_factory.ports.clock import Clock
 from agent_factory.ports.llm import LLM, LLMError
 from agent_factory.ports.publisher import RegistryPublishError, StatusPublisher
+from agent_factory.ports.runner import CommandTimeoutError
 from agent_factory.ports.store import EventStore
 from agent_factory.secrets import redact_secrets
 from agent_factory.workspace import (
@@ -686,6 +689,45 @@ def suggest_title_from_repo(
 
 
 VALID_CHAT_MODES: frozenset[str] = frozenset({"chat", "audit", "document"})
+VALID_CHAT_ENTRY_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+SERVER_BOOT_ID: str = uuid.uuid4().hex[:12]
+CHAT_RUNNING_ORPHAN_SECONDS: float = 260.0
+CHAT_STAGE_READ_FILES = "1/3 Leyendo archivos del repositorio"
+CHAT_STAGE_LLM_ANALYZE = "2/3 Analizando código con IA"
+CHAT_STAGE_SAVE_REPORT = "3/3 Guardando reporte"
+CHAT_STAGE_COMPLETED = "Completada"
+
+
+def validate_chat_entry_id(entry_id: str) -> str:
+    """Validate chat entry identifier strictly preventing path traversal (INV-22)."""
+    cleaned = str(entry_id or "").strip()
+    if not cleaned or ".." in cleaned or not VALID_CHAT_ENTRY_ID_RE.fullmatch(cleaned):
+        raise ValueError(f"Invalid chat entry_id '{entry_id}'")
+    return cleaned
+
+
+def _parse_utc_iso_timestamp(raw_iso: object) -> datetime | None:
+    """Parse ISO-8601 timestamp string into aware UTC datetime when valid."""
+    if not isinstance(raw_iso, str) or not raw_iso.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw_iso.strip())
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _is_chat_timeout_error(exc: BaseException) -> bool:
+    """Classify timeout exceptions vs generic execution errors."""
+    if isinstance(exc, (CommandTimeoutError, TimeoutError)):
+        return True
+    low = str(exc).lower()
+    return any(
+        tok in low
+        for tok in ("timed out", "timeout", "tiempo de espera", "superó el tiempo")
+    )
 
 
 class ProjectChatReply(BaseModel):
@@ -821,6 +863,8 @@ class Orchestrator:
         self.workspace_manager = workspace_manager
         self.vcs = vcs
         self._lock = threading.RLock()
+        self._chat_io_lock = threading.RLock()
+        self._server_boot_id = SERVER_BOOT_ID
         self._project_locks: dict[str, threading.RLock] = {}
         self._specs: dict[str, Spec] = {}
         self._last_published_status: dict[str, tuple[object, ...]] = {}
@@ -1087,6 +1131,99 @@ class Orchestrator:
             raise ValueError(f"Chat file symlink rejected: {target}")
         return target
 
+    def _read_raw_chat_entries(
+        self,
+        project_id: str,
+        chats_dir: Path,
+    ) -> tuple[list[dict[str, Any]], Path]:
+        chat_file = self._chat_file_path(project_id, chats_dir)
+        if not chat_file.is_file():
+            return [], chat_file
+        try:
+            raw = json.loads(chat_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return [], chat_file
+        if not isinstance(raw, list):
+            return [], chat_file
+        return [dict(e) for e in raw if isinstance(e, dict)], chat_file
+
+    def _write_chat_entries(
+        self,
+        project_id: str,
+        entries: Sequence[Mapping[str, Any]],
+        chats_dir: Path,
+    ) -> Path:
+        with self._chat_io_lock:
+            chats_dir.mkdir(parents=True, exist_ok=True)
+            chat_file = self._chat_file_path(project_id, chats_dir)
+            trimmed = [dict(e) for e in entries][-50:]
+            payload_text = json.dumps(trimmed, indent=2, ensure_ascii=False) + "\n"
+            tmp_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=chats_dir,
+                    prefix=f".{project_id}_",
+                    suffix=".tmp",
+                    delete=False,
+                ) as tmp_file:
+                    tmp_file.write(payload_text)
+                    tmp_path = Path(tmp_file.name)
+                os.replace(tmp_path, chat_file)
+                tmp_path = None
+            finally:
+                if tmp_path is not None:
+                    tmp_path.unlink(missing_ok=True)
+            return chat_file
+
+    def _heal_orphaned_running_entries(self, entries: list[dict[str, Any]]) -> bool:
+        now_dt = self._now()
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=UTC)
+        changed = False
+        for entry in entries:
+            if entry.get("status") != "running":
+                continue
+            ref_dt = _parse_utc_iso_timestamp(entry.get("started_at") or entry.get("created_at"))
+            elapsed_secs: float | None = (
+                (now_dt - ref_dt).total_seconds() if ref_dt is not None else None
+            )
+            stale_boot = str(entry.get("server_boot_id") or "") != self._server_boot_id
+            expired = elapsed_secs is not None and elapsed_secs > CHAT_RUNNING_ORPHAN_SECONDS
+            if stale_boot or expired:
+                stage = str(entry.get("stage_label") or CHAT_STAGE_READ_FILES).strip()
+                if not stage:
+                    stage = CHAT_STAGE_READ_FILES
+                entry["status"] = "interrupted"
+                entry["stage_label"] = stage
+                entry["error_detail"] = (
+                    f"La ejecución se interrumpió o superó el tiempo límite en la etapa: {stage}"
+                )
+                if entry.get("duration_seconds") is None and elapsed_secs is not None:
+                    entry["duration_seconds"] = round(max(0.0, elapsed_secs), 2)
+                changed = True
+        return changed
+
+    def _update_chat_entry(
+        self,
+        project_id: str,
+        chats_dir: Path,
+        entry_id: str,
+        fields: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        with self._chat_io_lock:
+            raw_entries, _ = self._read_raw_chat_entries(project_id, chats_dir)
+            updated = False
+            for entry in raw_entries:
+                if entry.get("id") == entry_id:
+                    entry.update(fields)
+                    updated = True
+                    break
+            if updated:
+                self._write_chat_entries(project_id, raw_entries, chats_dir)
+            return raw_entries
+
     def get_project_chat_history(
         self,
         project_id: str,
@@ -1094,24 +1231,18 @@ class Orchestrator:
         chats_dir: Path | None = None,
         extra_secrets: Sequence[str] = (),
     ) -> list[dict[str, Any]]:
-        """Return persisted read-only audit/Q&A chat history for project_id with secrets redacted."""
+        """Return persisted read-only audit/Q&A chat history for project_id, healing orphans and redacting secrets."""
         validate_project_id(project_id)
         if not self.store.get_events(project_id):
             raise ValueError(f"Project '{project_id}' does not exist")
         eff_dir = self._resolve_chats_dir(chats_dir)
-        chat_file = self._chat_file_path(project_id, eff_dir)
-        if not chat_file.is_file():
-            return []
-        try:
-            raw = json.loads(chat_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, ValueError):
-            return []
-        if not isinstance(raw, list):
-            return []
+        with self._chat_io_lock:
+            raw, _ = self._read_raw_chat_entries(project_id, eff_dir)
+            if self._heal_orphaned_running_entries(raw):
+                self._write_chat_entries(project_id, raw, eff_dir)
+
         cleaned: list[dict[str, Any]] = []
         for entry in raw:
-            if not isinstance(entry, dict):
-                continue
             item: dict[str, Any] = {}
             for k, v in entry.items():
                 item[str(k)] = (
@@ -1119,8 +1250,38 @@ class Orchestrator:
                 )
             item.setdefault("commit_sha", "")
             item.setdefault("version_label", "")
+            eff_status = str(item.get("status") or "completed")
+            item["status"] = eff_status
+            if "stage_label" not in item or item.get("stage_label") is None:
+                item["stage_label"] = CHAT_STAGE_COMPLETED if eff_status == "completed" else ""
+            item.setdefault("error_detail", "")
+            item.setdefault("duration_seconds", None)
+            item.setdefault("server_boot_id", "")
             cleaned.append(item)
         return cleaned
+
+    def delete_project_chat_entry(
+        self,
+        project_id: str,
+        entry_id: str,
+        *,
+        chats_dir: Path | None = None,
+    ) -> bool:
+        """Delete a single persisted audit/document/chat entry by validated entry_id (INV-22)."""
+        validate_project_id(project_id)
+        clean_entry_id = validate_chat_entry_id(entry_id)
+        if not self.store.get_events(project_id):
+            raise ValueError(f"Project '{project_id}' does not exist")
+        eff_dir = self._resolve_chats_dir(chats_dir)
+        with self._chat_io_lock:
+            raw, _ = self._read_raw_chat_entries(project_id, eff_dir)
+            if not raw:
+                return False
+            remaining = [entry for entry in raw if entry.get("id") != clean_entry_id]
+            if len(remaining) == len(raw):
+                return False
+            self._write_chat_entries(project_id, remaining, eff_dir)
+            return True
 
     def delete_project_chat_history(
         self,
@@ -1131,12 +1292,344 @@ class Orchestrator:
         """Remove persisted chat log file for project_id if present."""
         validate_project_id(project_id)
         eff_dir = self._resolve_chats_dir(chats_dir)
-        raw_file = eff_dir / f"{project_id}.json"
-        if raw_file.is_symlink():
-            return
-        resolved = raw_file.resolve()
-        if resolved.is_relative_to(eff_dir) and resolved.is_file():
-            resolved.unlink()
+        with self._chat_io_lock:
+            raw_file = eff_dir / f"{project_id}.json"
+            if raw_file.is_symlink():
+                return
+            resolved = raw_file.resolve()
+            if resolved.is_relative_to(eff_dir) and resolved.is_file():
+                resolved.unlink()
+
+    def _invoke_chat_llm(
+        self,
+        llm_messages: list[dict[str, str]],
+        *,
+        timeout_seconds: float = 240.0,
+    ) -> Any:
+        """Invoke LLM generate() or complete() passing timeout_seconds when supported."""
+        gen_fn = getattr(self.llm, "generate", None)
+        target_fn = gen_fn if callable(gen_fn) else self.llm.complete
+        try:
+            sig = inspect.signature(target_fn)
+            if "timeout_seconds" in sig.parameters:
+                return target_fn(
+                    llm_messages,
+                    schema=ProjectChatReply,
+                    timeout_seconds=timeout_seconds,
+                )
+        except (TypeError, ValueError):
+            pass
+        return target_fn(llm_messages, schema=ProjectChatReply)
+
+    @staticmethod
+    def _default_prompt_for_chat_mode(mode: str) -> str:
+        if mode == "audit":
+            return (
+                "Audita el proyecto completo: identifica posibles bugs, rutas o recursos rotos, "
+                "dependencias faltantes, riesgos de seguridad y mejoras claras de UX."
+            )
+        if mode == "document":
+            return (
+                "Genera un documento técnico y guía de uso completa del proyecto en Markdown "
+                "listo para descargar."
+            )
+        raise ValueError("El mensaje de consulta no puede estar vacío.")
+
+    @staticmethod
+    def _resolve_retry_prompt(
+        entries: Sequence[Mapping[str, Any]],
+        target_idx: int,
+        mode: str,
+    ) -> str:
+        target = entries[target_idx]
+        stored_prompt = str(target.get("prompt") or "").strip()
+        if stored_prompt:
+            return stored_prompt
+        if target.get("role") == "user":
+            content_prompt = str(target.get("content") or "").strip()
+            if content_prompt:
+                return content_prompt
+        for idx in range(target_idx - 1, -1, -1):
+            prev = entries[idx]
+            if prev.get("role") == "user" and str(prev.get("mode") or "") == mode:
+                cand = str(prev.get("content") or "").strip()
+                if cand:
+                    return cand
+        return (
+            Orchestrator._default_prompt_for_chat_mode(mode)
+            if mode in ("audit", "document")
+            else "Explica el funcionamiento actual de este proyecto."
+        )
+
+    def _run_project_chat_execution(
+        self,
+        *,
+        project_id: str,
+        clean_mode: str,
+        clean_msg: str,
+        workspace_dir: Path | None,
+        chats_dir: Path | None,
+        workspace_manager: WorkspaceManager | None,
+        extra_secrets: Sequence[str],
+        retry_entry_id: str | None = None,
+    ) -> dict[str, Any]:
+        status = self.get_status(project_id)
+        plan = self.get_plan(project_id)
+        spec = self._get_spec(project_id)
+        eff_chats_dir = self._resolve_chats_dir(chats_dir)
+
+        checkpoints = self.list_project_checkpoints(project_id, extra_secrets=extra_secrets)
+        current_sha = str(checkpoints[0].get("commit_sha") or "") if checkpoints else ""
+        current_version = str(checkpoints[0].get("version_label") or "") if checkpoints else ""
+
+        default_doc = (
+            f"{project_id}-auditoria.md"
+            if clean_mode == "audit"
+            else (
+                f"{project_id}-documentacion.md"
+                if clean_mode == "document"
+                else f"{project_id}-consulta.md"
+            )
+        )
+        now_iso = self._now().isoformat()
+        mono_start = time.monotonic()
+
+        with self._chat_io_lock:
+            raw_entries, _ = self._read_raw_chat_entries(project_id, eff_chats_dir)
+            self._heal_orphaned_running_entries(raw_entries)
+            if retry_entry_id is not None:
+                entry_id = retry_entry_id
+                found = False
+                for item in raw_entries:
+                    if item.get("id") == entry_id:
+                        item.update(
+                            {
+                                "mode": clean_mode,
+                                "prompt": clean_msg,
+                                "status": "running",
+                                "stage_label": CHAT_STAGE_READ_FILES,
+                                "error_detail": "",
+                                "duration_seconds": None,
+                                "server_boot_id": self._server_boot_id,
+                                "commit_sha": current_sha,
+                                "version_label": current_version,
+                                "started_at": now_iso,
+                            }
+                        )
+                        found = True
+                        break
+                if not found:
+                    raise LookupError(f"Chat entry '{retry_entry_id}' not found")
+            else:
+                entry_id = f"a-{uuid.uuid4().hex[:10]}"
+                raw_entries.append(
+                    {
+                        "id": f"u-{uuid.uuid4().hex[:10]}",
+                        "role": "user",
+                        "mode": clean_mode,
+                        "content": clean_msg,
+                        "status": "completed",
+                        "stage_label": CHAT_STAGE_COMPLETED,
+                        "error_detail": "",
+                        "duration_seconds": 0.0,
+                        "server_boot_id": self._server_boot_id,
+                        "commit_sha": current_sha,
+                        "version_label": current_version,
+                        "created_at": now_iso,
+                    }
+                )
+                raw_entries.append(
+                    {
+                        "id": entry_id,
+                        "role": "assistant",
+                        "mode": clean_mode,
+                        "prompt": clean_msg,
+                        "content": "",
+                        "suggested_changes": "",
+                        "document_title": default_doc,
+                        "status": "running",
+                        "stage_label": CHAT_STAGE_READ_FILES,
+                        "error_detail": "",
+                        "duration_seconds": None,
+                        "server_boot_id": self._server_boot_id,
+                        "commit_sha": current_sha,
+                        "version_label": current_version,
+                        "started_at": now_iso,
+                        "created_at": now_iso,
+                    }
+                )
+            self._write_chat_entries(project_id, raw_entries, eff_chats_dir)
+
+        prior_history = [
+            e
+            for e in raw_entries
+            if e.get("id") != entry_id and str(e.get("status") or "completed") == "completed"
+        ]
+        current_stage = CHAT_STAGE_READ_FILES
+        try:
+            eff_ws = self._resolve_project_workspace_dir(
+                project_id,
+                status=status,
+                workspace_dir=workspace_dir,
+                workspace_manager=workspace_manager,
+            )
+            code_ctx = (
+                collect_workspace_code_context(
+                    eff_ws,
+                    max_chars=12000,
+                    extra_secrets=extra_secrets,
+                )
+                if eff_ws is not None
+                else ""
+            )
+
+            if clean_mode == "audit":
+                mode_guidance = (
+                    "MODO AUDITORÍA (SOLO LECTURA): Analiza bugs, casos borde, rutas HTTP o enlaces rotos, "
+                    "selectores DOM, dependencias o ejecución local, seguridad (validación de entradas, rutas, "
+                    "secretos) y mejoras de UX. Responde en Markdown estructurado en 'reply' y redacta en "
+                    "'suggested_changes' instrucciones concretas y accionables para corregir los hallazgos."
+                )
+            elif clean_mode == "document":
+                mode_guidance = (
+                    "MODO GENERADOR DE DOCUMENTOS (SOLO LECTURA): Genera documentación técnica completa y guía de "
+                    "uso en Markdown limpio en 'reply' (resumen, arquitectura/archivos, dependencias y arranque "
+                    "local, endpoints/flujos y notas). Define un nombre sugerido .md en 'document_title'."
+                )
+            else:
+                mode_guidance = (
+                    "MODO CONSULTA (SOLO LECTURA): Responde con claridad y precisión basándote únicamente en el código "
+                    "y metadatos observados del proyecto. Si detectas alguna mejora útil, opcionalmente inclúyela en "
+                    "'suggested_changes'."
+                )
+
+            system_prompt = (
+                "Eres un Auditor de Software y Redactor Técnico Senior trabajando en modo ESTRICTAMENTE DE SOLO LECTURA.\n"
+                "No modifiques archivos ni propongas ejecutar cambios automáticamente.\n"
+                "Responde siempre en español claro usando formato Markdown dentro del campo JSON 'reply'.\n"
+                f"{mode_guidance}"
+            )
+            meta_block = (
+                f"Proyecto: {status.name or project_id} (ID: {project_id}, estado: {status.state.value})\n"
+                f"Objetivo: {redact_secrets(status.objective or spec.objective or 'N/D', extra_secrets=extra_secrets)}\n"
+                f"Plan: {redact_secrets(plan.summary if plan is not None else 'N/D', extra_secrets=extra_secrets)}\n"
+            )
+            context_block = code_ctx or "(Sin archivos de código disponibles en este workspace.)"
+
+            llm_messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+            for prev in prior_history[-8:]:
+                p_role = "assistant" if prev.get("role") == "assistant" else "user"
+                p_text = str(prev.get("content", "")).strip()
+                if p_text:
+                    llm_messages.append({"role": p_role, "content": p_text[:2000]})
+            llm_messages.append(
+                {
+                    "role": "user",
+                    "content": redact_secrets(
+                        f"{meta_block}\nCódigo real del repositorio:\n{context_block}\n\n"
+                        f"Solicitud del usuario ({clean_mode}):\n{clean_msg}",
+                        extra_secrets=extra_secrets,
+                    ),
+                }
+            )
+
+            current_stage = CHAT_STAGE_LLM_ANALYZE
+            self._update_chat_entry(
+                project_id,
+                eff_chats_dir,
+                entry_id,
+                {"stage_label": CHAT_STAGE_LLM_ANALYZE},
+            )
+            raw_resp = self._invoke_chat_llm(llm_messages, timeout_seconds=240.0)
+
+            current_stage = CHAT_STAGE_SAVE_REPORT
+            self._update_chat_entry(
+                project_id,
+                eff_chats_dir,
+                entry_id,
+                {"stage_label": CHAT_STAGE_SAVE_REPORT},
+            )
+
+            raw_reply = ""
+            raw_suggested = ""
+            raw_doc_title = ""
+            if isinstance(raw_resp, Mapping):
+                raw_reply = str(
+                    raw_resp.get("reply")
+                    or raw_resp.get("markdown")
+                    or raw_resp.get("content")
+                    or ""
+                ).strip()
+                raw_suggested = str(raw_resp.get("suggested_changes") or "").strip()
+                raw_doc_title = str(raw_resp.get("document_title") or "").strip()
+
+            clean_reply = redact_secrets(
+                raw_reply or "No se recibió contenido del modelo para esta consulta.",
+                extra_secrets=extra_secrets,
+            )
+            clean_suggested = redact_secrets(raw_suggested, extra_secrets=extra_secrets)
+            clean_doc_title = (
+                redact_secrets(raw_doc_title, extra_secrets=extra_secrets) or default_doc
+            )
+            if not clean_doc_title.lower().endswith(".md"):
+                clean_doc_title = f"{clean_doc_title}.md"
+
+            duration_secs = round(max(0.0, time.monotonic() - mono_start), 2)
+            self._update_chat_entry(
+                project_id,
+                eff_chats_dir,
+                entry_id,
+                {
+                    "content": clean_reply,
+                    "suggested_changes": clean_suggested,
+                    "document_title": clean_doc_title,
+                    "status": "completed",
+                    "stage_label": CHAT_STAGE_COMPLETED,
+                    "error_detail": "",
+                    "duration_seconds": duration_secs,
+                    "commit_sha": current_sha,
+                    "version_label": current_version,
+                    "completed_at": self._now().isoformat(),
+                },
+            )
+        except Exception as exc:
+            fail_status = "timed_out" if _is_chat_timeout_error(exc) else "failed"
+            clean_err = redact_secrets(str(exc), extra_secrets=extra_secrets)
+            duration_secs = round(max(0.0, time.monotonic() - mono_start), 2)
+            self._update_chat_entry(
+                project_id,
+                eff_chats_dir,
+                entry_id,
+                {
+                    "status": fail_status,
+                    "stage_label": current_stage,
+                    "error_detail": clean_err,
+                    "duration_seconds": duration_secs,
+                },
+            )
+            raise
+
+        updated_history = self.get_project_chat_history(
+            project_id,
+            chats_dir=eff_chats_dir,
+            extra_secrets=extra_secrets,
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "entry_id": entry_id,
+            "mode": clean_mode,
+            "status": "completed",
+            "stage_label": CHAT_STAGE_COMPLETED,
+            "duration_seconds": duration_secs,
+            "reply": clean_reply,
+            "suggested_changes": clean_suggested,
+            "document_title": clean_doc_title,
+            "commit_sha": current_sha,
+            "version_label": current_version,
+            "context_chars": len(code_ctx),
+            "history": updated_history,
+        }
 
     def chat_with_project(
         self,
@@ -1149,7 +1642,7 @@ class Orchestrator:
         workspace_manager: WorkspaceManager | None = None,
         extra_secrets: Sequence[str] = (),
     ) -> dict[str, Any]:
-        """Execute strictly read-only Q&A, audit, or Markdown doc generation over project code (INV-19)."""
+        """Execute strictly read-only Q&A, audit, or Markdown doc generation with persistent lifecycle (INV-19)."""
         validate_project_id(project_id)
         clean_mode = str(mode or "chat").strip().lower()
         if clean_mode not in VALID_CHAT_MODES:
@@ -1159,37 +1652,39 @@ class Orchestrator:
 
         clean_msg = redact_secrets(str(message or "").strip(), extra_secrets=extra_secrets)
         if not clean_msg:
-            if clean_mode == "audit":
-                clean_msg = (
-                    "Audita el proyecto completo: identifica posibles bugs, rutas o recursos rotos, "
-                    "dependencias faltantes, riesgos de seguridad y mejoras claras de UX."
-                )
-            elif clean_mode == "document":
-                clean_msg = (
-                    "Genera un documento técnico y guía de uso completa del proyecto en Markdown "
-                    "listo para descargar."
-                )
-            else:
-                raise ValueError("El mensaje de consulta no puede estar vacío.")
+            clean_msg = self._default_prompt_for_chat_mode(clean_mode)
 
         events = self.store.get_events(project_id)
         if not events:
             raise ValueError(f"Project '{project_id}' does not exist")
 
-        status = self.get_status(project_id)
-        plan = self.get_plan(project_id)
-        spec = self._get_spec(project_id)
-        eff_ws = self._resolve_project_workspace_dir(
-            project_id,
-            status=status,
+        return self._run_project_chat_execution(
+            project_id=project_id,
+            clean_mode=clean_mode,
+            clean_msg=clean_msg,
             workspace_dir=workspace_dir,
+            chats_dir=chats_dir,
             workspace_manager=workspace_manager,
+            extra_secrets=extra_secrets,
+            retry_entry_id=None,
         )
-        code_ctx = (
-            collect_workspace_code_context(eff_ws, max_chars=16000, extra_secrets=extra_secrets)
-            if eff_ws is not None
-            else ""
-        )
+
+    def retry_project_chat_entry(
+        self,
+        project_id: str,
+        entry_id: str,
+        workspace_dir: Path | None = None,
+        *,
+        chats_dir: Path | None = None,
+        workspace_manager: WorkspaceManager | None = None,
+        extra_secrets: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """Re-execute an existing audit, document, or chat entry reusing original mode/prompt (INV-19, INV-22)."""
+        validate_project_id(project_id)
+        clean_entry_id = validate_chat_entry_id(entry_id)
+        events = self.store.get_events(project_id)
+        if not events:
+            raise ValueError(f"Project '{project_id}' does not exist")
 
         eff_chats_dir = self._resolve_chats_dir(chats_dir)
         history = self.get_project_chat_history(
@@ -1197,132 +1692,34 @@ class Orchestrator:
             chats_dir=eff_chats_dir,
             extra_secrets=extra_secrets,
         )
+        target_idx = -1
+        for idx, item in enumerate(history):
+            if item.get("id") == clean_entry_id:
+                target_idx = idx
+                break
+        if target_idx < 0:
+            raise LookupError(f"Chat entry '{clean_entry_id}' not found")
 
-        if clean_mode == "audit":
-            mode_guidance = (
-                "MODO AUDITORÍA (SOLO LECTURA): Analiza bugs, casos borde, rutas HTTP o enlaces rotos, "
-                "selectores DOM, dependencias o ejecución local, seguridad (validación de entradas, rutas, "
-                "secretos) y mejoras de UX. Responde en Markdown estructurado en 'reply' y redacta en "
-                "'suggested_changes' instrucciones concretas y accionables para corregir los hallazgos."
-            )
-            default_doc = f"{project_id}-auditoria.md"
-        elif clean_mode == "document":
-            mode_guidance = (
-                "MODO GENERADOR DE DOCUMENTOS (SOLO LECTURA): Genera documentación técnica completa y guía de "
-                "uso en Markdown limpio en 'reply' (resumen, arquitectura/archivos, dependencias y arranque "
-                "local, endpoints/flujos y notas). Define un nombre sugerido .md en 'document_title'."
-            )
-            default_doc = f"{project_id}-documentacion.md"
-        else:
-            mode_guidance = (
-                "MODO CONSULTA (SOLO LECTURA): Responde con claridad y precisión basándote únicamente en el código "
-                "y metadatos observados del proyecto. Si detectas alguna mejora útil, opcionalmente inclúyela en "
-                "'suggested_changes'."
-            )
-            default_doc = f"{project_id}-consulta.md"
+        target_item = history[target_idx]
+        if target_item.get("status") == "running":
+            raise RuntimeError(f"Chat entry '{clean_entry_id}' is already running")
 
-        system_prompt = (
-            "Eres un Auditor de Software y Redactor Técnico Senior trabajando en modo ESTRICTAMENTE DE SOLO LECTURA.\n"
-            "No modifiques archivos ni propongas ejecutar cambios automáticamente.\n"
-            "Responde siempre en español claro usando formato Markdown dentro del campo JSON 'reply'.\n"
-            f"{mode_guidance}"
-        )
+        clean_mode = str(target_item.get("mode") or "audit").strip().lower()
+        if clean_mode not in VALID_CHAT_MODES:
+            clean_mode = "audit"
+        raw_prompt = self._resolve_retry_prompt(history, target_idx, clean_mode)
+        clean_msg = redact_secrets(raw_prompt, extra_secrets=extra_secrets)
 
-        meta_block = (
-            f"Proyecto: {status.name or project_id} (ID: {project_id}, estado: {status.state.value})\n"
-            f"Objetivo: {redact_secrets(status.objective or spec.objective or 'N/D', extra_secrets=extra_secrets)}\n"
-            f"Plan: {redact_secrets(plan.summary if plan is not None else 'N/D', extra_secrets=extra_secrets)}\n"
-        )
-        context_block = code_ctx or "(Sin archivos de código disponibles en este workspace.)"
-
-        llm_messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
-        for prev in history[-8:]:
-            p_role = "assistant" if prev.get("role") == "assistant" else "user"
-            p_text = str(prev.get("content", "")).strip()
-            if p_text:
-                llm_messages.append({"role": p_role, "content": p_text[:2000]})
-        llm_messages.append(
-            {
-                "role": "user",
-                "content": redact_secrets(
-                    f"{meta_block}\nCódigo real del repositorio:\n{context_block}\n\n"
-                    f"Solicitud del usuario ({clean_mode}):\n{clean_msg}",
-                    extra_secrets=extra_secrets,
-                ),
-            }
-        )
-
-        raw_resp = self.llm.complete(llm_messages, schema=ProjectChatReply)
-        raw_reply = ""
-        raw_suggested = ""
-        raw_doc_title = ""
-        if isinstance(raw_resp, Mapping):
-            raw_reply = str(
-                raw_resp.get("reply")
-                or raw_resp.get("markdown")
-                or raw_resp.get("content")
-                or ""
-            ).strip()
-            raw_suggested = str(raw_resp.get("suggested_changes") or "").strip()
-            raw_doc_title = str(raw_resp.get("document_title") or "").strip()
-
-        clean_reply = redact_secrets(
-            raw_reply or "No se recibió contenido del modelo para esta consulta.",
+        return self._run_project_chat_execution(
+            project_id=project_id,
+            clean_mode=clean_mode,
+            clean_msg=clean_msg,
+            workspace_dir=workspace_dir,
+            chats_dir=eff_chats_dir,
+            workspace_manager=workspace_manager,
             extra_secrets=extra_secrets,
+            retry_entry_id=clean_entry_id,
         )
-        clean_suggested = redact_secrets(raw_suggested, extra_secrets=extra_secrets)
-        clean_doc_title = redact_secrets(raw_doc_title, extra_secrets=extra_secrets) or default_doc
-        if not clean_doc_title.lower().endswith(".md"):
-            clean_doc_title = f"{clean_doc_title}.md"
-
-        checkpoints = self.list_project_checkpoints(project_id, extra_secrets=extra_secrets)
-        current_sha = str(checkpoints[0].get("commit_sha") or "") if checkpoints else ""
-        current_version = str(checkpoints[0].get("version_label") or "") if checkpoints else ""
-
-        now_iso = self._now().isoformat()
-        updated_history = [
-            *history,
-            {
-                "id": f"u-{uuid.uuid4().hex[:10]}",
-                "role": "user",
-                "mode": clean_mode,
-                "content": clean_msg,
-                "commit_sha": current_sha,
-                "version_label": current_version,
-                "created_at": now_iso,
-            },
-            {
-                "id": f"a-{uuid.uuid4().hex[:10]}",
-                "role": "assistant",
-                "mode": clean_mode,
-                "content": clean_reply,
-                "suggested_changes": clean_suggested,
-                "document_title": clean_doc_title,
-                "commit_sha": current_sha,
-                "version_label": current_version,
-                "created_at": now_iso,
-            },
-        ][-50:]
-
-        eff_chats_dir.mkdir(parents=True, exist_ok=True)
-        chat_file = self._chat_file_path(project_id, eff_chats_dir)
-        chat_file.write_text(
-            json.dumps(updated_history, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-
-        return {
-            "ok": True,
-            "project_id": project_id,
-            "mode": clean_mode,
-            "reply": clean_reply,
-            "suggested_changes": clean_suggested,
-            "document_title": clean_doc_title,
-            "commit_sha": current_sha,
-            "version_label": current_version,
-            "context_chars": len(code_ctx),
-            "history": updated_history,
-        }
 
     def import_project(
         self,

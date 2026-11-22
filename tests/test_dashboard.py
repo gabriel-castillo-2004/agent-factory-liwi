@@ -3886,6 +3886,192 @@ def test_dashboard_second_audit_fixes_layers_mobile_md_dev_aria(
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_audit_lifecycle_endpoints_retry_delete_and_ui_cards(
+    tmp_path: Path,
+) -> None:
+    """Dashboard exposes POST /chat/<id>/retry and DELETE /chat/<id> (INV-22), surfaces running/timed_out/interrupted/failed/completed audit cards with 250s /chat timeout and instant refresh."""
+    from datetime import timedelta
+
+    from agent_factory.ports.llm import LLMError
+
+    class _FixedClock:
+        def __init__(self, current: datetime) -> None:
+            self._current = current
+
+        def now(self) -> datetime:
+            return self._current
+
+        def sleep(self, seconds: float) -> None:
+            pass
+
+    pid = "audit-ui-life"
+    secret_val = "DASH_AUDIT_SECRET_321"
+    clock = _FixedClock(datetime(2026, 4, 22, 16, 0, tzinfo=UTC))
+    store = SqliteEventStore(db_path=tmp_path / "dash_audit_life.db")
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_dash_life")
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / "main.py").write_text("print('hi')\n", encoding="utf-8")
+
+    plan_dict = _plan_payload("Plan Audit UI Lifecycle")
+    plan_hash = Plan.model_validate(plan_dict).compute_hash()
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "Audit UI", "objective": "Probar ciclo persistente", "state": "INTERVIEW"}, at=clock.now()),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=clock.now()),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=clock.now()),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=clock.now()),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=clock.now()),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=clock.now()),
+        create_event(pid, EventType.PROJECT_DELIVERED, {"repo_url": "", "deploy_url": "", "commit_sha": "beef12345678", "version_label": "v1"}, at=clock.now()),
+    ):
+        store.append(ev)
+
+    llm = FakeLLM(
+        responses=[
+            LLMError(f"agy CLI timed out reading code ({secret_val})"),
+            {
+                "reply": "# Informe Tras Reintento\nTodo verificado tras reintentar.",
+                "suggested_changes": "Ninguno.",
+                "document_title": "audit-reintentada.md",
+            },
+        ]
+    )
+    orch = Orchestrator(store=store, llm=llm, clock=clock, workspace_manager=ws_mgr)
+    chats_dir = tmp_path / "chats_dash_life"
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        workspace_manager=ws_mgr,
+        chats_dir=chats_dir,
+        secrets_to_redact=(secret_val,),
+    )
+    try:
+        # 1. Failed/timed_out POST /chat returns 409 cleanly while persisting timed_out entry & redacted detail
+        c_fail, r_fail = _http_json(
+            f"{base_url}/api/projects/{pid}/chat",
+            method="POST",
+            body={"message": "", "mode": "audit"},
+        )
+        assert c_fail == 409
+        assert secret_val not in r_fail["error"]
+
+        c_hist1, r_hist1 = _http_json(f"{base_url}/api/projects/{pid}/chat")
+        assert c_hist1 == 200
+        failed_card = r_hist1["messages"][-1]
+        entry_id = failed_card["id"]
+        assert failed_card["status"] == "timed_out"
+        assert failed_card["stage_label"] == "2/3 Analizando código con IA"
+        assert secret_val not in failed_card["error_detail"]
+        assert "[REDACTED]" in failed_card["error_detail"]
+
+        # 2. Retry via POST /api/projects/<id>/chat/<entry_id>/retry completes existing card
+        c_retry, r_retry = _http_json(
+            f"{base_url}/api/projects/{pid}/chat/{entry_id}/retry",
+            method="POST",
+            body={},
+        )
+        assert c_retry == 200
+        assert r_retry["status"] == "completed"
+        assert "Informe Tras Reintento" in r_retry["reply"]
+        assert r_retry["history"][-1]["id"] == entry_id
+        assert r_retry["history"][-1]["status"] == "completed"
+        assert r_retry["history"][-1]["stage_label"] == "Completada"
+
+        # 3. Orphan 'running' card returns as 'interrupted' on GET /chat and 409 when retrying an active running one
+        chat_file = chats_dir / f"{pid}.json"
+        saved = json.loads(chat_file.read_text(encoding="utf-8"))
+        saved.append(
+            {
+                "id": "a-active-run",
+                "role": "assistant",
+                "mode": "audit",
+                "prompt": "Activa",
+                "content": "",
+                "status": "running",
+                "stage_label": "1/3 Leyendo archivos del repositorio",
+                "server_boot_id": orch._server_boot_id,
+                "created_at": clock.now().isoformat(),
+            }
+        )
+        saved.append(
+            {
+                "id": "a-stale-run",
+                "role": "assistant",
+                "mode": "document",
+                "prompt": "Vencida",
+                "content": "",
+                "status": "running",
+                "stage_label": "2/3 Analizando código con IA",
+                "server_boot_id": orch._server_boot_id,
+                "created_at": (clock.now() - timedelta(seconds=280)).isoformat(),
+            }
+        )
+        chat_file.write_text(json.dumps(saved), encoding="utf-8")
+
+        c_active_retry, _ = _http_json(
+            f"{base_url}/api/projects/{pid}/chat/a-active-run/retry",
+            method="POST",
+            body={},
+        )
+        assert c_active_retry == 409
+
+        c_hist2, r_hist2 = _http_json(f"{base_url}/api/projects/{pid}/chat")
+        assert c_hist2 == 200
+        by_id = {m["id"]: m for m in r_hist2["messages"]}
+        assert by_id["a-stale-run"]["status"] == "interrupted"
+        assert "2/3 Analizando código con IA" in by_id["a-stale-run"]["error_detail"]
+
+        # 4. DELETE /api/projects/<id>/chat/<entry_id> deletes record, 404 when absent, 400 on bad entry_id
+        c_del, r_del = _http_json(
+            f"{base_url}/api/projects/{pid}/chat/a-stale-run",
+            method="DELETE",
+        )
+        assert c_del == 200
+        assert "a-stale-run" not in [m["id"] for m in r_del["messages"]]
+
+        c_del_missing, _ = _http_json(
+            f"{base_url}/api/projects/{pid}/chat/a-stale-run",
+            method="DELETE",
+        )
+        assert c_del_missing == 404
+
+        c_bad_id, _ = _http_json(
+            f"{base_url}/api/projects/{pid}/chat/bad%20id!",
+            method="DELETE",
+        )
+        assert c_bad_id == 400
+
+        # 5. HTML UI checks: 250000ms /chat timeout, live status badges, stage diagnostic, retry & delete controls
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            assert html_resp.status == 200
+            html = html_resp.read().decode("utf-8")
+
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+        assert "250000" in html
+        for marker in (
+            "⏳ En curso",
+            "✅ Completada",
+            "⚠️ Tiempo agotado / Interrumpida",
+            "❌ Error",
+            "🔄 Reintentar",
+            "🗑️ Eliminar",
+            "data-audit-retry",
+            "data-audit-delete",
+            "1/3 Leyendo archivos del repositorio",
+        ):
+            assert marker in html
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+
 
 
 

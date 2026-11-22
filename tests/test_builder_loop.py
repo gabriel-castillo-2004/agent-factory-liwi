@@ -2702,45 +2702,89 @@ def test_build_worker_writes_manifest_json_without_secrets_and_commits_to_git(
 def test_agy_llm_adapter_uses_stdin_or_temp_file_for_long_prompts_avoiding_winerror_206(
     tmp_path: Path,
 ) -> None:
-    """AgyLLMAdapter keeps short prompts in argv and switches prompts >6,000 chars to stdin (or temp-file fallback) so Windows argv never hits WinError 206."""
+    """AgyLLMAdapter keeps short prompts inline in -p, uses UTF-8 temp files referenced in -p (never stdin) for prompts >6,000 chars, supports per-call timeout_seconds, and cleans up in finally."""
     import sys
 
-    from agent_factory.adapters.agy_llm_adapter import AgyLLMAdapter
+    from agent_factory.adapters.agy_llm_adapter import (
+        MAX_CLI_ARG_PROMPT_CHARS,
+        AgyLLMAdapter,
+    )
     from agent_factory.adapters.fake_runner import FakeRunner
     from agent_factory.adapters.subprocess_runner import SubprocessRunner
+    from agent_factory.ports.llm import LLMError
+    from agent_factory.ports.runner import CommandTimeoutError
 
-    # 1. Short prompt preserves legacy -p <prompt> argv invocation
+    assert MAX_CLI_ARG_PROMPT_CHARS == 6000
+
+    # 1. Short prompt preserves legacy -p <prompt> argv invocation with adapter default timeout
     short_runner = FakeRunner(results=[CommandResult(exit_code=0, stdout='{"ok": true}')])
-    short_adapter = AgyLLMAdapter(runner=short_runner, cwd=tmp_path)
+    short_adapter = AgyLLMAdapter(runner=short_runner, cwd=tmp_path, timeout_seconds=60.0)
     assert short_adapter.complete([{"role": "user", "content": "hola corto"}]) == {"ok": True}
     assert "hola corto" in " ".join(short_runner.calls[0]["command"])
     assert short_runner.calls[0]["input"] is None
+    assert short_runner.calls[0]["timeout_seconds"] == 60.0
 
-    # 2. Long prompt (> 10,000 chars) passes payload via stdin and keeps argv tiny
-    long_body = "CODIGO_REPOSITORIO_" + ("x" * 12500)
-    long_runner = FakeRunner(results=[CommandResult(exit_code=0, stdout='{"reply": "audit ok"}')])
-    long_adapter = AgyLLMAdapter(runner=long_runner, cwd=tmp_path)
-    out = long_adapter.complete(
+    # 2. Long prompt (> 6,000 chars) writes UTF-8 temp file, passes path reference in -p (NO stdin), and cleans up
+    long_body = "CODIGO_REPOSITORIO_ÑÁÉÍÓÚ_" + ("x" * 12500)
+    seen_temp_paths: list[Path] = []
+    seen_temp_contents: list[str] = []
+
+    class _InspectTempFileRunner(FakeRunner):
+        def run(self, command, cwd, timeout_seconds=30.0, env=None, input=None):
+            for token in command:
+                tok_str = str(token)
+                if ":" in tok_str:
+                    candidate = Path(tok_str.split(":", 1)[-1].strip())
+                    if candidate.suffix == ".txt" and candidate.exists():
+                        seen_temp_paths.append(candidate)
+                        seen_temp_contents.append(candidate.read_text(encoding="utf-8"))
+            return super().run(
+                command=command,
+                cwd=cwd,
+                timeout_seconds=timeout_seconds,
+                env=env,
+                input=input,
+            )
+
+    long_runner = _InspectTempFileRunner(
+        results=[CommandResult(exit_code=0, stdout='{"reply": "audit ok"}')]
+    )
+    long_adapter = AgyLLMAdapter(runner=long_runner, cwd=tmp_path, timeout_seconds=60.0)
+    out = long_adapter.generate(
         [{"role": "user", "content": long_body}],
         schema={"type": "object", "properties": {"reply": {"type": "string"}}},
+        timeout_seconds=240.0,
     )
     assert out == {"reply": "audit ok"}
     call_long = long_runner.calls[0]
     assert sum(len(a) for a in call_long["command"]) < 1000
     assert long_body not in " ".join(call_long["command"])
-    assert isinstance(call_long["input"], str)
-    assert len(call_long["input"]) > 12500
-    assert long_body in call_long["input"]
+    assert call_long["input"] is None
+    assert call_long["timeout_seconds"] == 240.0
+    assert len(seen_temp_paths) == 1
+    assert long_body in seen_temp_contents[0]
+    assert not seen_temp_paths[0].exists()
 
-    # 3. Fallback to UTF-8 temp file (cleaned up in finally) if custom runner lacks 'input' kwarg
+    # Subsequent call without override restores default timeout (60.0)
+    long_runner.enqueue(CommandResult(exit_code=0, stdout='{"reply": "default ok"}'))
+    assert long_adapter.complete([{"role": "user", "content": "corto"}]) == {"reply": "default ok"}
+    assert long_runner.calls[1]["timeout_seconds"] == 60.0
+
+    # Temp file is still removed in finally when Runner raises timeout
+    timeout_runner = _InspectTempFileRunner(results=[CommandTimeoutError("cli", 240.0)])
+    timeout_adapter = AgyLLMAdapter(runner=timeout_runner, cwd=tmp_path)
+    with pytest.raises(LLMError, match="timed out|timeout|240"):
+        timeout_adapter.generate([{"role": "user", "content": long_body}], timeout_seconds=240.0)
+    assert len(seen_temp_paths) == 2
+    assert not seen_temp_paths[1].exists()
+
+    # 3. Simulated custom Runner without 'input' kwarg remains fully compatible
     class _NoInputRunner:
         def __init__(self) -> None:
             self.seen_files: list[Path] = []
             self.seen_text: list[str] = []
-            self.argv_len: int = 0
 
         def run(self, command, cwd, timeout_seconds=30.0, env=None):
-            self.argv_len = sum(len(str(x)) for x in command)
             joined = " ".join(str(x) for x in command)
             for token in command:
                 p = Path(str(token).split(":", 1)[-1].strip()) if ":" in str(token) else Path(str(token))
@@ -2757,17 +2801,21 @@ def test_agy_llm_adapter_uses_stdin_or_temp_file_for_long_prompts_avoiding_winer
     assert long_body in no_in_runner.seen_text[0]
     assert not no_in_runner.seen_files[0].exists()
 
-    # 4. Real SubprocessRunner executes >20,000-char prompt via stdin without WinError 206
-    echo_script = tmp_path / "echo_stdin_len.py"
-    echo_script.write_text(
+    # 4. Real SubprocessRunner reads >22,000-char prompt from UTF-8 file referenced in -p without WinError 206
+    read_file_script = tmp_path / "read_prompt_file.py"
+    read_file_script.write_text(
         "import json, sys\n"
-        "data = sys.stdin.read()\n"
+        "from pathlib import Path\n"
+        "idx = sys.argv.index('-p')\n"
+        "p_arg = sys.argv[idx + 1]\n"
+        "fpath = Path(p_arg.split(':', 1)[-1].strip())\n"
+        "data = fpath.read_text(encoding='utf-8')\n"
         "print(json.dumps({'chars': len(data)}))\n",
         encoding="utf-8",
     )
     real_adapter = AgyLLMAdapter(
         runner=SubprocessRunner(default_timeout_seconds=10.0),
-        cli_command=[sys.executable, str(echo_script)],
+        cli_command=[sys.executable, str(read_file_script)],
         cwd=tmp_path,
     )
     huge_res = real_adapter.complete([{"role": "user", "content": "Z" * 22000}])
@@ -2902,6 +2950,193 @@ def test_orchestrator_chat_persists_current_commit_sha_and_version_retroactively
     assert hist[2]["commit_sha"] == sha_v2
     assert hist[2]["version_label"] == "v2"
     store.close()
+
+
+def test_orchestrator_chat_persistent_lifecycle_timeout_orphan_retry_and_delete(
+    tmp_path: Path,
+) -> None:
+    """Orchestrator persists running/stage_label immediately, transitions to timed_out/failed keeping stage_label & redacted error (INV-19), recovers orphans to interrupted, and supports retry & delete."""
+    import json
+    from datetime import timedelta
+    from typing import Any
+
+    from agent_factory.adapters.sqlite_store import SqliteEventStore
+    from agent_factory.domain.events import create_event
+    from agent_factory.domain.models import Plan
+    from agent_factory.ports.llm import LLMError
+
+    class _StaticClock:
+        def __init__(self, current: datetime) -> None:
+            self._current = current
+
+        def now(self) -> datetime:
+            return self._current
+
+        def sleep(self, seconds: float) -> None:
+            pass
+
+    pid = "proj-audit-lifecycle"
+    secret_tok = "SECRET_AUDIT_ERR_987"
+    clock = _StaticClock(datetime(2026, 4, 22, 14, 0, tzinfo=UTC))
+    store = SqliteEventStore(str(tmp_path / "audit_life.db"))
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_life")
+    ws_dir = ws_mgr.create_workspace(pid)
+    # Create >14k chars to verify max_chars=12000 cap
+    (ws_dir / "big.py").write_text("X = '" + ("A" * 14000) + "'\n", encoding="utf-8")
+
+    plan_dict = {
+        "summary": "Lifecycle App",
+        "rationale": "Simple",
+        "template_id": "static-web",
+        "deployment_target": "github-pages",
+        "files": [{"path": "big.py", "purpose": "Main", "contract": "Python"}],
+        "acceptance_tests": [{"id": "AT-01", "description": "Works", "type": "unit"}],
+        "estimated_cost": "low",
+    }
+    plan_hash = Plan.model_validate(plan_dict).compute_hash()
+    sha_v1 = "abcdef1234567890abcdef1234567890abcdef12"
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "Life", "objective": "Obj", "state": "INTERVIEW"}, at=clock.now()),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=clock.now()),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=clock.now()),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=clock.now()),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=clock.now()),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=clock.now()),
+        create_event(pid, EventType.PROJECT_DELIVERED, {"repo_url": "", "deploy_url": "", "commit_sha": sha_v1, "version_label": "v1"}, at=clock.now()),
+    ):
+        store.append(ev)
+
+    chats_dir = tmp_path / "chats_life"
+    chat_file = chats_dir / f"{pid}.json"
+    observed_mid_call: list[dict[str, Any]] = []
+    observed_timeouts: list[float | None] = []
+
+    class _SpyLifecycleLLM:
+        def __init__(self) -> None:
+            self.step = 0
+
+        def complete(
+            self,
+            messages: list[dict[str, str]],
+            schema: Any = None,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> dict[str, Any]:
+            observed_timeouts.append(timeout_seconds)
+            if chat_file.is_file():
+                disk = json.loads(chat_file.read_text(encoding="utf-8"))
+                observed_mid_call.append(dict(disk[-1]))
+            self.step += 1
+            if self.step == 1:
+                raise LLMError(f"agy CLI timed out after 240s using {secret_tok}")
+            return {
+                "reply": "# Auditoría recuperada\nTodo verificado.",
+                "suggested_changes": "Sin cambios críticos.",
+                "document_title": "audit-recuperada.md",
+            }
+
+    orch = Orchestrator(
+        store=store,
+        llm=_SpyLifecycleLLM(),
+        clock=clock,
+        workspace_manager=ws_mgr,
+    )
+
+    # 1. Timeout persists status='timed_out', keeps stage 2/3, and redacts secret (INV-19)
+    with pytest.raises(LLMError):
+        orch.chat_with_project(
+            pid,
+            "",
+            mode="audit",
+            chats_dir=chats_dir,
+            extra_secrets=(secret_tok,),
+        )
+
+    assert observed_timeouts[0] == 240.0
+    assert observed_mid_call[0]["status"] == "running"
+    assert observed_mid_call[0]["stage_label"] == "2/3 Analizando código con IA"
+    assert observed_mid_call[0]["server_boot_id"] == orch._server_boot_id
+
+    hist1 = orch.get_project_chat_history(pid, chats_dir=chats_dir, extra_secrets=(secret_tok,))
+    timed_out_entry = hist1[-1]
+    entry_id = timed_out_entry["id"]
+    assert timed_out_entry["status"] == "timed_out"
+    assert timed_out_entry["stage_label"] == "2/3 Analizando código con IA"
+    assert secret_tok not in timed_out_entry["error_detail"]
+    assert "[REDACTED]" in timed_out_entry["error_detail"]
+    assert isinstance(timed_out_entry["duration_seconds"], (int, float))
+
+    # 2. Retry reuses mode & prompt and updates the SAME existing entry to 'completed'
+    retry_res = orch.retry_project_chat_entry(
+        pid,
+        entry_id,
+        chats_dir=chats_dir,
+        extra_secrets=(secret_tok,),
+    )
+    assert retry_res["status"] == "completed"
+    assert retry_res["stage_label"] == "Completada"
+    assert "Auditoría recuperada" in retry_res["reply"]
+    assert retry_res["context_chars"] <= 12500
+
+    hist2 = orch.get_project_chat_history(pid, chats_dir=chats_dir)
+    assert len(hist2) == len(hist1)
+    assert hist2[-1]["id"] == entry_id
+    assert hist2[-1]["status"] == "completed"
+    assert hist2[-1]["stage_label"] == "Completada"
+    assert hist2[-1]["error_detail"] == ""
+
+    # 3. Orphaned 'running' entries (old server_boot_id OR >260s) auto-recover to 'interrupted' on disk
+    disk_data = json.loads(chat_file.read_text(encoding="utf-8"))
+    disk_data.append(
+        {
+            "id": "a-orphan-boot",
+            "role": "assistant",
+            "mode": "document",
+            "prompt": "Doc",
+            "content": "",
+            "status": "running",
+            "stage_label": "1/3 Leyendo archivos del repositorio",
+            "server_boot_id": "dead-boot-999",
+            "created_at": clock.now().isoformat(),
+        }
+    )
+    disk_data.append(
+        {
+            "id": "a-orphan-ttl",
+            "role": "assistant",
+            "mode": "audit",
+            "prompt": "Audit",
+            "content": "",
+            "status": "running",
+            "stage_label": "2/3 Analizando código con IA",
+            "server_boot_id": orch._server_boot_id,
+            "created_at": (clock.now() - timedelta(seconds=270)).isoformat(),
+        }
+    )
+    chat_file.write_text(json.dumps(disk_data), encoding="utf-8")
+
+    hist3 = orch.get_project_chat_history(pid, chats_dir=chats_dir)
+    by_id = {m["id"]: m for m in hist3}
+    assert by_id["a-orphan-boot"]["status"] == "interrupted"
+    assert (
+        by_id["a-orphan-boot"]["error_detail"]
+        == "La ejecución se interrumpió o superó el tiempo límite en la etapa: 1/3 Leyendo archivos del repositorio"
+    )
+    assert by_id["a-orphan-ttl"]["status"] == "interrupted"
+    assert (
+        by_id["a-orphan-ttl"]["error_detail"]
+        == "La ejecución se interrumpió o superó el tiempo límite en la etapa: 2/3 Analizando código con IA"
+    )
+
+    # 4. delete_project_chat_entry removes target entry and rejects traversal IDs (INV-22)
+    assert orch.delete_project_chat_entry(pid, "a-orphan-boot", chats_dir=chats_dir) is True
+    assert orch.delete_project_chat_entry(pid, "a-orphan-boot", chats_dir=chats_dir) is False
+    with pytest.raises(ValueError):
+        orch.delete_project_chat_entry(pid, "../escape", chats_dir=chats_dir)
+    hist4 = orch.get_project_chat_history(pid, chats_dir=chats_dir)
+    assert "a-orphan-boot" not in [m["id"] for m in hist4]
+    store.close()
+
 
 
 
