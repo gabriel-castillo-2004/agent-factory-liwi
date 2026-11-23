@@ -6,6 +6,7 @@ import inspect
 import json
 import logging
 import re
+import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -275,6 +276,19 @@ class AgyLLMAdapter:
             invalid_response=True,
         )
 
+    @staticmethod
+    def _resolve_binary_path(binary: str) -> str:
+        """Resolve executable path via shutil.which (handles Windows .cmd/.bat shims), keeping mock binaries when unresolved."""
+        resolved = shutil.which(binary)
+        return resolved if resolved else binary
+
+    def _build_base_command(self) -> list[str]:
+        """Build CLI command prefix resolving argv[0] via _resolve_binary_path."""
+        command = list(self.cli_command)
+        if command:
+            command[0] = self._resolve_binary_path(command[0])
+        return command
+
     def _invoke_cli_prompt(
         self,
         *,
@@ -285,8 +299,9 @@ class AgyLLMAdapter:
     ) -> CommandResult:
         """Execute CLI keeping prompts <=6,000 chars inline and using a UTF-8 temp file in -p for longer prompts."""
         eff_timeout = self.timeout_seconds if timeout_seconds is None else float(timeout_seconds)
+        base_command = self._build_base_command()
         if len(prompt) <= MAX_CLI_ARG_PROMPT_CHARS:
-            command = list(self.cli_command) + ["-p", prompt]
+            command = base_command + ["-p", prompt]
             if active_model:
                 command.extend(["--model", active_model])
             return self.runner.run(
@@ -306,8 +321,8 @@ class AgyLLMAdapter:
                 delete=False,
             ) as tmp_file:
                 tmp_file.write(prompt)
-                tmp_file_path = Path(tmp_file.name)
-            file_command = list(self.cli_command) + [
+                tmp_file_path = Path(tmp_file.name).resolve()
+            file_command = base_command + [
                 "-p",
                 f"Lee y sigue exactamente las instrucciones y el contexto del archivo: {tmp_file_path}",
             ]

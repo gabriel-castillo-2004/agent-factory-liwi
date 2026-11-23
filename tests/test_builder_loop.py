@@ -2822,6 +2822,122 @@ def test_agy_llm_adapter_uses_stdin_or_temp_file_for_long_prompts_avoiding_winer
     assert huge_res["chars"] > 22000
 
 
+def test_agy_llm_adapter_resolves_windows_cmd_shim_and_spaced_temp_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AgyLLMAdapter resolves .cmd/.bat shims via shutil.which (keeping mocks intact when None) and handles spaced temp paths on Windows."""
+    import os
+    import shutil
+    import sys
+    import tempfile
+
+    from agent_factory.adapters.agy_llm_adapter import AgyLLMAdapter
+    from agent_factory.adapters.fake_runner import FakeRunner
+    from agent_factory.adapters.subprocess_runner import SubprocessRunner
+
+    resolved_cmd = r"C:\Users\Test User\AppData\Local\Programs\agy\agy.cmd"
+
+    # 1. Mock shutil.which -> .cmd shim path used in argv[0] for short and long prompts
+    monkeypatch.setattr(shutil, "which", lambda binary: resolved_cmd if binary == "agy" else None)
+
+    spaced_temp_dir = tmp_path / "Angel laptopJaz" / "Temp With Spaces"
+    spaced_temp_dir.mkdir(parents=True)
+    monkeypatch.setattr(tempfile, "tempdir", str(spaced_temp_dir))
+
+    seen_files: list[Path] = []
+    seen_contents: list[str] = []
+
+    class _SpacedTempInspectRunner(FakeRunner):
+        def run(self, command, cwd, timeout_seconds=30.0, env=None, input=None):
+            for tok in command:
+                s = str(tok)
+                if ":" in s:
+                    cand = Path(s.split(":", 1)[-1].strip())
+                    if cand.suffix == ".txt" and cand.exists():
+                        seen_files.append(cand)
+                        seen_contents.append(cand.read_text(encoding="utf-8"))
+            return super().run(
+                command=command,
+                cwd=cwd,
+                timeout_seconds=timeout_seconds,
+                env=env,
+                input=input,
+            )
+
+    runner = _SpacedTempInspectRunner(
+        results=[
+            CommandResult(exit_code=0, stdout='{"ok": "short"}'),
+            CommandResult(exit_code=0, stdout='{"ok": "long"}'),
+        ]
+    )
+    adapter = AgyLLMAdapter(runner=runner, cli_command=("agy",), cwd=tmp_path)
+
+    # Short prompt -> resolved .cmd in argv[0]
+    assert adapter.complete([{"role": "user", "content": "hola corto"}]) == {"ok": "short"}
+    assert runner.calls[0]["command"][0] == resolved_cmd
+
+    # Long prompt (>6,000 chars) -> resolved .cmd in argv[0] + spaced temp file in -p
+    long_prompt = "REPOSITORIO_CON_ESPACIOS_" + ("Y" * 7000)
+    assert adapter.generate([{"role": "user", "content": long_prompt}]) == {"ok": "long"}
+    assert runner.calls[1]["command"][0] == resolved_cmd
+    assert runner.calls[1]["input"] is None
+    assert len(seen_files) == 1
+    assert "Angel laptopJaz" in str(seen_files[0])
+    assert "Temp With Spaces" in str(seen_files[0])
+    assert long_prompt in seen_contents[0]
+    assert not seen_files[0].exists()
+
+    # 2. When shutil.which returns None, original mock binary name is preserved
+    monkeypatch.setattr(shutil, "which", lambda _binary: None)
+    fallback_runner = FakeRunner(
+        results=[
+            CommandResult(exit_code=0, stdout='{"ok": "mock-short"}'),
+            CommandResult(exit_code=0, stdout='{"ok": "mock-long"}'),
+        ]
+    )
+    mock_adapter = AgyLLMAdapter(runner=fallback_runner, cli_command=("mock-agy",), cwd=tmp_path)
+    assert mock_adapter.complete([{"role": "user", "content": "corto"}]) == {"ok": "mock-short"}
+    assert fallback_runner.calls[0]["command"][0] == "mock-agy"
+    assert mock_adapter.complete([{"role": "user", "content": long_prompt}]) == {"ok": "mock-long"}
+    assert fallback_runner.calls[1]["command"][0] == "mock-agy"
+
+    # 3. End-to-end SubprocessRunner execution on Windows with real .cmd shim + spaces in shim & temp paths
+    if os.name == "nt":
+        real_py_helper = spaced_temp_dir / "read_from_cmd.py"
+        real_py_helper.write_text(
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            "idx = sys.argv.index('-p')\n"
+            "arg = sys.argv[idx + 1]\n"
+            "fpath = Path(arg.split(':', 1)[-1].strip())\n"
+            "text = fpath.read_text(encoding='utf-8')\n"
+            "print(json.dumps({'path': str(fpath), 'chars': len(text)}))\n",
+            encoding="utf-8",
+        )
+        shim_dir = tmp_path / "Programs With Spaces" / "agy dir"
+        shim_dir.mkdir(parents=True)
+        cmd_shim = shim_dir / "agy_wrapper.cmd"
+        cmd_shim.write_text(
+            f'@echo off\r\n"{sys.executable}" "{real_py_helper}" %*\r\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            shutil,
+            "which",
+            lambda b: str(cmd_shim) if b == "agy_wrapper" else None,
+        )
+        real_cmd_adapter = AgyLLMAdapter(
+            runner=SubprocessRunner(default_timeout_seconds=10.0),
+            cli_command=("agy_wrapper",),
+            cwd=tmp_path,
+        )
+        res_real = real_cmd_adapter.complete([{"role": "user", "content": long_prompt}])
+        assert "Angel laptopJaz" in res_real["path"]
+        assert res_real["chars"] > 7000
+
+
+
 def test_build_worker_records_commit_sha_and_version_label_on_project_delivered(
     tmp_path: Path,
 ) -> None:
