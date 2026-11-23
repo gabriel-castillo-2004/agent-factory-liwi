@@ -266,6 +266,17 @@ class AgyLLMAdapter:
                 return parsed
             saw_non_dict_json = True
 
+        decoder = json.JSONDecoder()
+        for idx, ch in enumerate(stripped):
+            if ch != "{":
+                continue
+            try:
+                parsed_obj, _ = decoder.raw_decode(stripped[idx:])
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(parsed_obj, dict):
+                return parsed_obj
+
         if saw_non_dict_json:
             self._raise_error(
                 "Expected JSON object dictionary from agy CLI, got non-dict JSON",
@@ -300,8 +311,15 @@ class AgyLLMAdapter:
         """Execute CLI keeping prompts <=6,000 chars inline and using a UTF-8 temp file in -p for longer prompts."""
         eff_timeout = self.timeout_seconds if timeout_seconds is None else float(timeout_seconds)
         base_command = self._build_base_command()
+        is_batch_shim = bool(
+            base_command and base_command[0].lower().endswith((".cmd", ".bat"))
+        )
         if len(prompt) <= MAX_CLI_ARG_PROMPT_CHARS:
-            command = base_command + ["-p", prompt]
+            # Windows cmd.exe batch wrappers (%*) truncate -p arguments at the first CR/LF.
+            inline_prompt = (
+                re.sub(r"[\r\n]+", " ", prompt).strip() if is_batch_shim else prompt
+            )
+            command = base_command + ["-p", inline_prompt]
             if active_model:
                 command.extend(["--model", active_model])
             return self.runner.run(

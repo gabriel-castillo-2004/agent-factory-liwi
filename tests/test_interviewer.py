@@ -375,3 +375,61 @@ def test_interview_round_output_supports_nested_and_flat_payloads() -> None:
     assert out_flat.spec.users == ["Bob"]
     assert out_flat.spec.business_rules == ["Rule 1"]
     assert out_flat.questions == ["Q2"]
+
+
+def test_interviewer_tolerant_parser_and_fallback_questions_on_unexpected_llm_output() -> None:
+    """Interviewer tolerates malformed/Spanish/prose payloads and InvalidLLMResponseError with structured objective-based questions."""
+    from agent_factory.ports.llm import InvalidLLMResponseError
+
+    # 1. Tolerant coercion of Spanish keys, string lists, and dict question objects
+    llm_odd = FakeLLM(
+        responses=[
+            {
+                "objetivo": "Pagina responsiva",
+                "caracteristicas": "Menú adaptable, Tarjetas de productos",
+                "preguntas": [
+                    {"question": "¿Qué secciones principales necesita tu sitio?"},
+                    {"text": "¿Tienes preferencia de colores o tipografía?"},
+                ],
+            }
+        ]
+    )
+    interviewer_odd = Interviewer(llm=llm_odd, max_rounds=6)
+    res_odd = interviewer_odd.run_round(Spec(), "Pagina responsiva", round_number=1)
+    assert res_odd.is_complete is False
+    assert res_odd.spec.objective == "Pagina responsiva"
+    assert res_odd.spec.features == ["Menú adaptable", "Tarjetas de productos"]
+    assert res_odd.questions == [
+        "¿Qué secciones principales necesita tu sitio?",
+        "¿Tienes preferencia de colores o tipografía?",
+    ]
+
+    # 2. Completely unexpected dict or non-JSON InvalidLLMResponseError produces structured fallback questions instead of crashing
+    class _BrokenFormatLLM:
+        def __init__(self, responses: list[object]) -> None:
+            self._responses = list(responses)
+
+        def complete(self, messages, schema=None):
+            item = self._responses.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+    llm_broken = _BrokenFormatLLM(
+        responses=[
+            InvalidLLMResponseError("Plain non-JSON response from CLI"),
+            {"unexpected_key": "no spec and no questions"},
+        ]
+    )
+    interviewer_fb = Interviewer(llm=llm_broken, max_rounds=6)
+    res_fb1 = interviewer_fb.run_round(Spec(), "Pagina responsiva", round_number=1)
+    assert res_fb1.is_complete is False
+    assert res_fb1.spec.objective == "Pagina responsiva"
+    assert 1 <= len(res_fb1.questions) <= 3
+    assert any("Pagina responsiva" in q for q in res_fb1.questions)
+
+    res_fb2 = interviewer_fb.run_round(Spec(), "Landing de café artesanal", round_number=1)
+    assert res_fb2.is_complete is False
+    assert res_fb2.spec.objective == "Landing de café artesanal"
+    assert 1 <= len(res_fb2.questions) <= 3
+

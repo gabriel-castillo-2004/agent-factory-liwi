@@ -57,6 +57,7 @@ ALLOWED_TRANSITIONS: dict[ProjectState, frozenset[ProjectState]] = {
 RETRYABLE_SOURCE_STATES: frozenset[ProjectState] = frozenset(
     {
         ProjectState.FAILED,
+        ProjectState.INTERVIEW,
         ProjectState.BUILDING,
         ProjectState.VERIFYING,
         ProjectState.DEBATE,

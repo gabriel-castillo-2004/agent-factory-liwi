@@ -4071,6 +4071,159 @@ def test_dashboard_audit_lifecycle_endpoints_retry_delete_and_ui_cards(
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_failed_interview_retry_regenerates_questions_and_empty_interview_banner(
+    tmp_path: Path,
+) -> None:
+    """Retrying a project failed in INTERVIEW or stuck in INTERVIEW without questions regenerates InterviewerAgent questions, and UI suppresses 'Esperando tus respuestas' when questions is empty."""
+    pid_fail = "pagina-responsiva"
+    store = SqliteEventStore(db_path=tmp_path / "retry_interview.db")
+
+    first_fail_done = threading.Event()
+
+    class _FailFirstInterviewLLM(FakeLLM):
+        def complete(
+            self,
+            messages: list[dict[str, str]],
+            schema: Any = None,
+        ) -> dict[str, Any]:
+            try:
+                return super().complete(messages=messages, schema=schema)
+            except LLMError:
+                first_fail_done.set()
+                raise
+
+    llm = _FailFirstInterviewLLM(
+        responses=[
+            # 1. Create pagina-responsiva -> first interview attempt fails with transport error -> FAILED
+            LLMError("Initial agy CLI failure during interview"),
+            # 2. Retry pagina-responsiva -> InterviewerAgent succeeds with 2 clarifying questions
+            {
+                "spec": {
+                    "objective": "Pagina responsiva",
+                    "users": ["Visitantes móviles"],
+                    "features": [],
+                    "business_rules": [],
+                    "edge_cases": [],
+                    "constraints": [],
+                    "success_criteria": [],
+                    "assumptions": [],
+                },
+                "questions": [
+                    "¿Qué secciones principales tendrá tu página responsiva?",
+                    "¿Qué estilo visual o paleta de colores prefieres?",
+                ],
+            },
+            # 3. Retry project already stuck in INTERVIEW without questions -> regenerates questions cleanly
+            {
+                "spec": {
+                    "objective": "Portafolio interactivo",
+                    "users": ["Reclutadores"],
+                    "features": ["Proyectos"],
+                    "business_rules": [],
+                    "edge_cases": [],
+                    "constraints": [],
+                    "success_criteria": [],
+                    "assumptions": [],
+                },
+                "questions": ["¿Deseas incluir formulario de contacto?"],
+            },
+        ]
+    )
+    orch = Orchestrator(store=store, llm=llm)
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        # 1. Verify HTML buildGuidanceBanner behavior when questions is empty vs populated
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            assert html_resp.status == 200
+            html = html_resp.read().decode("utf-8")
+
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+
+        fn_start = html.index("function buildGuidanceBanner(")
+        fn_end = html.index("function renderDetail()", fn_start)
+        fn_body = html[fn_start:fn_end]
+        _, after_int = fn_body.split("if (st.state === 'INTERVIEW')", 1)
+        interview_block, _ = after_int.split("if (st.state === 'WAITING_APPROVAL')", 1)
+        assert "if (!questions.length)" in interview_block
+        empty_q_branch, populated_q_branch = interview_block.split("if (!questions.length)", 1)
+        populated_after_empty = populated_q_branch.split("return '<div class=\"guidance-banner", 2)
+        empty_return = populated_after_empty[1]
+        assert "Aún no se han generado las preguntas de aclaración" in empty_return
+        assert "Generar preguntas ahora" in empty_return
+        assert "retry-interview" in empty_return
+        assert "Esperando tus respuestas" not in empty_return
+        assert '<ol class="question-list">' in populated_after_empty[2]
+        assert "Esperando tus respuestas" in populated_after_empty[2]
+
+        # 2. Create project -> first interview fails cleanly into FAILED
+        c_code, c_res = _http_json(
+            f"{base_url}/api/projects",
+            method="POST",
+            body={"prompt": "Pagina responsiva"},
+        )
+        assert c_code == 200
+        assert c_res["project_id"] == pid_fail
+        assert first_fail_done.wait(timeout=5.0) is True
+        assert server.controller.wait_for_idle(timeout=5.0) is True
+
+        _, detail_failed = _http_json(f"{base_url}/api/projects/{pid_fail}")
+        assert detail_failed["status"]["state"] == "FAILED"
+        assert not any(
+            ev["type"] == EventType.INTERVIEW_ROUND and ev["payload"].get("questions")
+            for ev in detail_failed["events"]
+        )
+
+        # 3. POST /api/projects/<id>/retry -> regenerates InterviewerAgent questions & returns INTERVIEW
+        r_code, r_res = _http_json(
+            f"{base_url}/api/projects/{pid_fail}/retry",
+            method="POST",
+            body={"clean_workspace": False},
+        )
+        assert r_code == 200
+        assert r_res["status"]["state"] == "INTERVIEW"
+
+        g_code, g_detail = _http_json(f"{base_url}/api/projects/{pid_fail}")
+        assert g_code == 200
+        assert g_detail["status"]["state"] == "INTERVIEW"
+        round_events = [
+            ev for ev in g_detail["events"] if ev["type"] == EventType.INTERVIEW_ROUND
+        ]
+        assert len(round_events) == 1
+        assert round_events[0]["payload"]["questions"] == [
+            "¿Qué secciones principales tendrá tu página responsiva?",
+            "¿Qué estilo visual o paleta de colores prefieres?",
+        ]
+
+        # 4. Project already in INTERVIEW with zero questions -> retry regenerates questions directly
+        stuck_pid = "stuck-interview"
+        orch.create_project(stuck_pid, "Portafolio", "Portafolio interactivo")
+        assert orch.get_status(stuck_pid).state == ProjectState.INTERVIEW
+
+        r2_code, r2_res = _http_json(
+            f"{base_url}/api/projects/{stuck_pid}/retry",
+            method="POST",
+            body={"clean_workspace": False},
+        )
+        assert r2_code == 200
+        assert r2_res["status"]["state"] == "INTERVIEW"
+
+        _, g2_detail = _http_json(f"{base_url}/api/projects/{stuck_pid}")
+        round2 = [ev for ev in g2_detail["events"] if ev["type"] == EventType.INTERVIEW_ROUND]
+        assert len(round2) == 1
+        assert round2[0]["payload"]["questions"] == ["¿Deseas incluir formulario de contacto?"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+
 
 
 

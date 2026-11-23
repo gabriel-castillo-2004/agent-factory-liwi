@@ -2933,12 +2933,55 @@ class Orchestrator:
             )
             return self.get_status(project_id)
 
+    @staticmethod
+    def _has_active_interview_questions(events: Sequence[Event]) -> bool:
+        """Return True if the latest active INTERVIEW phase already produced non-empty questions."""
+        for ev in reversed(events):
+            if ev.type == EventType.INTERVIEW_ROUND:
+                pl = ev.payload or {}
+                questions = pl.get("questions") if isinstance(pl, Mapping) else None
+                if isinstance(questions, Sequence) and not isinstance(questions, str):
+                    return any(str(q).strip() for q in questions)
+                return False
+            if ev.type == EventType.STATE_TRANSITIONED:
+                pl = ev.payload or {}
+                if pl.get("to") == ProjectState.INTERVIEW.value:
+                    return False
+            elif ev.type == EventType.PROJECT_CREATED:
+                return False
+        return False
+
+    @staticmethod
+    def _resolve_interview_retry_prompt(
+        events: Sequence[Event],
+        status: ProjectStatus,
+    ) -> str:
+        """Pick the best user prompt/objective for regenerating INTERVIEW questions on retry."""
+        for ev in reversed(events):
+            if ev.type in {"ADJUSTMENT_REQUESTED", "CHANGE_REQUEST", EventType.STATE_TRANSITIONED}:
+                pl = ev.payload or {}
+                if (
+                    ev.type == EventType.STATE_TRANSITIONED
+                    and pl.get("to") != ProjectState.INTERVIEW.value
+                ):
+                    continue
+                for key in ("reason", "change_description", "prompt", "message"):
+                    val = pl.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+        return (
+            (status.objective or "").strip()
+            or (status.name or "").strip()
+            or "Genera preguntas iniciales para definir el proyecto."
+        )
+
     def retry_project(
         self,
         project_id: str,
         *,
         workspace_manager: WorkspaceManager | None = None,
         clean_workspace: bool = False,
+        regenerate_interview: bool = True,
     ) -> ProjectStatus:
         """Reset failure counters for a FAILED or orphaned active project, optionally clean workspace, and return to recoverable state."""
         validate_project_id(project_id)
@@ -2950,6 +2993,7 @@ class Orchestrator:
             current_status = self.get_status(project_id)
             allowed_retry_states = {
                 ProjectState.FAILED,
+                ProjectState.INTERVIEW,
                 ProjectState.BUILDING,
                 ProjectState.VERIFYING,
                 ProjectState.DEBATE,
@@ -2960,6 +3004,8 @@ class Orchestrator:
                     f"Cannot retry project '{project_id}' in state {current_status.state.value}: "
                     f"expected one of {[s.value for s in allowed_retry_states]}"
                 )
+
+            had_active_questions = self._has_active_interview_questions(events)
 
             tracked = ProjectState.IDLE
             last_active_state = ProjectState.INTERVIEW
@@ -3023,6 +3069,8 @@ class Orchestrator:
             self.circuit_breaker.reset(project_id, last_active_state)
             if target_state != last_active_state:
                 self.circuit_breaker.reset(project_id, target_state)
+            if target_state == ProjectState.INTERVIEW:
+                self.circuit_breaker.reset(project_id, ProjectState.INTERVIEW)
             if last_active_state in {ProjectState.BUILDING, ProjectState.VERIFYING}:
                 self.circuit_breaker.reset(project_id, ProjectState.BUILDING)
                 self.circuit_breaker.reset(project_id, ProjectState.VERIFYING)
@@ -3059,6 +3107,15 @@ class Orchestrator:
                     at=self._now(),
                 )
             )
+            if regenerate_interview and target_state == ProjectState.INTERVIEW and (
+                current_status.state == ProjectState.INTERVIEW or not had_active_questions
+            ):
+                retry_prompt = self._resolve_interview_retry_prompt(events, current_status)
+                return self.handle_interview_message(
+                    project_id,
+                    f"retry-int-{uuid.uuid4().hex[:12]}",
+                    retry_prompt,
+                )
             return self.get_status(project_id)
 
     def delete_project(self, project_id: str) -> bool:

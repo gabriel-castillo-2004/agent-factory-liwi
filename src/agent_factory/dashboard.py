@@ -1398,7 +1398,10 @@ class DashboardController:
                 self.build_worker.queue.remove(project_id)
 
             background_started = False
-            if updated.state in (ProjectState.DEBATE, ProjectState.MEDIATION):
+            if updated.state in (ProjectState.DEBATE, ProjectState.MEDIATION) or (
+                updated.state == ProjectState.INTERVIEW
+                and self.orchestrator.get_spec(project_id).is_complete()
+            ):
                 background_started = self._start_background(
                     project_id,
                     lambda: self._run_debate_pipeline(
@@ -2248,6 +2251,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       padding-left: 20px;
       font-size: 0.92rem;
       line-height: 1.45;
+      list-style-type: decimal;
     }
     .question-list li { margin-bottom: 4px; }
     .inactivity-note {
@@ -4148,7 +4152,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (typeof explicitMs === 'number' && explicitMs > 0) return explicitMs;
       const u = String(url || '');
       if (u.indexOf('/chat') >= 0) return 250000;
-      if (/\\/(start|modify|rollback|import)\\b/.test(u)) return 120000;
+      if (/\\/(start|modify|rollback|import|retry)\\b/.test(u)) return 120000;
       return 30000;
     }
 
@@ -4761,21 +4765,35 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       if (st.state === 'INTERVIEW') {
         const questions = extractLatestQuestions(events);
-        const qHtml = questions.length
-          ? '<ul class="question-list">' + questions.map((q) => '<li>' + escapeHtml(q) + '</li>').join('') + '</ul>'
-          : '<div class="banner-desc">Cuéntanos los detalles que deseas incluir para completar la especificación.</div>';
         const inact = formatInactivityNote(st.last_event_at);
         const inactHtml = inact ? '<div class="inactivity-note">' + escapeHtml(inact) + '</div>' : '';
-        const draft = escapeHtml((state.replyDrafts && state.replyDrafts[st.project_id]) || '');
         const pendingHtml = (state.interviewPendingByPid && state.interviewPendingByPid[st.project_id])
           ? '<div class="optimistic-sent-pill">✓ Respuesta enviada · Analizando…</div>'
           : '';
+        if (!questions.length) {
+          return '<div class="guidance-banner banner-warn">' +
+            '<div class="banner-content">' +
+              '<div class="banner-icon">⚠️</div>' +
+              '<div class="banner-body">' +
+                '<div class="banner-title">Aún no se han generado las preguntas de aclaración</div>' +
+                '<div class="banner-desc">La entrevista inicial no produjo preguntas. Genera las preguntas de aclaración antes de continuar.</div>' +
+                inactHtml +
+                pendingHtml +
+              '</div>' +
+            '</div>' +
+            '<div class="banner-actions">' +
+              '<button id="generate-questions-btn" class="btn btn-primary" type="button" data-dact="retry-interview">Generar preguntas ahora</button>' +
+              '<span id="interview-retry-inline-status"></span>' +
+            '</div>' +
+          '</div>';
+        }
+        const draft = escapeHtml((state.replyDrafts && state.replyDrafts[st.project_id]) || '');
         return '<div class="guidance-banner banner-info">' +
           '<div class="banner-content">' +
             '<div class="banner-icon">💬</div>' +
             '<div class="banner-body">' +
               '<div class="banner-title">Esperando tus respuestas</div>' +
-              qHtml +
+              '<ol class="question-list">' + questions.map((q) => '<li>' + escapeHtml(q) + '</li>').join('') + '</ol>' +
               inactHtml +
               pendingHtml +
             '</div>' +
@@ -7240,12 +7258,46 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/approve', { method: 'POST' });
           setNote('✓ Construcción iniciada para ' + pid + '.', 'ok');
         } else if (action === 'retry') {
-          await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/retry', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ clean_workspace: false }),
-          });
-          setNote('Reintento iniciado para ' + pid + '.');
+          await runTrackedOperation(
+            {
+              pid,
+              label: 'Reintentando etapa del proyecto...',
+              subtext: 'Recuperando estado y preparando el siguiente paso...',
+              buttonEl: triggerBtn,
+            },
+            async () => {
+              await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/retry', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ clean_workspace: false }),
+              });
+              setNote('Reintento iniciado para ' + pid + '.');
+              state.lastBannerSignature = null;
+              await loadProjects();
+            }
+          );
+          return;
+        } else if (action === 'retry-interview') {
+          await runTrackedOperation(
+            {
+              pid,
+              label: 'Generando preguntas de aclaración...',
+              subtext: 'Consultando al entrevistador para definir los detalles del proyecto...',
+              buttonEl: triggerBtn || 'generate-questions-btn',
+              inlineTargetId: 'interview-retry-inline-status',
+            },
+            async () => {
+              await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/retry', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ clean_workspace: false }),
+              });
+              setNote('✓ Preguntas de aclaración generadas para ' + pid + '.', 'ok');
+              state.lastBannerSignature = null;
+              await loadProjects();
+            }
+          );
+          return;
         } else if (action === 'retry-clean') {
           const cleanOk = await askCustomConfirm({
             title: 'Reconstruir desde cero',

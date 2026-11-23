@@ -2936,6 +2936,45 @@ def test_agy_llm_adapter_resolves_windows_cmd_shim_and_spaced_temp_paths(
         assert "Angel laptopJaz" in res_real["path"]
         assert res_real["chars"] > 7000
 
+        # 4. Multiline InterviewRoundOutput schema prompt through real .cmd wrapper does NOT truncate at [SYSTEM]
+        interview_py = spaced_temp_dir / "echo_interview_prompt.py"
+        interview_py.write_text(
+            "import json, sys\n"
+            "idx = sys.argv.index('-p')\n"
+            "p_arg = sys.argv[idx + 1]\n"
+            "assert 'Pagina responsiva' in p_arg, f'Truncated -p: {p_arg!r}'\n"
+            "assert 'InterviewRoundOutput' in p_arg or 'JSON Schema:' in p_arg\n"
+            "print(json.dumps({'spec': {'objective': 'Pagina responsiva'}, 'questions': ['¿Para qué usuarios?']}))\n",
+            encoding="utf-8",
+        )
+        interview_cmd = shim_dir / "agy_interview.cmd"
+        interview_cmd.write_text(
+            f'@echo off\r\n"{sys.executable}" "{interview_py}" %*\r\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            shutil,
+            "which",
+            lambda b: str(interview_cmd) if b == "agy" else None,
+        )
+        from agent_factory.agents.interviewer import InterviewRoundOutput
+
+        int_adapter = AgyLLMAdapter(
+            runner=SubprocessRunner(default_timeout_seconds=10.0),
+            cli_command=("agy",),
+            cwd=tmp_path,
+        )
+        int_res = int_adapter.complete(
+            [
+                {"role": "system", "content": "You are an interviewer."},
+                {"role": "user", "content": "Pagina responsiva"},
+            ],
+            schema=InterviewRoundOutput,
+        )
+        assert int_res["spec"]["objective"] == "Pagina responsiva"
+        assert int_res["questions"] == ["¿Para qué usuarios?"]
+
+
 
 
 def test_build_worker_records_commit_sha_and_version_label_on_project_delivered(
