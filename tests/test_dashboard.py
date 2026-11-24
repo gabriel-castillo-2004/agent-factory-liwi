@@ -5674,3 +5674,138 @@ def test_dashboard_runtime_start_timeout_180s_and_swallows_client_disconnects(
         if thread.is_alive():
             thread.join(timeout=2.0)
         store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_questions_chat_clean_layout_collapse_relative_paths_and_noise_filtering(
+    tmp_path: Path,
+) -> None:
+    """Questions tab uses single-scroll flex #audit-chat-panel (max-height 68vh, 16px padding, 14px gap, sticky composer, 78% user right / 90% assistant left with 1.6 line-height), collapses prior auditor replies >420 chars or >8 lines while keeping latest open, converts file:///.../workspaces/<slug>/<path> to clean relative paths, filters audit/empty entries, and places subtle footer actions only on non-empty auditor replies."""
+    store = SqliteEventStore(str(tmp_path / "chat_ux_redesign.db"))
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_chat_ux")
+    pid = "chat-ux-demo"
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / "src" / "yt_music_dl").mkdir(parents=True)
+    (ws_dir / "src" / "yt_music_dl" / "app.py").write_text("def main(): return True\n", encoding="utf-8")
+
+    now = datetime(2026, 11, 24, 15, 0, tzinfo=UTC)
+    pdict = _plan_payload("Chat UX Redesign App")
+    phash = Plan.model_validate(pdict).compute_hash()
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "Chat UX App", "objective": "Chat limpio", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": pdict, "plan_hash": phash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": phash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+        create_event(pid, EventType.PROJECT_DELIVERED, {"repo_url": "", "deploy_url": "", "version_label": "v1"}, at=now),
+    ):
+        store.append(ev)
+
+    long_md_reply = (
+        "El punto de entrada está en "
+        "[app.py](file:///c:/Users/Angel%20laptopJaz/Documents/projects/agent-factory-liwi/workspaces/chat-ux-demo/src/yt_music_dl/app.py#L1-L10) "
+        "y también consulta file:///C:/Users/Angel%20laptopJaz/workspaces/chat-ux-demo/README.md.\n"
+        + "\n".join(f"- Línea de detalle arquitectónico número {i} con explicación clara." for i in range(1, 11))
+    )
+    llm = FakeLLM(
+        responses=[
+            {
+                "reply": long_md_reply,
+                "suggested_changes": "Extraer configuración de rutas.",
+                "document_title": "consulta-arquitectura.md",
+            }
+        ]
+    )
+    orch = Orchestrator(store=store, llm=llm, workspace_manager=ws_mgr)
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        workspace_manager=ws_mgr,
+        chats_dir=tmp_path / "chats_ux",
+    )
+    try:
+        # Round-trip a chat question returning file:/// workspace links and >420 chars / >8 lines
+        c_chat, r_chat = _http_json(
+            f"{base_url}/api/projects/{pid}/chat",
+            method="POST",
+            body={"message": "¿Dónde vive el punto de entrada?", "mode": "chat"},
+        )
+        assert c_chat == 200
+        assert "src/yt_music_dl/app.py" in r_chat["reply"]
+
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            assert html_resp.status == 200
+            html = html_resp.read().decode("utf-8")
+
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+
+        # 1. Clean single-scroll flex layout & role bubbles CSS
+        panel_css_start = html.index("#audit-chat-panel {")
+        panel_css_end = html.index("}", panel_css_start)
+        panel_css = html[panel_css_start:panel_css_end]
+        assert "display: flex;" in panel_css
+        assert "flex-direction: column;" in panel_css
+        assert "max-height: 68vh;" in panel_css
+        assert "padding: 16px;" in panel_css
+
+        assert "gap: 14px;" in html
+        assert "max-width: 78%;" in html
+        assert "max-width: 90%;" in html
+        assert "line-height: 1.6;" in html
+        assert 'id="audit-chat-panel"' in html
+        assert "audit-chat-composer" in html
+
+        # 2. Auto-collapse (>420 chars or >8 lines) keeping latest assistant reply open
+        assert "function isLongAuditorReply(" in html
+        long_fn_start = html.index("function isLongAuditorReply(")
+        long_fn_end = html.index("function isQuestionsTabEntry(", long_fn_start)
+        long_fn_body = html[long_fn_start:long_fn_end]
+        assert "420" in long_fn_body
+        assert "> 8" in long_fn_body
+
+        assert "Ver respuesta completa" in html
+        assert "Colapsar" in html
+        assert "lastAssistantChatIdx" in html
+        assert "data-chat-toggle" in html
+        assert "chat-msg-fade" in html
+
+        # 3. Clean workspace relative paths without broken file:/// URLs in renderSafeMarkdown
+        assert "function extractCleanProjectPathFromFileUrl(" in html
+        path_fn_start = html.index("function extractCleanProjectPathFromFileUrl(")
+        path_fn_end = html.index("function formatSafeInlineMd(", path_fn_start)
+        path_fn_body = html[path_fn_start:path_fn_end]
+        assert "/workspaces/" in path_fn_body
+        assert "decodeURI" in path_fn_body
+
+        md_start = html.index("function renderSafeMarkdown(")
+        md_end = html.index("function inferAuditVersionBadge(", md_start)
+        md_body = html[md_start:md_end]
+        assert "@@AF_FPATH_" in md_body
+        assert "md-file-ref" in md_body
+        assert 'href="file://' not in md_body
+
+        # 4. Noise filtering & discreet footer actions in Preguntas
+        q_fn_start = html.index("function isQuestionsTabEntry(")
+        q_fn_end = html.index("function renderAuditChatTab(", q_fn_start)
+        q_fn_body = html[q_fn_start:q_fn_end]
+        assert "kind === 'audit'" in q_fn_body
+        assert "Audita el proyecto completo" in q_fn_body or "audita el proyecto completo" in q_fn_body
+        assert "if (!text) return false" in q_fn_body
+
+        audit_fn_start = html.index("function renderAuditChatTab(")
+        audit_fn_end = html.index("async function loadProjectChatHistory(", audit_fn_start)
+        audit_fn_body = html[audit_fn_start:audit_fn_end]
+        assert "m.role === 'user' && (m.mode === 'audit' || m.mode === 'document')" not in audit_fn_body
+        assert "isQuestionsTabEntry(" in audit_fn_body
+        assert "chat-msg-footer" in audit_fn_body
+        assert "!isUser && hasRealContent" in audit_fn_body
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()

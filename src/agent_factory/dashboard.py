@@ -3024,50 +3024,159 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       gap: 8px;
       margin-bottom: 12px;
     }
-    .audit-thread {
+    #audit-chat-panel {
       display: flex;
       flex-direction: column;
-      gap: 10px;
-      max-height: 440px;
-      overflow-y: auto;
-      padding: 10px;
+      max-height: 68vh;
+      padding: 16px;
+      gap: 12px;
       background: var(--surface-alt);
       border: 1px solid var(--border);
-      border-radius: 10px;
-      margin-bottom: 12px;
+      border-radius: 12px;
+      overflow: hidden;
     }
-    .audit-msg {
-      padding: 10px 12px;
-      border-radius: 9px;
+    .audit-thread,
+    #audit-chat-stream,
+    .audit-chat-stream {
+      flex: 1 1 auto;
+      min-height: 150px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      overflow-y: auto;
+      padding: 4px 6px 8px 2px;
+      margin: 0;
+      background: transparent;
+      border: none;
+    }
+    .audit-chat-composer {
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+      background: var(--surface-alt);
+    }
+    .audit-msg,
+    .chat-msg {
+      padding: 12px 16px;
+      border-radius: 12px;
       border: 1px solid var(--border);
       background: var(--surface);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
     }
-    .audit-msg.user {
-      border-color: rgba(56, 189, 248, 0.45);
+    .audit-msg.user,
+    .chat-msg.user {
+      align-self: flex-end;
+      max-width: 78%;
+      border-color: rgba(56, 189, 248, 0.38);
       background: var(--info-bg);
+      border-bottom-right-radius: 4px;
+    }
+    .audit-msg.assistant,
+    .chat-msg.assistant {
+      align-self: flex-start;
+      width: 100%;
+      max-width: 90%;
+      background: var(--surface);
+      border-color: var(--border);
+      border-bottom-left-radius: 4px;
     }
     .audit-msg-head {
       display: flex;
       justify-content: space-between;
       align-items: center;
       gap: 8px;
-      font-size: 0.78rem;
+      font-size: 0.76rem;
       color: var(--muted);
-      margin-bottom: 6px;
+      margin-bottom: 2px;
     }
-    .audit-msg-body {
-      white-space: pre-wrap;
-      font-size: 0.88rem;
-      line-height: 1.48;
+    .audit-msg-body,
+    .chat-msg.assistant .md-body {
+      font-size: 0.9rem;
+      line-height: 1.6;
       word-break: break-word;
     }
-    .audit-msg-actions {
+    .audit-msg.user .audit-msg-body {
+      white-space: pre-wrap;
+    }
+    .md-file-ref {
+      display: inline-block;
+      padding: 1px 7px;
+      border-radius: 6px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.82em;
+      color: var(--accent);
+      background: var(--info-bg);
+      border: 1px solid rgba(56, 189, 248, 0.28);
+      word-break: break-all;
+    }
+    .chat-msg-collapsible {
+      position: relative;
+    }
+    .chat-msg-collapsible.collapsed {
+      max-height: 170px;
+      overflow: hidden;
+    }
+    .chat-msg-fade {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 54px;
+      background: linear-gradient(to bottom, transparent, var(--surface));
+      pointer-events: none;
+    }
+    .chat-collapse-btn {
+      align-self: flex-start;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--accent);
+      font-size: var(--fs-xs);
+      font-weight: 600;
+      padding: 3px 10px;
+      border-radius: 999px;
+      cursor: pointer;
+      margin-top: 2px;
+    }
+    .chat-collapse-btn:hover {
+      background: var(--info-bg);
+      border-color: var(--accent);
+    }
+    .audit-msg-actions,
+    .chat-msg-footer {
       display: flex;
       flex-wrap: wrap;
-      gap: 8px;
-      margin-top: 8px;
-      padding-top: 8px;
-      border-top: 1px dashed var(--border);
+      align-items: center;
+      gap: 6px;
+      margin-top: 6px;
+      padding-top: 6px;
+      border-top: 1px solid var(--border);
+    }
+    .chat-action-link {
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      font-size: var(--fs-xs);
+      padding: 2px 4px;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .chat-action-link:hover:not(:disabled) {
+      color: var(--accent);
+      background: var(--info-bg);
+    }
+    .chat-action-link:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .chat-action-sep {
+      color: var(--muted);
+      font-size: var(--fs-xs);
+      user-select: none;
     }
     .versions-panel {
       margin-top: 10px;
@@ -4377,6 +4486,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       auditSubTabByPid: {},
       auditFilterByPid: {},
       selectedAuditMsgIdByPid: {},
+      chatMsgCollapseOverrideByPid: {},
+      preserveChatScrollTop: null,
       targetFilesQueryByPid: {},
       interviewPendingByPid: {},
       lastBannerSignature: null,
@@ -7428,6 +7539,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    function extractCleanProjectPathFromFileUrl(rawUrl) {
+      let cleaned = String(rawUrl || '').trim().replace(/^[<"'`]+|[>"'`.,;:]+$/g, '');
+      const hashIdx = cleaned.indexOf('#');
+      if (hashIdx >= 0) cleaned = cleaned.slice(0, hashIdx);
+      const qIdx = cleaned.indexOf('?');
+      if (qIdx >= 0) cleaned = cleaned.slice(0, qIdx);
+      try {
+        cleaned = decodeURI(cleaned);
+      } catch (_) {
+        cleaned = cleaned.replace(/%20/g, ' ');
+      }
+      cleaned = cleaned.replace(/\\\\/g, '/');
+      const wsMatch = new RegExp('/workspaces/[^/]+/(.+)$', 'i').exec(cleaned);
+      if (wsMatch && wsMatch[1]) {
+        return wsMatch[1].replace(/^\\/+/, '');
+      }
+      const noScheme = cleaned
+        .replace(/^file:\\/\\/+\\/?/i, '')
+        .replace(/^[a-zA-Z]:\\//, '')
+        .replace(/^\\/+/, '');
+      if (!noScheme) return 'archivo';
+      const parts = noScheme.split('/').filter(Boolean);
+      return parts.length > 3 ? parts.slice(-3).join('/') : parts.join('/');
+    }
+
     function formatSafeInlineMd(escapedLine) {
       const codeSpans = [];
       let s = String(escapedLine || '').replace(/`([^`]+)`/g, (_m, inner) => {
@@ -7451,7 +7587,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         codeBlocks.push({ lang: String(lang || '').trim() || 'código', raw: code });
         return '\\n@@AF_FCODE_' + idx + '@@\\n';
       });
-      const escaped = escapeHtml(withoutFences);
+      const fileRefs = [];
+      function pushFileRef(rawUrl) {
+        const idx = fileRefs.length;
+        fileRefs.push(extractCleanProjectPathFromFileUrl(rawUrl));
+        return '@@AF_FPATH_' + idx + '@@';
+      }
+      const withCleanPaths = withoutFences
+        .replace(/`(file:\\/\\/\\/?[^`\\n]+)`/gi, (_m, u) => pushFileRef(u))
+        .replace(/\\[([^\\]\\n]*)\\]\\((file:\\/\\/\\/?(?:[^()\\n]|\\([^()\\n]*\\))+)\\)/gi, (_m, rawLbl, u) => {
+          const rel = extractCleanProjectPathFromFileUrl(u);
+          const lbl = String(rawLbl || '').trim();
+          const tok = pushFileRef(u);
+          const cleanLbl = lbl.replace(/\\\\/g, '/').split(/[:#]/)[0].trim();
+          if (
+            !cleanLbl ||
+            cleanLbl.toLowerCase().indexOf('file://') >= 0 ||
+            cleanLbl === rel ||
+            rel.endsWith('/' + cleanLbl)
+          ) {
+            return tok;
+          }
+          return lbl + ' (' + tok + ')';
+        })
+        .replace(/file:\\/\\/\\/?[^\\s<>)"'`]+/gi, (rawMatch) => {
+          const trailMatch = /([.,;:!?]+)$/.exec(rawMatch);
+          const trail = trailMatch ? trailMatch[1] : '';
+          const core = trail ? rawMatch.slice(0, -trail.length) : rawMatch;
+          return pushFileRef(core) + trail;
+        });
+      const escaped = escapeHtml(withCleanPaths);
       const lines = escaped.split('\\n');
       const toc = [];
       const out = [];
@@ -7578,6 +7743,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             '<pre><code>' + escapeHtml(cb.raw) + '</code></pre>' +
           '</div>';
         html = html.replace('@@AF_FCODE_' + idx + '@@', () => blockHtml);
+      });
+      fileRefs.forEach((relPath, idx) => {
+        const refHtml = '<code class="md-file-ref">' + escapeHtml(relPath) + '</code>';
+        html = html.replace('@@AF_FPATH_' + idx + '@@', () => refHtml);
       });
       return { html: '<div class="md-body">' + html + '</div>', toc, codeBlocks };
     }
@@ -7779,6 +7948,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         timeHtml;
     }
 
+    function isLongAuditorReply(rawText) {
+      const text = String(rawText || '').replace(/\\r\\n?/g, '\\n').trim();
+      if (!text) return false;
+      if (text.length > 420) return true;
+      return text.split('\\n').length > 8;
+    }
+
+    function isQuestionsTabEntry(m) {
+      if (!m || typeof m !== 'object') return false;
+      const kind = String(m.kind || m.mode || 'chat').trim().toLowerCase();
+      if (kind === 'audit' || kind === 'document') return false;
+      const mode = String(m.mode || '').trim().toLowerCase();
+      if (mode === 'audit' || mode === 'document') return false;
+      const text = String(m.content || '').trim();
+      if (!text) return false;
+      if (/^audita el proyecto completo\\s*:/i.test(text)) return false;
+      if (/^genera un documento t[eé]cnico y gu[ií]a de uso completa/i.test(text)) return false;
+      return m.role === 'user' || m.role === 'assistant';
+    }
+
     function renderAuditChatTab(pid, readOnlyModifying) {
       const container = document.getElementById('tab-audit');
       if (!container) return;
@@ -7797,12 +7986,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .reverse();
       const chatEntries = msgs
         .map((m, idx) => ({ entry: m, origIdx: idx }))
-        .filter((x) => {
-          const m = x.entry;
-          if (!m) return false;
-          if (m.mode === 'chat') return true;
-          return m.role === 'user' && (m.mode === 'audit' || m.mode === 'document');
-        });
+        .filter((x) => isQuestionsTabEntry(x.entry));
+      const collapseOverrides = (state.chatMsgCollapseOverrideByPid && state.chatMsgCollapseOverrideByPid[pid]) || {};
       const activeSub = (state.auditSubTabByPid && state.auditSubTabByPid[pid]) || 'index';
       const activeFilter = (state.auditFilterByPid && state.auditFilterByPid[pid]) || 'all';
       const selectedReportId = (state.selectedAuditMsgIdByPid && state.selectedAuditMsgIdByPid[pid]) || null;
@@ -7814,6 +7999,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         activeFilter,
         selectedReportId,
         cps.length,
+        collapseOverrides,
         msgs.map((m) => [
           m.id,
           m.role,
@@ -7950,32 +8136,65 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         indexBodyHtml = filtersHtml + cardsHtml;
       }
 
+      let lastAssistantChatIdx = -1;
+      for (let ci = chatEntries.length - 1; ci >= 0; ci--) {
+        if (chatEntries[ci].entry.role === 'assistant') {
+          lastAssistantChatIdx = ci;
+          break;
+        }
+      }
+
       const chatMsgsHtml = chatEntries.length
-        ? chatEntries.map((item) => {
+        ? chatEntries.map((item, chatIdx) => {
             const m = item.entry;
             const idx = item.origIdx;
+            const msgKey = String(m.id || ('idx-' + idx));
             const isUser = m.role === 'user';
-            const modeLabel = m.mode === 'audit' ? 'Auditoría' : (m.mode === 'document' ? 'Documento .md' : 'Consulta');
-            const who = isUser ? ('Tú · ' + modeLabel) : ('Auditor · ' + modeLabel);
+            const rawContent = String(m.content || '');
+            const hasRealContent = Boolean(rawContent.trim());
+            const who = isUser ? 'Tú' : 'Auditor';
             const verStr = inferAuditVersionBadge(m, cps);
             let bodyHtml = '';
+            let collapseBtnHtml = '';
             if (isUser) {
-              bodyHtml = '<div class="audit-msg-body">' + escapeHtml(m.content || '') + '</div>';
+              bodyHtml = '<div class="audit-msg-body">' + escapeHtml(rawContent.trim()) + '</div>';
             } else {
-              const parsed = renderSafeMarkdown(m.content || '');
+              const parsed = renderSafeMarkdown(rawContent);
               const baseOffset = allCodeBlocks.length;
               parsed.codeBlocks.forEach((cb) => allCodeBlocks.push(cb));
-              bodyHtml = parsed.html.replace(/data-md-code-idx="(\\d+)"/g, (_mt, n) =>
+              const renderedMd = parsed.html.replace(/data-md-code-idx="(\\d+)"/g, (_mt, n) =>
                 'data-md-code-idx="' + (Number(n) + baseOffset) + '"'
               );
+              const isLong = isLongAuditorReply(rawContent);
+              const defaultExpanded = chatIdx === lastAssistantChatIdx;
+              const isExpanded = (msgKey in collapseOverrides)
+                ? Boolean(collapseOverrides[msgKey])
+                : defaultExpanded;
+              if (isLong) {
+                const collapsedCls = isExpanded ? '' : ' collapsed';
+                const fadeHtml = isExpanded ? '' : '<div class="chat-msg-fade" aria-hidden="true"></div>';
+                const toggleLabel = isExpanded ? 'Colapsar' : 'Ver respuesta completa';
+                bodyHtml =
+                  '<div class="chat-msg-collapsible' + collapsedCls + '">' +
+                    renderedMd +
+                    fadeHtml +
+                  '</div>';
+                collapseBtnHtml =
+                  '<button type="button" class="chat-collapse-btn" data-chat-toggle="' + escapeHtml(msgKey) + '" aria-expanded="' + (isExpanded ? 'true' : 'false') + '">' +
+                    toggleLabel +
+                  '</button>';
+              } else {
+                bodyHtml = renderedMd;
+              }
             }
-            const actionsHtml = !isUser
-              ? '<div class="audit-msg-actions">' +
-                  '<button class="btn btn-sm" type="button" data-audit-dl="' + idx + '">Descargar .md</button>' +
-                  '<button class="btn btn-sm" type="button" data-audit-apply="' + idx + '"' + disabledAttr + '>Enviar hallazgos a Aplicar cambios</button>' +
+            const actionsHtml = (!isUser && hasRealContent)
+              ? '<div class="audit-msg-actions chat-msg-footer">' +
+                  '<button class="chat-action-link" type="button" data-audit-dl="' + idx + '">Descargar .md</button>' +
+                  '<span class="chat-action-sep" aria-hidden="true">·</span>' +
+                  '<button class="chat-action-link" type="button" data-audit-apply="' + idx + '"' + disabledAttr + '>Enviar hallazgos a Aplicar cambios</button>' +
                 '</div>'
               : '';
-            return '<div class="audit-msg ' + (isUser ? 'user' : 'assistant') + '">' +
+            return '<div class="audit-msg chat-msg ' + (isUser ? 'user' : 'assistant') + '">' +
               '<div class="audit-msg-head">' +
                 '<span style="display:inline-flex; gap:6px; align-items:center; flex-wrap:wrap;"><strong>' + escapeHtml(who) + '</strong>' +
                   (verStr ? '<span class="model-pill">' + escapeHtml(verStr) + '</span>' : '') +
@@ -7983,10 +8202,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 '<span>' + escapeHtml(formatFriendlyTime(m.created_at)) + '</span>' +
               '</div>' +
               bodyHtml +
+              collapseBtnHtml +
               actionsHtml +
             '</div>';
           }).join('')
-        : '<div class="muted" style="font-size:0.86rem;">Consulta código, solicita una auditoría de solo lectura o genera documentación en Markdown sin alterar tus archivos.</div>';
+        : '<div class="muted" style="font-size:0.88rem; padding:12px 4px;">Haz una pregunta puntual sobre el código, rutas o arquitectura de este proyecto.</div>';
 
       const placeholderTxt = isReadOnly
         ? 'Disponible al terminar los cambios...'
@@ -8012,21 +8232,45 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         '</div>' +
         '<div id="audit-index" style="display:' + (activeSub === 'index' ? 'flex' : 'none') + ';">' + indexBodyHtml + '</div>' +
         '<div id="audit-questions-pane" style="display:' + (activeSub === 'questions' ? 'block' : 'none') + ';">' +
-          '<div id="audit-chat-history" class="audit-thread">' + chatMsgsHtml + '</div>' +
-          '<div class="input-row-with-mic">' +
-            '<textarea id="audit-chat-input" class="input-field" rows="2" placeholder="' + escapeHtml(placeholderTxt) + '"' + disabledAttr + '>' + escapeHtml(draft) + '</textarea>' +
-            '<button id="audit-chat-mic-btn" class="btn btn-sm mic-btn" type="button" title="Dictar consulta por voz (es-MX)"' + disabledAttr + '>🎤</button>' +
-          '</div>' +
-          '<div class="banner-actions">' +
-            '<button id="audit-chat-send-btn" class="btn btn-primary btn-sm" type="button"' + disabledAttr + '>Enviar consulta</button>' +
-            '<span id="audit-inline-status"></span>' +
+          '<div id="audit-chat-panel">' +
+            '<div id="audit-chat-history" class="audit-thread audit-chat-stream">' + chatMsgsHtml + '</div>' +
+            '<div class="audit-chat-composer">' +
+              '<div class="input-row-with-mic">' +
+                '<textarea id="audit-chat-input" class="input-field" rows="2" placeholder="' + escapeHtml(placeholderTxt) + '"' + disabledAttr + '>' + escapeHtml(draft) + '</textarea>' +
+                '<button id="audit-chat-mic-btn" class="btn btn-sm mic-btn" type="button" title="Dictar consulta por voz (es-MX)"' + disabledAttr + '>🎤</button>' +
+              '</div>' +
+              '<div class="banner-actions" style="margin-top:0;">' +
+                '<button id="audit-chat-send-btn" class="btn btn-primary btn-sm" type="button"' + disabledAttr + '>Enviar consulta</button>' +
+                '<span id="audit-inline-status"></span>' +
+              '</div>' +
+            '</div>' +
           '</div>' +
         '</div>';
 
       const threadEl = document.getElementById('audit-chat-history');
       if (threadEl && activeSub === 'questions') {
-        threadEl.scrollTop = threadEl.scrollHeight;
+        if (typeof state.preserveChatScrollTop === 'number') {
+          threadEl.scrollTop = state.preserveChatScrollTop;
+          state.preserveChatScrollTop = null;
+        } else {
+          threadEl.scrollTop = threadEl.scrollHeight;
+        }
       }
+
+      container.querySelectorAll('button[data-chat-toggle]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const msgKey = btn.getAttribute('data-chat-toggle');
+          if (!msgKey) return;
+          if (!state.chatMsgCollapseOverrideByPid[pid]) {
+            state.chatMsgCollapseOverrideByPid[pid] = {};
+          }
+          const currentlyExpanded = btn.getAttribute('aria-expanded') === 'true';
+          state.chatMsgCollapseOverrideByPid[pid][msgKey] = !currentlyExpanded;
+          state.preserveChatScrollTop = threadEl ? threadEl.scrollTop : 0;
+          state.lastChatSig = null;
+          renderAuditChatTab(pid, isReadOnly);
+        });
+      });
 
       const inputEl = document.getElementById('audit-chat-input');
       const sendBtn = document.getElementById('audit-chat-send-btn');
