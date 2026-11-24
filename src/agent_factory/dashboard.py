@@ -24,8 +24,10 @@ from agent_factory.domain.events import Event, EventType
 from agent_factory.domain.models import ApprovalEvent, ProjectStatus, validate_project_id
 from agent_factory.domain.states import IllegalTransition, ProjectState
 from agent_factory.orchestrator import (
+    BACKGROUND_OP_ORPHAN_SECONDS,
     ApprovalError,
     Orchestrator,
+    _parse_utc_iso_timestamp,
     synthesize_project_title,
     validate_chat_entry_id,
 )
@@ -150,6 +152,9 @@ class DashboardController:
             )
         self._lock = threading.RLock()
         self._active_projects: set[str] = set()
+        self._active_ops: dict[str, dict[str, Any]] = {}
+        self._project_threads: dict[str, threading.Thread] = {}
+        self._op_seq = 0
         self._threads: list[threading.Thread] = []
 
     def _get_live_status_info(self, running: bool) -> dict[str, Any]:
@@ -214,25 +219,134 @@ class DashboardController:
             "max_rounds": _opt_int(live.get("max_rounds"), allow_zero=False),
         }
 
+    def _has_live_thread(self, project_id: str) -> bool:
+        """Return True if a tracked background thread for project_id is currently alive."""
+        with self._lock:
+            t = self._project_threads.get(project_id)
+            return bool(t is not None and t.is_alive())
+
+    def _reconcile_running_state(
+        self,
+        project_id: str,
+        *,
+        force: bool = False,
+        reason: str = "",
+    ) -> tuple[bool, dict[str, Any] | None, bool]:
+        """Reconcile in-memory locks and persistent background ops, auto-healing orphans."""
+        validate_project_id(project_id)
+        has_live_thread = self._has_live_thread(project_id)
+        healed_bg, open_op = self.orchestrator.heal_orphaned_background_op(
+            project_id,
+            has_live_thread=has_live_thread,
+            force=force,
+            reason=reason,
+            chats_dir=self.chats_dir,
+            extra_secrets=self.secrets_to_redact,
+        )
+
+        healed_mem = False
+        active_mem_op: dict[str, Any] | None = None
+        now_dt = _parse_utc_iso_timestamp(self.orchestrator._now().isoformat())
+        with self._lock:
+            in_active = project_id in self._active_projects
+            mem_op = self._active_ops.get(project_id)
+            t = self._project_threads.get(project_id)
+            thread_alive = bool(t is not None and t.is_alive())
+            thread_dead = t is not None and not t.is_alive()
+
+            if healed_bg or force:
+                if in_active or mem_op is not None or t is not None:
+                    self._active_projects.discard(project_id)
+                    self._active_ops.pop(project_id, None)
+                    self._project_threads.pop(project_id, None)
+                    healed_mem = True
+            elif in_active and mem_op is not None:
+                started_dt = mem_op.get("started_at_dt")
+                elapsed_secs = (
+                    (now_dt - started_dt).total_seconds()
+                    if (now_dt is not None and started_dt is not None)
+                    else 0.0
+                )
+                op_boot = str(mem_op.get("server_boot_id") or "").strip()
+                has_thread_flag = bool(mem_op.get("has_thread"))
+                stale_boot = (op_boot != self.orchestrator._server_boot_id) and not thread_alive
+                died_unexpectedly = has_thread_flag and thread_dead
+                expired = elapsed_secs > BACKGROUND_OP_ORPHAN_SECONDS
+                if stale_boot or died_unexpectedly or expired:
+                    self._active_projects.discard(project_id)
+                    self._active_ops.pop(project_id, None)
+                    self._project_threads.pop(project_id, None)
+                    healed_mem = True
+                else:
+                    active_mem_op = dict(mem_op)
+            elif in_active:
+                if thread_dead:
+                    self._active_projects.discard(project_id)
+                    self._project_threads.pop(project_id, None)
+                    healed_mem = True
+                else:
+                    active_mem_op = {}
+
+            still_in_active = project_id in self._active_projects
+            no_active = not self._active_projects
+
+        if (healed_bg or healed_mem or force) and no_active and self.model_resolver is not None:
+            clear_fn = getattr(self.model_resolver, "clear_active_activity", None)
+            if callable(clear_fn):
+                clear_fn()
+
+        eff_op = active_mem_op or open_op
+        running = bool(still_in_active or (open_op is not None and not force))
+        return running, (eff_op if eff_op else None), bool(healed_bg or healed_mem)
+
     def is_busy(self, project_id: str) -> bool:
         """Return True if a background task is currently executing for project_id."""
-        with self._lock:
-            return project_id in self._active_projects
+        return self.is_running(project_id)
 
     def is_running(self, project_id: str) -> bool:
         """Return True if an active task thread is currently running for project_id."""
-        with self._lock:
-            return project_id in self._active_projects
+        running, _, _ = self._reconcile_running_state(project_id)
+        return running
 
-    def mark_running(self, project_id: str) -> None:
+    def mark_running(
+        self,
+        project_id: str,
+        *,
+        op_id: str | None = None,
+        op_type: str = "background",
+        activity_summary: str = "",
+        stage: str | None = None,
+        agents_count: int | None = None,
+    ) -> None:
         """Register project_id as having an active task running in memory."""
+        now_dt = _parse_utc_iso_timestamp(self.orchestrator._now().isoformat())
         with self._lock:
+            self._op_seq += 1
+            eff_op_id = str(op_id or f"mem-{self._op_seq}").strip()
             self._active_projects.add(project_id)
+            self._active_ops[project_id] = {
+                "op_id": eff_op_id,
+                "op_type": str(op_type or "background").strip(),
+                "started_at": now_dt.isoformat() if now_dt is not None else None,
+                "started_at_dt": now_dt,
+                "server_boot_id": self.orchestrator._server_boot_id,
+                "has_thread": False,
+                "activity_summary": str(activity_summary or "").strip(),
+                "stage": str(stage or "").strip(),
+                "agents_count": agents_count,
+            }
 
     def mark_stopped(self, project_id: str) -> None:
         """Unregister project_id from active running tasks."""
         with self._lock:
             self._active_projects.discard(project_id)
+            self._active_ops.pop(project_id, None)
+            self._project_threads.pop(project_id, None)
+            no_active = not self._active_projects
+        if no_active and self.model_resolver is not None:
+            clear_fn = getattr(self.model_resolver, "clear_active_activity", None)
+            if callable(clear_fn):
+                clear_fn()
 
     def wait_for_idle(self, timeout: float = 5.0) -> bool:
         """Wait for all active background dashboard tasks to finish within timeout seconds."""
@@ -248,32 +362,118 @@ class DashboardController:
                 return False
             alive[0].join(timeout=min(remaining, 0.2))
 
-    def _start_background(self, project_id: str, target: Callable[[], None]) -> bool:
+    def _start_background(
+        self,
+        project_id: str,
+        target: Callable[..., None],
+        *,
+        op_id: str | None = None,
+        op_type: str = "background",
+        activity_summary: str = "",
+        stage: str | None = None,
+        agents_count: int | None = None,
+        record_event: bool = False,
+        accepts_op_id: bool = False,
+    ) -> bool:
         """Run target in a daemon thread if project_id does not already have a running job."""
         with self._lock:
+            self._reconcile_running_state(project_id)
             if project_id in self._active_projects:
                 raise ProjectConflictError(
                     f"Project '{project_id}' already has an active background operation"
                 )
+            if record_event:
+                started_ev = self.orchestrator.record_background_op_started(
+                    project_id,
+                    op_type=op_type,
+                    op_id=op_id,
+                    activity_summary=activity_summary,
+                    stage=stage,
+                    agents_count=agents_count,
+                    extra_secrets=self.secrets_to_redact,
+                )
+                eff_op_id = str((started_ev.payload or {}).get("op_id") or started_ev.id)
+                started_iso = str(
+                    (started_ev.payload or {}).get("started_at") or started_ev.at.isoformat()
+                )
+                started_dt = _parse_utc_iso_timestamp(started_iso)
+            else:
+                self._op_seq += 1
+                eff_op_id = str(op_id or f"mem-{self._op_seq}").strip()
+                started_dt = _parse_utc_iso_timestamp(self.orchestrator._now().isoformat())
+                started_iso = started_dt.isoformat() if started_dt is not None else None
+
             self._active_projects.add(project_id)
+            self._active_ops[project_id] = {
+                "op_id": eff_op_id,
+                "op_type": str(op_type or "background").strip(),
+                "started_at": started_iso,
+                "started_at_dt": started_dt,
+                "server_boot_id": self.orchestrator._server_boot_id,
+                "has_thread": True,
+                "activity_summary": str(activity_summary or "").strip(),
+                "stage": str(stage or "").strip(),
+                "agents_count": agents_count,
+            }
 
             def _runner() -> None:
+                op_status = "completed"
+                op_reason = ""
                 try:
-                    target()
+                    if accepts_op_id:
+                        target(eff_op_id)
+                    else:
+                        target()
+                except Exception as exc:
+                    op_status = "failed"
+                    op_reason = str(exc) or exc.__class__.__name__
+                    raise
                 finally:
-                    with self._lock:
-                        self._active_projects.discard(project_id)
-                        no_active = not self._active_projects
-                    if no_active and self.model_resolver is not None:
-                        clear_fn = getattr(self.model_resolver, "clear_active_activity", None)
-                        if callable(clear_fn):
-                            clear_fn()
+                    try:
+                        if record_event:
+                            cur_events = self.orchestrator.store.get_events(project_id)
+                            open_op = self.orchestrator.get_open_background_op(
+                                project_id, events=cur_events
+                            )
+                            if open_op is not None and str(open_op.get("op_id") or "") == eff_op_id:
+                                now_fin = _parse_utc_iso_timestamp(
+                                    self.orchestrator._now().isoformat()
+                                )
+                                dur = (
+                                    (now_fin - started_dt).total_seconds()
+                                    if (now_fin is not None and started_dt is not None)
+                                    else None
+                                )
+                                self.orchestrator.record_background_op_finished(
+                                    project_id,
+                                    op_id=eff_op_id,
+                                    op_type=op_type,
+                                    status=op_status,
+                                    reason=op_reason,
+                                    duration_seconds=dur,
+                                    extra_secrets=self.secrets_to_redact,
+                                )
+                    finally:
+                        with self._lock:
+                            cur_op = self._active_ops.get(project_id)
+                            if cur_op is not None and str(cur_op.get("op_id") or "") == eff_op_id:
+                                self._active_projects.discard(project_id)
+                                self._active_ops.pop(project_id, None)
+                                self._project_threads.pop(project_id, None)
+                            elif cur_op is None:
+                                self._project_threads.pop(project_id, None)
+                            no_active = not self._active_projects
+                        if no_active and self.model_resolver is not None:
+                            clear_fn = getattr(self.model_resolver, "clear_active_activity", None)
+                            if callable(clear_fn):
+                                clear_fn()
 
             t = threading.Thread(
                 target=_runner,
                 name=f"dashboard-{project_id}",
                 daemon=True,
             )
+            self._project_threads[project_id] = t
             self._threads = [existing for existing in self._threads if existing.is_alive()]
             self._threads.append(t)
             t.start()
@@ -393,11 +593,28 @@ class DashboardController:
         events: Sequence[Event],
         *,
         has_plan: bool,
+        reconciled: tuple[bool, dict[str, Any] | None, bool] | None = None,
     ) -> dict[str, Any]:
+        if reconciled is None:
+            running, active_op, healed = self._reconcile_running_state(project_id)
+            if healed:
+                events = self.orchestrator.store.get_events(project_id)
+                status = self.orchestrator.get_status(project_id)
+        else:
+            running, active_op, _ = reconciled
         last_error = self._extract_last_error(status, events)
         last_event_at = events[-1].at.isoformat() if events else None
-        running = self.is_running(project_id)
         live_info = self._get_live_status_info(running)
+        if running and active_op:
+            op_summary = str(active_op.get("activity_summary") or "").strip()
+            op_agents = active_op.get("agents_count")
+            cur_act = str(live_info.get("activity_summary") or "").strip()
+            if op_summary and (
+                not cur_act or "Analizando tu idea y preparando preguntas" in cur_act
+            ):
+                live_info["activity_summary"] = op_summary
+            if (not live_info.get("agents_count")) and isinstance(op_agents, int) and op_agents > 0:
+                live_info["agents_count"] = op_agents
         if running and status.state == ProjectState.DELIVERED:
             cur_act = str(live_info.get("activity_summary") or "").strip()
             if not cur_act or "Analizando tu idea y preparando preguntas" in cur_act:
@@ -405,6 +622,19 @@ class DashboardController:
             if not live_info.get("agents_count"):
                 live_info["agents_count"] = 2
         raw = status.model_dump(mode="json")
+        op_started_at: str | None = None
+        if running:
+            raw_op_started = str((active_op or {}).get("started_at") or "").strip()
+            op_started_at = (
+                raw_op_started
+                or (str(raw.get("step_started_at") or "").strip() if status.state != ProjectState.DELIVERED else "")
+                or last_event_at
+            )
+            if op_started_at and (
+                not raw.get("step_started_at") or status.state == ProjectState.DELIVERED
+            ):
+                raw["step_started_at"] = op_started_at
+        raw["op_started_at"] = op_started_at
         raw["last_error"] = last_error
         raw["has_plan"] = has_plan
         raw["busy"] = running
@@ -462,6 +692,9 @@ class DashboardController:
         if not events:
             raise ProjectNotFoundError(f"Project '{project_id}' not found")
 
+        reconciled = self._reconcile_running_state(project_id)
+        if reconciled[2]:
+            events = self.orchestrator.store.get_events(project_id)
         status = self.orchestrator.get_status(project_id)
         self._sync_external_workspace(project_id, status)
         spec = self.orchestrator.get_spec(project_id)
@@ -495,13 +728,18 @@ class DashboardController:
         ]
 
         summary = self._serialize_summary(
-            project_id, status, events, has_plan=(plan is not None)
+            project_id,
+            status,
+            events,
+            has_plan=(plan is not None),
+            reconciled=reconciled,
         )
         return {
             "project_id": project_id,
             "status": summary,
             "questions": _scrub_value(clean_questions, self.secrets_to_redact),
             "is_running": summary["is_running"],
+            "op_started_at": summary.get("op_started_at"),
             "local_app": summary["local_app"],
             "logo_url": summary["logo_url"],
             "active_model": summary["active_model"],
@@ -530,6 +768,7 @@ class DashboardController:
             raise ProjectNotFoundError(f"Project '{project_id}' not found")
 
         with self._lock:
+            self._reconcile_running_state(project_id)
             if project_id in self._active_projects:
                 raise ProjectConflictError(
                     f"Project '{project_id}' already has an active background operation"
@@ -896,6 +1135,7 @@ class DashboardController:
         """Restore isolated repository to commit_sha, run pytest + smoke test, push if remote, and record DELIVERED."""
         self._require_project_events(project_id)
         with self._lock:
+            self._reconcile_running_state(project_id)
             if project_id in self._active_projects:
                 raise ProjectConflictError(
                     f"Project '{project_id}' already has an active background operation"
@@ -944,6 +1184,7 @@ class DashboardController:
         """Run read-only ParentAuditor evaluation, update current version scorecard, and persist report."""
         self._require_project_events(project_id)
         with self._lock:
+            self._reconcile_running_state(project_id)
             if project_id in self._active_projects:
                 raise ProjectConflictError(
                     f"Project '{project_id}' already has an active background operation"
@@ -1007,6 +1248,7 @@ class DashboardController:
             raise TypeError("El campo 'force_polish' debe ser booleano.")
         self._require_project_events(project_id)
         with self._lock:
+            self._reconcile_running_state(project_id)
             if project_id in self._active_projects:
                 raise ProjectConflictError(
                     f"Project '{project_id}' already has an active background operation"
@@ -1060,7 +1302,7 @@ class DashboardController:
 
             self.local_runner.stop(project_id)
 
-            def _run_improve() -> None:
+            def _run_improve(bg_op_id: str | None = None) -> None:
                 try:
                     res = self.orchestrator.improve_project_quality(
                         project_id,
@@ -1068,6 +1310,7 @@ class DashboardController:
                         chats_dir=self.chats_dir,
                         force_polish=force_polish,
                         extra_secrets=self.secrets_to_redact,
+                        _bg_op_id=bg_op_id,
                     )
                     sc = res.get("scorecard") or {}
                     tier_lbl = sc.get("tier_label") or "🥇 Producción"
@@ -1105,7 +1348,16 @@ class DashboardController:
                         f"{redact_secrets(str(exc), extra_secrets=self.secrets_to_redact)}",
                     )
 
-            background_started = self._start_background(project_id, _run_improve)
+            background_started = self._start_background(
+                project_id,
+                _run_improve,
+                op_type="quality_improve",
+                activity_summary="Refinando calidad con debate de 2 agentes...",
+                stage="DELIVERED",
+                agents_count=2,
+                record_event=True,
+                accepts_op_id=True,
+            )
 
         summary = self._serialize_summary(
             project_id,
@@ -1431,6 +1683,7 @@ class DashboardController:
             raise ValueError("El campo 'instructions' es obligatorio.")
 
         with self._lock:
+            self._reconcile_running_state(project_id)
             if project_id in self._active_projects:
                 raise ProjectConflictError(
                     f"Project '{project_id}' already has an active background operation"
@@ -1496,7 +1749,15 @@ class DashboardController:
                                 extra_secrets=self.secrets_to_redact,
                             )
 
-                background_started = self._start_background(project_id, _run_modify_build)
+                background_started = self._start_background(
+                    project_id,
+                    _run_modify_build,
+                    op_type="modify",
+                    activity_summary="Aplicando cambios solicitados...",
+                    stage="BUILDING",
+                    agents_count=2,
+                    record_event=True,
+                )
 
             summary = self._serialize_summary(
                 project_id,
@@ -1523,6 +1784,7 @@ class DashboardController:
             raise ValueError("El campo 'message' es obligatorio.")
 
         with self._lock:
+            self._reconcile_running_state(project_id)
             if project_id in self._active_projects:
                 raise ProjectConflictError(
                     f"Project '{project_id}' already has an active background operation"
@@ -1585,6 +1847,7 @@ class DashboardController:
             raise ProjectNotFoundError(f"Project '{project_id}' not found")
 
         with self._lock:
+            self._reconcile_running_state(project_id)
             if project_id in self._active_projects:
                 raise ProjectConflictError(
                     f"Project '{project_id}' already has an active background operation"
@@ -1627,10 +1890,56 @@ class DashboardController:
             "background_started": background_started,
         }
 
+    def recover_project(self, project_id: str) -> dict[str, Any]:
+        """Force-unlock any orphaned or stuck background operation, chat, or activity state."""
+        validate_project_id(project_id)
+        events = self.orchestrator.store.get_events(project_id)
+        if not events:
+            raise ProjectNotFoundError(f"Project '{project_id}' not found")
+
+        with self._lock:
+            _, _, healed_op = self._reconcile_running_state(
+                project_id,
+                force=True,
+                reason="Operación desbloqueada manualmente desde el panel.",
+            )
+            healed_chats = self.orchestrator.heal_orphaned_chat_entries(
+                project_id,
+                chats_dir=self.chats_dir,
+                force=True,
+            )
+            self._active_projects.discard(project_id)
+            self._active_ops.pop(project_id, None)
+            self._project_threads.pop(project_id, None)
+            no_active = not self._active_projects
+        if no_active and self.model_resolver is not None:
+            clear_fn = getattr(self.model_resolver, "clear_active_activity", None)
+            if callable(clear_fn):
+                clear_fn()
+
+        refreshed_events = self.orchestrator.store.get_events(project_id)
+        status = self.orchestrator.get_status(project_id)
+        has_plan = self.orchestrator.get_plan(project_id) is not None
+        summary = self._serialize_summary(
+            project_id,
+            status,
+            refreshed_events,
+            has_plan=has_plan,
+            reconciled=(False, None, bool(healed_op or healed_chats)),
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "unlocked": bool(healed_op or healed_chats),
+            "recovered": True,
+            "status": summary,
+        }
+
     def delete_project(self, project_id: str) -> dict[str, Any]:
         """Delete project events from SQLite and remove workspaces/<project_id> if present."""
         validate_project_id(project_id)
         with self._lock:
+            self._reconcile_running_state(project_id)
             if project_id in self._active_projects:
                 raise ProjectConflictError(
                     f"Project '{project_id}' has an active background operation in progress"
@@ -4905,6 +5214,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         'PROJECT_RETRIED': 'Reanudación iniciada',
         'PHASE_ERROR': 'Error en la etapa',
         'PROJECT_DELIVERED': '¡Proyecto entregado con éxito!',
+        'BACKGROUND_OP_STARTED': 'Operación en segundo plano',
+        'BACKGROUND_OP_FINISHED': 'Operación finalizada',
         'REGISTRY_PUBLISH_FAILED': 'Error al publicar registro',
       };
       return labels[type] || type;
@@ -4958,6 +5269,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         case 'PROJECT_COMPLETED':
         case 'COMPLETED':
           return '¡Proyecto entregado con éxito!';
+        case 'BACKGROUND_OP_STARTED':
+          return String(pl.activity_summary || 'Inicio de operación en segundo plano');
+        case 'BACKGROUND_OP_FINISHED':
+          return (pl.status === 'interrupted')
+            ? String(pl.reason || 'Operación interrumpida o desbloqueada')
+            : 'Operación en segundo plano completada';
         case 'REGISTRY_PUBLISH_FAILED':
           return 'Aviso al publicar registro';
         case 'STATE_TRANSITIONED':
@@ -5007,6 +5324,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           return pl.state ? stateToPhaseNum(pl.state) : 4;
         case 'PROJECT_FAILED':
           return pl.failed_from ? stateToPhaseNum(pl.failed_from) : 4;
+        case 'BACKGROUND_OP_STARTED':
+        case 'BACKGROUND_OP_FINISHED':
+          return pl.stage ? stateToPhaseNum(pl.stage) : 5;
         default:
           return 1;
       }
@@ -5145,17 +5465,35 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    function formatHandoffElapsed(pid, startedIso) {
-      const parsedMs = startedIso ? Date.parse(startedIso) : NaN;
+    function resolveOperationStartMs(st, pid, fallbackIso) {
+      const targetPid = pid || (st && st.project_id) || state.selectedId;
+      const startIso = (st && st.op_started_at)
+        || fallbackIso
+        || (st && (st.step_started_at || st.last_event_at))
+        || '';
+      const parsedMs = startIso ? Date.parse(startIso) : NaN;
       let startMs = isFinite(parsedMs) ? parsedMs : NaN;
-      if (state.opHandoff && state.opHandoff.pid === pid && (Date.now() - state.opHandoff.endedAtMs) < 30000) {
+      if (state.opHandoff && state.opHandoff.pid === targetPid && (Date.now() - state.opHandoff.endedAtMs) < 30000) {
         if (!isFinite(startMs) || startMs >= (state.opHandoff.startedAtMs - 1500)) {
           startMs = state.opHandoff.startedAtMs;
         }
       }
-      if (!isFinite(startMs)) return '';
-      const elapsedSecs = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
-      return formatDurationHuman(elapsedSecs, '0s') || '0s';
+      return startMs;
+    }
+
+    function resolveOperationElapsedSeconds(st, pid, fallbackIso) {
+      const startMs = resolveOperationStartMs(st, pid, fallbackIso);
+      if (!isFinite(startMs)) return null;
+      return Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+    }
+
+    function formatHandoffElapsed(pid, startedIso) {
+      const st = (state.detail && state.detail.status && (!pid || state.detail.status.project_id === pid))
+        ? state.detail.status
+        : null;
+      const elapsedSecs = resolveOperationElapsedSeconds(st, pid, startedIso);
+      if (elapsedSecs === null) return '';
+      return formatClockMmSs(elapsedSecs);
     }
 
     function renderLiveActivityBanner() {
@@ -5178,9 +5516,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         stalled = httpSecs >= STALL_HTTP_SECONDS;
       } else if (state.detail && state.detail.status && (state.detail.status.is_running || state.detail.status.busy)) {
         const st = state.detail.status;
-        const refIso = st.last_event_at || st.step_started_at;
-        const refMs = refIso ? Date.parse(refIso) : NaN;
-        const idleMins = isFinite(refMs) ? ((Date.now() - refMs) / 60000) : 0;
+        const refIso = st.op_started_at || st.step_started_at || st.last_event_at || '';
+        const refMs = resolveOperationStartMs(st, st.project_id, refIso);
+        const idleSecs = resolveOperationElapsedSeconds(st, st.project_id, refIso);
+        const idleMins = idleSecs !== null ? (idleSecs / 60) : 0;
         if (idleMins >= STALL_BG_MINUTES) {
           label = st.activity_summary || friendlyStateName(st.state) || 'Procesando...';
           subtext = 'Sin cambios recientes en la etapa actual.';
@@ -5279,14 +5618,50 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     (function initActivityBannerInteractions() {
       const reloadBtn = document.getElementById('live-activity-reload-btn');
       if (reloadBtn) {
-        reloadBtn.addEventListener('click', (ev) => {
+        reloadBtn.addEventListener('click', async (ev) => {
           ev.stopPropagation();
+          const targetPid = (state.activeOp && state.activeOp.pid)
+            || (state.detail && state.detail.status && state.detail.status.project_id)
+            || state.selectedId;
           state.activeOp = null;
           state.bgOpStartedAtMs = null;
+          state.opHandoff = null;
           state.lastBannerSignature = null;
+          if (targetPid) {
+            if (state.interviewPendingByPid) {
+              state.interviewPendingByPid[targetPid] = false;
+            }
+            if (state.devMetaLoadedSig) {
+              delete state.devMetaLoadedSig[targetPid];
+            }
+          }
           renderLiveActivityBanner();
-          setNote('Recargando estado del servidor...', 'info');
-          loadProjects();
+          if (targetPid) {
+            reloadBtn.disabled = true;
+            setNote('Limpiando bloqueo y recargando estado del servidor...', 'info');
+            try {
+              const resp = await fetch('/api/projects/' + encodeURIComponent(targetPid) + '/recover', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: '{}',
+              });
+              const data = await resp.json().catch(() => ({}));
+              if (resp.ok && data && data.unlocked) {
+                setNote('Estado desbloqueado y recargado desde el servidor.', 'ok');
+              } else if (resp.ok) {
+                setNote('Estado actualizado desde el servidor.', 'info');
+              } else {
+                setNote((data && data.error) || 'No se pudo recargar el estado.', 'err');
+              }
+            } catch (err) {
+              setNote(err && err.message ? err.message : 'Error al recargar estado.', 'err');
+            } finally {
+              reloadBtn.disabled = false;
+            }
+          } else {
+            setNote('Recargando estado del servidor...', 'info');
+          }
+          await loadProjects();
         });
       }
       const banner = document.getElementById('live-activity-banner');
@@ -5303,9 +5678,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.querySelectorAll('.live-step-timer[data-started-at]').forEach((el) => {
         const startedAt = el.getAttribute('data-started-at');
         const pid = el.getAttribute('data-pid') || state.selectedId;
-        const formatted = formatHandoffElapsed(pid, startedAt);
-        if (formatted) {
-          el.textContent = 'Tiempo en este paso: ' + formatted;
+        const st = (state.detail && state.detail.status && (!pid || state.detail.status.project_id === pid))
+          ? state.detail.status
+          : null;
+        const elapsedSecs = resolveOperationElapsedSeconds(st, pid, startedAt);
+        if (elapsedSecs !== null) {
+          el.textContent = 'Tiempo en este paso: ' + formatClockMmSs(elapsedSecs);
         }
       });
       renderLiveActivityBanner();
@@ -5346,9 +5724,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const modelPill = st.active_model
           ? '<span class="model-pill tech-only">Modelo: ' + escapeHtml(st.active_model) + '</span>'
           : '';
-        const elapsedText = st.step_started_at ? formatHandoffElapsed(st.project_id, st.step_started_at) : '';
-        const timerPill = st.step_started_at
-          ? '<span class="model-pill live-step-timer" aria-hidden="true" data-pid="' + escapeHtml(st.project_id) + '" data-started-at="' + escapeHtml(st.step_started_at) + '">Tiempo en este paso: ' + escapeHtml(elapsedText || '0s') + '</span>'
+        const timerOriginIso = st.op_started_at || st.step_started_at || '';
+        const elapsedSecs = resolveOperationElapsedSeconds(st, st.project_id, timerOriginIso);
+        const elapsedText = elapsedSecs !== null ? formatClockMmSs(elapsedSecs) : '';
+        const timerPill = (timerOriginIso || elapsedSecs !== null)
+          ? '<span class="model-pill live-step-timer" aria-hidden="true" data-pid="' + escapeHtml(st.project_id) + '" data-started-at="' + escapeHtml(timerOriginIso) + '">Tiempo en este paso: ' + escapeHtml(elapsedText || '00:00s') + '</span>'
           : '';
         return '<div class="guidance-banner banner-info">' +
           '<div class="banner-content">' +
@@ -5634,7 +6014,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       while (i < rawEvents.length) {
         const ev = rawEvents[i];
         const pl = ev && ev.payload ? ev.payload : {};
-        if (ev.type === 'STATE_TRANSITIONED' || ev.type === 'PRAGMATIST_PROPOSED' || ev.type === 'STRUCTURALIST_CRITIQUED') {
+        if (ev.type === 'STATE_TRANSITIONED' || ev.type === 'PRAGMATIST_PROPOSED' || ev.type === 'STRUCTURALIST_CRITIQUED' || ev.type === 'BACKGROUND_OP_STARTED' || ev.type === 'BACKGROUND_OP_FINISHED') {
           items.push({ kind: 'tech_only', ev });
           i++;
           continue;
@@ -6016,6 +6396,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const activitySummary = st.activity_summary || (state.detail && state.detail.activity_summary) || null;
       const activityDetail = st.activity_detail || (state.detail && state.detail.activity_detail) || null;
       const agentsCount = st.agents_count || (state.detail && state.detail.agents_count) || null;
+      const opStartedAt = st.op_started_at || (state.detail && state.detail.op_started_at) || null;
       const stepStartedAt = st.step_started_at || (state.detail && state.detail.step_started_at) || null;
       const testsPassed = (st.tests_passed !== null && st.tests_passed !== undefined)
         ? st.tests_passed
@@ -6032,6 +6413,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         activity_summary: activitySummary,
         activity_detail: activityDetail,
         agents_count: agentsCount,
+        op_started_at: opStartedAt,
         step_started_at: stepStartedAt,
         tests_passed: testsPassed,
         tests_total: testsTotal,
@@ -6060,6 +6442,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         testsTotal,
         buildRound,
         maxRounds,
+        st.op_started_at,
         st.last_event_at,
         st.last_error,
         questions,
@@ -6437,6 +6820,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         isRunning,
         activeModel,
         events.length,
+        st.op_started_at,
         st.last_event_at,
         st.last_error,
         info.stage,
@@ -8955,6 +9339,7 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         if len(parts) == 2 and parts[1] in {
             "approve",
             "retry",
+            "recover",
             "message",
             "start",
             "stop",
@@ -9148,6 +9533,7 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         if pid is None or action not in {
             "approve",
             "retry",
+            "recover",
             "message",
             "start",
             "stop",
@@ -9171,6 +9557,9 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
                 if not isinstance(raw_clean, bool):
                     raise TypeError("El campo 'clean_workspace' debe ser booleano.")
                 result = ctrl.retry_project(pid, clean_workspace=raw_clean)
+            elif action == "recover":
+                self._drain_body()
+                result = ctrl.recover_project(pid)
             elif action == "start":
                 self._drain_body()
                 result = ctrl.start_local_app(pid)

@@ -7,7 +7,7 @@ import stat
 import threading
 import urllib.error
 import urllib.request
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -5217,4 +5217,365 @@ def test_dashboard_polish_conserves_v1_note_busy_delivered_banner_and_completed_
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_auto_recovers_orphaned_delivered_ops_manual_recover_and_unifies_timers(
+    tmp_path: Path,
+) -> None:
+    """Auto-recover orphaned DELIVERED background ops (>600s or foreign server_boot_id), support POST /recover without 409 from Reintentar / Recargar estado, allow re-running #polish-debate-btn, and unify banner/card timer origin."""
+    import subprocess
 
+    from agent_factory.agents.quality_auditor import ParentAuditor
+    from agent_factory.builder import BuildWorker
+
+    def _mk_delivered_repo(pid_val: str, db_name: str, ws_sub: str, llm_obj: FakeLLM) -> tuple[SqliteEventStore, WorkspaceManager, Path, Orchestrator, str]:
+        st = SqliteEventStore(db_path=tmp_path / db_name)
+        wm = WorkspaceManager(base_dir=tmp_path / ws_sub)
+        wdir = wm.create_workspace(pid_val)
+        (wdir / "index.html").write_text(
+            "<!doctype html><html><body><h1>Base v1</h1></body></html>\n",
+            encoding="utf-8",
+        )
+        (wdir / "tests").mkdir(exist_ok=True)
+        (wdir / "tests" / "test_ok.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
+        subprocess.run(["git", "init"], cwd=wdir, check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-M", "main"], cwd=wdir, check=True, capture_output=True)
+        subprocess.run(["git", "add", "-A"], cwd=wdir, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@local", "commit", "-m", "init v1"],
+            cwd=wdir,
+            check=True,
+            capture_output=True,
+        )
+        sha1 = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=wdir, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        orch_obj = Orchestrator(store=st, llm=llm_obj, workspace_manager=wm)
+        base_t = datetime.now(UTC) - timedelta(minutes=25)
+        plan_d = _plan_payload("Orphan Recovery App")
+        plan_h = Plan.model_validate(plan_d).compute_hash()
+        for ev in (
+            create_event(pid_val, EventType.PROJECT_CREATED, {"name": "Orphan Polish", "objective": "App estable", "state": "INTERVIEW"}, at=base_t),
+            create_event(pid_val, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=base_t),
+            create_event(pid_val, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=base_t),
+            create_event(pid_val, EventType.PLAN_CREATED, {"plan": plan_d, "plan_hash": plan_h, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=base_t),
+            create_event(pid_val, EventType.APPROVAL_RECORDED, {"plan_hash": plan_h, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=base_t),
+            create_event(pid_val, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=base_t),
+            create_event(
+                pid_val,
+                EventType.PROJECT_DELIVERED,
+                {"repo_url": "", "deploy_url": "", "commit_sha": sha1, "version_label": "v1"},
+                at=base_t,
+            ),
+        ):
+            st.append(ev)
+        return st, wm, wdir, orch_obj, sha1
+
+    llm1 = FakeLLM(
+        responses=[
+            {
+                "summary": "Cumple Producción (88%).",
+                "dimensions": {
+                    "ux_ui": {"score": 88.0, "findings": ["Ajustar header"], "improvements": ["Mejorar header"]},
+                    "functional_completeness": {"score": 88.0, "findings": [], "improvements": []},
+                    "robustness": {"score": 88.0, "findings": [], "improvements": []},
+                    "architecture_quality": {"score": 88.0, "findings": [], "improvements": []},
+                    "security_hygiene": {"score": 88.0, "findings": [], "improvements": []},
+                    "testing_runtime": {"score": 88.0, "findings": [], "improvements": []},
+                },
+                "objections": [
+                    {
+                        "dimension": "ux_ui",
+                        "file_path": "index.html",
+                        "severity": "low",
+                        "issue": "Falta landmark main",
+                        "concrete_fix": "Usar main en index.html",
+                    }
+                ],
+            },
+            {
+                "builder_response": "index.html: agregado landmark main.",
+                "surgical_instructions": "Envuelve h1 en main en index.html.",
+            },
+            {
+                "summary": "Pulido a Excelencia (95%).",
+                "resolved_count": 1,
+                "diff_summary": "Agregado landmark main",
+                "dimensions": {
+                    "ux_ui": {"score": 95.0, "findings": [], "improvements": []},
+                    "functional_completeness": {"score": 95.0, "findings": [], "improvements": []},
+                    "robustness": {"score": 95.0, "findings": [], "improvements": []},
+                    "architecture_quality": {"score": 95.0, "findings": [], "improvements": []},
+                    "security_hygiene": {"score": 95.0, "findings": [], "improvements": []},
+                    "testing_runtime": {"score": 95.0, "findings": [], "improvements": []},
+                },
+            },
+        ]
+    )
+    pid1 = "orphan-boot-polish"
+    pid2 = "orphan-timeout-polish"
+    store, ws_mgr, _ws_dir, orch, sha_v1 = _mk_delivered_repo(pid1, "orphan_recovery.db", "ws_orphan_rec", llm1)
+    chats_dir = tmp_path / "chats_orphan_rec"
+    now_utc = datetime.now(UTC)
+
+    # Seed Case 1: unclosed op started 20s ago from another server_boot_id
+    store.append(
+        create_event(
+            pid1,
+            EventType.BACKGROUND_OP_STARTED,
+            {
+                "op_id": "bg-old-boot-1",
+                "op_type": "quality_improve",
+                "server_boot_id": "prior-boot-xyz",
+                "started_at": (now_utc - timedelta(seconds=20)).isoformat(),
+                "activity_summary": "Refinando calidad con debate de 2 agentes...",
+                "stage": "VERIFYING",
+                "agents_count": 2,
+            },
+            at=now_utc - timedelta(seconds=20),
+        )
+    )
+
+    # Seed Case 2 in same store: unclosed op started 620s (> 10 min) ago even with CURRENT server_boot_id
+    ws_dir2 = ws_mgr.create_workspace(pid2)
+    (ws_dir2 / "index.html").write_text("<h1>Timeout test</h1>\n", encoding="utf-8")
+    plan_d2 = _plan_payload("Timeout App")
+    plan_h2 = Plan.model_validate(plan_d2).compute_hash()
+    for ev in (
+        create_event(pid2, EventType.PROJECT_CREATED, {"name": "Timeout App", "objective": "Obj", "state": "INTERVIEW"}, at=now_utc - timedelta(minutes=30)),
+        create_event(pid2, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now_utc - timedelta(minutes=30)),
+        create_event(pid2, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now_utc - timedelta(minutes=30)),
+        create_event(pid2, EventType.PLAN_CREATED, {"plan": plan_d2, "plan_hash": plan_h2, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now_utc - timedelta(minutes=30)),
+        create_event(pid2, EventType.APPROVAL_RECORDED, {"plan_hash": plan_h2, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now_utc - timedelta(minutes=30)),
+        create_event(pid2, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now_utc - timedelta(minutes=30)),
+        create_event(pid2, EventType.PROJECT_DELIVERED, {"repo_url": "", "deploy_url": "", "commit_sha": sha_v1, "version_label": "v1"}, at=now_utc - timedelta(minutes=30)),
+        create_event(
+            pid2,
+            EventType.BACKGROUND_OP_STARTED,
+            {
+                "op_id": "bg-expired-620",
+                "op_type": "quality_improve",
+                "server_boot_id": orch._server_boot_id,
+                "started_at": (now_utc - timedelta(seconds=620)).isoformat(),
+                "activity_summary": "Refinando calidad con debate de 2 agentes...",
+                "stage": "VERIFYING",
+                "agents_count": 2,
+            },
+            at=now_utc - timedelta(seconds=620),
+        ),
+    ):
+        store.append(ev)
+
+    worker = BuildWorker(
+        orchestrator=orch,
+        workspace_manager=ws_mgr,
+        code_agent=FakeCodeAgent(
+            impl_steps=[
+                {"index.html": "<!doctype html><html><body><main><h1>Pulido v2</h1></main></body></html>\n"}
+            ]
+        ),
+        runner=FakeRunner(results=[CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True})]),
+        vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
+        quality_auditor=ParentAuditor(llm=llm1),
+        chats_dir=chats_dir,
+    )
+    resolver = ModelResolver(runner=FakeRunner(), auto_probe=False)
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        build_worker=worker,
+        workspace_manager=ws_mgr,
+        model_resolver=resolver,
+        chats_dir=chats_dir,
+    )
+    try:
+        # 1. Inspect UI HTML for timer unification and /recover wiring on Reintentar / Recargar estado
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            assert html_resp.status == 200
+            html = html_resp.read().decode("utf-8")
+
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+        assert "function resolveOperationStartMs(" in html
+        assert "function resolveOperationElapsedSeconds(" in html
+
+        live_fn_start = html.index("function renderLiveActivityBanner(")
+        live_fn_end = html.index("async function runTrackedOperation(", live_fn_start)
+        live_fn_body = html[live_fn_start:live_fn_end]
+        assert "resolveOperationStartMs(" in live_fn_body
+        assert "st.last_event_at || st.step_started_at" not in live_fn_body
+
+        guide_fn_start = html.index("function buildGuidanceBanner(")
+        guide_fn_end = html.index("if (st.state === 'INTERVIEW')", guide_fn_start)
+        guide_running_body = html[guide_fn_start:guide_fn_end]
+        assert "resolveOperationElapsedSeconds(" in guide_running_body
+        assert "step_started_at" in guide_running_body
+
+        reload_fn_start = html.index("const reloadBtn = document.getElementById('live-activity-reload-btn')")
+        reload_fn_end = html.index("function updateLiveTimers(", reload_fn_start)
+        reload_body = html[reload_fn_start:reload_fn_end]
+        assert "/recover" in reload_body
+
+        # 2. Querying GET /api/projects/<pid1> auto-recovers stale server_boot_id op -> is_running=False & persists BACKGROUND_OP_FINISHED
+        c1, d1 = _http_json(f"{base_url}/api/projects/{pid1}")
+        assert c1 == 200
+        assert d1["status"]["state"] == "DELIVERED"
+        assert d1["is_running"] is False
+        assert d1["status"]["is_running"] is False
+        assert d1["status"]["busy"] is False
+        assert d1["step_started_at"] is None
+        assert any(
+            ev["type"] == EventType.BACKGROUND_OP_FINISHED
+            and ev["payload"].get("op_id") == "bg-old-boot-1"
+            and ev["payload"].get("status") == "interrupted"
+            for ev in d1["events"]
+        )
+
+        # 3. Querying GET /api/projects list (_serialize_summary) auto-recovers >600s expired op for pid2
+        c_list, r_list = _http_json(f"{base_url}/api/projects")
+        assert c_list == 200
+        by_pid = {p["project_id"]: p for p in r_list["projects"]}
+        assert by_pid[pid2]["state"] == "DELIVERED"
+        assert by_pid[pid2]["is_running"] is False
+        assert by_pid[pid2]["busy"] is False
+        assert any(
+            ev.type == EventType.BACKGROUND_OP_FINISHED
+            and ev.payload.get("op_id") == "bg-expired-620"
+            and ev.payload.get("status") == "interrupted"
+            for ev in store.get_events(pid2)
+        )
+
+        # 4. Can immediately trigger #polish-debate-btn (POST /quality/improve with force_polish=True) without 409 after auto-recovery
+        c_imp, r_imp = _http_json(
+            f"{base_url}/api/projects/{pid1}/quality/improve",
+            method="POST",
+            body={"force_polish": True},
+            timeout=15.0,
+        )
+        assert c_imp == 200
+        assert r_imp["ok"] is True
+        assert server.controller.wait_for_idle(timeout=15.0)
+        _, cps_res = _http_json(f"{base_url}/api/projects/{pid1}/checkpoints")
+        assert cps_res["checkpoints"][0]["version_label"] == "v2"
+
+        # 5. Live running DELIVERED project unifies op_started_at & step_started_at; manual unlock via POST /api/projects/<pid2>/recover clears everything without 409
+        chats_dir.mkdir(parents=True, exist_ok=True)
+        (chats_dir / f"{pid2}.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "a-hung-audit",
+                        "role": "assistant",
+                        "mode": "audit",
+                        "prompt": "Pulir",
+                        "content": "",
+                        "status": "running",
+                        "stage_label": "2/3 Analizando código con IA",
+                        "server_boot_id": orch._server_boot_id,
+                        "created_at": now_utc.isoformat(),
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        resolver.record_activity(
+            "Refinando calidad con debate de 2 agentes...",
+            agents_count=2,
+            stage="VERIFYING",
+        )
+        server.controller.mark_running(pid2)
+        store.append(
+            create_event(
+                pid2,
+                EventType.BACKGROUND_OP_STARTED,
+                {
+                    "op_id": "bg-manual-stuck",
+                    "op_type": "quality_improve",
+                    "server_boot_id": orch._server_boot_id,
+                    "started_at": now_utc.isoformat(),
+                },
+                at=now_utc,
+            )
+        )
+        _, live_busy = _http_json(f"{base_url}/api/projects/{pid2}")
+        assert live_busy["is_running"] is True
+        assert live_busy["op_started_at"] == live_busy["status"]["op_started_at"]
+        assert live_busy["op_started_at"] is not None
+        assert live_busy["step_started_at"] is not None
+
+        # INV-22 & 404 guards on /recover
+        assert _http_json(f"{base_url}/api/projects/..%2Fbad/recover", method="POST")[0] == 400
+        assert _http_json(f"{base_url}/api/projects/no-existe-rec/recover", method="POST")[0] == 404
+        # Clean /retry on DELIVERED still enforces 409 when not using /recover
+        assert _http_json(f"{base_url}/api/projects/{pid1}/retry", method="POST")[0] == 409
+
+        c_rec, r_rec = _http_json(
+            f"{base_url}/api/projects/{pid2}/recover",
+            method="POST",
+            body={},
+        )
+        assert c_rec == 200
+        assert r_rec["ok"] is True
+        assert r_rec["status"]["state"] == "DELIVERED"
+        assert r_rec["status"]["is_running"] is False
+        assert r_rec["status"]["busy"] is False
+        assert r_rec["status"]["op_started_at"] is None
+        assert r_rec["status"]["step_started_at"] is None
+        assert server.controller.is_running(pid2) is False
+        assert resolver.get_active_activity()["activity_summary"] is None
+        assert any(
+            ev.type == EventType.BACKGROUND_OP_FINISHED
+            and ev.payload.get("op_id") == "bg-manual-stuck"
+            and ev.payload.get("status") == "interrupted"
+            for ev in store.get_events(pid2)
+        )
+        c_chat2, r_chat2 = _http_json(f"{base_url}/api/projects/{pid2}/chat")
+        assert c_chat2 == 200
+        assert r_chat2["messages"][-1]["status"] == "interrupted"
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+
+
+
+def test_dashboard_expires_stale_in_memory_active_ops_over_600s(tmp_path: Path) -> None:
+    """Expire stale in-memory active_ops entries (>600s) without requiring a restart."""
+    from agent_factory.dashboard import DashboardController
+
+    store = SqliteEventStore(str(tmp_path / "stale_mem_op.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM(responses=[]))
+    pid = "stale-mem-op-proj"
+    base_t = datetime.now(UTC) - timedelta(minutes=20)
+    plan_d = _plan_payload("Stale Memory App")
+    plan_h = Plan.model_validate(plan_d).compute_hash()
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "Stale Mem", "objective": "Test stale mem", "state": "INTERVIEW"}, at=base_t),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=base_t),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=base_t),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": plan_d, "plan_hash": plan_h, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=base_t),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_h, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=base_t),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=base_t),
+        create_event(pid, EventType.PROJECT_DELIVERED, {"repo_url": "", "deploy_url": "", "commit_sha": "abc123", "version_label": "v1"}, at=base_t),
+    ):
+        store.append(ev)
+
+    ctrl = DashboardController(orchestrator=orch)
+    ctrl.mark_running(pid, op_type="quality_improve", activity_summary="Pulido activo")
+    assert ctrl.is_running(pid) is True
+
+    # Simulate an active in-memory operation stuck longer than 600s
+    stale_dt = datetime.now(UTC) - timedelta(seconds=615)
+    ctrl._active_ops[pid]["started_at"] = stale_dt.isoformat()
+    ctrl._active_ops[pid]["started_at_dt"] = stale_dt
+
+    detail = ctrl.get_project_detail(pid)
+    assert detail["is_running"] is False
+    assert detail["op_started_at"] is None
+    assert detail["status"]["busy"] is False
+    assert ctrl.is_running(pid) is False

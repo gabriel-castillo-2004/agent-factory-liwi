@@ -693,6 +693,7 @@ VALID_CHAT_MODES: frozenset[str] = frozenset({"chat", "audit", "document"})
 VALID_CHAT_ENTRY_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 SERVER_BOOT_ID: str = uuid.uuid4().hex[:12]
 CHAT_RUNNING_ORPHAN_SECONDS: float = 260.0
+BACKGROUND_OP_ORPHAN_SECONDS: float = 600.0
 CHAT_STAGE_READ_FILES = "1/3 Leyendo archivos del repositorio"
 CHAT_STAGE_LLM_ANALYZE = "2/3 Analizando código con IA"
 CHAT_STAGE_SAVE_REPORT = "3/3 Guardando reporte"
@@ -865,8 +866,10 @@ class Orchestrator:
         self.vcs = vcs
         self._lock = threading.RLock()
         self._chat_io_lock = threading.RLock()
+        self._bg_op_heal_lock = threading.RLock()
         self._server_boot_id = SERVER_BOOT_ID
         self._project_locks: dict[str, threading.RLock] = {}
+        self._active_bg_ops: dict[str, str] = {}
         self._specs: dict[str, Spec] = {}
         self._last_published_status: dict[str, tuple[object, ...]] = {}
         self.build_worker: Any | None = None
@@ -1179,7 +1182,9 @@ class Orchestrator:
                     tmp_path.unlink(missing_ok=True)
             return chat_file
 
-    def _heal_orphaned_running_entries(self, entries: list[dict[str, Any]]) -> bool:
+    def _heal_orphaned_running_entries(
+        self, entries: list[dict[str, Any]], *, force: bool = False
+    ) -> bool:
         now_dt = self._now()
         if now_dt.tzinfo is None:
             now_dt = now_dt.replace(tzinfo=UTC)
@@ -1193,7 +1198,7 @@ class Orchestrator:
             )
             stale_boot = str(entry.get("server_boot_id") or "") != self._server_boot_id
             expired = elapsed_secs is not None and elapsed_secs > CHAT_RUNNING_ORPHAN_SECONDS
-            if stale_boot or expired:
+            if force or stale_boot or expired:
                 stage = str(entry.get("stage_label") or CHAT_STAGE_READ_FILES).strip()
                 if not stage:
                     stage = CHAT_STAGE_READ_FILES
@@ -1206,6 +1211,215 @@ class Orchestrator:
                     entry["duration_seconds"] = round(max(0.0, elapsed_secs), 2)
                 changed = True
         return changed
+
+    def heal_orphaned_chat_entries(
+        self,
+        project_id: str,
+        *,
+        chats_dir: Path | None = None,
+        force: bool = False,
+    ) -> bool:
+        """Persist interrupted state for orphaned or forced-unlocked running chat/audit entries without creating files."""
+        validate_project_id(project_id)
+        eff_dir = self._resolve_chats_dir(chats_dir)
+        chat_file = self._chat_file_path(project_id, eff_dir)
+        if not chat_file.is_file():
+            return False
+        with self._chat_io_lock:
+            raw, _ = self._read_raw_chat_entries(project_id, eff_dir)
+            if self._heal_orphaned_running_entries(raw, force=force):
+                self._write_chat_entries(project_id, raw, eff_dir)
+                return True
+        return False
+
+    def record_background_op_started(
+        self,
+        project_id: str,
+        *,
+        op_type: str = "quality_improve",
+        op_id: str | None = None,
+        activity_summary: str = "",
+        stage: str | None = None,
+        agents_count: int | None = None,
+        started_at: str | None = None,
+        extra_secrets: Sequence[str] = (),
+    ) -> Event:
+        """Append persistent BACKGROUND_OP_STARTED event with server_boot_id and UTC timestamp."""
+        validate_project_id(project_id)
+        eff_op_id = str(op_id or f"bg-{uuid.uuid4().hex[:12]}").strip()
+        now_dt = self._now()
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=UTC)
+        eff_started_at = str(started_at or "").strip() or now_dt.isoformat()
+        payload: dict[str, Any] = {
+            "op_id": eff_op_id,
+            "op_type": str(op_type or "background").strip(),
+            "server_boot_id": self._server_boot_id,
+            "started_at": eff_started_at,
+        }
+        if activity_summary:
+            payload["activity_summary"] = redact_secrets(
+                str(activity_summary).strip(), extra_secrets=extra_secrets
+            )
+        if stage:
+            payload["stage"] = str(stage).strip()
+        if isinstance(agents_count, int) and agents_count > 0:
+            payload["agents_count"] = agents_count
+        ev = create_event(
+            project_id=project_id,
+            event_type=EventType.BACKGROUND_OP_STARTED,
+            payload=payload,
+            at=now_dt,
+        )
+        self.store.append(ev)
+        return ev
+
+    def record_background_op_finished(
+        self,
+        project_id: str,
+        *,
+        op_id: str,
+        op_type: str = "quality_improve",
+        status: str = "completed",
+        reason: str = "",
+        duration_seconds: float | None = None,
+        extra_secrets: Sequence[str] = (),
+    ) -> Event:
+        """Append persistent BACKGROUND_OP_FINISHED closing event for op_id."""
+        validate_project_id(project_id)
+        now_dt = self._now()
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=UTC)
+        payload: dict[str, Any] = {
+            "op_id": str(op_id).strip(),
+            "op_type": str(op_type or "background").strip(),
+            "status": str(status or "completed").strip(),
+            "server_boot_id": self._server_boot_id,
+            "ended_at": now_dt.isoformat(),
+        }
+        if reason:
+            payload["reason"] = redact_secrets(str(reason).strip(), extra_secrets=extra_secrets)
+        if duration_seconds is not None:
+            payload["duration_seconds"] = round(max(0.0, float(duration_seconds)), 2)
+        ev = create_event(
+            project_id=project_id,
+            event_type=EventType.BACKGROUND_OP_FINISHED,
+            payload=payload,
+            at=now_dt,
+        )
+        self.store.append(ev)
+        return ev
+
+    @staticmethod
+    def get_open_background_op(
+        project_id: str,
+        *,
+        events: Sequence[Event],
+    ) -> dict[str, Any] | None:
+        """Return latest unclosed BACKGROUND_OP_STARTED metadata dict or None."""
+        validate_project_id(project_id)
+        open_ops: dict[str, dict[str, Any]] = {}
+        for ev in events:
+            pl = ev.payload or {}
+            if ev.type == EventType.BACKGROUND_OP_STARTED:
+                op_id = str(pl.get("op_id") or ev.id).strip()
+                started_iso = str(pl.get("started_at") or "").strip() or ev.at.isoformat()
+                started_dt = _parse_utc_iso_timestamp(started_iso) or _parse_utc_iso_timestamp(
+                    ev.at.isoformat()
+                )
+                raw_agents = pl.get("agents_count")
+                open_ops[op_id] = {
+                    "op_id": op_id,
+                    "op_type": str(pl.get("op_type") or "background").strip(),
+                    "server_boot_id": str(pl.get("server_boot_id") or "").strip(),
+                    "started_at": started_iso,
+                    "started_at_dt": started_dt,
+                    "activity_summary": str(pl.get("activity_summary") or "").strip(),
+                    "stage": str(pl.get("stage") or "").strip(),
+                    "agents_count": (
+                        int(raw_agents)
+                        if isinstance(raw_agents, int) and not isinstance(raw_agents, bool)
+                        else None
+                    ),
+                    "event_id": ev.id,
+                }
+            elif ev.type == EventType.BACKGROUND_OP_FINISHED:
+                fin_id = str(pl.get("op_id") or "").strip()
+                if fin_id and fin_id in open_ops:
+                    open_ops.pop(fin_id, None)
+                elif not fin_id:
+                    open_ops.clear()
+            elif ev.type in {
+                EventType.PROJECT_DELIVERED,
+                EventType.PROJECT_FAILED,
+                EventType.PROJECT_RETRIED,
+            }:
+                open_ops.clear()
+        if not open_ops:
+            return None
+        return list(open_ops.values())[-1]
+
+    def heal_orphaned_background_op(
+        self,
+        project_id: str,
+        *,
+        has_live_thread: bool = False,
+        force: bool = False,
+        reason: str = "",
+        chats_dir: Path | None = None,
+        extra_secrets: Sequence[str] = (),
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Auto-close orphaned (>600s or foreign server_boot_id without live thread) or forced background ops."""
+        validate_project_id(project_id)
+        healed = False
+        active_open: dict[str, Any] | None = None
+        with self._bg_op_heal_lock:
+            events = self.store.get_events(project_id)
+            if not events:
+                return False, None
+            open_op = self.get_open_background_op(project_id, events=events)
+            if open_op is not None:
+                now_dt = self._now()
+                if now_dt.tzinfo is None:
+                    now_dt = now_dt.replace(tzinfo=UTC)
+                started_dt = open_op.get("started_at_dt")
+                elapsed_secs: float | None = (
+                    (now_dt - started_dt).total_seconds() if started_dt is not None else None
+                )
+                op_boot = str(open_op.get("server_boot_id") or "").strip()
+                stale_boot = (op_boot != self._server_boot_id) and not has_live_thread
+                expired = (
+                    elapsed_secs is not None
+                    and elapsed_secs > BACKGROUND_OP_ORPHAN_SECONDS
+                )
+                if force or stale_boot or expired:
+                    if reason:
+                        eff_reason = reason
+                    elif expired:
+                        eff_reason = (
+                            "Operación interrumpida automáticamente tras superar el tiempo límite (10 minutos)."
+                        )
+                    elif force:
+                        eff_reason = "Operación desbloqueada manualmente desde el panel."
+                    else:
+                        eff_reason = (
+                            "Operación interrumpida automáticamente por reinicio del servidor."
+                        )
+                    self.record_background_op_finished(
+                        project_id,
+                        op_id=str(open_op["op_id"]),
+                        op_type=str(open_op.get("op_type") or "background"),
+                        status="interrupted",
+                        reason=eff_reason,
+                        duration_seconds=elapsed_secs,
+                        extra_secrets=extra_secrets,
+                    )
+                    healed = True
+                else:
+                    active_open = open_op
+        if force or healed:
+            self.heal_orphaned_chat_entries(project_id, chats_dir=chats_dir, force=force)
+        return healed, active_open
 
     def _update_chat_entry(
         self,
@@ -2509,6 +2723,7 @@ class Orchestrator:
         chats_dir: Path | None = None,
         force_polish: bool = False,
         extra_secrets: Sequence[str] = (),
+        _bg_op_id: str | None = None,
     ) -> dict[str, Any]:
         """Audit project quality and run bounded 2-agent debate via BuildWorker when needed or under force_polish."""
         validate_project_id(project_id)
@@ -2518,40 +2733,81 @@ class Orchestrator:
             stage="VERIFYING",
         )
         eff_worker = build_worker if build_worker is not None else self.build_worker
-        if eff_worker is not None:
-            res = eff_worker.improve_project_quality(
+        owns_bg_op = _bg_op_id is None
+        eff_op_id = _bg_op_id or ""
+        t0 = time.monotonic()
+        op_status = "completed"
+        op_reason = ""
+        if owns_bg_op:
+            start_ev = self.record_background_op_started(
+                project_id,
+                op_type="quality_improve",
+                activity_summary="Refinando calidad con debate de 2 agentes...",
+                stage="VERIFYING",
+                agents_count=2,
+                extra_secrets=extra_secrets,
+            )
+            eff_op_id = str((start_ev.payload or {}).get("op_id") or start_ev.id)
+            with self._lock:
+                self._active_bg_ops[project_id] = eff_op_id
+        try:
+            if eff_worker is not None:
+                res = eff_worker.improve_project_quality(
+                    project_id,
+                    auditor=auditor,
+                    chats_dir=chats_dir,
+                    force_polish=force_polish,
+                )
+                return self._persist_conserved_version_polish_note(
+                    project_id,
+                    dict(res) if isinstance(res, Mapping) else {},
+                    chats_dir=chats_dir,
+                    extra_secrets=extra_secrets,
+                )
+            eval_res = self.evaluate_project_quality(
                 project_id,
                 auditor=auditor,
                 chats_dir=chats_dir,
-                force_polish=force_polish,
-            )
-            return self._persist_conserved_version_polish_note(
-                project_id,
-                dict(res) if isinstance(res, Mapping) else {},
-                chats_dir=chats_dir,
                 extra_secrets=extra_secrets,
             )
-        eval_res = self.evaluate_project_quality(
-            project_id,
-            auditor=auditor,
-            chats_dir=chats_dir,
-            extra_secrets=extra_secrets,
-        )
-        if not force_polish and eval_res["scorecard"].get("passed"):
-            return self._persist_conserved_version_polish_note(
-                project_id,
-                {
-                    **eval_res,
-                    "already_passed": True,
-                    "improved": False,
-                    "new_version_created": False,
-                },
-                chats_dir=chats_dir,
-                extra_secrets=extra_secrets,
+            if not force_polish and eval_res["scorecard"].get("passed"):
+                return self._persist_conserved_version_polish_note(
+                    project_id,
+                    {
+                        **eval_res,
+                        "already_passed": True,
+                        "improved": False,
+                        "new_version_created": False,
+                    },
+                    chats_dir=chats_dir,
+                    extra_secrets=extra_secrets,
+                )
+            raise RuntimeError(
+                "No hay un BuildWorker configurado para ejecutar el refinamiento de calidad."
             )
-        raise RuntimeError(
-            "No hay un BuildWorker configurado para ejecutar el refinamiento de calidad."
-        )
+        except Exception as exc:
+            op_status = "failed"
+            op_reason = str(exc)
+            raise
+        finally:
+            if owns_bg_op:
+                with self._lock:
+                    if self._active_bg_ops.get(project_id) == eff_op_id:
+                        self._active_bg_ops.pop(project_id, None)
+                with self._project_lock(project_id):
+                    cur_open = self.get_open_background_op(
+                        project_id, events=self.store.get_events(project_id)
+                    )
+                    if cur_open is not None and cur_open.get("op_id") == eff_op_id:
+                        self.record_background_op_finished(
+                            project_id,
+                            op_id=eff_op_id,
+                            op_type="quality_improve",
+                            status=op_status,
+                            reason=op_reason,
+                            duration_seconds=time.monotonic() - t0,
+                            extra_secrets=extra_secrets,
+                        )
 
     @staticmethod
     def _run_rollback_git(
@@ -3798,6 +4054,12 @@ class Orchestrator:
         events = self.store.get_events(project_id)
         if not events:
             raise ValueError(f"Project '{project_id}' does not exist")
+
+        with self._lock:
+            has_live = project_id in self._active_bg_ops
+        healed, _ = self.heal_orphaned_background_op(project_id, has_live_thread=has_live)
+        if healed:
+            events = self.store.get_events(project_id)
 
         status = self.get_status(project_id)
         spec = self.get_spec(project_id)
