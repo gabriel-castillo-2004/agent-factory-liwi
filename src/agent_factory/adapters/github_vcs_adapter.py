@@ -9,7 +9,8 @@ import re
 import shutil
 import unicodedata
 import urllib.parse
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -105,6 +106,133 @@ def slugify_repo_name(title: str, max_len: int = 63) -> str:
     return slug
 
 
+_GITHUB_REDIRECT_STATUSES: frozenset[int] = frozenset({301, 302, 307, 308})
+_GITHUB_MAX_REDIRECTS: int = 3
+_NON_REPO_HTML_ROOTS: frozenset[str] = frozenset(
+    {
+        "orgs",
+        "users",
+        "enterprises",
+        "settings",
+        "apps",
+        "marketplace",
+        "topics",
+        "features",
+        "repos",
+        "repositories",
+    }
+)
+
+
+def _extract_http_header(resp: Any, header_name: str) -> str:
+    """Case-insensitively extract a header value from an HTTP response object."""
+    headers = getattr(resp, "headers", None)
+    if not isinstance(headers, Mapping):
+        return ""
+    target = header_name.lower()
+    for k, v in headers.items():
+        if str(k).lower() == target and v is not None:
+            return str(v).strip()
+    return ""
+
+
+def _validate_owner_repo_pair(raw_owner: str, raw_repo: str) -> tuple[str, str] | None:
+    """Validate and return canonical (owner, repo) tuple or None if malformed."""
+    try:
+        clean_owner = _validate_owner(raw_owner)
+        clean_repo = _validate_repo_segment(raw_repo)
+    except ValueError:
+        return None
+    if clean_owner.lower() in ("repositories", "user", "orgs"):
+        return None
+    return clean_owner, clean_repo
+
+
+def _parse_github_repo_slug_from_url(
+    raw_url: str,
+    *,
+    allowed_repo_hosts: Collection[str] = ("github.com",),
+    allowed_api_hosts: Collection[str] = ("api.github.com",),
+) -> tuple[str, str] | None:
+    """Extract canonical (owner, repo) from a GitHub API /repos/{owner}/{repo} or HTML repository URL."""
+    text = str(raw_url or "").strip()
+    if not text:
+        return None
+    parsed = urllib.parse.urlsplit(text)
+    host = (parsed.hostname or "").lower()
+    segments = [seg for seg in parsed.path.strip("/").split("/") if seg]
+    if not segments:
+        return None
+
+    is_relative = not parsed.scheme and not host
+    if (is_relative or host in allowed_api_hosts) and len(segments) >= 3 and segments[0] == "repos":
+        return _validate_owner_repo_pair(segments[1], segments[2])
+
+    if (
+        host in allowed_repo_hosts
+        and len(segments) >= 2
+        and segments[0].lower() not in _NON_REPO_HTML_ROOTS
+    ):
+        repo_part = segments[1].removesuffix(".git") if len(segments) == 2 else segments[1]
+        return _validate_owner_repo_pair(segments[0], repo_part)
+
+    return None
+
+
+def _parse_repo_dict(
+    obj: Any,
+    *,
+    allowed_repo_hosts: Collection[str],
+    allowed_api_hosts: Collection[str],
+) -> tuple[str, str] | None:
+    if not isinstance(obj, Mapping):
+        return None
+    full_name = str(obj.get("full_name") or "").strip()
+    if "/" in full_name and full_name.count("/") == 1:
+        raw_owner, raw_repo = full_name.split("/", 1)
+        pair = _validate_owner_repo_pair(raw_owner, raw_repo)
+        if pair is not None:
+            return pair
+    for key in ("url", "html_url"):
+        val = str(obj.get(key) or "").strip()
+        if val:
+            pair = _parse_github_repo_slug_from_url(
+                val,
+                allowed_repo_hosts=allowed_repo_hosts,
+                allowed_api_hosts=allowed_api_hosts,
+            )
+            if pair is not None:
+                return pair
+    return None
+
+
+def _extract_canonical_repo_from_payload(
+    data: Any,
+    *,
+    allowed_repo_hosts: Collection[str],
+    allowed_api_hosts: Collection[str],
+) -> tuple[str, str] | None:
+    """Extract canonical (owner, repo) from GitHub repository, PR, or redirect JSON bodies."""
+    if not isinstance(data, Mapping):
+        return None
+    base_obj = data.get("base")
+    candidates: list[Any] = []
+    if isinstance(base_obj, Mapping) and isinstance(base_obj.get("repo"), Mapping):
+        candidates.append(base_obj["repo"])
+    if isinstance(data.get("repo"), Mapping):
+        candidates.append(data["repo"])
+    candidates.append(data)
+    for cand in candidates:
+        pair = _parse_repo_dict(
+            cand,
+            allowed_repo_hosts=allowed_repo_hosts,
+            allowed_api_hosts=allowed_api_hosts,
+        )
+        if pair is not None:
+            return pair
+    return None
+
+
 class GitHubVCSAdapter(VCS):
     """Executes isolated workspace Git and GitHub workflows via Runner/API with clean env."""
 
@@ -155,6 +283,107 @@ class GitHubVCSAdapter(VCS):
         self.http_transport = http_transport
         self._last_workspace_dir: dict[str, Path] = {}
         self._local_only_projects: set[str] = set()
+        self.repo_slug: str = ""
+        self.repo_url: str = ""
+        self._repo_slug_by_project: dict[str, str] = {}
+        self._repo_url_by_project: dict[str, str] = {}
+        self._active_project_id: str | None = None
+
+    @contextmanager
+    def _project_op_context(self, project_id: str) -> Iterator[None]:
+        prev = self._active_project_id
+        self._active_project_id = project_id
+        try:
+            yield
+        finally:
+            self._active_project_id = prev
+
+    def _allowed_repo_hosts(self) -> frozenset[str]:
+        base_host = (urllib.parse.urlsplit(self.repo_base_url).hostname or "").lower()
+        return frozenset({h for h in ("github.com", base_host) if h})
+
+    def _allowed_api_hosts(self) -> frozenset[str]:
+        api_host = (urllib.parse.urlsplit(self.api_base_url).hostname or "").lower()
+        return frozenset({h for h in ("api.github.com", api_host) if h})
+
+    def _update_canonical_repo(
+        self,
+        *,
+        location: str = "",
+        final_url: str = "",
+        body: str = "",
+        project_id: str | None = None,
+    ) -> tuple[str, str] | None:
+        """Update canonical repo_slug and repo_url from API redirect headers or JSON payload."""
+        repo_hosts = self._allowed_repo_hosts()
+        api_hosts = self._allowed_api_hosts()
+        pair: tuple[str, str] | None = None
+        for url_cand in (location, final_url):
+            if url_cand:
+                pair = _parse_github_repo_slug_from_url(
+                    url_cand,
+                    allowed_repo_hosts=repo_hosts,
+                    allowed_api_hosts=api_hosts,
+                )
+                if pair is not None:
+                    break
+        if pair is None and body.strip().startswith("{"):
+            try:
+                parsed_json = json.loads(body)
+            except json.JSONDecodeError:
+                parsed_json = None
+            if parsed_json is not None:
+                pair = _extract_canonical_repo_from_payload(
+                    parsed_json,
+                    allowed_repo_hosts=repo_hosts,
+                    allowed_api_hosts=api_hosts,
+                )
+        if pair is None:
+            return None
+
+        canon_owner, canon_repo = pair
+        full_slug = f"{canon_owner}/{canon_repo}"
+        repo_base = (
+            self.repo_base_url.rstrip("/")
+            if self.repo_base_url and not is_local_remote_url(self.repo_base_url)
+            else "https://github.com"
+        )
+        canon_url = f"{repo_base}/{full_slug}"
+        self.repo_slug = full_slug
+        self.repo_url = canon_url
+        eff_pid = project_id or self._active_project_id
+        if eff_pid:
+            self._repo_slug_by_project[eff_pid] = full_slug
+            self._repo_url_by_project[eff_pid] = canon_url
+        return pair
+
+    def _resolve_repo_target(self, project_id: str, fallback: str) -> str:
+        return self._repo_slug_by_project.get(project_id) or fallback
+
+    def _resolve_repo_url(self, project_id: str, repo_target: str) -> str:
+        return self._repo_url_by_project.get(project_id) or f"{self.repo_base_url}/{repo_target}"
+
+    def _resolve_github_redirect_url(self, current_url: str, location: str) -> str:
+        """Resolve redirect Location safely on the same API origin without leaking Bearer tokens (INV-19)."""
+        resolved = urllib.parse.urljoin(current_url, location)
+        parsed_target = urllib.parse.urlsplit(resolved)
+        parsed_base = urllib.parse.urlsplit(self.api_base_url)
+        base_scheme = parsed_base.scheme.lower()
+        target_scheme = parsed_target.scheme.lower()
+        allowed_schemes = ("https",) if base_scheme == "https" else ("http", "https")
+        if target_scheme not in allowed_schemes:
+            raise ValueError(
+                f"Unsafe GitHub redirect scheme '{target_scheme}' rejected (INV-19)"
+            )
+        target_host = (parsed_target.hostname or "").lower()
+        base_host = (parsed_base.hostname or "").lower()
+        if not target_host or target_host != base_host:
+            raise ValueError(
+                f"Cross-origin GitHub redirect host '{target_host}' rejected (INV-19)"
+            )
+        if parsed_base.port is not None and parsed_target.port != parsed_base.port:
+            raise ValueError("Cross-port GitHub redirect rejected (INV-19)")
+        return resolved
 
     def build_clean_env(self, host_env: Mapping[str, str] | None = None) -> dict[str, str]:
         """Build sanitized subprocess env keeping system vars and stripping unrelated secrets (INV-19)."""
@@ -232,6 +461,56 @@ class GitHubVCSAdapter(VCS):
             return self.http_transport
         return None
 
+    def _build_github_headers(self) -> dict[str, str]:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "agent-factory",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if self.github_token:
+            headers["Authorization"] = f"Bearer {self.github_token}"
+        return headers
+
+    def _dispatch_github_transport(
+        self,
+        transport: Any,
+        method: str,
+        url: str,
+        payload: Mapping[str, Any] | None,
+        headers: Mapping[str, str],
+    ) -> Any:
+        req_headers = dict(headers)
+        if hasattr(transport, "request_json"):
+            if getattr(transport, "supports_explicit_redirects", False):
+                return transport.request_json(
+                    method,
+                    url,
+                    payload=payload,
+                    timeout_seconds=self.timeout_seconds,
+                    headers=req_headers,
+                    extra_secrets=self.secrets,
+                    raise_on_http_error=False,
+                    follow_redirects=False,
+                )
+            return transport.request_json(
+                method,
+                url,
+                payload=payload,
+                timeout_seconds=self.timeout_seconds,
+                headers=req_headers,
+                extra_secrets=self.secrets,
+                raise_on_http_error=False,
+            )
+        if method == "POST":
+            return transport.post_json(
+                url,
+                payload or {},
+                timeout_seconds=self.timeout_seconds,
+                headers=req_headers,
+                extra_secrets=self.secrets,
+            )
+        raise ValueError(f"Unsupported HTTP transport for {method} {url}")
+
     def _github_request(
         self,
         method: str,
@@ -241,36 +520,7 @@ class GitHubVCSAdapter(VCS):
         transport = self._effective_http_transport()
         if transport is None:
             raise VcsError("GitHub HTTP transport is unavailable")
-        if hasattr(transport, "request_json"):
-            return self._github_request_with_transport(transport, method, path, payload)
-        url = f"{self.api_base_url}/{path.lstrip('/')}"
-        headers = {
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "agent-factory",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
-        if self.github_token:
-            headers["Authorization"] = f"Bearer {self.github_token}"
-
-        resp: Any = None
-        err_detail: str | None = None
-        try:
-            if method.upper() == "POST":
-                resp = transport.post_json(
-                    url,
-                    payload or {},
-                    timeout_seconds=self.timeout_seconds,
-                    headers=headers,
-                    extra_secrets=self.secrets,
-                )
-            else:
-                err_detail = f"Unsupported HTTP transport for {method} {path}"
-        except (TelegramTransportError, OSError, RuntimeError, ValueError) as exc:
-            err_detail = str(exc) or type(exc).__name__
-        if err_detail is not None:
-            self._raise_vcs_error("GitHub API request failed", err_detail)
-        assert resp is not None
-        return int(resp.status_code), str(resp.body or "")
+        return self._github_request_with_transport(transport, method, path, payload)
 
     def _sync_owner_urls(self, resolved_owner: str) -> None:
         valid_owner = _validate_owner(resolved_owner)
@@ -322,38 +572,42 @@ class GitHubVCSAdapter(VCS):
         owner = self._resolve_authenticated_owner(env=env)
         transport = self._effective_http_transport()
         if transport is not None and (self.github_token or self.http_transport is not None):
-            status_code, body = self._github_request("GET", f"/repos/{owner}/{project_id}")
-            if status_code == 200:
-                return owner
-            if status_code == 404:
-                if not self.github_token and self.http_transport is None:
-                    raise VcsError(
-                        f"GitHub repository '{owner}/{project_id}' not found and GITHUB_TOKEN is missing"
-                    )
-                if not self._authenticated_login and self.github_token:
-                    u_status, u_body = self._github_request("GET", "/user")
-                    if u_status == 200 and u_body.strip():
-                        try:
-                            self._authenticated_login = str(json.loads(u_body).get("login", "")).strip()
-                        except json.JSONDecodeError:
-                            pass
-                payload = {"name": project_id, "private": False, "auto_init": False}
-                if not self._authenticated_login or self._authenticated_login.lower() == owner.lower():
-                    c_status, c_body = self._github_request("POST", "/user/repos", payload)
-                else:
-                    c_status, c_body = self._github_request("POST", f"/orgs/{owner}/repos", payload)
-                    if c_status == 404:
+            with self._project_op_context(project_id):
+                repo_target = self._resolve_repo_target(project_id, f"{owner}/{project_id}")
+                status_code, body = self._github_request("GET", f"/repos/{repo_target}")
+                if status_code == 200:
+                    updated_target = self._resolve_repo_target(project_id, repo_target)
+                    return updated_target.split("/", 1)[0] if "/" in updated_target else owner
+                if status_code == 404:
+                    if not self.github_token and self.http_transport is None:
+                        raise VcsError(
+                            f"GitHub repository '{owner}/{project_id}' not found and GITHUB_TOKEN is missing"
+                        )
+                    if not self._authenticated_login and self.github_token:
+                        u_status, u_body = self._github_request("GET", "/user")
+                        if u_status == 200 and u_body.strip():
+                            try:
+                                self._authenticated_login = str(json.loads(u_body).get("login", "")).strip()
+                            except json.JSONDecodeError:
+                                pass
+                    payload = {"name": project_id, "private": False, "auto_init": False}
+                    if not self._authenticated_login or self._authenticated_login.lower() == owner.lower():
                         c_status, c_body = self._github_request("POST", "/user/repos", payload)
-                if c_status in (200, 201, 422):
-                    return owner
+                    else:
+                        c_status, c_body = self._github_request("POST", f"/orgs/{owner}/repos", payload)
+                        if c_status == 404:
+                            c_status, c_body = self._github_request("POST", "/user/repos", payload)
+                    if c_status in (200, 201, 422):
+                        updated_target = self._resolve_repo_target(project_id, repo_target)
+                        return updated_target.split("/", 1)[0] if "/" in updated_target else owner
+                    self._raise_vcs_error(
+                        f"GitHub repo creation failed (HTTP {c_status})",
+                        c_body or f"status {c_status}",
+                    )
                 self._raise_vcs_error(
-                    f"GitHub repo creation failed (HTTP {c_status})",
-                    c_body or f"status {c_status}",
+                    f"GitHub repo lookup failed (HTTP {status_code})",
+                    body or f"status {status_code}",
                 )
-            self._raise_vcs_error(
-                f"GitHub repo lookup failed (HTTP {status_code})",
-                body or f"status {status_code}",
-            )
 
         if self._is_real_subprocess_runner() and shutil.which("gh"):
             view_res = self.runner.run(
@@ -576,16 +830,17 @@ class GitHubVCSAdapter(VCS):
                 not is_local_remote_url(self.repo_base_url)
                 and (self.http_transport is not None or self._is_real_subprocess_runner())
             )
-            owner = (
-                self._ensure_github_repo(project_id, env=clean_env)
-                if should_manage_github
-                else (self.owner or "agent-factory")
-            )
-            remote_url = (
-                f"{self.repo_base_url}/{owner}/{project_id}.git"
-                if owner
-                else f"{self.repo_base_url}/{project_id}.git"
-            )
+            with self._project_op_context(project_id):
+                owner = (
+                    self._ensure_github_repo(project_id, env=clean_env)
+                    if should_manage_github
+                    else (self.owner or "agent-factory")
+                )
+                canon_target = self._resolve_repo_target(
+                    project_id,
+                    f"{owner}/{project_id}" if owner else project_id,
+                )
+            remote_url = f"{self.repo_base_url}/{canon_target}.git"
             if (workspace_dir / ".git" / "HEAD").is_file():
                 if not existing_origin:
                     self._run_git(
@@ -631,7 +886,10 @@ class GitHubVCSAdapter(VCS):
             if (not is_local and (self.http_transport is not None or self._is_real_subprocess_runner()))
             else self.owner
         )
-        repo_target = f"{owner}/{project_id}" if owner else project_id
+        repo_target = self._resolve_repo_target(
+            project_id,
+            f"{owner}/{project_id}" if owner else project_id,
+        )
         ws_dir = self._last_workspace_dir.get(project_id)
 
         if is_local and self._is_real_subprocess_runner() and shutil.which("gh") is None:
@@ -643,10 +901,11 @@ class GitHubVCSAdapter(VCS):
             and shutil.which("gh") is None
         )
         if use_rest_api:
-            status_code, body = self._github_request(
-                "GET",
-                f"/repos/{repo_target}/actions/runs?branch={valid_branch}&per_page=1",
-            )
+            with self._project_op_context(project_id):
+                status_code, body = self._github_request(
+                    "GET",
+                    f"/repos/{repo_target}/actions/runs?branch={valid_branch}&per_page=1",
+                )
             if status_code == 200:
                 try:
                     data = json.loads(body) if body.strip() else {}
@@ -784,42 +1043,50 @@ class GitHubVCSAdapter(VCS):
             "base": self.default_branch,
             "body": f"Automated PR for {project_id}",
         }
-        pr_status, pr_body = self._github_request("POST", f"/repos/{repo_target}/pulls", pr_payload)
-        pr_number: int | None = None
-        if pr_status in (200, 201) and pr_body.strip():
-            pr_number = int(json.loads(pr_body)["number"])
-        elif pr_status == 422:
-            if "no commits between" in pr_body.lower():
-                return
-            owner = repo_target.split("/", 1)[0]
-            list_status, list_body = self._github_request(
-                "GET",
-                f"/repos/{repo_target}/pulls?head={owner}:{valid_branch}&base={self.default_branch}&state=open",
+        with self._project_op_context(project_id):
+            active_target = self._resolve_repo_target(project_id, repo_target)
+            pr_status, pr_body = self._github_request(
+                "POST",
+                f"/repos/{active_target}/pulls",
+                pr_payload,
             )
-            if list_status == 200 and list_body.strip():
-                prs = json.loads(list_body)
-                if isinstance(prs, list) and prs:
-                    pr_number = int(prs[0]["number"])
-            if pr_number is None:
-                self._run_git(
-                    ["push", "-u", "origin", f"{valid_branch}:{self.default_branch}"],
-                    cwd=ws_dir,
-                    env=push_env,
-                    context="Merge failed",
-                    extra_secrets=push_secrets,
+            active_target = self._resolve_repo_target(project_id, active_target)
+            pr_number: int | None = None
+            if pr_status in (200, 201) and pr_body.strip():
+                pr_number = int(json.loads(pr_body)["number"])
+            elif pr_status == 422:
+                if "no commits between" in pr_body.lower():
+                    return
+                pr_owner = active_target.split("/", 1)[0]
+                list_status, list_body = self._github_request(
+                    "GET",
+                    f"/repos/{active_target}/pulls?head={pr_owner}:{valid_branch}&base={self.default_branch}&state=open",
                 )
-                return
-        else:
-            self._raise_vcs_error("Merge failed", pr_body or f"HTTP {pr_status}")
+                active_target = self._resolve_repo_target(project_id, active_target)
+                if list_status == 200 and list_body.strip():
+                    prs = json.loads(list_body)
+                    if isinstance(prs, list) and prs:
+                        pr_number = int(prs[0]["number"])
+                if pr_number is None:
+                    self._run_git(
+                        ["push", "-u", "origin", f"{valid_branch}:{self.default_branch}"],
+                        cwd=ws_dir,
+                        env=push_env,
+                        context="Merge failed",
+                        extra_secrets=push_secrets,
+                    )
+                    return
+            else:
+                self._raise_vcs_error("Merge failed", pr_body or f"HTTP {pr_status}")
 
-        if pr_number is not None:
-            m_status, m_body = self._github_request(
-                "PUT",
-                f"/repos/{repo_target}/pulls/{pr_number}/merge",
-                {"merge_method": "merge"},
-            )
-            if m_status not in (200, 201):
-                self._raise_vcs_error("Merge failed", m_body or f"HTTP {m_status}")
+            if pr_number is not None:
+                m_status, m_body = self._github_request(
+                    "PUT",
+                    f"/repos/{active_target}/pulls/{pr_number}/merge",
+                    {"merge_method": "merge"},
+                )
+                if m_status not in (200, 201):
+                    self._raise_vcs_error("Merge failed", m_body or f"HTTP {m_status}")
 
     def merge_and_deploy(
         self,
@@ -831,112 +1098,114 @@ class GitHubVCSAdapter(VCS):
         valid_branch = self._validate_branch(branch)
         clean_env = self.build_clean_env()
         is_local = project_id in self._local_only_projects or is_local_remote_url(self.repo_base_url)
-        owner = (
-            self._resolve_authenticated_owner(env=clean_env)
-            if (not is_local and (self.http_transport is not None or self._is_real_subprocess_runner()))
-            else self.owner
-        )
-        repo_target = f"{owner}/{project_id}" if owner else project_id
-
-        ws_dir = self._last_workspace_dir.get(
-            project_id, Path("workspaces") / project_id
-        )
-
-        use_rest_merge = (
-            self._is_real_subprocess_runner()
-            and shutil.which("gh") is None
-        )
-        if use_rest_merge:
-            self._merge_via_github_api_or_git(
-                project_id, repo_target, valid_branch, ws_dir, clean_env
+        with self._project_op_context(project_id):
+            owner = (
+                self._resolve_authenticated_owner(env=clean_env)
+                if (not is_local and (self.http_transport is not None or self._is_real_subprocess_runner()))
+                else self.owner
             )
-        else:
-            if (ws_dir / ".git").is_dir():
-                if self._is_real_subprocess_runner() and shutil.which("gh") is not None:
-                    push_env, push_secrets = build_git_push_env(
-                        clean_env, self.github_token, repo_base_url=self.repo_base_url
-                    )
-                    ls_res = self.runner.run(
-                        ["git", "ls-remote", "--heads", "origin", self.default_branch],
-                        cwd=ws_dir,
-                        env=push_env,
-                    )
-                    if ls_res.exit_code == 0 and not ls_res.stdout.strip():
-                        self._run_git(
-                            ["push", "-u", "origin", f"{valid_branch}:{self.default_branch}"],
+            repo_target = self._resolve_repo_target(
+                project_id,
+                f"{owner}/{project_id}" if owner else project_id,
+            )
+
+            ws_dir = self._last_workspace_dir.get(
+                project_id, Path("workspaces") / project_id
+            )
+
+            use_rest_merge = (
+                self._is_real_subprocess_runner()
+                and shutil.which("gh") is None
+            )
+            if use_rest_merge:
+                self._merge_via_github_api_or_git(
+                    project_id, repo_target, valid_branch, ws_dir, clean_env
+                )
+                repo_target = self._resolve_repo_target(project_id, repo_target)
+            else:
+                if (ws_dir / ".git").is_dir():
+                    if self._is_real_subprocess_runner() and shutil.which("gh") is not None:
+                        push_env, push_secrets = build_git_push_env(
+                            clean_env, self.github_token, repo_base_url=self.repo_base_url
+                        )
+                        ls_res = self.runner.run(
+                            ["git", "ls-remote", "--heads", "origin", self.default_branch],
                             cwd=ws_dir,
                             env=push_env,
-                            context="Merge failed",
-                            extra_secrets=push_secrets,
                         )
-                try:
-                    self.runner.run(
-                        [
-                            "gh",
-                            "pr",
-                            "create",
-                            "--head",
-                            valid_branch,
-                            "--base",
-                            self.default_branch,
-                            "--title",
-                            f"Merge {valid_branch}",
-                            "--body",
-                            f"Automated PR for {project_id}",
-                            "--repo",
-                            repo_target,
-                        ],
-                        cwd=ws_dir,
-                        env=clean_env,
-                    )
-                except (CommandTimeoutError, OSError, RuntimeError, ValueError) as pr_exc:
-                    _ = redact_secrets(str(pr_exc), extra_secrets=self.secrets)
+                        if ls_res.exit_code == 0 and not ls_res.stdout.strip():
+                            self._run_git(
+                                ["push", "-u", "origin", f"{valid_branch}:{self.default_branch}"],
+                                cwd=ws_dir,
+                                env=push_env,
+                                context="Merge failed",
+                                extra_secrets=push_secrets,
+                            )
+                    try:
+                        self.runner.run(
+                            [
+                                "gh",
+                                "pr",
+                                "create",
+                                "--head",
+                                valid_branch,
+                                "--base",
+                                self.default_branch,
+                                "--title",
+                                f"Merge {valid_branch}",
+                                "--body",
+                                f"Automated PR for {project_id}",
+                                "--repo",
+                                repo_target,
+                            ],
+                            cwd=ws_dir,
+                            env=clean_env,
+                        )
+                    except (CommandTimeoutError, OSError, RuntimeError, ValueError) as pr_exc:
+                        _ = redact_secrets(str(pr_exc), extra_secrets=self.secrets)
 
-            cmd = ["gh", "pr", "merge", valid_branch, "--repo", repo_target, "--merge", "--auto"]
-            clean_err: str | None = None
-            res = None
-            try:
-                res = self.runner.run(cmd, cwd=Path.cwd(), env=clean_env)
-            except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
-                clean_err = redact_secrets(str(exc), extra_secrets=self.secrets)
+                cmd = ["gh", "pr", "merge", valid_branch, "--repo", repo_target, "--merge", "--auto"]
+                clean_err: str | None = None
+                res = None
+                try:
+                    res = self.runner.run(cmd, cwd=Path.cwd(), env=clean_env)
+                except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
+                    clean_err = redact_secrets(str(exc), extra_secrets=self.secrets)
+                else:
+                    if res.exit_code != 0:
+                        err = res.stderr or res.stdout or f"exit code {res.exit_code}"
+                        clean_err = redact_secrets(err, extra_secrets=self.secrets)
+
+                if clean_err is not None:
+                    err_obj = VcsError(f"Merge failed: {clean_err}")
+                    err_obj.__cause__ = None
+                    err_obj.__context__ = None
+                    raise err_obj
+
+            repo_url = self._resolve_repo_url(project_id, repo_target)
+            is_python_local = ws_dir.is_dir() and detect_workspace_app(ws_dir).app_type == "python_local"
+            if is_python_local:
+                deploy_url = ""
+            elif self.deploy_publisher is not None:
+                deploy_url = self.deploy_publisher.deploy_site(project_id, ws_dir)
+                if (
+                    use_rest_merge
+                    and not is_local
+                    and self.deploy_publisher.target.lower() in ("gh-pages", "github-pages")
+                    and (self.github_token or self.http_transport is not None)
+                ):
+                    try:
+                        self._github_request(
+                            "POST",
+                            f"/repos/{repo_target}/pages",
+                            {"source": {"branch": self.deploy_publisher.branch, "path": "/"}},
+                        )
+                    except VcsError:
+                        pass
             else:
-                if res.exit_code != 0:
-                    err = res.stderr or res.stdout or f"exit code {res.exit_code}"
-                    clean_err = redact_secrets(err, extra_secrets=self.secrets)
-
-            if clean_err is not None:
-                err_obj = VcsError(f"Merge failed: {clean_err}")
-                err_obj.__cause__ = None
-                err_obj.__context__ = None
-                raise err_obj
-
-        repo_url = (
-            f"{self.repo_base_url}/{owner}/{project_id}"
-            if owner
-            else f"{self.repo_base_url}/{project_id}"
-        )
-        is_python_local = ws_dir.is_dir() and detect_workspace_app(ws_dir).app_type == "python_local"
-        if is_python_local:
-            deploy_url = ""
-        elif self.deploy_publisher is not None:
-            deploy_url = self.deploy_publisher.deploy_site(project_id, ws_dir)
-            if (
-                use_rest_merge
-                and not is_local
-                and self.deploy_publisher.target.lower() in ("gh-pages", "github-pages")
-                and (self.github_token or self.http_transport is not None)
-            ):
-                try:
-                    self._github_request(
-                        "POST",
-                        f"/repos/{repo_target}/pages",
-                        {"source": {"branch": self.deploy_publisher.branch, "path": "/"}},
-                    )
-                except VcsError:
-                    pass
-        else:
-            deploy_url = f"{self.deploy_base_url}/{project_id}" if self.deploy_base_url else repo_url
-        return (repo_url, deploy_url)
+                canon_repo_name = repo_target.split("/", 1)[-1]
+                deploy_url = f"{self.deploy_base_url}/{canon_repo_name}" if self.deploy_base_url else repo_url
+            return (repo_url, deploy_url)
 
     def _github_request_with_transport(
         self,
@@ -945,34 +1214,49 @@ class GitHubVCSAdapter(VCS):
         path: str,
         payload: Mapping[str, Any] | None = None,
     ) -> tuple[int, str]:
-        """Execute a GitHub REST API call against an explicit transport with secret redaction."""
-        url = f"{self.api_base_url}/{path.lstrip('/')}"
-        headers = {
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "agent-factory",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
-        if self.github_token:
-            headers["Authorization"] = f"Bearer {self.github_token}"
+        """Execute a GitHub REST API call against an explicit transport, following 301/302/307/308 redirects (max 3 hops) cleanly."""
+        norm_method = method.upper()
+        current_url = (
+            path
+            if path.startswith(("http://", "https://"))
+            else f"{self.api_base_url}/{path.lstrip('/')}"
+        )
+        headers = self._build_github_headers()
 
-        resp: Any = None
+        status_code = 0
+        body = ""
         err_detail: str | None = None
         try:
-            resp = transport.request_json(
-                method,
-                url,
-                payload=payload,
-                timeout_seconds=self.timeout_seconds,
-                headers=headers,
-                extra_secrets=self.secrets,
-                raise_on_http_error=False,
-            )
+            for hop in range(_GITHUB_MAX_REDIRECTS + 1):
+                resp = self._dispatch_github_transport(
+                    transport,
+                    norm_method,
+                    current_url,
+                    payload,
+                    headers,
+                )
+                assert resp is not None
+                status_code = int(resp.status_code)
+                body = str(resp.body or "")
+                location = _extract_http_header(resp, "Location")
+                final_url = str(getattr(resp, "final_url", "") or "").strip() or current_url
+                self._update_canonical_repo(
+                    location=location,
+                    final_url=final_url,
+                    body=body,
+                )
+                if status_code in _GITHUB_REDIRECT_STATUSES and location:
+                    next_url = self._resolve_github_redirect_url(current_url, location)
+                    if hop < _GITHUB_MAX_REDIRECTS:
+                        current_url = next_url
+                        continue
+                break
         except (TelegramTransportError, OSError, RuntimeError, ValueError) as exc:
             err_detail = str(exc) or type(exc).__name__
+
         if err_detail is not None:
             self._raise_vcs_error("GitHub API request failed", err_detail)
-        assert resp is not None
-        return int(resp.status_code), str(resp.body or "")
+        return status_code, body
 
     def rename_repository(
         self,
@@ -1039,6 +1323,13 @@ class GitHubVCSAdapter(VCS):
 
         repo_base = self.repo_base_url.rstrip("/") if host == repo_base_host and self.repo_base_url else "https://github.com"
         new_repo_url = f"{repo_base}/{owner}/{final_slug}"
+        self.repo_slug = f"{owner}/{final_slug}"
+        self.repo_url = new_repo_url
+        if workspace_dir is not None:
+            ws_name = Path(workspace_dir).name
+            if ws_name:
+                self._repo_slug_by_project[ws_name] = self.repo_slug
+                self._repo_url_by_project[ws_name] = new_repo_url
         if self.deploy_base_url and owner.lower() == self.owner.lower():
             deploy_base = self.deploy_base_url.rstrip("/")
         else:

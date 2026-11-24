@@ -1078,3 +1078,401 @@ def test_static_deploy_publisher_publishes_src_subdir_not_empty_root_template(
     ).stdout
     assert "Real Built App" in deployed_index
     assert "Static Web App" not in deployed_index
+
+
+def test_github_vcs_follows_redirects_preserves_method_payload_auth_and_updates_canonical_slug(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Follow 301/302/307/308 redirects (up to 3 hops) preserving method, JSON payload, and Authorization header, reject unsafe cross-origin redirects (INV-19), and update repo_slug/repo_url."""
+    gh_tok = "TEST_GH_REDIRECT_SECRET_777"
+    orig_which = shutil.which
+
+    def _hide_gh(
+        name: str,
+        mode: int = os.F_OK | os.X_OK,
+        path: str | None = None,
+    ) -> str | None:
+        return None if name == "gh" else orig_which(name, mode=mode, path=path)
+
+    monkeypatch.setattr("agent_factory.adapters.github_vcs_adapter.shutil.which", _hide_gh)
+
+    # Set up local bare remote + workspace with remote main so _merge_via_github_api_or_git uses PR API
+    bare_remote = tmp_path / "bare" / "acme-dev" / "old-app.git"
+    bare_remote.parent.mkdir(parents=True)
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare_remote)], check=True, capture_output=True)
+    seed_dir = tmp_path / "seed_redir"
+    seed_dir.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=seed_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Seed"], cwd=seed_dir, check=True)
+    subprocess.run(["git", "config", "user.email", "seed@local.test"], cwd=seed_dir, check=True)
+    (seed_dir / "README.md").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=seed_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "seed"], cwd=seed_dir, check=True, capture_output=True)
+    subprocess.run(["git", "push", str(bare_remote), "main:main"], cwd=seed_dir, check=True, capture_output=True)
+
+    ws_dir = tmp_path / "ws" / "old-app"
+    ws_dir.mkdir(parents=True)
+    (ws_dir / "index.html").write_text("<h1>Renamed</h1>\n", encoding="utf-8")
+
+    empty_home = tmp_path / "home_redir"
+    empty_home.mkdir()
+
+    class _RedirGitRunner(SubprocessRunner):
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            iso_env = dict(env if env is not None else os.environ)
+            iso_env["HOME"] = str(empty_home)
+            iso_env["USERPROFILE"] = str(empty_home)
+            iso_env["GIT_CONFIG_NOSYSTEM"] = "1"
+            iso_env["GIT_CONFIG_GLOBAL"] = str(empty_home / "none")
+            rewritten = (
+                [str(bare_remote) if arg == "origin" else arg for arg in command]
+                if len(command) >= 2 and command[0] == "git" and command[1] in ("push", "ls-remote")
+                else list(command)
+            )
+            return super().run(rewritten, cwd, timeout_seconds=timeout_seconds, env=iso_env)
+
+    recorded_http: list[dict[str, Any]] = []
+
+    class _RedirectTransport:
+        def request_json(
+            self,
+            method: str,
+            url: str,
+            payload: Mapping[str, Any] | None = None,
+            timeout_seconds: float = 30.0,
+            headers: Mapping[str, str] | None = None,
+            extra_secrets: Sequence[str] = (),
+            *,
+            raise_on_http_error: bool = False,
+        ) -> HttpResponse:
+            _ = (timeout_seconds, extra_secrets, raise_on_http_error)
+            hdrs = dict(headers or {})
+            body_copy = dict(payload) if payload is not None else None
+            recorded_http.append({"method": method, "url": url, "payload": body_copy, "headers": hdrs})
+
+            if method == "GET" and url == "https://api.github.com/repos/acme-dev/old-app":
+                return HttpResponse(status_code=200, body=json.dumps({"full_name": "acme-dev/old-app"}))
+            if method == "POST" and url == "https://api.github.com/repos/acme-dev/old-app/pulls":
+                return HttpResponse(
+                    status_code=301,
+                    body=json.dumps(
+                        {
+                            "message": "Moved Permanently",
+                            "url": "https://api.github.com/repos/acme-dev/renamed-app/pulls",
+                        }
+                    ),
+                    headers={"Location": "https://api.github.com/repos/acme-dev/renamed-app/pulls"},
+                )
+            if method == "POST" and url == "https://api.github.com/repos/acme-dev/renamed-app/pulls":
+                return HttpResponse(
+                    status_code=201,
+                    body=json.dumps(
+                        {
+                            "number": 12,
+                            "html_url": "https://github.com/acme-dev/renamed-app/pull/12",
+                            "base": {
+                                "repo": {
+                                    "full_name": "acme-dev/renamed-app",
+                                    "html_url": "https://github.com/acme-dev/renamed-app",
+                                }
+                            },
+                        }
+                    ),
+                )
+            if method == "PUT" and url == "https://api.github.com/repos/acme-dev/renamed-app/pulls/12/merge":
+                return HttpResponse(
+                    status_code=301,
+                    body=json.dumps({"message": "Moved Permanently"}),
+                    headers={"Location": "https://api.github.com/repositories/777888/pulls/12/merge"},
+                )
+            if method == "PUT" and url == "https://api.github.com/repositories/777888/pulls/12/merge":
+                return HttpResponse(
+                    status_code=308,
+                    body=json.dumps({"message": "Permanent Redirect"}),
+                    headers={"Location": "/repos/acme-dev/renamed-app/pulls/12/merge?final=1"},
+                )
+            if method == "PUT" and url == "https://api.github.com/repos/acme-dev/renamed-app/pulls/12/merge?final=1":
+                return HttpResponse(status_code=200, body=json.dumps({"merged": True}))
+            return HttpResponse(status_code=500, body=f"unexpected {method} {url}")
+
+    vcs = GitHubVCSAdapter(
+        runner=_RedirGitRunner(),
+        owner="acme-dev",
+        github_token=gh_tok,
+        secrets=(gh_tok,),
+        http_transport=_RedirectTransport(),
+    )
+    vcs.push_branch("old-app", ws_dir, branch="work")
+    repo_url, deploy_url = vcs.merge_and_deploy("old-app", branch="work")
+
+    assert repo_url == "https://github.com/acme-dev/renamed-app"
+    assert deploy_url == "https://acme-dev.github.io/renamed-app"
+    assert vcs.repo_slug == "acme-dev/renamed-app"
+    assert vcs.repo_url == "https://github.com/acme-dev/renamed-app"
+
+    # Verify POST redirect preserved method, JSON payload, and Bearer token
+    post_hops = [c for c in recorded_http if "/pulls" in c["url"] and "/merge" not in c["url"]]
+    assert [c["url"] for c in post_hops] == [
+        "https://api.github.com/repos/acme-dev/old-app/pulls",
+        "https://api.github.com/repos/acme-dev/renamed-app/pulls",
+    ]
+    for hop in post_hops:
+        assert hop["method"] == "POST"
+        assert hop["payload"] == {
+            "title": "Merge work",
+            "head": "work",
+            "base": "main",
+            "body": "Automated PR for old-app",
+        }
+        assert hop["headers"].get("Authorization") == f"Bearer {gh_tok}"
+
+    # Verify PUT merge started on updated canonical slug (NOT old-app) and followed 301 + 308 preserving PUT, payload & token
+    put_hops = [c for c in recorded_http if "/merge" in c["url"]]
+    assert [c["url"] for c in put_hops] == [
+        "https://api.github.com/repos/acme-dev/renamed-app/pulls/12/merge",
+        "https://api.github.com/repositories/777888/pulls/12/merge",
+        "https://api.github.com/repos/acme-dev/renamed-app/pulls/12/merge?final=1",
+    ]
+    for hop in put_hops:
+        assert hop["method"] == "PUT"
+        assert hop["payload"] == {"merge_method": "merge"}
+        assert hop["headers"].get("Authorization") == f"Bearer {gh_tok}"
+
+    # Part B: 302 + 307 + 301 up to 3 hops works for PATCH/GET, while > 3 hops stops and unsafe external redirect is blocked (INV-19)
+    calls_edge: list[tuple[str, str, dict[str, Any] | None, dict[str, str]]] = []
+
+    class _EdgeRedirectTransport:
+        def request_json(
+            self,
+            method: str,
+            url: str,
+            payload: Mapping[str, Any] | None = None,
+            timeout_seconds: float = 30.0,
+            headers: Mapping[str, str] | None = None,
+            extra_secrets: Sequence[str] = (),
+            *,
+            raise_on_http_error: bool = False,
+        ) -> HttpResponse:
+            _ = (timeout_seconds, extra_secrets, raise_on_http_error)
+            calls_edge.append((method, url, dict(payload) if payload else None, dict(headers or {})))
+            if url.endswith("/hop0"):
+                return HttpResponse(status_code=302, body="{}", headers={"location": "/hop1"})
+            if url.endswith("/hop1"):
+                return HttpResponse(status_code=307, body="{}", headers={"Location": "https://api.github.com/hop2"})
+            if url.endswith("/hop2"):
+                return HttpResponse(status_code=308, body="{}", headers={"Location": "/hop3"})
+            if url.endswith("/hop3"):
+                return HttpResponse(
+                    status_code=200,
+                    body=json.dumps({"full_name": "acme-dev/three-hops", "html_url": "https://github.com/acme-dev/three-hops"}),
+                )
+            if url.endswith("/loop0"):
+                return HttpResponse(status_code=301, body="{}", headers={"Location": "/loop1"})
+            if url.endswith("/loop1"):
+                return HttpResponse(status_code=301, body="{}", headers={"Location": "/loop2"})
+            if url.endswith("/loop2"):
+                return HttpResponse(status_code=301, body="{}", headers={"Location": "/loop3"})
+            if url.endswith("/loop3"):
+                return HttpResponse(status_code=301, body='{"message":"Still Moving"}', headers={"Location": "/loop4"})
+            if url.endswith("/evil-hop"):
+                return HttpResponse(status_code=301, body="{}", headers={"Location": "https://evil.attacker.invalid/steal"})
+            return HttpResponse(status_code=500, body="unexpected")
+
+    vcs_edge = GitHubVCSAdapter(
+        runner=FakeRunner(),
+        owner="acme-dev",
+        github_token=gh_tok,
+        http_transport=_EdgeRedirectTransport(),
+    )
+    st3, _ = vcs_edge._github_request("PATCH", "/hop0", {"name": "three-hops"})
+    assert st3 == 200
+    assert vcs_edge.repo_slug == "acme-dev/three-hops"
+    assert vcs_edge.repo_url == "https://github.com/acme-dev/three-hops"
+    patch_calls = [c for c in calls_edge if "/hop" in c[1]]
+    assert len(patch_calls) == 4  # initial + 3 hops
+    assert all(c[0] == "PATCH" and c[2] == {"name": "three-hops"} and c[3]["Authorization"] == f"Bearer {gh_tok}" for c in patch_calls)
+
+    st_limit, _ = vcs_edge._github_request("GET", "/loop0")
+    assert st_limit == 301
+    assert not any(c[1].endswith("/loop4") for c in calls_edge)
+
+    with pytest.raises(VcsError) as unsafe_err:
+        vcs_edge._github_request("POST", "/evil-hop", {"title": "PR"})
+    assert gh_tok not in str(unsafe_err.value)
+    assert not any("evil.attacker.invalid" in c[1] for c in calls_edge)
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_github_vcs_real_urllib_transport_preserves_post_and_put_across_301_redirects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise real UrllibHttpTransport against loopback HTTP 301 server confirming urllib does not downgrade POST/PUT to GET or strip JSON body/Bearer header."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from agent_factory.adapters.telegram_client import UrllibHttpTransport
+
+    gh_tok = "TEST_REAL_URLLIB_REDIR_TOKEN_999"
+    orig_which = shutil.which
+
+    def _hide_gh(
+        name: str,
+        mode: int = os.F_OK | os.X_OK,
+        path: str | None = None,
+    ) -> str | None:
+        return None if name == "gh" else orig_which(name, mode=mode, path=path)
+
+    monkeypatch.setattr("agent_factory.adapters.github_vcs_adapter.shutil.which", _hide_gh)
+
+    observed: list[tuple[str, str, str, str]] = []
+
+    class _FakeGitHubRedirectServer(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length).decode("utf-8") if length else ""
+            auth = str(self.headers.get("Authorization") or "")
+            observed.append(("POST", self.path, auth, raw))
+            port = self.server.server_port
+            if self.path == "/repos/acme-dev/legacy-slug/pulls":
+                self.send_response(301)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Location", f"http://127.0.0.1:{port}/repos/acme-dev/canon-slug/pulls")
+                body = b'{"message":"Moved Permanently"}'
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/repos/acme-dev/canon-slug/pulls":
+                body = json.dumps({"number": 42, "html_url": "https://github.com/acme-dev/canon-slug/pull/42"}).encode("utf-8")
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def do_PUT(self) -> None:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length).decode("utf-8") if length else ""
+            auth = str(self.headers.get("Authorization") or "")
+            observed.append(("PUT", self.path, auth, raw))
+            port = self.server.server_port
+            if self.path == "/repos/acme-dev/canon-slug/pulls/42/merge":
+                self.send_response(301)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Location", f"http://127.0.0.1:{port}/repositories/555/pulls/42/merge")
+                body = b'{"message":"Moved Permanently"}'
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/repositories/555/pulls/42/merge":
+                body = json.dumps({"merged": True}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def do_GET(self) -> None:
+            auth = str(self.headers.get("Authorization") or "")
+            observed.append(("GET", self.path, auth, ""))
+            self.send_response(405)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            _ = (format, args)
+
+    srv = HTTPServer(("127.0.0.1", 0), _FakeGitHubRedirectServer)
+    srv_thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    srv_thread.start()
+    try:
+        # Repo with remote main so merge_and_deploy executes PR create + merge via REST
+        bare_remote = tmp_path / "bare" / "acme-dev" / "legacy-slug.git"
+        bare_remote.parent.mkdir(parents=True)
+        subprocess.run(["git", "init", "--bare", "-b", "main", str(bare_remote)], check=True, capture_output=True)
+        seed = tmp_path / "seed_http"
+        seed.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=seed, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Seed"], cwd=seed, check=True)
+        subprocess.run(["git", "config", "user.email", "seed@local.test"], cwd=seed, check=True)
+        (seed / "README.md").write_text("seed\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=seed, check=True)
+        subprocess.run(["git", "commit", "-m", "seed"], cwd=seed, check=True, capture_output=True)
+        subprocess.run(["git", "push", str(bare_remote), "main:main"], cwd=seed, check=True, capture_output=True)
+
+        ws_dir = tmp_path / "ws" / "legacy-slug"
+        ws_dir.mkdir(parents=True)
+        (ws_dir / "index.html").write_text("<h1>Live</h1>\n", encoding="utf-8")
+        empty_home = tmp_path / "home_http"
+        empty_home.mkdir()
+
+        class _LoopbackRunner(SubprocessRunner):
+            def run(
+                self,
+                command: Sequence[str],
+                cwd: Path,
+                timeout_seconds: float = 30.0,
+                env: Mapping[str, str] | None = None,
+            ) -> CommandResult:
+                iso_env = dict(env if env is not None else os.environ)
+                iso_env["HOME"] = str(empty_home)
+                iso_env["USERPROFILE"] = str(empty_home)
+                iso_env["GIT_CONFIG_NOSYSTEM"] = "1"
+                iso_env["GIT_CONFIG_GLOBAL"] = str(empty_home / "none")
+                rewritten = (
+                    [str(bare_remote) if arg == "origin" else arg for arg in command]
+                    if len(command) >= 2 and command[0] == "git" and command[1] in ("push", "ls-remote")
+                    else list(command)
+                )
+                return super().run(rewritten, cwd, timeout_seconds=timeout_seconds, env=iso_env)
+
+        class _LocalNoCreateVCS(GitHubVCSAdapter):
+            def _ensure_github_repo(self, project_id: str, *, env: Mapping[str, str]) -> str:
+                _ = (project_id, env)
+                return "acme-dev"
+
+        vcs = _LocalNoCreateVCS(
+            runner=_LoopbackRunner(),
+            owner="acme-dev",
+            github_token=gh_tok,
+            secrets=(gh_tok,),
+            api_base_url=f"http://127.0.0.1:{srv.server_port}",
+            http_transport=UrllibHttpTransport(),
+        )
+        vcs.push_branch("legacy-slug", ws_dir, branch="work")
+        repo_url, _ = vcs.merge_and_deploy("legacy-slug", branch="work")
+
+        assert repo_url == "https://github.com/acme-dev/canon-slug"
+        assert vcs.repo_slug == "acme-dev/canon-slug"
+        assert [row[:2] for row in observed] == [
+            ("POST", "/repos/acme-dev/legacy-slug/pulls"),
+            ("POST", "/repos/acme-dev/canon-slug/pulls"),
+            ("PUT", "/repos/acme-dev/canon-slug/pulls/42/merge"),
+            ("PUT", "/repositories/555/pulls/42/merge"),
+        ]
+        assert not any(row[0] == "GET" for row in observed)
+        for method, _path, auth, raw_body in observed:
+            assert auth == f"Bearer {gh_tok}"
+            parsed_json = json.loads(raw_body)
+            if method == "POST":
+                assert parsed_json["head"] == "work"
+            else:
+                assert parsed_json == {"merge_method": "merge"}
+    finally:
+        srv.shutdown()
+        srv.server_close()

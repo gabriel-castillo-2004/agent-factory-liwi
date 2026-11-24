@@ -18,8 +18,43 @@ from agent_factory.ports.notifier import (
 from agent_factory.secrets import redact_secrets
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Disable urllib implicit redirects so callers handle 301/302/307/308 without method/auth loss."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        _ = (req, fp, code, msg, headers, newurl)
+        return None
+
+
+_DEFAULT_URLOPEN = urllib.request.urlopen
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
+def _extract_response_headers(
+    raw_headers: Any,
+    extra_secrets: Sequence[str],
+) -> dict[str, str]:
+    if raw_headers is None or not hasattr(raw_headers, "items"):
+        return {}
+    clean: dict[str, str] = {}
+    for k, v in raw_headers.items():
+        if v is not None:
+            clean[str(k)] = redact_secrets(str(v), extra_secrets=extra_secrets)
+    return clean
+
+
 class UrllibHttpTransport:
     """Standard-library outbound HTTP JSON transport (no server sockets, no extra deps)."""
+
+    supports_explicit_redirects: bool = True
 
     def request_json(
         self,
@@ -31,6 +66,7 @@ class UrllibHttpTransport:
         extra_secrets: Sequence[str] = (),
         *,
         raise_on_http_error: bool = False,
+        follow_redirects: bool = True,
     ) -> HttpResponse:
         """Execute outbound HTTPS JSON request using urllib.request."""
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
@@ -56,11 +92,28 @@ class UrllibHttpTransport:
                         extra.append(v.removeprefix("Bearer ").strip())
 
         err_to_raise: TelegramTransportError | None = None
+        use_no_redirect = (not follow_redirects) and (urllib.request.urlopen is _DEFAULT_URLOPEN)
         try:
-            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            open_cm = (
+                _NO_REDIRECT_OPENER.open(req, timeout=timeout_seconds)
+                if use_no_redirect
+                else urllib.request.urlopen(req, timeout=timeout_seconds)
+            )
+            with open_cm as resp:
                 body = resp.read().decode("utf-8")
-                return HttpResponse(status_code=resp.status, body=body)
+                resp_headers = _extract_response_headers(getattr(resp, "headers", None), extra)
+                geturl_fn = getattr(resp, "geturl", None)
+                final_url = str(geturl_fn()) if callable(geturl_fn) else url
+                return HttpResponse(
+                    status_code=resp.status,
+                    body=body,
+                    headers=resp_headers,
+                    final_url=final_url,
+                )
         except urllib.error.HTTPError as err:
+            err_headers = _extract_response_headers(getattr(err, "headers", None), extra)
+            geturl_fn = getattr(err, "geturl", None)
+            err_final_url = str(geturl_fn()) if callable(geturl_fn) else url
             if not raise_on_http_error:
                 try:
                     raw_body = (
@@ -75,6 +128,8 @@ class UrllibHttpTransport:
                 return HttpResponse(
                     status_code=int(err.code),
                     body=redact_secrets(raw_body, extra_secrets=extra),
+                    headers=err_headers,
+                    final_url=err_final_url,
                 )
             clean_msg = redact_secrets(
                 f"HTTP transport failed for {url}: {err}",

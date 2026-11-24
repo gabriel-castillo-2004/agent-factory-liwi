@@ -44,6 +44,8 @@ class HttpResponse(BaseModel):
 
     status_code: int
     body: str
+    headers: dict[str, str] = Field(default_factory=dict)
+    final_url: str = ""
 
 
 @runtime_checkable
