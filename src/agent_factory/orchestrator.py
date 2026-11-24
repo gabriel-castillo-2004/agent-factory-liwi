@@ -1224,6 +1224,100 @@ class Orchestrator:
                 self._write_chat_entries(project_id, raw_entries, chats_dir)
             return raw_entries
 
+    @staticmethod
+    def _scrub_chat_value(value: Any, extra_secrets: Sequence[str]) -> Any:
+        if isinstance(value, str):
+            return redact_secrets(value, extra_secrets=extra_secrets)
+        if isinstance(value, list):
+            return [Orchestrator._scrub_chat_value(v, extra_secrets) for v in value]
+        if isinstance(value, dict):
+            return {
+                str(k): Orchestrator._scrub_chat_value(v, extra_secrets)
+                for k, v in value.items()
+            }
+        return value
+
+    def record_automated_quality_audit(
+        self,
+        project_id: str,
+        *,
+        report: Any,
+        commit_sha: str = "",
+        version_label: str = "",
+        duration_seconds: float | None = None,
+        chats_dir: Path | None = None,
+        extra_secrets: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """Persist automatic ParentAuditor Markdown report and scorecard into project audit history."""
+        validate_project_id(project_id)
+        if not self.store.get_events(project_id):
+            raise ValueError(f"Project '{project_id}' does not exist")
+        eff_dir = self._resolve_chats_dir(chats_dir)
+        clean_sha = ""
+        if isinstance(commit_sha, str) and commit_sha.strip():
+            try:
+                clean_sha = validate_commit_sha(commit_sha.strip())
+            except ValueError:
+                clean_sha = ""
+        clean_ver = redact_secrets(str(version_label or "").strip(), extra_secrets=extra_secrets)
+        scorecard = (
+            report.to_scorecard_dict(extra_secrets=extra_secrets)
+            if hasattr(report, "to_scorecard_dict")
+            else (
+                self._scrub_chat_value(dict(report), extra_secrets)
+                if isinstance(report, Mapping)
+                else {}
+            )
+        )
+        raw_markdown = (
+            str(getattr(report, "markdown_report", "") or "")
+            if not isinstance(report, Mapping)
+            else str(report.get("markdown_report") or report.get("content") or "")
+        )
+        clean_markdown = redact_secrets(raw_markdown.strip(), extra_secrets=extra_secrets)
+        raw_improvements = (
+            getattr(report, "improvements", None)
+            if not isinstance(report, Mapping)
+            else report.get("improvements")
+        ) or []
+        suggested = "\n".join(
+            f"- {redact_secrets(str(imp).strip(), extra_secrets=extra_secrets)}"
+            for imp in raw_improvements
+            if str(imp).strip()
+        )
+        ver_suffix = f"-{clean_ver}" if clean_ver else ""
+        doc_title = f"{project_id}-auditoria{ver_suffix}.md"
+        now_iso = self._now().isoformat()
+        entry_id = f"qa-{uuid.uuid4().hex[:10]}"
+        entry: dict[str, Any] = {
+            "id": entry_id,
+            "role": "assistant",
+            "mode": "audit",
+            "prompt": f"Auditoría integral automática ({clean_ver or 'entrega'})",
+            "content": clean_markdown,
+            "suggested_changes": suggested,
+            "document_title": doc_title,
+            "status": "completed",
+            "stage_label": CHAT_STAGE_COMPLETED,
+            "error_detail": "",
+            "duration_seconds": (
+                round(max(0.0, float(duration_seconds)), 2)
+                if duration_seconds is not None
+                else None
+            ),
+            "server_boot_id": self._server_boot_id,
+            "commit_sha": clean_sha,
+            "version_label": clean_ver,
+            "quality_scorecard": scorecard,
+            "created_at": now_iso,
+            "completed_at": now_iso,
+        }
+        with self._chat_io_lock:
+            raw, _ = self._read_raw_chat_entries(project_id, eff_dir)
+            raw.append(entry)
+            self._write_chat_entries(project_id, raw, eff_dir)
+        return entry
+
     def get_project_chat_history(
         self,
         project_id: str,
@@ -1245,9 +1339,7 @@ class Orchestrator:
         for entry in raw:
             item: dict[str, Any] = {}
             for k, v in entry.items():
-                item[str(k)] = (
-                    redact_secrets(v, extra_secrets=extra_secrets) if isinstance(v, str) else v
-                )
+                item[str(k)] = self._scrub_chat_value(v, extra_secrets)
             item.setdefault("commit_sha", "")
             item.setdefault("version_label", "")
             eff_status = str(item.get("status") or "completed")
@@ -2015,20 +2107,27 @@ class Orchestrator:
                 extra_secrets=extra_secrets,
             )
             rollback_from = str(pl.get("rollback_from") or "").strip() or None
-            checkpoints.append(
-                {
-                    "version_label": label,
-                    "commit_sha": clean_sha,
-                    "short_sha": clean_sha[:7] if clean_sha else "",
-                    "delivered_at": ev.at.isoformat(),
-                    "repo_url": redact_secrets(str(pl.get("repo_url") or ""), extra_secrets=extra_secrets),
-                    "deploy_url": redact_secrets(str(pl.get("deploy_url") or ""), extra_secrets=extra_secrets),
-                    "rollback_from": rollback_from,
-                    "summary": redact_secrets(str(pl.get("summary") or ""), extra_secrets=extra_secrets),
-                    "can_rollback": bool(clean_sha),
-                    "is_current": False,
-                }
+            raw_scorecard = pl.get("quality_scorecard")
+            scorecard = (
+                self._scrub_chat_value(raw_scorecard, extra_secrets)
+                if isinstance(raw_scorecard, Mapping)
+                else None
             )
+            cp_entry: dict[str, Any] = {
+                "version_label": label,
+                "commit_sha": clean_sha,
+                "short_sha": clean_sha[:7] if clean_sha else "",
+                "delivered_at": ev.at.isoformat(),
+                "repo_url": redact_secrets(str(pl.get("repo_url") or ""), extra_secrets=extra_secrets),
+                "deploy_url": redact_secrets(str(pl.get("deploy_url") or ""), extra_secrets=extra_secrets),
+                "rollback_from": rollback_from,
+                "summary": redact_secrets(str(pl.get("summary") or ""), extra_secrets=extra_secrets),
+                "can_rollback": bool(clean_sha),
+                "is_current": False,
+            }
+            if scorecard is not None:
+                cp_entry["quality_scorecard"] = scorecard
+            checkpoints.append(cp_entry)
         if checkpoints:
             checkpoints[-1]["is_current"] = True
         return list(reversed(checkpoints))

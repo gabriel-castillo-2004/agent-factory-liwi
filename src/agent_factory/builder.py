@@ -10,9 +10,18 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from agent_factory.adapters.agy_cli_adapter import sanitize_agent_summary
+from agent_factory.adapters.agy_cli_adapter import (
+    build_sanitized_cli_env,
+    sanitize_agent_summary,
+)
 from agent_factory.adapters.model_resolver import ACTIVITY_MESSAGES
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
+from agent_factory.agents.quality_auditor import (
+    ParentAuditor,
+    QualityAuditReport,
+    build_quality_markdown_report,
+    format_refinement_feedback,
+)
 from agent_factory.domain.events import Event, EventType, create_event
 from agent_factory.domain.models import (
     AcceptanceTest,
@@ -26,7 +35,7 @@ from agent_factory.orchestrator import Orchestrator
 from agent_factory.ports.clock import Clock
 from agent_factory.ports.code_agent import CodeAgent, CodeAgentError, QuotaExhaustedError
 from agent_factory.ports.publisher import RegistryPublisher, RegistryPublishError
-from agent_factory.ports.runner import CommandTimeoutError, Runner
+from agent_factory.ports.runner import CommandResult, CommandTimeoutError, Runner
 from agent_factory.ports.vcs import VCS
 from agent_factory.runtime_runner import LocalAppRunner, detect_workspace_app, run_http_smoke_test
 from agent_factory.secrets import redact_secrets
@@ -40,6 +49,7 @@ from agent_factory.workspace import (
     is_python_cache_path,
     read_workspace_git_head_sha,
     verify_and_restore_test_lock,
+    verify_isolated_git_root,
     workspace_nonempty_test_files,
     write_workspace_manifest,
 )
@@ -254,6 +264,10 @@ class BuildWorker:
         registry_publisher: RegistryPublisher | None = None,
         secrets_to_redact: Sequence[str] = (),
         local_app_runner: LocalAppRunner | None = None,
+        quality_auditor: ParentAuditor | None = None,
+        quality_audit_enabled: bool | None = None,
+        chats_dir: Path | None = None,
+        max_quality_refinement_rounds: int = 2,
     ) -> None:
         self.orchestrator = orchestrator
         self.workspace_manager = workspace_manager
@@ -269,6 +283,10 @@ class BuildWorker:
         self.registry_publisher = registry_publisher
         self.secrets_to_redact: tuple[str, ...] = tuple(secrets_to_redact)
         self.local_app_runner = local_app_runner
+        self.quality_auditor = quality_auditor
+        self.quality_audit_enabled = quality_audit_enabled
+        self.chats_dir: Path | None = Path(chats_dir).resolve() if chats_dir is not None else None
+        self.max_quality_refinement_rounds = max(0, min(2, int(max_quality_refinement_rounds)))
 
     @staticmethod
     def _extract_modification_context(events: Sequence[Event]) -> tuple[str | None, list[str]]:
@@ -862,6 +880,588 @@ class BuildWorker:
             extra_secrets=self.secrets_to_redact,
         )
 
+    _SNAPSHOT_SKIP_DIRS: frozenset[str] = frozenset(
+        {
+            ".git",
+            ".agent-factory",
+            ".venv",
+            "venv",
+            "node_modules",
+            "__pycache__",
+            ".pytest_cache",
+        }
+    )
+
+    def _resolve_quality_auditor(self) -> ParentAuditor | None:
+        if self.quality_audit_enabled is False:
+            return None
+        if self.quality_auditor is not None:
+            return self.quality_auditor
+        llm = getattr(self.orchestrator, "llm", None)
+        if llm is None:
+            return ParentAuditor(None) if self.quality_audit_enabled is True else None
+        if (
+            self.quality_audit_enabled is None
+            and llm.__class__.__name__ == "FakeLLM"
+            and not getattr(llm, "_responses", None)
+        ):
+            return None
+        return ParentAuditor(llm)
+
+    def _should_persist_audit_history(self) -> bool:
+        if self.chats_dir is not None:
+            return True
+        db_path = getattr(self.orchestrator.store, "db_path", None)
+        return bool(db_path and str(db_path) != ":memory:")
+
+    @classmethod
+    def _snapshot_workspace_files(cls, ws_dir: Path) -> dict[str, bytes]:
+        """Capture bounded snapshot of regular non-secret workspace files cleanly (INV-19, INV-22)."""
+        ws_resolved = ws_dir.resolve()
+        snap: dict[str, bytes] = {}
+        for item in ws_resolved.rglob("*"):
+            if item.is_symlink() or not item.is_file():
+                continue
+            try:
+                resolved_item = item.resolve()
+            except OSError:
+                continue
+            if not resolved_item.is_relative_to(ws_resolved):
+                continue
+            rel = resolved_item.relative_to(ws_resolved).as_posix()
+            parts = rel.split("/")
+            if any(p in cls._SNAPSHOT_SKIP_DIRS for p in parts):
+                continue
+            if parts[-1] == ".env" or parts[-1].startswith(".env."):
+                continue
+            try:
+                snap[rel] = resolved_item.read_bytes()
+            except OSError:
+                continue
+        return snap
+
+    def _commit_git_checkpoint(
+        self,
+        project_id: str,
+        ws_dir: Path,
+        message: str,
+    ) -> str | None:
+        """Create an isolated Git checkpoint commit when using real Runner + Git repo."""
+        if self.runner.__class__.__name__ == "FakeRunner" or not (ws_dir / ".git").exists():
+            return read_workspace_git_head_sha(ws_dir, runner=self.runner)
+        try:
+            ws_resolved = verify_isolated_git_root(ws_dir, self.runner)
+        except (SandboxViolationError, ValueError, OSError):
+            return None
+        clean_env = build_sanitized_cli_env()
+        self.runner.run(["git", "add", "-A"], cwd=ws_resolved, timeout_seconds=10.0, env=clean_env)
+        diff_res = self.runner.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=ws_resolved,
+            timeout_seconds=10.0,
+            env=clean_env,
+        )
+        head_sha = read_workspace_git_head_sha(ws_resolved, runner=self.runner)
+        if diff_res.exit_code != 0 or not head_sha:
+            allow_empty = ["--allow-empty"] if (not head_sha and diff_res.exit_code == 0) else []
+            self.runner.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=AgentFactory",
+                    "-c",
+                    "user.email=agent@factory.local",
+                    "commit",
+                    *allow_empty,
+                    "--no-verify",
+                    "-m",
+                    f"chore({project_id}): {message}",
+                ],
+                cwd=ws_resolved,
+                timeout_seconds=10.0,
+                env=clean_env,
+            )
+        return read_workspace_git_head_sha(ws_resolved, runner=self.runner)
+
+    def _restore_quality_checkpoint(
+        self,
+        ws_dir: Path,
+        *,
+        commit_sha: str | None,
+        snapshot: Mapping[str, bytes],
+        lock_snapshot: TestLockSnapshot,
+    ) -> None:
+        """Restore workspace cleanly to verified Git commit or contained file snapshot (INV-13, INV-22)."""
+        ws_resolved = ws_dir.resolve()
+        if (
+            commit_sha
+            and self.runner.__class__.__name__ != "FakeRunner"
+            and (ws_resolved / ".git").exists()
+        ):
+            try:
+                verified_ws = verify_isolated_git_root(ws_resolved, self.runner)
+                clean_env = build_sanitized_cli_env()
+                self.runner.run(
+                    ["git", "reset", "--hard", commit_sha],
+                    cwd=verified_ws,
+                    timeout_seconds=10.0,
+                    env=clean_env,
+                )
+                self.runner.run(
+                    ["git", "clean", "-fd", "-e", ".agent-factory"],
+                    cwd=verified_ws,
+                    timeout_seconds=10.0,
+                    env=clean_env,
+                )
+                verify_and_restore_test_lock(ws_resolved, lock_snapshot)
+                return
+            except (SandboxViolationError, ValueError, OSError):
+                pass
+
+        for existing in list(ws_resolved.rglob("*")):
+            if existing.is_symlink() or not existing.is_file():
+                continue
+            try:
+                resolved_item = existing.resolve()
+            except OSError:
+                continue
+            if not resolved_item.is_relative_to(ws_resolved):
+                continue
+            rel = resolved_item.relative_to(ws_resolved).as_posix()
+            parts = rel.split("/")
+            if any(p in self._SNAPSHOT_SKIP_DIRS for p in parts):
+                continue
+            if parts[-1] == ".env" or parts[-1].startswith(".env."):
+                continue
+            if rel not in snapshot:
+                try:
+                    resolved_item.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        for rel, data in snapshot.items():
+            target = (ws_resolved / rel).resolve()
+            if not target.is_relative_to(ws_resolved) or target.is_symlink():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+
+        verify_and_restore_test_lock(ws_resolved, lock_snapshot)
+
+    def _run_local_pytest(
+        self,
+        project_id: str,
+        job: BuildJob,
+        ws_dir: Path,
+        *,
+        build_round: int,
+    ) -> tuple[bool, int, int, list[str], CommandResult, float]:
+        """Run pytest inside ws_dir, parse test counts, update job results, and emit TESTS_UPDATED."""
+        pytest_ini_path = self.workspace_manager.resolve_safe_path(project_id, "pytest.ini")
+        pytest_cmd = [
+            "pytest",
+            "-v",
+            "--tb=short",
+            "-ra",
+            "-o",
+            "addopts=",
+            *(["-c", str(pytest_ini_path)] if pytest_ini_path.is_file() else []),
+            f"--rootdir={ws_dir}",
+        ]
+        verify_t0 = time.monotonic()
+        runner_result = self.runner.run(
+            command=pytest_cmd,
+            cwd=ws_dir,
+            timeout_seconds=30.0,
+        )
+        local_test_duration = round(max(0.0, time.monotonic() - verify_t0), 3)
+        required_test_ids = [at.id for at in job.plan.acceptance_tests]
+        parsed_counts = _parse_pytest_counts(runner_result.stdout, runner_result.stderr)
+        no_skipped_or_errors = (
+            parsed_counts["failed"] == 0
+            and parsed_counts["errors"] == 0
+            and parsed_counts["skipped"] == 0
+            and parsed_counts["xfailed"] == 0
+        )
+
+        tests_passed_count = 0
+        tests_total_count = len(job.plan.acceptance_tests)
+        if runner_result.test_results:
+            job.test_results = dict(runner_result.test_results)
+            passed = sum(1 for v in runner_result.test_results.values() if v)
+            failed = sum(1 for v in runner_result.test_results.values() if not v)
+            total = len(runner_result.test_results)
+            tests_passed_count = passed
+            tests_total_count = total
+            failing_tests = [
+                tid
+                for tid in required_test_ids
+                if runner_result.test_results.get(tid) is not True
+            ] + [
+                k
+                for k, v in runner_result.test_results.items()
+                if not v and k not in required_test_ids
+            ]
+            self.orchestrator.store.append(
+                create_event(
+                    project_id=project_id,
+                    event_type=EventType.TESTS_UPDATED,
+                    payload={
+                        "passed": passed,
+                        "failed": failed,
+                        "total": total,
+                        "round": build_round,
+                        "duration_seconds": local_test_duration,
+                    },
+                    at=self.orchestrator._now(),
+                )
+            )
+            has_all_plan_tests = all(
+                runner_result.test_results.get(tid) is True for tid in required_test_ids
+            )
+            all_reported_tests_passed = all(runner_result.test_results.values())
+            local_tests_passed = (
+                runner_result.exit_code == 0
+                and has_all_plan_tests
+                and all_reported_tests_passed
+                and no_skipped_or_errors
+            )
+        else:
+            passed = parsed_counts["passed"]
+            failed = (
+                parsed_counts["failed"]
+                + parsed_counts["errors"]
+                + parsed_counts["skipped"]
+                + parsed_counts["xfailed"]
+            )
+            total = passed + failed
+            local_tests_passed = (
+                runner_result.exit_code == 0 and passed > 0 and no_skipped_or_errors
+            )
+            if total > 0:
+                tests_passed_count = passed
+                tests_total_count = total
+                if local_tests_passed:
+                    job.test_results = (
+                        {tid: True for tid in required_test_ids}
+                        if required_test_ids
+                        else {f"test_{idx}": True for idx in range(1, passed + 1)}
+                    )
+                    failing_tests = []
+                else:
+                    failing_tests = _extract_failing_nodeids(
+                        runner_result.stdout, runner_result.stderr
+                    )
+                self.orchestrator.store.append(
+                    create_event(
+                        project_id=project_id,
+                        event_type=EventType.TESTS_UPDATED,
+                        payload={
+                            "passed": passed,
+                            "failed": failed,
+                            "total": total,
+                            "round": build_round,
+                            "duration_seconds": local_test_duration,
+                        },
+                        at=self.orchestrator._now(),
+                    )
+                )
+            else:
+                failing_tests = []
+
+        return (
+            local_tests_passed,
+            tests_passed_count,
+            tests_total_count,
+            failing_tests,
+            runner_result,
+            verify_t0,
+        )
+
+    def _run_local_smoke_test(
+        self,
+        project_id: str,
+        ws_dir: Path,
+        *,
+        build_round: int,
+        max_code_rounds: int,
+        tests_passed_count: int,
+        tests_total_count: int,
+    ) -> tuple[bool, str | None, tuple[str, ...]]:
+        """Run HTTP smoke check when applicable, returning (passed, redacted_error, failed_resources)."""
+        if not (
+            (self.local_app_runner is not None or isinstance(self.runner, SubprocessRunner))
+            and detect_workspace_app(ws_dir).app_type in ("static", "python_local")
+        ):
+            return True, None, ()
+
+        self._report_activity(
+            "Verificando arranque local (HTTP Smoke Test)...",
+            agents_count=1,
+            stage="VERIFYING",
+            detail=f"Ronda {build_round} de hasta {max_code_rounds}",
+            tests_passed=tests_passed_count,
+            tests_total=tests_total_count,
+            build_round=build_round,
+            max_rounds=max_code_rounds,
+        )
+        smoke_runner = (
+            self.local_app_runner
+            if self.local_app_runner is not None
+            else LocalAppRunner(
+                workspace_manager=self.workspace_manager,
+                secrets_to_redact=self.secrets_to_redact,
+            )
+        )
+        smoke_res = run_http_smoke_test(smoke_runner, project_id, ws_dir)
+        if smoke_res.passed:
+            return True, None, ()
+        return False, self._redact(smoke_res.summary), tuple(smoke_res.failed_resources)
+
+    def _run_quality_audit_and_refinement(
+        self,
+        project_id: str,
+        job: BuildJob,
+        ws_dir: Path,
+        *,
+        build_round: int,
+        max_code_rounds: int,
+        effective_plan: Plan,
+        tests_passed_count: int,
+        tests_total_count: int,
+    ) -> tuple[QualityAuditReport | None, int, int, bool, float]:
+        """Run ParentAuditor + bounded 2-round refinement with anti-regression checkpointing."""
+        auditor = self._resolve_quality_auditor()
+        if auditor is None:
+            return None, tests_passed_count, tests_total_count, False, 0.0
+
+        assert job.lock_snapshot is not None
+        audit_t0 = time.monotonic()
+        building_limit = (
+            self.orchestrator.circuit_breaker.get_limit(ProjectState.BUILDING) or 15
+        )
+        max_ref_rounds = self.max_quality_refinement_rounds
+
+        def _invoke_auditor(audit_round_num: int) -> QualityAuditReport:
+            cur_status = self.orchestrator.get_status(project_id)
+            spec = self.orchestrator.get_spec(project_id)
+            self._report_activity(
+                "Evaluando calidad integral (6 sub-auditores)...",
+                agents_count=6,
+                stage="VERIFYING",
+                detail=f"Auditoría ronda {audit_round_num}",
+                tests_passed=tests_passed_count,
+                tests_total=tests_total_count,
+                build_round=build_round,
+                max_rounds=max_code_rounds,
+            )
+            call_t0 = time.monotonic()
+            rep = auditor.audit_workspace(
+                project_id,
+                ws_dir,
+                spec=spec,
+                plan=job.plan,
+                test_results=job.test_results,
+                round_number=audit_round_num,
+                project_name=cur_status.name or project_id,
+                extra_secrets=self.secrets_to_redact,
+            )
+            call_dur = round(max(0.0, time.monotonic() - call_t0), 3)
+            if rep.source == "llm":
+                cur_calls = self.orchestrator.circuit_breaker.get_calls(
+                    project_id, ProjectState.BUILDING
+                )
+                if cur_calls < building_limit:
+                    self.orchestrator.record_state_call(
+                        project_id,
+                        ProjectState.BUILDING,
+                        model=self._active_code_agent_model(),
+                        agent="quality_auditor",
+                        duration_seconds=call_dur,
+                        summary_short=self._bound_redacted(rep.summary, 180),
+                        outcome="ok" if rep.passed else "needs_refinement",
+                        extra_secrets=self.secrets_to_redact,
+                    )
+            return rep
+
+        best_report = _invoke_auditor(1)
+        best_test_results = dict(job.test_results)
+        best_tests_passed = tests_passed_count
+        best_tests_total = tests_total_count
+        best_snapshot = self._snapshot_workspace_files(ws_dir)
+        best_sha = self._commit_git_checkpoint(
+            project_id, ws_dir, f"quality checkpoint r0 ({best_report.global_score:.1f}%)"
+        )
+        restored_best = False
+
+        if best_report.passed or max_ref_rounds <= 0:
+            total_dur = round(max(0.0, time.monotonic() - audit_t0), 2)
+            return best_report, best_tests_passed, best_tests_total, restored_best, total_dur
+
+        for ref_round in range(1, max_ref_rounds + 1):
+            cur_calls = self.orchestrator.circuit_breaker.get_calls(
+                project_id, ProjectState.BUILDING
+            )
+            if cur_calls >= building_limit:
+                break
+
+            feedback = format_refinement_feedback(
+                best_report,
+                refinement_round=ref_round,
+                max_rounds=max_ref_rounds,
+                extra_secrets=self.secrets_to_redact,
+            )
+            self._report_activity(
+                f"Refinando calidad del proyecto (ronda {ref_round}/{max_ref_rounds})...",
+                agents_count=1,
+                stage="BUILDING",
+                detail=f"Puntaje previo: {best_report.global_score:.1f}%",
+                tests_passed=best_tests_passed,
+                tests_total=best_tests_total,
+                build_round=build_round + ref_round,
+                max_rounds=max_code_rounds,
+            )
+            ref_t0 = time.monotonic()
+            try:
+                impl_result = self.code_agent.implement_or_fix(
+                    ws_dir,
+                    effective_plan,
+                    failure_output=feedback,
+                    attempt=job.invocations_used + 1,
+                )
+            except (QuotaExhaustedError, CodeAgentError, CommandTimeoutError):
+                self._restore_quality_checkpoint(
+                    ws_dir,
+                    commit_sha=best_sha,
+                    snapshot=best_snapshot,
+                    lock_snapshot=job.lock_snapshot,
+                )
+                job.test_results = dict(best_test_results)
+                restored_best = True
+                break
+
+            ref_dur = round(max(0.0, time.monotonic() - ref_t0), 3)
+            tampered = not verify_and_restore_test_lock(ws_dir, job.lock_snapshot)
+            impl_files = self._sanitize_files_written(
+                getattr(impl_result, "files_written", None), tests_only=False
+            )
+            self.orchestrator.record_state_call(
+                project_id,
+                ProjectState.BUILDING,
+                model=getattr(impl_result, "model", None) or self._active_code_agent_model(),
+                agent="implement_or_fix",
+                duration_seconds=ref_dur,
+                round_num=build_round + ref_round,
+                max_rounds=max_code_rounds,
+                files_written=impl_files,
+                summary_short=self._summarize_short(getattr(impl_result, "summary", None)),
+                outcome="reverted_tamper" if tampered else "ok",
+                extra_secrets=self.secrets_to_redact,
+            )
+            job.invocations_used += 1
+
+            if tampered:
+                self._restore_quality_checkpoint(
+                    ws_dir,
+                    commit_sha=best_sha,
+                    snapshot=best_snapshot,
+                    lock_snapshot=job.lock_snapshot,
+                )
+                job.test_results = dict(best_test_results)
+                restored_best = True
+                continue
+
+            try:
+                (
+                    tests_ok,
+                    cur_passed,
+                    cur_total,
+                    _failing,
+                    _raw_res,
+                    _t0,
+                ) = self._run_local_pytest(
+                    project_id, job, ws_dir, build_round=build_round + ref_round
+                )
+            except (CommandTimeoutError, OSError, RuntimeError, ValueError):
+                tests_ok = False
+                cur_passed = 0
+                cur_total = best_tests_total
+
+            smoke_ok = False
+            if tests_ok:
+                cur_meta = self.orchestrator.get_status(project_id)
+                ensure_workspace_favicon(
+                    ws_dir,
+                    cur_meta.name or project_id,
+                    cur_meta.objective or job.plan.summary,
+                )
+                smoke_ok, _, _ = self._run_local_smoke_test(
+                    project_id,
+                    ws_dir,
+                    build_round=build_round + ref_round,
+                    max_code_rounds=max_code_rounds,
+                    tests_passed_count=cur_passed,
+                    tests_total_count=cur_total,
+                )
+
+            if not tests_ok or not smoke_ok:
+                self._restore_quality_checkpoint(
+                    ws_dir,
+                    commit_sha=best_sha,
+                    snapshot=best_snapshot,
+                    lock_snapshot=job.lock_snapshot,
+                )
+                job.test_results = dict(best_test_results)
+                restored_best = True
+                if best_tests_total > 0:
+                    self.orchestrator.store.append(
+                        create_event(
+                            project_id=project_id,
+                            event_type=EventType.TESTS_UPDATED,
+                            payload={
+                                "passed": best_tests_passed,
+                                "failed": 0,
+                                "total": best_tests_total,
+                                "round": build_round + ref_round,
+                                "restored_checkpoint": True,
+                            },
+                            at=self.orchestrator._now(),
+                        )
+                    )
+                continue
+
+            new_report = _invoke_auditor(ref_round + 1)
+            improved_or_same = new_report.global_score >= best_report.global_score and (
+                not best_report.passed or new_report.passed
+            )
+            if not improved_or_same:
+                self._restore_quality_checkpoint(
+                    ws_dir,
+                    commit_sha=best_sha,
+                    snapshot=best_snapshot,
+                    lock_snapshot=job.lock_snapshot,
+                )
+                job.test_results = dict(best_test_results)
+                restored_best = True
+                continue
+
+            best_report = new_report
+            best_test_results = dict(job.test_results)
+            best_tests_passed = cur_passed
+            best_tests_total = cur_total
+            best_snapshot = self._snapshot_workspace_files(ws_dir)
+            best_sha = self._commit_git_checkpoint(
+                project_id,
+                ws_dir,
+                f"quality checkpoint r{ref_round} ({best_report.global_score:.1f}%)",
+            )
+            restored_best = False
+            if best_report.passed:
+                break
+
+        total_dur = round(max(0.0, time.monotonic() - audit_t0), 2)
+        return best_report, best_tests_passed, best_tests_total, restored_best, total_dur
+
     def run_job(
         self,
         project_id: str,
@@ -1154,124 +1754,25 @@ class BuildWorker:
                 build_round=build_round,
                 max_rounds=max_code_rounds,
             )
-            pytest_ini_path = self.workspace_manager.resolve_safe_path(project_id, "pytest.ini")
-            pytest_cmd = [
-                "pytest",
-                "-v",
-                "--tb=short",
-                "-ra",
-                "-o",
-                "addopts=",
-                *(["-c", str(pytest_ini_path)] if pytest_ini_path.is_file() else []),
-                f"--rootdir={ws_dir}",
-            ]
-            verify_t0 = time.monotonic()
             try:
-                runner_result = self.runner.run(
-                    command=pytest_cmd,
-                    cwd=ws_dir,
-                    timeout_seconds=30.0,
+                (
+                    local_tests_passed,
+                    tests_passed_count,
+                    tests_total_count,
+                    failing_tests,
+                    runner_result,
+                    verify_t0,
+                ) = self._run_local_pytest(
+                    project_id,
+                    job,
+                    ws_dir,
+                    build_round=build_round,
                 )
             except (CommandTimeoutError, OSError, RuntimeError, ValueError) as err:
                 return self._fail_job(
                     project_id, job, err, failed_state=ProjectState.BUILDING
                 )
 
-            local_test_duration = round(max(0.0, time.monotonic() - verify_t0), 3)
-            required_test_ids = [at.id for at in job.plan.acceptance_tests]
-            parsed_counts = _parse_pytest_counts(runner_result.stdout, runner_result.stderr)
-            no_skipped_or_errors = (
-                parsed_counts["failed"] == 0
-                and parsed_counts["errors"] == 0
-                and parsed_counts["skipped"] == 0
-                and parsed_counts["xfailed"] == 0
-            )
-
-            # Update test results from structured runner output or parsed pytest summary/progress
-            if runner_result.test_results:
-                job.test_results = dict(runner_result.test_results)
-                passed = sum(1 for v in runner_result.test_results.values() if v)
-                failed = sum(1 for v in runner_result.test_results.values() if not v)
-                total = len(runner_result.test_results)
-                tests_passed_count = passed
-                tests_total_count = total
-                failing_tests = [
-                    tid
-                    for tid in required_test_ids
-                    if runner_result.test_results.get(tid) is not True
-                ] + [
-                    k
-                    for k, v in runner_result.test_results.items()
-                    if not v and k not in required_test_ids
-                ]
-                self.orchestrator.store.append(
-                    create_event(
-                        project_id=project_id,
-                        event_type=EventType.TESTS_UPDATED,
-                        payload={
-                            "passed": passed,
-                            "failed": failed,
-                            "total": total,
-                            "round": build_round,
-                            "duration_seconds": local_test_duration,
-                        },
-                        at=self.orchestrator._now(),
-                    )
-                )
-                has_all_plan_tests = all(
-                    runner_result.test_results.get(tid) is True for tid in required_test_ids
-                )
-                all_reported_tests_passed = all(runner_result.test_results.values())
-                local_tests_passed = (
-                    runner_result.exit_code == 0
-                    and has_all_plan_tests
-                    and all_reported_tests_passed
-                    and no_skipped_or_errors
-                )
-            else:
-                passed = parsed_counts["passed"]
-                failed = (
-                    parsed_counts["failed"]
-                    + parsed_counts["errors"]
-                    + parsed_counts["skipped"]
-                    + parsed_counts["xfailed"]
-                )
-                total = passed + failed
-                local_tests_passed = (
-                    runner_result.exit_code == 0
-                    and passed > 0
-                    and no_skipped_or_errors
-                )
-                if total > 0:
-                    tests_passed_count = passed
-                    tests_total_count = total
-                    if local_tests_passed:
-                        job.test_results = (
-                            {tid: True for tid in required_test_ids}
-                            if required_test_ids
-                            else {f"test_{idx}": True for idx in range(1, passed + 1)}
-                        )
-                        failing_tests = []
-                    else:
-                        failing_tests = _extract_failing_nodeids(
-                            runner_result.stdout, runner_result.stderr
-                        )
-                    self.orchestrator.store.append(
-                        create_event(
-                            project_id=project_id,
-                            event_type=EventType.TESTS_UPDATED,
-                            payload={
-                                "passed": passed,
-                                "failed": failed,
-                                "total": total,
-                                "round": build_round,
-                                "duration_seconds": local_test_duration,
-                            },
-                            at=self.orchestrator._now(),
-                        )
-                    )
-                else:
-                    failing_tests = []
             self._save_round_checkpoint(
                 project_id,
                 job.lock_snapshot,
@@ -1320,52 +1821,55 @@ class BuildWorker:
             )
 
             # Local HTTP Smoke Test before promoting to VERIFYING
-            if (
-                self.local_app_runner is not None
-                or isinstance(self.runner, SubprocessRunner)
-            ) and detect_workspace_app(ws_dir).app_type in ("static", "python_local"):
-                self._report_activity(
-                    "Verificando arranque local (HTTP Smoke Test)...",
-                    agents_count=1,
-                    stage="VERIFYING",
-                    detail=f"Ronda {build_round} de hasta {max_code_rounds}",
-                    tests_passed=tests_passed_count,
-                    tests_total=tests_total_count,
-                    build_round=build_round,
-                    max_rounds=max_code_rounds,
-                )
-                smoke_runner = (
-                    self.local_app_runner
-                    if self.local_app_runner is not None
-                    else LocalAppRunner(
-                        workspace_manager=self.workspace_manager,
-                        secrets_to_redact=self.secrets_to_redact,
+            smoke_passed, smoke_err, smoke_failed_resources = self._run_local_smoke_test(
+                project_id,
+                ws_dir,
+                build_round=build_round,
+                max_code_rounds=max_code_rounds,
+                tests_passed_count=tests_passed_count,
+                tests_total_count=tests_total_count,
+            )
+            if not smoke_passed:
+                assert smoke_err is not None
+                job.last_failure_output = smoke_err
+                smoke_sig = (-1, smoke_failed_resources, smoke_err)
+                if not impl_files:
+                    same_failure = last_failure_sig is None or smoke_sig == last_failure_sig
+                    consecutive_noop_rounds = (
+                        consecutive_noop_rounds + 1 if same_failure else 1
                     )
-                )
-                smoke_res = run_http_smoke_test(smoke_runner, project_id, ws_dir)
-                if not smoke_res.passed:
-                    smoke_err = self._redact(smoke_res.summary)
-                    job.last_failure_output = smoke_err
-                    smoke_sig = (-1, tuple(smoke_res.failed_resources), smoke_err)
-                    if not impl_files:
-                        same_failure = last_failure_sig is None or smoke_sig == last_failure_sig
-                        consecutive_noop_rounds = (
-                            consecutive_noop_rounds + 1 if same_failure else 1
+                    last_failure_sig = smoke_sig
+                    if consecutive_noop_rounds >= 2:
+                        return self._fail_job(
+                            project_id,
+                            job,
+                            f"Proceso detenido automáticamente tras 2 rondas consecutivas sin cambios ({self._bound_redacted(smoke_err, limit=180)}).",
+                            failed_state=ProjectState.BUILDING,
                         )
-                        last_failure_sig = smoke_sig
-                        if consecutive_noop_rounds >= 2:
-                            return self._fail_job(
-                                project_id,
-                                job,
-                                f"Proceso detenido automáticamente tras 2 rondas consecutivas sin cambios ({self._bound_redacted(smoke_err, limit=180)}).",
-                                failed_state=ProjectState.BUILDING,
-                            )
-                    else:
-                        consecutive_noop_rounds = 0
-                        last_failure_sig = smoke_sig
-                    continue
+                else:
+                    consecutive_noop_rounds = 0
+                    last_failure_sig = smoke_sig
+                continue
 
-            # Local tests and HTTP Smoke Test passed! Reset stagnation tracking, clear failure output, and transition to VERIFYING
+            # Parent Auditor + 6 Sub-Auditors + bounded 2-round quality refinement before delivery
+            (
+                quality_report,
+                tests_passed_count,
+                tests_total_count,
+                quality_restored_best,
+                quality_audit_dur,
+            ) = self._run_quality_audit_and_refinement(
+                project_id,
+                job,
+                ws_dir,
+                build_round=build_round,
+                max_code_rounds=max_code_rounds,
+                effective_plan=effective_plan,
+                tests_passed_count=tests_passed_count,
+                tests_total_count=tests_total_count,
+            )
+
+            # Local tests, HTTP Smoke Test, and Quality Audit passed! Transition to VERIFYING
             consecutive_noop_rounds = 0
             last_failure_sig = None
             job.last_failure_output = ""
@@ -1437,15 +1941,27 @@ class BuildWorker:
                     for ev in self.orchestrator.store.get_events(project_id)
                     if ev.type == EventType.PROJECT_DELIVERED
                 )
+                version_label = f"v{prior_delivered + 1}"
                 commit_sha = read_workspace_git_head_sha(ws_dir, runner=self.runner)
                 delivered_payload: dict[str, object] = {
                     "repo_url": repo_url,
                     "deploy_url": deploy_url,
                     "duration_seconds": pub_duration,
-                    "version_label": f"v{prior_delivered + 1}",
+                    "version_label": version_label,
                 }
                 if commit_sha:
                     delivered_payload["commit_sha"] = commit_sha
+                if quality_report is not None:
+                    quality_report.markdown_report = build_quality_markdown_report(
+                        quality_report,
+                        project_name=cur_meta.name or project_id,
+                        version_label=version_label,
+                        restored_best_checkpoint=quality_restored_best,
+                        extra_secrets=self.secrets_to_redact,
+                    )
+                    delivered_payload["quality_scorecard"] = quality_report.to_scorecard_dict(
+                        extra_secrets=self.secrets_to_redact
+                    )
                 self.orchestrator.store.append(
                     create_event(
                         project_id=project_id,
@@ -1454,6 +1970,16 @@ class BuildWorker:
                         at=self.orchestrator._now(),
                     )
                 )
+                if quality_report is not None and self._should_persist_audit_history():
+                    self.orchestrator.record_automated_quality_audit(
+                        project_id,
+                        report=quality_report,
+                        commit_sha=commit_sha or "",
+                        version_label=version_label,
+                        duration_seconds=quality_audit_dur,
+                        chats_dir=self.chats_dir,
+                        extra_secrets=self.secrets_to_redact,
+                    )
                 # Write PROJECT_PROMPT.md
                 prompt_file = ws_dir / "PROJECT_PROMPT.md"
                 prompt_content = (

@@ -3296,13 +3296,420 @@ def test_orchestrator_chat_persistent_lifecycle_timeout_orphan_retry_and_delete(
     store.close()
 
 
+def _build_full_audit_payload(
+    *,
+    ux_ui: float = 90.0,
+    functional_completeness: float = 90.0,
+    robustness: float = 90.0,
+    architecture_quality: float = 90.0,
+    security_hygiene: float = 90.0,
+    testing_runtime: float = 90.0,
+    ux_findings: list[str] | None = None,
+    ux_improvements: list[str] | None = None,
+) -> dict[str, object]:
+    return {
+        "summary": "Evaluación integral de 6 dimensiones.",
+        "dimensions": {
+            "ux_ui": {
+                "score": ux_ui,
+                "findings": ux_findings or ([] if ux_ui >= 70 else ["Contraste insuficiente en móvil"]),
+                "improvements": ux_improvements or ([] if ux_ui >= 70 else ["Mejorar contraste y botones >= 44px"]),
+            },
+            "functional_completeness": {
+                "score": functional_completeness,
+                "findings": [],
+                "improvements": [],
+            },
+            "robustness": {
+                "score": robustness,
+                "findings": [],
+                "improvements": [],
+            },
+            "architecture_quality": {
+                "score": architecture_quality,
+                "findings": [],
+                "improvements": [],
+            },
+            "security_hygiene": {
+                "score": security_hygiene,
+                "findings": [],
+                "improvements": [],
+            },
+            "testing_runtime": {
+                "score": testing_runtime,
+                "findings": [],
+                "improvements": [],
+            },
+        },
+    }
 
 
+def _setup_sqlite_approved_project(
+    tmp_path: Path,
+    pid: str,
+    *,
+    llm: object,
+) -> tuple[Orchestrator, object, WorkspaceManager]:
+    from agent_factory.adapters.sqlite_store import SqliteEventStore
+    from agent_factory.domain.events import create_event
+    from agent_factory.domain.models import AcceptanceTest, AcceptanceTestType, FileSpec, Plan
+
+    store = SqliteEventStore(str(tmp_path / f"{pid}.db"))
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / f"ws_{pid}")
+    plan = Plan(
+        summary="App web responsive",
+        rationale="Simple static frontend",
+        template_id="static-web",
+        deployment_target="github-pages",
+        files=[
+            FileSpec(path="index.html", purpose="UI principal", contract="HTML5 responsive"),
+            FileSpec(path="styles.css", purpose="Estilos", contract="Tema claro/oscuro"),
+        ],
+        acceptance_tests=[
+            AcceptanceTest(id="AT-01", description="Renderiza UI principal", type=AcceptanceTestType.UNIT)
+        ],
+    )
+    plan_hash = plan.compute_hash()
+    orch = Orchestrator(store=store, llm=llm, workspace_manager=ws_mgr)  # type: ignore[arg-type]
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=UTC)
+    store.append(
+        create_event(
+            pid,
+            EventType.PROJECT_CREATED,
+            {"name": "App Calidad", "objective": "App web responsive", "state": "INTERVIEW"},
+            at=now,
+        )
+    )
+    store.append(create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now))
+    store.append(create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now))
+    store.append(
+        create_event(
+            pid,
+            EventType.PLAN_CREATED,
+            {"plan": plan.model_dump(mode="json"), "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"},
+            at=now,
+        )
+    )
+    orch.submit_approval(pid, ApprovalEvent(plan_hash=plan_hash, timestamp=now, decision="approved"))
+    return orch, store, ws_mgr
 
 
+def test_quality_auditor_approves_on_first_audit_and_persists_markdown_report_and_scorecard(
+    tmp_path: Path,
+) -> None:
+    """Test 1: Project passing >=85% global and >=70% per area on first audit delivers with quality_scorecard and persists Markdown audit history."""
+    from agent_factory.agents.quality_auditor import ParentAuditor
+
+    pid = "qa-pass-first"
+    chats_dir = tmp_path / "chats_qa1"
+    llm = FakeLLM(
+        responses=[
+            _build_full_audit_payload(
+                ux_ui=92.0,
+                functional_completeness=90.0,
+                robustness=88.0,
+                architecture_quality=86.0,
+                security_hygiene=94.0,
+                testing_runtime=88.0,
+            ),
+            _build_full_audit_payload(
+                ux_ui=95.0,
+                functional_completeness=92.0,
+                robustness=90.0,
+                architecture_quality=90.0,
+                security_hygiene=95.0,
+                testing_runtime=92.0,
+            ),
+        ]
+    )
+    orch, store, ws_mgr = _setup_sqlite_approved_project(tmp_path, pid, llm=llm)
+    try:
+        auditor = ParentAuditor(llm=llm)
+        worker = BuildWorker(
+            orchestrator=orch,
+            workspace_manager=ws_mgr,
+            code_agent=FakeCodeAgent(
+                test_gen_steps=[
+                    {"tests/test_ui.py": "def test_at_01(): assert 1 == 1\n"},
+                    {"tests/test_ui.py": "def test_at_01(): assert 1 == 1\ndef test_mod_02(): assert True\n"},
+                ],
+                impl_steps=[
+                    {
+                        "index.html": "<!doctype html><html><body><main><h1>Hola</h1></main></body></html>\n",
+                        "styles.css": ":root { --bg: #fff; }\n",
+                    },
+                    {
+                        "index.html": "<!doctype html><html><body><main><h1>Hola v2</h1></main></body></html>\n",
+                    },
+                ],
+            ),
+            runner=FakeRunner(
+                results=[
+                    CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True}),
+                    CommandResult(exit_code=0, stdout="2 passed", test_results={"AT-01": True, "MOD-02": True}),
+                ]
+            ),
+            vcs=FakeVCS(
+                ci_results=[
+                    CIRunResult(passed=True, summary="CI ok"),
+                    CIRunResult(passed=True, summary="CI mod ok"),
+                ]
+            ),
+            quality_auditor=auditor,
+            chats_dir=chats_dir,
+        )
+
+        report = worker.run_job(pid)
+        assert report.invocations == 2  # 1 test_gen + 1 impl, 0 refinement calls
+        status = orch.get_status(pid)
+        assert status.state == ProjectState.DELIVERED
+
+        delivered_ev = next(e for e in store.get_events(pid) if e.type == EventType.PROJECT_DELIVERED)
+        scorecard = delivered_ev.payload.get("quality_scorecard")
+        assert isinstance(scorecard, dict)
+        assert scorecard["passed"] is True
+        assert scorecard["global_score"] >= 85.0
+        assert all(area["score"] >= 70.0 for area in scorecard["areas"] if area["active"])
+
+        history = orch.get_project_chat_history(pid, chats_dir=chats_dir)
+        audit_entries = [h for h in history if h.get("role") == "assistant" and h.get("mode") == "audit"]
+        assert len(audit_entries) == 1
+        assert audit_entries[0]["status"] == "completed"
+        assert audit_entries[0]["version_label"] == "v1"
+        assert "| Área |" in audit_entries[0]["content"]
+        assert "UX/UI" in audit_entries[0]["content"]
+        assert audit_entries[0]["quality_scorecard"]["global_score"] == scorecard["global_score"]
+
+        # Verify post-delivery modify_project -> BuildWorker.run_job ALSO executes ParentAuditor and saves v2 scorecard
+        orch.modify_project(pid, "Actualizar título a Hola v2")
+        worker.queue.remove(pid)
+        worker.enqueue_approved_project(pid)
+        mod_report = worker.run_job(pid)
+        assert mod_report.failure_cause is None
+        delivered_events = [e for e in store.get_events(pid) if e.type == EventType.PROJECT_DELIVERED]
+        assert len(delivered_events) == 2
+        assert delivered_events[1].payload["version_label"] == "v2"
+        assert delivered_events[1].payload["quality_scorecard"]["passed"] is True
+        assert delivered_events[1].payload["quality_scorecard"]["global_score"] > scorecard["global_score"]
+        history2 = orch.get_project_chat_history(pid, chats_dir=chats_dir)
+        audit_entries2 = [h for h in history2 if h.get("role") == "assistant" and h.get("mode") == "audit"]
+        assert len(audit_entries2) == 2
+        assert audit_entries2[-1]["version_label"] == "v2"
+    finally:
+        store.close()
 
 
+def test_quality_auditor_triggers_refinement_when_failed_then_delivers_approved(
+    tmp_path: Path,
+) -> None:
+    """Test 2: First audit scoring 72% (ux_ui=60%) triggers bounded refinement sending penalized findings, reaches 90%, and delivers approved."""
+    from agent_factory.agents.quality_auditor import ParentAuditor
+
+    pid = "qa-refine-pass"
+    chats_dir = tmp_path / "chats_qa2"
+    llm = FakeLLM(
+        responses=[
+            # Audit round 1: 0.25*60 + 0.25*80 + 0.125*(74+76+76+70) = 15 + 20 + 37 = 72.0%
+            _build_full_audit_payload(
+                ux_ui=60.0,
+                functional_completeness=80.0,
+                robustness=74.0,
+                architecture_quality=76.0,
+                security_hygiene=76.0,
+                testing_runtime=70.0,
+                ux_findings=["Botones menores a 44px en 360px"],
+                ux_improvements=["Aplicar min-height: 44px y mejor contraste"],
+            ),
+            # Audit round 2 (after 1 refinement): 90.0%
+            _build_full_audit_payload(
+                ux_ui=90.0,
+                functional_completeness=90.0,
+                robustness=90.0,
+                architecture_quality=90.0,
+                security_hygiene=90.0,
+                testing_runtime=90.0,
+            ),
+        ]
+    )
+    orch, store, ws_mgr = _setup_sqlite_approved_project(tmp_path, pid, llm=llm)
+    try:
+        code_agent = FakeCodeAgent(
+            test_gen_steps=[{"tests/test_ui.py": "def test_at_01(): assert True\n"}],
+            impl_steps=[
+                {"index.html": "<html><body><button>Ok</button></body></html>\n"},
+                {"index.html": "<html><body><button style='min-height:44px'>Ok</button></body></html>\n"},
+            ],
+        )
+        worker = BuildWorker(
+            orchestrator=orch,
+            workspace_manager=ws_mgr,
+            code_agent=code_agent,
+            runner=FakeRunner(
+                results=[
+                    CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True}),
+                    CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True}),
+                ]
+            ),
+            vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI green")]),
+            quality_auditor=ParentAuditor(llm=llm),
+            chats_dir=chats_dir,
+        )
+
+        report = worker.run_job(pid)
+        assert report.invocations == 3  # 1 test_gen + 1 impl + 1 refinement
+        assert orch.get_status(pid).state == ProjectState.DELIVERED
+
+        # Refinement call received ONLY penalized/failed area findings (ux_ui < 70), not high-scoring areas
+        refinement_failure_ctx = str(code_agent.impl_calls[1]["failure_output"] or "")
+        assert "ux_ui" in refinement_failure_ctx.lower() or "UX/UI" in refinement_failure_ctx
+        assert "Botones menores a 44px" in refinement_failure_ctx
+        assert "functional_completeness" not in refinement_failure_ctx
+
+        delivered_ev = next(e for e in store.get_events(pid) if e.type == EventType.PROJECT_DELIVERED)
+        sc = delivered_ev.payload["quality_scorecard"]
+        assert sc["passed"] is True
+        assert sc["global_score"] == 90.0
+
+        history = orch.get_project_chat_history(pid, chats_dir=chats_dir)
+        assert any(
+            h.get("mode") == "audit" and h.get("status") == "completed" and "90.0%" in h.get("content", "")
+            for h in history
+        )
+    finally:
+        store.close()
 
 
+def test_quality_auditor_respects_max_2_refinements_and_restores_best_checkpoint_on_regression_or_broken_tests(
+    tmp_path: Path,
+) -> None:
+    """Test 3: Stops after max 2 refinement rounds and restores best verified checkpoint when round 2 regresses in score or breaks pytest."""
+    from agent_factory.agents.quality_auditor import ParentAuditor
 
+    # Case A: Round 1 improves 74% -> 81% (checkpointed); Round 2 worsens to 62% -> restores Round 1 files & 81% scorecard
+    pid_a = "qa-max2-regress"
+    chats_dir_a = tmp_path / "chats_qaa"
+    llm_a = FakeLLM(
+        responses=[
+            _build_full_audit_payload(
+                ux_ui=64.0,
+                functional_completeness=80.0,
+                robustness=76.0,
+                architecture_quality=76.0,
+                security_hygiene=76.0,
+                testing_runtime=76.0,
+            ),
+            _build_full_audit_payload(
+                ux_ui=69.0,
+                functional_completeness=85.0,
+                robustness=84.0,
+                architecture_quality=85.0,
+                security_hygiene=85.0,
+                testing_runtime=86.0,
+            ),
+            _build_full_audit_payload(
+                ux_ui=50.0,
+                functional_completeness=65.0,
+                robustness=65.0,
+                architecture_quality=65.0,
+                security_hygiene=70.0,
+                testing_runtime=65.0,
+            ),
+        ]
+    )
+    orch_a, store_a, ws_mgr_a = _setup_sqlite_approved_project(tmp_path, pid_a, llm=llm_a)
+    try:
+        worker_a = BuildWorker(
+            orchestrator=orch_a,
+            workspace_manager=ws_mgr_a,
+            code_agent=FakeCodeAgent(
+                test_gen_steps=[{"tests/test_ui.py": "def test_at_01(): assert True\n"}],
+                impl_steps=[
+                    {"index.html": "<!-- v0 -->\n"},
+                    {"index.html": "<!-- best_r1_81pct -->\n"},
+                    {"index.html": "<!-- regressed_r2_62pct -->\n", "bad_extra.js": "broken();\n"},
+                ],
+            ),
+            runner=FakeRunner(
+                results=[
+                    CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True}),
+                    CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True}),
+                    CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True}),
+                ]
+            ),
+            vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
+            quality_auditor=ParentAuditor(llm=llm_a),
+            chats_dir=chats_dir_a,
+        )
+        rep_a = worker_a.run_job(pid_a)
+        assert rep_a.invocations == 4  # 1 test_gen + 1 impl + 2 max refinement rounds (no 3rd round)
+        assert orch_a.get_status(pid_a).state == ProjectState.DELIVERED
 
+        ws_dir_a = ws_mgr_a.get_workspace_dir(pid_a)
+        assert "best_r1_81pct" in (ws_dir_a / "index.html").read_text(encoding="utf-8")
+        assert not (ws_dir_a / "bad_extra.js").exists()
+
+        deliv_a = next(e for e in store_a.get_events(pid_a) if e.type == EventType.PROJECT_DELIVERED)
+        expected_r1 = round(0.25 * 69.0 + 0.25 * 85.0 + 0.125 * (84.0 + 85.0 + 85.0 + 86.0), 2)
+        assert deliv_a.payload["quality_scorecard"]["global_score"] == expected_r1
+    finally:
+        store_a.close()
+
+    # Case B: Round 2 breaks pytest -> restores Round 1 passing checkpoint & delivers cleanly
+    pid_b = "qa-max2-broken-tests"
+    chats_dir_b = tmp_path / "chats_qab"
+    llm_b = FakeLLM(
+        responses=[
+            _build_full_audit_payload(
+                ux_ui=62.0,
+                functional_completeness=78.0,
+                robustness=76.0,
+                architecture_quality=76.0,
+                security_hygiene=76.0,
+                testing_runtime=76.0,
+            ),
+            _build_full_audit_payload(
+                ux_ui=69.0,
+                functional_completeness=86.0,
+                robustness=84.0,
+                architecture_quality=84.0,
+                security_hygiene=86.0,
+                testing_runtime=86.0,
+            ),
+        ]
+    )
+    orch_b, store_b, ws_mgr_b = _setup_sqlite_approved_project(tmp_path, pid_b, llm=llm_b)
+    try:
+        worker_b = BuildWorker(
+            orchestrator=orch_b,
+            workspace_manager=ws_mgr_b,
+            code_agent=FakeCodeAgent(
+                test_gen_steps=[{"tests/test_ui.py": "def test_at_01(): assert True\n"}],
+                impl_steps=[
+                    {"index.html": "<!-- v0 -->\n"},
+                    {"index.html": "<!-- passing_r1_checkpoint -->\n"},
+                    {"index.html": "<!-- broken_r2_fails_pytest -->\n"},
+                ],
+            ),
+            runner=FakeRunner(
+                results=[
+                    CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True}),
+                    CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True}),
+                    CommandResult(exit_code=1, stdout="0 passed, 1 failed", test_results={"AT-01": False}),
+                ]
+            ),
+            vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
+            quality_auditor=ParentAuditor(llm=llm_b),
+            chats_dir=chats_dir_b,
+        )
+        rep_b = worker_b.run_job(pid_b)
+        assert rep_b.invocations == 4
+        assert rep_b.test_results == {"AT-01": True}
+        assert orch_b.get_status(pid_b).state == ProjectState.DELIVERED
+
+        ws_dir_b = ws_mgr_b.get_workspace_dir(pid_b)
+        assert "passing_r1_checkpoint" in (ws_dir_b / "index.html").read_text(encoding="utf-8")
+        deliv_b = next(e for e in store_b.get_events(pid_b) if e.type == EventType.PROJECT_DELIVERED)
+        expected_r1_b = round(0.25 * 69.0 + 0.25 * 86.0 + 0.125 * (84.0 + 84.0 + 86.0 + 86.0), 2)
+        assert deliv_b.payload["quality_scorecard"]["global_score"] == expected_r1_b
+    finally:
+        store_b.close()

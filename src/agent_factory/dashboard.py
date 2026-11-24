@@ -3074,6 +3074,58 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       color: var(--accent);
       cursor: pointer;
     }
+    .quality-scorecard {
+      border: 1px solid var(--border);
+      background: var(--surface);
+      border-radius: 10px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin: 4px 0;
+    }
+    .quality-scorecard-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      font-size: var(--fs-sm);
+      font-weight: 700;
+      color: var(--text);
+    }
+    .quality-bars-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 8px 12px;
+    }
+    .quality-bar-item {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .quality-bar-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: var(--fs-xs);
+      color: var(--muted);
+    }
+    .quality-bar-track {
+      height: 7px;
+      width: 100%;
+      border-radius: 999px;
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      overflow: hidden;
+    }
+    .quality-bar-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: var(--ok);
+    }
+    .quality-bar-fill.warn { background: var(--accent); }
+    .quality-bar-fill.fail { background: var(--err); }
+    .quality-bar-fill.na { background: var(--border); }
     .readonly-mod-notice {
       padding: 8px 12px;
       border-radius: 8px;
@@ -6447,9 +6499,69 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       return '';
     }
 
+    function resolveAuditScorecard(rep, cps) {
+      if (rep && rep.quality_scorecard && typeof rep.quality_scorecard === 'object' && Array.isArray(rep.quality_scorecard.areas)) {
+        return rep.quality_scorecard;
+      }
+      if (!rep || rep.mode !== 'audit' || !Array.isArray(cps) || !cps.length) return null;
+      const repSha = String(rep.commit_sha || '').toLowerCase();
+      const repVer = String(rep.version_label || '').toLowerCase();
+      for (const cp of cps) {
+        if (!cp || !cp.quality_scorecard || !Array.isArray(cp.quality_scorecard.areas)) continue;
+        const cpSha = String(cp.commit_sha || '').toLowerCase();
+        const cpVer = String(cp.version_label || '').toLowerCase();
+        if ((repSha && cpSha && cpSha.startsWith(repSha.slice(0, 7))) || (repVer && cpVer === repVer)) {
+          return cp.quality_scorecard;
+        }
+      }
+      return null;
+    }
+
+    function renderQualityScorecardHtml(rep, cps) {
+      const sc = resolveAuditScorecard(rep, cps);
+      if (!sc) return '';
+      const pct = Math.round(Number(sc.global_score || 0));
+      const passed = Boolean(sc.passed);
+      const badgeCls = passed ? 'badge-ok' : 'badge-warn';
+      const verdictText = passed ? 'Aprobado' : 'Con observaciones';
+      const defaultLabels = {
+        ux_ui: 'UX/UI',
+        functional_completeness: 'Funcionalidad',
+        robustness: 'Robustez',
+        architecture_quality: 'Arquitectura',
+        security_hygiene: 'Seguridad',
+        testing_runtime: 'Pruebas',
+      };
+      const barsHtml = (sc.areas || []).map((area) => {
+        const label = area.label || defaultLabels[area.dimension] || area.dimension || '';
+        const isActive = area.active !== false;
+        const scoreNum = isActive ? Math.max(0, Math.min(100, Math.round(Number(area.score || 0)))) : 0;
+        const barCls = !isActive ? 'na' : (scoreNum >= 85 ? '' : (scoreNum >= 70 ? 'warn' : 'fail'));
+        const rightTxt = isActive ? (scoreNum + '%') : 'N/A';
+        return '<div class="quality-bar-item">' +
+          '<div class="quality-bar-label"><span>' + escapeHtml(label) + '</span><strong>' + escapeHtml(rightTxt) + '</strong></div>' +
+          '<div class="quality-bar-track"><div class="quality-bar-fill ' + barCls + '" style="width:' + scoreNum + '%;"></div></div>' +
+        '</div>';
+      }).join('');
+      return '<div class="quality-scorecard">' +
+        '<div class="quality-scorecard-head">' +
+          '<span>Global: ' + escapeHtml(String(pct)) + '% · ' + escapeHtml(verdictText) + '</span>' +
+          '<span class="badge ' + badgeCls + '">' + escapeHtml(verdictText) + '</span>' +
+        '</div>' +
+        '<div class="quality-bars-grid">' + barsHtml + '</div>' +
+      '</div>';
+    }
+
     function buildAuditMetaBadgesHtml(rep, cps) {
       const typeLabel = rep.mode === 'audit' ? '🔍 Auditoría' : '📄 Documento .md';
       const statusBadgeHtml = renderAuditStatusBadge(rep);
+      const sc = resolveAuditScorecard(rep, cps);
+      const scBadgeHtml = sc
+        ? '<span class="badge ' + (sc.passed ? 'badge-ok' : 'badge-warn') + '">Global: ' +
+            escapeHtml(String(Math.round(Number(sc.global_score || 0)))) + '% · ' +
+            escapeHtml(sc.passed ? 'Aprobado' : 'Con observaciones') +
+          '</span>'
+        : '';
       const stagePillHtml = rep.stage_label
         ? '<span class="model-pill">' + escapeHtml(rep.stage_label) + '</span>'
         : '';
@@ -6461,6 +6573,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const timeHtml = '<span class="muted" style="font-size:var(--fs-xs);">' + escapeHtml(formatFriendlyTime(rep.created_at)) + '</span>';
       return '<span class="badge badge-info">' + escapeHtml(typeLabel) + '</span>' +
         statusBadgeHtml +
+        scBadgeHtml +
         stagePillHtml +
         verPillHtml +
         durPillHtml +
@@ -6513,6 +6626,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           m.duration_seconds,
           m.commit_sha,
           m.version_label,
+          m.quality_scorecard && m.quality_scorecard.global_score,
         ]),
       ]);
       if (state.lastChatSig === chatSig && container.querySelector('#audit-index')) {
@@ -6538,6 +6652,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const repStatus = String(rep.status || 'completed');
         const hasContent = Boolean(rep.content && String(rep.content).trim());
         const diagHtml = renderAuditDiagnosticHtml(rep);
+        const scorecardHtml = renderQualityScorecardHtml(rep, cps);
         const parsed = hasContent ? renderSafeMarkdown(rep.content || '') : { html: '', toc: [], codeBlocks: [] };
         const baseCodeOffset = allCodeBlocks.length;
         parsed.codeBlocks.forEach((cb) => allCodeBlocks.push(cb));
@@ -6577,6 +6692,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               '</div>' +
             '</div>' +
             diagHtml +
+            scorecardHtml +
             tocHtml +
             readerHtml +
           '</div>';
@@ -6598,6 +6714,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               const repStatus = String(rep.status || 'completed');
               const hasContent = Boolean(rep.content && String(rep.content).trim());
               const diagHtml = renderAuditDiagnosticHtml(rep);
+              const scorecardHtml = renderQualityScorecardHtml(rep, cps);
               const excerpt = extractMarkdownExcerpt(rep.content || '', 130);
               const retryBtnHtml = (repId && repStatus !== 'running')
                 ? '<button class="btn btn-sm" type="button" data-audit-retry="' + escapeHtml(repId) + '"' + disabledAttr + '>🔄 Reintentar</button>'
@@ -6624,6 +6741,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                   '</div>' +
                 '</div>' +
                 diagHtml +
+                scorecardHtml +
                 (excerpt ? '<div class="audit-card-excerpt">' + escapeHtml(excerpt) + '</div>' : '') +
               '</div>';
             }).join('')

@@ -4364,3 +4364,174 @@ def test_dashboard_normalizes_empty_and_null_interview_questions_and_keeps_gener
             thread.join(timeout=2.0)
         store.close()
 
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_quality_auditor_adaptive_weights_ui_vs_cli_and_dashboard_renders_scorecard(
+    tmp_path: Path,
+) -> None:
+    """Test 4: Adaptive UI vs pure-CLI weights (ux_ui redistributed equally across robustness/architecture/testing), tolerant fallback + 240s timeout, and Dashboard scorecard rendering."""
+    from agent_factory.agents.quality_auditor import ParentAuditor
+    from agent_factory.domain.models import Spec
+
+    # 1. Workspaces: web frontend UI vs pure Python CLI/API
+    ui_ws = tmp_path / "ws_ui"
+    ui_ws.mkdir(parents=True)
+    (ui_ws / "index.html").write_text("<!doctype html><html><body><h1>Panel</h1></body></html>", encoding="utf-8")
+    (ui_ws / "styles.css").write_text("body { margin: 0; }", encoding="utf-8")
+    (ui_ws / "tests").mkdir()
+    (ui_ws / "tests" / "test_ui.py").write_text("def test_ui(): assert True\n", encoding="utf-8")
+
+    cli_ws = tmp_path / "ws_cli"
+    (cli_ws / "src").mkdir(parents=True)
+    (cli_ws / "tests").mkdir(parents=True)
+    (cli_ws / "src" / "cli.py").write_text(
+        "def run_cmd(arg: str) -> str:\n    return arg.strip()\n",
+        encoding="utf-8",
+    )
+    (cli_ws / "requirements.txt").write_text("click==8.1.7\n", encoding="utf-8")
+    (cli_ws / "tests" / "test_cli.py").write_text("def test_cli(): assert True\n", encoding="utf-8")
+
+    area_scores_payload = {
+        "dimensions": {
+            "ux_ui": {"score": 40.0, "findings": ["No UI visual polish"], "improvements": ["Add styling"]},
+            "functional_completeness": {"score": 90.0, "findings": [], "improvements": []},
+            "robustness": {"score": 88.0, "findings": [], "improvements": []},
+            "architecture_quality": {"score": 84.0, "findings": [], "improvements": []},
+            "security_hygiene": {"score": 92.0, "findings": [], "improvements": []},
+            "testing_runtime": {"score": 88.0, "findings": [], "improvements": []},
+        }
+    }
+
+    seen_timeouts: list[float | None] = []
+
+    class _SpyAuditLLM:
+        def __init__(self, payloads: list[object]) -> None:
+            self._payloads = list(payloads)
+
+        def generate(self, messages, schema=None, *, timeout_seconds: float | None = None):
+            seen_timeouts.append(timeout_seconds)
+            nxt = self._payloads.pop(0)
+            if isinstance(nxt, Exception):
+                raise nxt
+            return nxt
+
+        def complete(self, messages, schema=None):
+            return self.generate(messages, schema=schema)
+
+    spy_llm = _SpyAuditLLM(
+        [
+            area_scores_payload,
+            area_scores_payload,
+            LLMError("Non-JSON response triggers deterministic fallback"),
+        ]
+    )
+    auditor = ParentAuditor(llm=spy_llm)
+    spec = Spec(objective="Herramienta de cálculo", users=["Operadores"], features=["Calcular"])
+
+    ui_report = auditor.audit_workspace("ui-app", ui_ws, spec=spec)
+    assert seen_timeouts[0] == 240.0
+    assert ui_report.has_ui is True
+    assert ui_report.dimensions["ux_ui"].weight == pytest.approx(0.25)
+    assert ui_report.dimensions["functional_completeness"].weight == pytest.approx(0.25)
+    assert ui_report.dimensions["robustness"].weight == pytest.approx(0.125)
+    assert ui_report.global_score == pytest.approx(76.5, abs=0.05)
+    assert ui_report.passed is False
+    assert "ux_ui" in ui_report.failed_dimensions
+
+    cli_report = auditor.audit_workspace("cli-app", cli_ws, spec=spec)
+    assert seen_timeouts[1] == 240.0
+    assert cli_report.has_ui is False
+    assert cli_report.dimensions["ux_ui"].active is False
+    assert cli_report.dimensions["ux_ui"].weight == 0.0
+    redistributed = 0.125 + (0.25 / 3.0)
+    assert cli_report.dimensions["robustness"].weight == pytest.approx(redistributed, abs=1e-4)
+    assert cli_report.dimensions["architecture_quality"].weight == pytest.approx(redistributed, abs=1e-4)
+    assert cli_report.dimensions["testing_runtime"].weight == pytest.approx(redistributed, abs=1e-4)
+    assert cli_report.dimensions["security_hygiene"].weight == pytest.approx(0.125, abs=1e-4)
+    expected_cli = round(
+        0.25 * 90.0 + 0.125 * 92.0 + redistributed * (88.0 + 84.0 + 88.0),
+        2,
+    )
+    assert cli_report.global_score == pytest.approx(expected_cli, abs=0.05)
+    assert cli_report.passed is True
+
+    # Deterministic fallback still produces valid 6-dimension scorecard on LLMError
+    fb_report = auditor.audit_workspace("cli-app", cli_ws, spec=spec)
+    assert fb_report.source == "deterministic_fallback"
+    assert len(fb_report.dimensions) == 6
+    assert 0.0 <= fb_report.global_score <= 100.0
+
+    # 2. Dashboard renders Boleta de Calidad in audit cards, reader, and API
+    store = SqliteEventStore(db_path=tmp_path / "scorecard_ui.db")
+    chats_dir = tmp_path / "chats"
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_ui_dash")
+    pid = "scorecard-app"
+    now = datetime(2026, 4, 24, 14, 0, tzinfo=UTC)
+    plan_dict = _plan_payload("Scorecard Web")
+    plan_hash = Plan.model_validate(plan_dict).compute_hash()
+    sha_v1 = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+    scorecard_dict = cli_report.to_scorecard_dict()
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "Scorecard App", "objective": "Obj", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+        create_event(
+            pid,
+            EventType.PROJECT_DELIVERED,
+            {"repo_url": "", "deploy_url": "", "commit_sha": sha_v1, "version_label": "v1", "quality_scorecard": scorecard_dict},
+            at=now,
+        ),
+    ):
+        store.append(ev)
+
+    orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
+    orch.record_automated_quality_audit(
+        pid,
+        report=cli_report,
+        commit_sha=sha_v1,
+        version_label="v1",
+        chats_dir=chats_dir,
+    )
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0, workspace_manager=ws_mgr)
+    try:
+        chat_code, chat_data = _http_json(f"{base_url}/api/projects/{pid}/chat")
+        assert chat_code == 200
+        assert chat_data["messages"][-1]["quality_scorecard"]["global_score"] == scorecard_dict["global_score"]
+
+        cp_code, cp_data = _http_json(f"{base_url}/api/projects/{pid}/checkpoints")
+        assert cp_code == 200
+        assert cp_data["checkpoints"][0]["quality_scorecard"]["global_score"] == scorecard_dict["global_score"]
+
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            assert html_resp.status == 200
+            html = html_resp.read().decode("utf-8")
+
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+        for expected_ui in (
+            "quality-scorecard",
+            "quality-bar-track",
+            "renderQualityScorecardHtml",
+            "Global:",
+            "Aprobado",
+            "Con observaciones",
+            "UX/UI",
+            "Funcionalidad",
+            "Robustez",
+            "Arquitectura",
+            "Seguridad",
+            "Pruebas",
+        ):
+            assert expected_ui in html
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
