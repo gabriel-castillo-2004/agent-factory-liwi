@@ -398,6 +398,12 @@ class DashboardController:
         last_event_at = events[-1].at.isoformat() if events else None
         running = self.is_running(project_id)
         live_info = self._get_live_status_info(running)
+        if running and status.state == ProjectState.DELIVERED:
+            cur_act = str(live_info.get("activity_summary") or "").strip()
+            if not cur_act or "Analizando tu idea y preparando preguntas" in cur_act:
+                live_info["activity_summary"] = "Refinando calidad con debate de 2 agentes..."
+            if not live_info.get("agents_count"):
+                live_info["agents_count"] = 2
         raw = status.model_dump(mode="json")
         raw["last_error"] = last_error
         raw["has_plan"] = has_plan
@@ -3799,6 +3805,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       gap: 6px;
       flex-wrap: wrap;
     }
+    .version-polish-note {
+      font-size: var(--fs-xs);
+      color: var(--text);
+      background: var(--info-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 10px;
+      line-height: 1.4;
+    }
   </style>
 </head>
 <body>
@@ -4408,7 +4423,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.querySelectorAll('.more-popover, .themes-popover, .settings-popover').forEach((pop) => {
         pop.style.display = 'none';
       });
-      document.querySelectorAll('[aria-controls="project-more-popover"], [aria-controls="header-more-popover"], [aria-controls="audit-more-actions-menu"], #themes-menu-btn, #settings-menu-btn').forEach((b) => {
+      document.querySelectorAll('[aria-controls="project-more-popover"], [aria-controls="header-more-popover"], [aria-controls="audit-more-actions-menu"], [aria-controls="quality-more-actions-menu"], #themes-menu-btn, #settings-menu-btn').forEach((b) => {
         b.setAttribute('aria-expanded', 'false');
       });
     }
@@ -5302,8 +5317,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         if (state.activeOp) {
           return '';
         }
-        const descText = st.activity_summary
-          ? escapeHtml(st.activity_summary)
+        const isDeliveredBusy = st.state === 'DELIVERED' || st.state === 'COMPLETED';
+        const rawActSummary = String(st.activity_summary || '').trim();
+        const effSummary = isDeliveredBusy
+          ? (rawActSummary && !/Analizando tu idea y preparando preguntas/i.test(rawActSummary)
+              ? rawActSummary
+              : 'Refinando calidad con debate de 2 agentes...')
+          : rawActSummary;
+        const descText = effSummary
+          ? escapeHtml(effSummary)
           : 'Los agentes están avanzando en esta etapa. Esta pantalla se actualiza sola cada 5 segundos.';
         const subDescHtml = st.activity_detail
           ? '<div class="banner-subdesc tech-only">' + escapeHtml(st.activity_detail) + '</div>'
@@ -5316,7 +5338,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               '<span class="tech-only">' + (testsPending ? '' : '✓ ') + st.tests_passed + ' de ' + st.tests_total + ' pruebas aprobadas</span>' +
             '</div>'
           : '';
-        const agentsCount = Number(st.agents_count || 1);
+        const agentsCount = Number(st.agents_count || (isDeliveredBusy ? 2 : 1));
         const agentsText = agentsCount === 2
           ? '2 agentes colaborando'
           : (agentsCount > 1 ? (agentsCount + ' agentes colaborando') : '1 agente trabajando');
@@ -6351,10 +6373,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 '<button class="btn btn-sm" type="button" data-copy-version-sha="' + escapeHtml(shaShort) + '">Copiar hash</button>' +
               '</span>'
             : '';
+          const polishNote = (c && c.last_polish_note)
+            ? String(c.last_polish_note).trim()
+            : ((sc && sc.last_polish_note) ? String(sc.last_polish_note).trim() : '');
+          const polishNoteHtml = (c.is_current && polishNote)
+            ? '<div class="version-polish-note" role="status">ℹ️ ' + escapeHtml(polishNote) + '</div>'
+            : '';
           const actionBtnsHtml = c.is_current
-            ? '<button id="evaluate-quality-btn" class="btn btn-sm" type="button" data-quality-action="evaluate"' + busyAttr + '>🛡️ Re-evaluar calidad</button>' +
-              '<button id="improve-quality-btn" class="btn btn-primary btn-sm" type="button" data-quality-action="improve"' + busyAttr + '>✨ Mejorar hasta cumplir estándar</button>' +
-              '<button id="polish-debate-btn" class="btn btn-sm" type="button" data-quality-action="polish"' + busyAttr + '>⚔️ Pulir con debate</button>'
+            ? '<div class="audit-primary-split">' +
+                '<button id="polish-debate-btn" class="btn btn-primary btn-sm" type="button" data-quality-action="polish"' + busyAttr + '>⚔️ Pulir con debate</button>' +
+                '<div class="more-menu-wrap">' +
+                  '<button id="quality-more-actions-btn" class="btn btn-sm" type="button" aria-expanded="false" aria-controls="quality-more-actions-menu" title="Más opciones de calidad"' + busyAttr + '>▾</button>' +
+                  '<div id="quality-more-actions-menu" class="more-popover" style="display:none">' +
+                    '<button id="evaluate-quality-btn" class="more-menu-item" type="button" data-quality-action="evaluate"' + busyAttr + '>🛡️ Re-evaluar calidad</button>' +
+                    '<button id="improve-quality-btn" class="more-menu-item" type="button" data-quality-action="improve"' + busyAttr + '>✨ Mejorar hasta cumplir estándar</button>' +
+                  '</div>' +
+                '</div>' +
+              '</div>'
             : (c.commit_sha
                 ? '<button class="btn btn-sm btn-warn" type="button" data-history-rollback-sha="' + escapeHtml(c.commit_sha) + '"' + busyAttr + '>↩︎ Volver a esta versión</button>'
                 : '');
@@ -6372,6 +6407,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 '<span class="muted" style="font-size:var(--fs-xs);">' + escapeHtml(timeLbl) + '</span>' +
               '</div>' +
               (c.summary ? '<div class="muted" style="font-size:var(--fs-xs);">' + escapeHtml(c.summary) + '</div>' : '') +
+              polishNoteHtml +
               barsHtml +
               '<div class="version-actions">' +
                 actionBtnsHtml +
@@ -6413,6 +6449,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           c.quality_scorecard && c.quality_scorecard.global_score,
           c.quality_scorecard && c.quality_scorecard.tier_id,
           c.quality_scorecard && Array.isArray(c.quality_scorecard.debate_rounds) ? c.quality_scorecard.debate_rounds.length : 0,
+          c.last_polish_note || (c.quality_scorecard && c.quality_scorecard.last_polish_note) || '',
         ]),
       ]);
       if (state.lastEventsSignature === eventsSig) {
@@ -6537,17 +6574,39 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         });
       });
 
+      const qualityMoreBtn = eventsEl.querySelector('#quality-more-actions-btn');
+      const qualityMoreMenu = eventsEl.querySelector('#quality-more-actions-menu');
+      if (qualityMoreBtn && qualityMoreMenu && !isRunning) {
+        qualityMoreBtn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          const isOpen = qualityMoreMenu.style.display !== 'none';
+          closeFloatingDropdowns();
+          if (!isOpen) {
+            qualityMoreMenu.style.display = 'flex';
+            qualityMoreBtn.setAttribute('aria-expanded', 'true');
+          }
+        });
+      }
       const evalBtn = eventsEl.querySelector('button[data-quality-action="evaluate"]');
       if (evalBtn) {
-        evalBtn.addEventListener('click', () => submitEvaluateQuality(st.project_id, evalBtn));
+        evalBtn.addEventListener('click', () => {
+          closeFloatingDropdowns();
+          submitEvaluateQuality(st.project_id, evalBtn);
+        });
       }
       const improveBtn = eventsEl.querySelector('button[data-quality-action="improve"]');
       if (improveBtn) {
-        improveBtn.addEventListener('click', () => submitImproveQuality(st.project_id, improveBtn));
+        improveBtn.addEventListener('click', () => {
+          closeFloatingDropdowns();
+          submitImproveQuality(st.project_id, improveBtn);
+        });
       }
       const polishBtn = eventsEl.querySelector('button[data-quality-action="polish"]');
       if (polishBtn) {
-        polishBtn.addEventListener('click', () => submitPolishWithDebate(st.project_id, polishBtn));
+        polishBtn.addEventListener('click', () => {
+          closeFloatingDropdowns();
+          submitPolishWithDebate(st.project_id, polishBtn);
+        });
       }
       eventsEl.querySelectorAll('button[data-history-rollback-sha]').forEach((btn) => {
         btn.addEventListener('click', () => {
@@ -7426,7 +7485,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               ).join('') +
             '</ul></div>'
           : '';
-        const retryReaderBtn = (repId && repStatus !== 'running')
+        const retryReaderBtn = (repId && (repStatus === 'failed' || repStatus === 'timed_out' || repStatus === 'interrupted'))
           ? '<button class="btn btn-sm" type="button" data-audit-retry="' + escapeHtml(repId) + '"' + disabledAttr + '>🔄 Reintentar</button>'
           : '';
         const delReaderBtn = repId
@@ -7473,7 +7532,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               const diagHtml = renderAuditDiagnosticHtml(rep);
               const scorecardHtml = renderQualityScorecardHtml(rep, cps);
               const excerpt = extractMarkdownExcerpt(rep.content || '', 130);
-              const retryBtnHtml = (repId && repStatus !== 'running')
+              const retryBtnHtml = (repId && (repStatus === 'failed' || repStatus === 'timed_out' || repStatus === 'interrupted'))
                 ? '<button class="btn btn-sm" type="button" data-audit-retry="' + escapeHtml(repId) + '"' + disabledAttr + '>🔄 Reintentar</button>'
                 : '';
               const delBtnHtml = repId

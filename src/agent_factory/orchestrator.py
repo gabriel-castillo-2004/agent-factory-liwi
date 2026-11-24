@@ -1249,6 +1249,8 @@ class Orchestrator:
         duration_seconds: float | None = None,
         chats_dir: Path | None = None,
         prompt_label: str | None = None,
+        last_polish_note: str | None = None,
+        new_version_created: bool | None = None,
         extra_secrets: Sequence[str] = (),
     ) -> dict[str, Any]:
         """Persist automatic ParentAuditor Markdown report and scorecard into project audit history."""
@@ -1274,6 +1276,18 @@ class Orchestrator:
         )
         if isinstance(scorecard, Mapping) and scorecard:
             scorecard = ensure_scorecard_tier(scorecard)
+        eff_polish_note = ""
+        if isinstance(last_polish_note, str) and last_polish_note.strip():
+            eff_polish_note = redact_secrets(
+                last_polish_note.strip(), extra_secrets=extra_secrets
+            )
+        elif new_version_created is False or "conservada" in str(prompt_label or "").lower():
+            eff_polish_note = redact_secrets(
+                f"Revisión completada: se conservó {clean_ver or 'v1'} sin cambios nuevos en código",
+                extra_secrets=extra_secrets,
+            )
+        if eff_polish_note and isinstance(scorecard, dict):
+            scorecard["last_polish_note"] = eff_polish_note
         raw_markdown = (
             str(getattr(report, "markdown_report", "") or "")
             if not isinstance(report, Mapping)
@@ -1322,6 +1336,8 @@ class Orchestrator:
             "created_at": now_iso,
             "completed_at": now_iso,
         }
+        if eff_polish_note:
+            entry["last_polish_note"] = eff_polish_note
         with self._chat_io_lock:
             raw, _ = self._read_raw_chat_entries(project_id, eff_dir)
             raw.append(entry)
@@ -2113,6 +2129,11 @@ class Orchestrator:
             if not isinstance(raw_sc, Mapping) or not isinstance(raw_sc.get("areas"), Sequence):
                 continue
             sc_clean = ensure_scorecard_tier(self._scrub_chat_value(raw_sc, extra_secrets))
+            raw_entry_note = entry.get("last_polish_note")
+            if isinstance(raw_entry_note, str) and raw_entry_note.strip() and not sc_clean.get("last_polish_note"):
+                sc_clean["last_polish_note"] = redact_secrets(
+                    raw_entry_note.strip(), extra_secrets=extra_secrets
+                )
             ts = str(entry.get("completed_at") or entry.get("created_at") or "")
             ver = str(entry.get("version_label") or "").strip().lower()
             sha_short = str(entry.get("commit_sha") or "").strip().lower()[:7]
@@ -2229,6 +2250,18 @@ class Orchestrator:
                 "is_current": False,
                 "quality_scorecard": scorecard,
             }
+            raw_polish_note = (
+                (scorecard.get("last_polish_note") if isinstance(scorecard, Mapping) else None)
+                or pl.get("last_polish_note")
+                or ""
+            )
+            clean_polish_note = redact_secrets(
+                str(raw_polish_note).strip(), extra_secrets=extra_secrets
+            )
+            if clean_polish_note:
+                cp_entry["last_polish_note"] = clean_polish_note
+                if isinstance(scorecard, dict):
+                    scorecard["last_polish_note"] = clean_polish_note
             if isinstance(scorecard, Mapping) and isinstance(scorecard.get("debate_summary"), Mapping):
                 cp_entry["debate_summary"] = dict(scorecard["debate_summary"])
             checkpoints.append(cp_entry)
@@ -2414,6 +2447,59 @@ class Orchestrator:
             )
             return eff_plan_hash
 
+    def _persist_conserved_version_polish_note(
+        self,
+        project_id: str,
+        result: dict[str, Any],
+        *,
+        chats_dir: Path | None = None,
+        extra_secrets: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """Attach and persist last_polish_note when quality debate finishes with new_version_created=False."""
+        if result.get("new_version_created"):
+            return result
+        ver_lbl = redact_secrets(
+            str(result.get("version_label") or "v1").strip() or "v1",
+            extra_secrets=extra_secrets,
+        )
+        raw_note = str(
+            result.get("last_polish_note")
+            or f"Revisión completada: se conservó {ver_lbl} sin cambios nuevos en código"
+        ).strip()
+        polish_note = redact_secrets(raw_note, extra_secrets=extra_secrets)
+        result["new_version_created"] = False
+        result["last_polish_note"] = polish_note
+        for sc_key in ("scorecard", "quality_scorecard"):
+            sc_obj = result.get(sc_key)
+            if isinstance(sc_obj, dict):
+                sc_obj["last_polish_note"] = polish_note
+        chat_entry = result.get("chat_entry")
+        entry_id = str(chat_entry.get("id") or "") if isinstance(chat_entry, Mapping) else ""
+        if isinstance(chat_entry, dict):
+            chat_entry["last_polish_note"] = polish_note
+            if isinstance(chat_entry.get("quality_scorecard"), dict):
+                chat_entry["quality_scorecard"]["last_polish_note"] = polish_note
+        eff_chats_dir = self._resolve_chats_dir(chats_dir)
+        with self._chat_io_lock:
+            raw_entries, _ = self._read_raw_chat_entries(project_id, eff_chats_dir)
+            updated = False
+            for entry in reversed(raw_entries):
+                if entry_id and entry.get("id") != entry_id:
+                    continue
+                if entry.get("role") == "assistant" and entry.get("mode") == "audit":
+                    entry["last_polish_note"] = polish_note
+                    raw_sc = entry.get("quality_scorecard")
+                    if isinstance(raw_sc, dict):
+                        raw_sc["last_polish_note"] = polish_note
+                    updated = True
+                    break
+            if updated:
+                self._write_chat_entries(project_id, raw_entries, eff_chats_dir)
+        result["checkpoints"] = self.list_project_checkpoints(
+            project_id, chats_dir=eff_chats_dir, extra_secrets=extra_secrets
+        )
+        return result
+
     def improve_project_quality(
         self,
         project_id: str,
@@ -2426,13 +2512,24 @@ class Orchestrator:
     ) -> dict[str, Any]:
         """Audit project quality and run bounded 2-agent debate via BuildWorker when needed or under force_polish."""
         validate_project_id(project_id)
+        self._report_activity(
+            "Refinando calidad con debate de 2 agentes...",
+            agents_count=2,
+            stage="VERIFYING",
+        )
         eff_worker = build_worker if build_worker is not None else self.build_worker
         if eff_worker is not None:
-            return eff_worker.improve_project_quality(
+            res = eff_worker.improve_project_quality(
                 project_id,
                 auditor=auditor,
                 chats_dir=chats_dir,
                 force_polish=force_polish,
+            )
+            return self._persist_conserved_version_polish_note(
+                project_id,
+                dict(res) if isinstance(res, Mapping) else {},
+                chats_dir=chats_dir,
+                extra_secrets=extra_secrets,
             )
         eval_res = self.evaluate_project_quality(
             project_id,
@@ -2441,11 +2538,17 @@ class Orchestrator:
             extra_secrets=extra_secrets,
         )
         if not force_polish and eval_res["scorecard"].get("passed"):
-            return {
-                **eval_res,
-                "already_passed": True,
-                "improved": False,
-            }
+            return self._persist_conserved_version_polish_note(
+                project_id,
+                {
+                    **eval_res,
+                    "already_passed": True,
+                    "improved": False,
+                    "new_version_created": False,
+                },
+                chats_dir=chats_dir,
+                extra_secrets=extra_secrets,
+            )
         raise RuntimeError(
             "No hay un BuildWorker configurado para ejecutar el refinamiento de calidad."
         )

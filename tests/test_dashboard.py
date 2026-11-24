@@ -5015,3 +5015,206 @@ def test_dashboard_quality_improve_force_polish_endpoint_and_debate_history_ui(
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_polish_conserves_v1_note_busy_delivered_banner_and_completed_audit_hides_retry(
+    tmp_path: Path,
+) -> None:
+    """When quality debate/improvement conserves v1 (new_version_created=False), checkpoints expose last_polish_note; buildHistoryVersionsSectionHtml renders last_polish_note and primary #polish-debate-btn; buildGuidanceBanner shows 'Refinando calidad con debate de 2 agentes...' when DELIVERED is busy; renderAuditChatTab only shows Reintentar on failed/timed_out/interrupted."""
+    import subprocess
+
+    from agent_factory.agents.quality_auditor import ParentAuditor
+    from agent_factory.builder import BuildWorker
+
+    store = SqliteEventStore(db_path=tmp_path / "polish_v1_kept.db")
+    chats_dir = tmp_path / "chats_v1_kept"
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_v1_kept")
+    pid = "conserve-v1-app"
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / "index.html").write_text(
+        "<!doctype html><html><body><h1>Estable v1</h1></body></html>\n",
+        encoding="utf-8",
+    )
+    (ws_dir / "tests").mkdir(exist_ok=True)
+    (ws_dir / "tests" / "test_ok.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
+
+    subprocess.run(["git", "init"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "branch", "-M", "main"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "add", "-A"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@local", "commit", "-m", "init v1"],
+        cwd=ws_dir,
+        check=True,
+        capture_output=True,
+    )
+    sha_v1 = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ws_dir, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    llm = FakeLLM(
+        responses=[
+            # 1. force_polish initial Critic eval -> 89% Producción with 1 objection
+            {
+                "summary": "Cumple Producción (89%).",
+                "dimensions": {
+                    "ux_ui": {"score": 88.0, "findings": ["Ajustar botón"], "improvements": ["Mejorar botón"]},
+                    "functional_completeness": {"score": 89.0, "findings": [], "improvements": []},
+                    "robustness": {"score": 89.0, "findings": [], "improvements": []},
+                    "architecture_quality": {"score": 90.0, "findings": [], "improvements": []},
+                    "security_hygiene": {"score": 90.0, "findings": [], "improvements": []},
+                    "testing_runtime": {"score": 88.0, "findings": [], "improvements": []},
+                },
+                "objections": [
+                    {
+                        "dimension": "ux_ui",
+                        "file_path": "index.html",
+                        "severity": "low",
+                        "issue": "Botón sin subtítulo",
+                        "concrete_fix": "Agregar subtítulo en index.html",
+                    }
+                ],
+            },
+            # 2. BuilderResponder response
+            {
+                "builder_response": "index.html: intento de ajuste.",
+                "surgical_instructions": "Intenta ajustar index.html.",
+            },
+            # 3. Critic diff review -> lower score (82%), triggers anti-regression discard so v1 is conserved!
+            {
+                "summary": "El cambio redujo claridad visual (82%).",
+                "resolved_count": 0,
+                "diff_summary": "Cambio descartado por regresión",
+                "dimensions": {
+                    "ux_ui": {"score": 78.0, "findings": ["Regresión"], "improvements": []},
+                    "functional_completeness": {"score": 83.0, "findings": [], "improvements": []},
+                    "robustness": {"score": 83.0, "findings": [], "improvements": []},
+                    "architecture_quality": {"score": 83.0, "findings": [], "improvements": []},
+                    "security_hygiene": {"score": 83.0, "findings": [], "improvements": []},
+                    "testing_runtime": {"score": 82.0, "findings": [], "improvements": []},
+                },
+            },
+        ]
+    )
+    orch = Orchestrator(store=store, llm=llm, workspace_manager=ws_mgr)
+    now = datetime(2026, 5, 8, 10, 0, tzinfo=UTC)
+    plan_dict = _plan_payload("Conserve V1 App")
+    plan_hash = Plan.model_validate(plan_dict).compute_hash()
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "Conserve V1", "objective": "App estable", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+        create_event(
+            pid,
+            EventType.PROJECT_DELIVERED,
+            {"repo_url": "", "deploy_url": "", "commit_sha": sha_v1, "version_label": "v1"},
+            at=now,
+        ),
+    ):
+        store.append(ev)
+
+    worker = BuildWorker(
+        orchestrator=orch,
+        workspace_manager=ws_mgr,
+        code_agent=FakeCodeAgent(
+            impl_steps=[
+                {"index.html": "<!doctype html><html><body><h1>Intento Regresivo</h1></body></html>\n"}
+            ]
+        ),
+        runner=FakeRunner(results=[CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True})]),
+        vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
+        quality_auditor=ParentAuditor(llm=llm),
+        chats_dir=chats_dir,
+    )
+
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        build_worker=worker,
+        workspace_manager=ws_mgr,
+        chats_dir=chats_dir,
+    )
+    try:
+        # 1. Inspect HTML functions for the 3 UI improvements
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            assert html_resp.status == 200
+            html = html_resp.read().decode("utf-8")
+
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+
+        # 1a. buildHistoryVersionsSectionHtml renders last_polish_note and primary #polish-debate-btn with secondary options in ▾ menu
+        hist_start = html.index("function buildHistoryVersionsSectionHtml(")
+        hist_end = html.index("function renderEventsTab(", hist_start)
+        hist_body = html[hist_start:hist_end]
+        assert "last_polish_note" in hist_body
+        assert "version-polish-note" in hist_body
+        assert 'id="polish-debate-btn" class="btn btn-primary btn-sm"' in hist_body
+        assert 'id="quality-more-actions-menu"' in hist_body
+
+        # 1b. buildGuidanceBanner displays "Refinando calidad con debate de 2 agentes..." when DELIVERED is busy
+        banner_start = html.index("function buildGuidanceBanner(")
+        banner_end = html.index("function splitProjectAttempts(", banner_start)
+        banner_body = html[banner_start:banner_end]
+        running_branch = banner_body.split("if (st.state === 'INTERVIEW')", 1)[0]
+        assert "Refinando calidad con debate de 2 agentes..." in running_branch
+        assert "st.state === 'DELIVERED'" in running_branch
+
+        # 1c. renderAuditChatTab shows Reintentar ONLY for failed / timed_out / interrupted (not completed)
+        audit_start = html.index("function renderAuditChatTab(")
+        audit_end = html.index("async function loadProjectChatHistory(", audit_start)
+        audit_body = html[audit_start:audit_end]
+        assert "repId && repStatus !== 'running'" not in audit_body
+        assert (
+            "repId && (repStatus === 'failed' || repStatus === 'timed_out' || repStatus === 'interrupted')"
+            in audit_body
+        )
+
+        # 2. Verify DELIVERED project marked busy returns "Refinando calidad con debate de 2 agentes..." in status
+        server.controller.mark_running(pid)
+        try:
+            c_det_busy, r_det_busy = _http_json(f"{base_url}/api/projects/{pid}")
+            assert c_det_busy == 200
+            assert r_det_busy["status"]["is_running"] is True
+            assert (
+                r_det_busy["status"]["activity_summary"]
+                == "Refinando calidad con debate de 2 agentes..."
+            )
+        finally:
+            server.controller.mark_stopped(pid)
+
+        # 3. Run POST /quality/improve with force_polish=True where candidate change is discarded -> v1 conserved + last_polish_note set
+        c_imp, r_imp = _http_json(
+            f"{base_url}/api/projects/{pid}/quality/improve",
+            method="POST",
+            body={"force_polish": True},
+            timeout=15.0,
+        )
+        assert c_imp == 200
+        assert r_imp["ok"] is True
+        assert server.controller.wait_for_idle(timeout=15.0)
+
+        c_cp, r_cp = _http_json(f"{base_url}/api/projects/{pid}/checkpoints")
+        assert c_cp == 200
+        assert len(r_cp["checkpoints"]) == 1
+        cp_v1 = r_cp["checkpoints"][0]
+        assert cp_v1["version_label"] == "v1"
+        assert cp_v1["is_current"] is True
+        assert cp_v1.get("last_polish_note") == (
+            "Revisión completada: se conservó v1 sin cambios nuevos en código"
+        )
+        assert cp_v1["quality_scorecard"].get("last_polish_note") == (
+            "Revisión completada: se conservó v1 sin cambios nuevos en código"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+
