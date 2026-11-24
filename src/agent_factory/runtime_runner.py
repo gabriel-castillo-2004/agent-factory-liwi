@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_PORT_MIN = 8081
 DEFAULT_PORT_MAX = 8199
+DEFAULT_READINESS_TIMEOUT = 25.0
 
 _EXTERNAL_OR_SKIP_PREFIXES: tuple[str, ...] = (
     "http://",
@@ -84,6 +85,10 @@ _IGNORED_SCAN_DIRS: frozenset[str] = frozenset(
 _MAIN_GUARD_RE = re.compile(r"""if\s+__name__\s*==\s*["']__main__["']\s*:""")
 _WEB_SERVER_HINT_RE = re.compile(
     r"\b(?:HTTPServer|ThreadingHTTPServer|Flask|FastAPI|uvicorn|Bottle|Tornado|http\.server)\b"
+)
+_ASGI_APP_HINT_RE = re.compile(r"\b(?:FastAPI|Starlette)\s*\(")
+_PORT_ENV_OR_FLAG_RE = re.compile(
+    r"""(?:environ|getenv|env)\s*[\[(]\s*["']PORT["']|--port"""
 )
 _STATIC_SUBDIR_NAMES: tuple[str, ...] = ("src", "static", "public", "web")
 _MAIN_EMPTY_RE = re.compile(r"<main[^>]*>\s*</main>", re.IGNORECASE)
@@ -288,6 +293,92 @@ def _has_main_web_server(py_file: Path) -> bool:
     return bool(_MAIN_GUARD_RE.search(snippet) and _WEB_SERVER_HINT_RE.search(snippet))
 
 
+def _has_asgi_app(py_file: Path) -> bool:
+    try:
+        snippet = py_file.read_text(encoding="utf-8", errors="replace")[:16384]
+    except OSError:
+        return False
+    return bool(_ASGI_APP_HINT_RE.search(snippet))
+
+
+def _detect_fastapi_asgi_spec(entrypoint: Path) -> tuple[str | None, bool]:
+    """Return (app_attr, launch_via_uvicorn) when entrypoint exposes a FastAPI/ASGI app needing uvicorn."""
+    try:
+        source = entrypoint.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source, filename=str(entrypoint))
+    except (OSError, SyntaxError, ValueError):
+        return None, False
+
+    uses_fastapi_or_uvicorn = False
+    direct_asgi_attr: str | None = None
+    fallback_asgi_attr: str | None = None
+
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".", 1)[0].lower()
+                if top in {"fastapi", "starlette", "uvicorn"}:
+                    uses_fastapi_or_uvicorn = True
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            top = node.module.split(".", 1)[0].lower()
+            if top in {"fastapi", "starlette", "uvicorn"}:
+                uses_fastapi_or_uvicorn = True
+
+        target_name: str | None = None
+        rhs: ast.expr | None = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            target_name = node.targets[0].id
+            rhs = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            target_name = node.target.id
+            rhs = node.value
+
+        if target_name and isinstance(rhs, ast.Call):
+            fn = rhs.func
+            fn_name = fn.id if isinstance(fn, ast.Name) else (fn.attr if isinstance(fn, ast.Attribute) else "")
+            if fn_name in {"FastAPI", "Starlette"} and direct_asgi_attr is None:
+                direct_asgi_attr = target_name
+            elif target_name in {"app", "application", "api"} and fallback_asgi_attr is None:
+                fallback_asgi_attr = target_name
+
+    app_attr = direct_asgi_attr or (fallback_asgi_attr if uses_fastapi_or_uvicorn else None)
+    if app_attr is None:
+        return None, False
+
+    has_main = bool(_MAIN_GUARD_RE.search(source))
+    reads_port = bool(_PORT_ENV_OR_FLAG_RE.search(source))
+    uses_uvicorn_run = "uvicorn.run" in source
+    should_use_uvicorn = (not has_main) or (uses_uvicorn_run and not reads_port)
+    return app_attr, should_use_uvicorn
+
+
+def _resolve_asgi_launch_target(
+    ws_dir: Path,
+    app_info: WorkspaceAppInfo,
+    asgi_attr: str,
+) -> tuple[str, Path | None]:
+    """Compute uvicorn '<module>:<attr>' target and effective PYTHONPATH inside ws_dir."""
+    if app_info.module_name:
+        return f"{app_info.module_name}:{asgi_attr}", app_info.pythonpath
+
+    assert app_info.entrypoint is not None
+    entry = app_info.entrypoint.resolve()
+    rel = entry.relative_to(ws_dir)
+    if len(rel.parts) == 1:
+        return f"{rel.stem}:{asgi_attr}", app_info.pythonpath
+
+    all_packages = True
+    cur = ws_dir
+    for part in rel.parts[:-1]:
+        cur = cur / part
+        if not (cur / "__init__.py").is_file():
+            all_packages = False
+            break
+    if all_packages:
+        return f"{'.'.join(rel.with_suffix('').parts)}:{asgi_attr}", app_info.pythonpath
+    return f"{rel.stem}:{asgi_attr}", entry.parent
+
+
 def _find_python_entrypoint(ws: Path) -> Path | None:
     """Recursively locate a contained Python server entrypoint up to depth 3 ignoring tests/caches."""
     for name in _ROOT_PYTHON_NAMES:
@@ -322,6 +413,12 @@ def _find_python_entrypoint(ws: Path) -> Path | None:
     if main_matches:
         main_matches.sort(key=lambda p: (len(p.relative_to(ws).parts), p.as_posix()))
         return main_matches[0]
+
+    # 2b. FastAPI/Starlette ASGI module without __main__ guard
+    asgi_matches = [p for p in scanned_py if _is_non_test_python(p) and _has_asgi_app(p)]
+    if asgi_matches:
+        asgi_matches.sort(key=lambda p: (len(p.relative_to(ws).parts), p.as_posix()))
+        return asgi_matches[0]
 
     # 3. Fallback when requirements.txt exists: first executable .py in workspace
     req_file = ws / "requirements.txt"
@@ -369,8 +466,8 @@ def detect_workspace_app(workspace_dir: Path) -> WorkspaceAppInfo:
 
 
 def _drain_stderr(proc: subprocess.Popen[str], lines: deque[str]) -> None:
-    """Consume child stderr in background so buffers never stall."""
-    pipe = proc.stderr
+    """Consume child combined stdout/stderr in background so buffers never stall."""
+    pipe = proc.stdout if proc.stdout is not None else proc.stderr
     if pipe is None:
         return
     try:
@@ -415,11 +512,12 @@ def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
             except (OSError, subprocess.SubprocessError):
                 pass
 
-    if proc.stderr is not None:
-        try:
-            proc.stderr.close()
-        except OSError:
-            pass
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe is not None:
+            try:
+                pipe.close()
+            except OSError:
+                pass
 
 
 def _weak_atexit_cleanup(runner_ref: weakref.ref[LocalAppRunner]) -> None:
@@ -542,6 +640,9 @@ def _detect_workspace_third_party_packages(workspace_dir: Path) -> list[str]:
                 )
                 if mapped:
                     discovered.add(mapped)
+
+    if "fastapi" in discovered:
+        discovered.add("uvicorn")
 
     return sorted(discovered)
 
@@ -914,12 +1015,22 @@ class LocalAppRunner:
                 )
         return LocalAppStatus(running=False, url=None, lan_url=None, app_type=detected_type, port=None)
 
+    def _collect_process_diagnostic(self, project_id: str, entry: _RunningAppProcess) -> str:
+        """Stop process tree to flush output pipes and return redacted trailing stdout/stderr lines."""
+        self.stop(project_id)
+        if entry.stderr_thread is not None and entry.stderr_thread.is_alive():
+            entry.stderr_thread.join(timeout=1.0)
+        useful = [line.strip() for line in entry.stderr_lines if line and line.strip()]
+        if not useful:
+            return ""
+        return self._redact(" | ".join(useful[-10:]))
+
     def start(
         self,
         project_id: str,
         *,
         workspace_dir: Path | None = None,
-        readiness_timeout: float = 8.0,
+        readiness_timeout: float = DEFAULT_READINESS_TIMEOUT,
         install_deps: bool = False,
         dep_install_timeout: float = 180.0,
     ) -> LocalAppStatus:
@@ -973,25 +1084,48 @@ class LocalAppRunner:
             url = f"http://{self.host}:{port}"
             lan_ip = self._lan_ip_resolver() if self.lan_mode else None
             lan_url = f"http://{lan_ip}:{port}" if (self.lan_mode and lan_ip) else None
+
+            eff_pythonpath = app_info.pythonpath
+            if app_info.app_type == "static":
+                cmd = [sys.executable, "-m", "http.server", str(port), "--bind", bind_host]
+                cwd = app_info.serve_dir
+            else:
+                asgi_attr: str | None = None
+                use_uvicorn = False
+                if app_info.entrypoint is not None:
+                    asgi_attr, use_uvicorn = _detect_fastapi_asgi_spec(app_info.entrypoint)
+                if use_uvicorn and asgi_attr is not None:
+                    asgi_target, resolved_pp = _resolve_asgi_launch_target(
+                        ws_dir, app_info, asgi_attr
+                    )
+                    eff_pythonpath = resolved_pp
+                    cmd = [
+                        str(python_exe),
+                        "-m",
+                        "uvicorn",
+                        asgi_target,
+                        "--host",
+                        bind_host,
+                        "--port",
+                        str(port),
+                    ]
+                    cwd = ws_dir
+                elif app_info.module_name:
+                    cmd = [str(python_exe), "-m", app_info.module_name]
+                    cwd = ws_dir
+                else:
+                    assert app_info.entrypoint is not None
+                    rel_entry = app_info.entrypoint.resolve().relative_to(ws_dir)
+                    cmd = [str(python_exe), str(rel_entry)]
+                    cwd = ws_dir
+
             sub_env = self._build_env(
                 port=port,
                 app_type=app_info.app_type,
                 bind_host=bind_host,
-                pythonpath=app_info.pythonpath,
+                pythonpath=eff_pythonpath,
                 venv_dir=venv_dir,
             )
-
-            if app_info.app_type == "static":
-                cmd = [sys.executable, "-m", "http.server", str(port), "--bind", bind_host]
-                cwd = app_info.serve_dir
-            elif app_info.module_name:
-                cmd = [str(python_exe), "-m", app_info.module_name]
-                cwd = ws_dir
-            else:
-                assert app_info.entrypoint is not None
-                rel_entry = app_info.entrypoint.resolve().relative_to(ws_dir)
-                cmd = [str(python_exe), str(rel_entry)]
-                cwd = ws_dir
 
             try:
                 proc = subprocess.Popen(
@@ -999,8 +1133,8 @@ class LocalAppRunner:
                     cwd=str(cwd),
                     env=sub_env,
                     stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
@@ -1009,7 +1143,7 @@ class LocalAppRunner:
                 err_msg = self._redact(str(exc) or type(exc).__name__)
                 raise LocalAppError(f"Failed to start local app '{project_id}': {err_msg}") from None
 
-            stderr_lines: deque[str] = deque(maxlen=50)
+            stderr_lines: deque[str] = deque(maxlen=80)
             reader = threading.Thread(
                 target=_drain_stderr,
                 args=(proc, stderr_lines),
@@ -1034,12 +1168,8 @@ class LocalAppRunner:
         while time.monotonic() < deadline:
             exit_code = proc.poll()
             if exit_code is not None:
-                if entry.stderr_thread is not None:
-                    entry.stderr_thread.join(timeout=1.0)
-                recent = list(entry.stderr_lines)[-8:]
-                tail = " | ".join(recent)
-                self.stop(project_id)
-                detail = self._redact(tail) if tail else f"exit code {exit_code}"
+                diag = self._collect_process_diagnostic(project_id, entry)
+                detail = diag if diag else f"exit code {exit_code}"
                 raise LocalAppError(
                     f"La app local '{project_id}' se detuvo al iniciar (código {exit_code}): {detail}"
                 )
@@ -1055,11 +1185,8 @@ class LocalAppRunner:
             except OSError:
                 time.sleep(0.05)
 
-        if entry.stderr_thread is not None:
-            entry.stderr_thread.join(timeout=0.5)
-        tail = " | ".join(entry.stderr_lines)
-        self.stop(project_id)
-        detail = f": {self._redact(tail)}" if tail else ""
+        diag = self._collect_process_diagnostic(project_id, entry)
+        detail = f": {diag}" if diag else " (sin salida en stderr/stdout)"
         raise LocalAppError(
             f"Local app '{project_id}' failed to listen on {url} within {readiness_timeout:.1f}s{detail}"
         )
@@ -1139,7 +1266,7 @@ def run_http_smoke_test(
     project_id: str,
     workspace_dir: Path,
     *,
-    timeout_seconds: float = 8.0,
+    timeout_seconds: float = DEFAULT_READINESS_TIMEOUT,
     install_deps: bool = False,
 ) -> HttpSmokeTestResult:
     """Start project_id on 127.0.0.1, probe GET / and relative script/link resources, and stop cleanly."""

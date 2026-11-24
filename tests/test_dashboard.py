@@ -5579,3 +5579,98 @@ def test_dashboard_expires_stale_in_memory_active_ops_over_600s(tmp_path: Path) 
     assert detail["op_started_at"] is None
     assert detail["status"]["busy"] is False
     assert ctrl.is_running(pid) is False
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_runtime_start_timeout_180s_and_swallows_client_disconnects(
+    tmp_path: Path,
+) -> None:
+    """JS client configures 180000ms timeout for /start and /runtime/start, backend aliases /runtime/start with INV-22 checks, and _send_json/_send_html swallow Windows ConnectionAbortedError cleanly."""
+    import io
+    from types import SimpleNamespace
+
+    from agent_factory.dashboard import DashboardController, _DashboardRequestHandler
+    from agent_factory.runtime_runner import LocalAppRunner
+
+    store = SqliteEventStore(str(tmp_path / "rt_timeout_dash.db"))
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_rt_timeout")
+    pid = "proj-rt-180"
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / "index.html").write_text("<h1>Runtime 180s</h1>\n", encoding="utf-8")
+
+    now = datetime(2026, 11, 21, 10, 0, tzinfo=UTC)
+    pdict = _plan_payload("Runtime 180 App")
+    phash = Plan.model_validate(pdict).compute_hash()
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "RT 180", "objective": "App runtime", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": pdict, "plan_hash": phash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": phash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+        create_event(pid, EventType.PROJECT_DELIVERED, {"repo_url": "", "deploy_url": ""}, at=now),
+    ):
+        store.append(ev)
+
+    orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
+    local_runner = LocalAppRunner(workspace_manager=ws_mgr)
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        workspace_manager=ws_mgr,
+        local_runner=local_runner,
+    )
+    try:
+        # 1. JS resolveFetchTimeoutMs & local-start configure 180000 ms for /start and /runtime/start
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            html = html_resp.read().decode("utf-8")
+
+        fn_start = html.index("function resolveFetchTimeoutMs(")
+        fn_end = html.index("async function apiFetch(", fn_start)
+        fn_body = html[fn_start:fn_end]
+        assert "180000" in fn_body
+        assert "runtime" in fn_body
+        assert "start" in fn_body
+        assert "timeoutMs: 180000" in html
+
+        # 2. /runtime/start route alias enforces INV-22 and starts local app cleanly
+        assert _http_json(f"{base_url}/api/projects/..%2Fbad/runtime/start", method="POST")[0] == 400
+        code_rt, res_rt = _http_json(f"{base_url}/api/projects/{pid}/runtime/start", method="POST")
+        assert code_rt == 200
+        assert res_rt["local_app"]["running"] is True
+        code_stp, res_stp = _http_json(f"{base_url}/api/projects/{pid}/runtime/stop", method="POST")
+        assert code_stp == 200
+        assert res_stp["local_app"]["running"] is False
+
+        # 3. _send_json and _send_html safely swallow client disconnect socket errors (WinError 10053)
+        ctrl = DashboardController(orchestrator=orch, secrets_to_redact=("TOP_SECRET_10053",))
+        for exc_cls in (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
+            class _AbortedWriter:
+                def __init__(self, err_type: type[OSError]) -> None:
+                    self._err_type = err_type
+
+                def write(self, _data: bytes) -> int:
+                    raise self._err_type(10053, "WinError 10053 aborted")
+
+            handler = object.__new__(_DashboardRequestHandler)
+            handler.server = SimpleNamespace(controller=ctrl)  # type: ignore[assignment]
+            handler.wfile = _AbortedWriter(exc_cls)  # type: ignore[assignment]
+            handler._headers_buffer = []
+            handler.close_connection = False
+            handler.send_response = lambda *_a, **_kw: None  # type: ignore[method-assign]
+            handler.send_header = lambda *_a, **_kw: None  # type: ignore[method-assign]
+            handler.end_headers = lambda *_a, **_kw: None  # type: ignore[method-assign]
+            handler.rfile = io.BytesIO(b"")  # type: ignore[assignment]
+
+            # Must not raise!
+            handler._send_json(200, {"ok": True, "secret": "TOP_SECRET_10053"})
+            handler._send_html(200, "<html><body>ok</body></html>")
+    finally:
+        local_runner.stop_all()
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()

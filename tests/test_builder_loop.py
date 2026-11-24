@@ -4390,3 +4390,159 @@ def test_force_polish_debate_upgrades_passing_project_and_reverts_on_broken_test
         store_c.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_local_app_runner_readiness_timeout_stderr_diagnostics_and_uvicorn_port_flags(
+    tmp_path: Path,
+) -> None:
+    """Default readiness_timeout is 25.0s, timeouts/early exits capture redacted stdout+stderr diagnostics cleanly (INV-19), and FastAPI apps pass PORT env and --port <port> to uvicorn."""
+    import inspect
+    import json
+    import os
+    import subprocess
+    import sys
+    import urllib.request
+
+    from agent_factory.runtime_runner import (
+        LocalAppError,
+        LocalAppRunner,
+        _compute_deps_hash,
+        _find_python_dependency_manifests,
+        run_http_smoke_test,
+    )
+
+    # 1. Default readiness timeouts must be 25.0s
+    assert inspect.signature(LocalAppRunner.start).parameters["readiness_timeout"].default == 25.0
+    assert inspect.signature(run_http_smoke_test).parameters["timeout_seconds"].default == 25.0
+
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_runtime_diag")
+    secret_val = "TEST_DIAG_SECRET_9182"
+
+    # 2. Readiness timeout attaches buffered stdout + stderr diagnostics with secret redaction
+    pid_slow = "proj-slow-boot"
+    ws_slow = ws_mgr.create_workspace(pid_slow)
+    (ws_slow / "app.py").write_text(
+        "import sys, time\n"
+        "print('stdout: loading heavy imaging modules', flush=True)\n"
+        f"sys.stderr.write('stderr: still importing weights token={secret_val}\\n')\n"
+        "sys.stderr.flush()\n"
+        "time.sleep(10.0)\n",
+        encoding="utf-8",
+    )
+    runner_diag = LocalAppRunner(
+        workspace_manager=ws_mgr,
+        secrets_to_redact=(secret_val,),
+    )
+    try:
+        with pytest.raises(LocalAppError) as timeout_err:
+            runner_diag.start(pid_slow, readiness_timeout=0.7)
+        msg = str(timeout_err.value)
+        assert "0.7s" in msg
+        assert "stdout: loading heavy imaging modules" in msg
+        assert "stderr: still importing weights" in msg
+        assert secret_val not in msg
+        assert "[REDACTED]" in msg
+    finally:
+        runner_diag.stop_all()
+
+    # 3. FastAPI workspace (no __main__, AND hardcoded uvicorn port=8000) launches via `python -m uvicorn <mod>:app --host ... --port <port>` with PORT in env
+    def _create_fake_venv_site(ws_path: Path) -> Path:
+        venv_dir = ws_path / ".venv"
+        subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv_dir)], check=True)
+        site_dir = (
+            venv_dir / "Lib" / "site-packages"
+            if os.name == "nt"
+            else next((venv_dir / "lib").glob("python*/site-packages"))
+        )
+        site_dir.mkdir(parents=True, exist_ok=True)
+        (site_dir / "fastapi.py").write_text("class FastAPI:\n    pass\n", encoding="utf-8")
+        uv_pkg = site_dir / "uvicorn"
+        uv_pkg.mkdir(parents=True, exist_ok=True)
+        (uv_pkg / "__init__.py").write_text(
+            "def run(*args, **kwargs):\n    raise RuntimeError('should pass assigned port via CLI')\n",
+            encoding="utf-8",
+        )
+        (uv_pkg / "__main__.py").write_text(
+            "import argparse, http.server, json, os, sys\n"
+            "p = argparse.ArgumentParser()\n"
+            "p.add_argument('target')\n"
+            "p.add_argument('--host', default='127.0.0.1')\n"
+            "p.add_argument('--port', type=int, required=True)\n"
+            "args = p.parse_args()\n"
+            "class H(http.server.BaseHTTPRequestHandler):\n"
+            "    def do_GET(self):\n"
+            "        body = json.dumps({'target': args.target, 'cli_port': args.port, 'env_port': os.environ.get('PORT'), 'argv': sys.argv[1:]}).encode()\n"
+            "        self.send_response(200)\n"
+            "        self.send_header('Content-Type', 'application/json')\n"
+            "        self.send_header('Content-Length', str(len(body)))\n"
+            "        self.end_headers()\n"
+            "        self.wfile.write(body)\n"
+            "    def log_message(self, *a): pass\n"
+            "http.server.ThreadingHTTPServer((args.host, args.port), H).serve_forever()\n",
+            encoding="utf-8",
+        )
+        reqs, pyps = _find_python_dependency_manifests(ws_path)
+        dep_hash = _compute_deps_hash(ws_path, [*reqs, *pyps], ast_packages=["fastapi", "uvicorn"])
+        (venv_dir / ".deps_hash").write_text(dep_hash, encoding="utf-8")
+        return site_dir
+
+    pid_fastapi = "proj-fastapi-uvicorn"
+    ws_fastapi = ws_mgr.create_workspace(pid_fastapi)
+    (ws_fastapi / "requirements.txt").write_text("fastapi\nuvicorn\n", encoding="utf-8")
+    (ws_fastapi / "main.py").write_text(
+        "from fastapi import FastAPI\n"
+        "import uvicorn\n"
+        "app = FastAPI()\n"
+        "if __name__ == '__main__':\n"
+        "    uvicorn.run(app, host='127.0.0.1', port=8000)\n",
+        encoding="utf-8",
+    )
+    _create_fake_venv_site(ws_fastapi)
+
+    runner_fast = LocalAppRunner(
+        workspace_manager=ws_mgr,
+        dep_command_runner=lambda *a, **kw: subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+    )
+    try:
+        st = runner_fast.start(pid_fastapi, install_deps=True, readiness_timeout=5.0)
+        assert st.running is True
+        assert st.app_type == "python_local"
+        assert st.port is not None
+        with urllib.request.urlopen(st.url, timeout=5.0) as resp:
+            info = json.loads(resp.read().decode("utf-8"))
+        assert info["target"] == "main:app"
+        assert info["cli_port"] == st.port
+        assert info["env_port"] == str(st.port)
+        assert "--port" in info["argv"]
+        assert str(st.port) in info["argv"]
+    finally:
+        runner_fast.stop_all()
+
+    # 4. FastAPI without __main__ (nested src/main.py) also resolves uvicorn target and passes --port + PORT env
+    pid_fast_nomain = "proj-fastapi-nomain"
+    ws_nomain = ws_mgr.create_workspace(pid_fast_nomain)
+    (ws_nomain / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+    (ws_nomain / "src").mkdir(parents=True)
+    (ws_nomain / "src" / "main.py").write_text(
+        "from fastapi import FastAPI\n"
+        "api_app = FastAPI()\n",
+        encoding="utf-8",
+    )
+    _create_fake_venv_site(ws_nomain)
+    runner_nomain = LocalAppRunner(
+        workspace_manager=ws_mgr,
+        dep_command_runner=lambda *a, **kw: subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+    )
+    try:
+        st2 = runner_nomain.start(pid_fast_nomain, install_deps=True, readiness_timeout=5.0)
+        assert st2.running is True
+        with urllib.request.urlopen(st2.url, timeout=5.0) as resp2:
+            info2 = json.loads(resp2.read().decode("utf-8"))
+        assert info2["target"] == "main:api_app"
+        assert info2["cli_port"] == st2.port
+        assert info2["env_port"] == str(st2.port)
+    finally:
+        runner_nomain.stop_all()
+
+
+

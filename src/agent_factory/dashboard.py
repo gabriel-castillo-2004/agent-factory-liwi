@@ -5051,7 +5051,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (typeof explicitMs === 'number' && explicitMs > 0) return explicitMs;
       const u = String(url || '');
       if (u.indexOf('/chat') >= 0) return 250000;
-      if (/\\/(start|modify|rollback|import|retry)\\b/.test(u)) return 120000;
+      if (/\\/(?:runtime\\/)?start\\b/.test(u)) return 180000;
+      if (/\\/(modify|rollback|import|retry)\\b/.test(u)) return 120000;
       return 30000;
     }
 
@@ -8789,7 +8790,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               inlineTargetId: 'local-inline-status',
             },
             async () => {
-              const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/start', { method: 'POST' });
+              const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/runtime/start', { method: 'POST', timeoutMs: 180000 });
               const url = res.local_app && res.local_app.url ? res.local_app.url : '';
               setNote(url ? ('✓ App encendida en ' + url) : ('✓ App encendida para ' + pid), 'ok');
               state.lastBannerSignature = null;
@@ -9204,32 +9205,29 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         """Silence stderr access logs and route diagnostics at debug level."""
         logger.debug("dashboard: " + format, *args)
 
+    def _send_raw_response(self, status_code: int, content_type: str, body: bytes) -> None:
+        try:
+            self.send_response(status_code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
+            logger.debug("Client disconnected before receiving HTTP response (%s)", status_code)
+
     def _send_json(self, status_code: int, payload: dict[str, Any]) -> None:
         scrubbed = _scrub_value(payload, self.server.controller.secrets_to_redact)
         body = json.dumps(scrubbed, ensure_ascii=False).encode("utf-8")
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        self._send_raw_response(status_code, "application/json; charset=utf-8", body)
 
     def _send_html(self, status_code: int, html: str) -> None:
         body = html.encode("utf-8")
-        self.send_response(status_code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        self._send_raw_response(status_code, "text/html; charset=utf-8", body)
 
     def _send_bytes(self, status_code: int, content_type: str, body: bytes) -> None:
-        self.send_response(status_code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        self._send_raw_response(status_code, content_type, body)
 
     def _extract_uploaded_logo_payload(self) -> tuple[bytes, str]:
         raw_len = self.headers.get("Content-Length")
@@ -9354,6 +9352,8 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             "rollback",
         }:
             return urllib.parse.unquote(parts[0]), parts[1]
+        if len(parts) == 3 and parts[1] == "runtime" and parts[2] in {"start", "stop"}:
+            return urllib.parse.unquote(parts[0]), parts[2]
         # Reject multi-segment or path-traversal attempts (e.g., ../etc) as invalid project_id
         return urllib.parse.unquote(rest), None
 
