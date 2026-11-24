@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import re
 import sys
@@ -149,6 +150,9 @@ class ParentAuditLLMOutput(BaseModel):
     summary: str = ""
     global_score: float | None = None
     dimensions: _AllDimensionsSchema = Field(default_factory=_AllDimensionsSchema)
+    objections: list[dict[str, Any]] = Field(default_factory=list)
+    resolved_count: int | None = None
+    diff_summary: str = ""
     raw_payload: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="before")
@@ -178,6 +182,14 @@ class ParentAuditLLMOutput(BaseModel):
                         "findings": _coerce_str_list(val.get("findings")),
                         "improvements": _coerce_str_list(val.get("improvements")),
                     }
+        raw_objs = copied.get("objections")
+        norm_objs = [dict(o) for o in raw_objs if isinstance(o, Mapping)] if isinstance(raw_objs, list) else []
+        raw_resolved = copied.get("resolved_count")
+        resolved_cnt = (
+            int(raw_resolved)
+            if isinstance(raw_resolved, int) and not isinstance(raw_resolved, bool)
+            else None
+        )
         out = {
             "summary": str(copied.get("summary") or ""),
             "global_score": (
@@ -186,9 +198,111 @@ class ParentAuditLLMOutput(BaseModel):
                 else None
             ),
             "dimensions": norm_dims,
+            "objections": norm_objs,
+            "resolved_count": resolved_cnt,
+            "diff_summary": str(copied.get("diff_summary") or ""),
             "raw_payload": copied,
         }
         return out
+
+
+class BuilderResponseLLMOutput(BaseModel):
+    """Structured schema for BuilderResponder point-by-point debate response."""
+
+    model_config = ConfigDict(extra="allow")
+
+    builder_response: str = ""
+    surgical_instructions: str = ""
+    fixes: list[dict[str, Any]] = Field(default_factory=list)
+
+
+_VALID_SEVERITIES: frozenset[str] = frozenset({"high", "medium", "low"})
+_SEVERITY_ALIASES: dict[str, str] = {
+    "high": "high",
+    "alta": "high",
+    "critical": "high",
+    "critica": "high",
+    "crítica": "high",
+    "medium": "medium",
+    "media": "medium",
+    "low": "low",
+    "baja": "low",
+}
+
+
+class DebateObjection(BaseModel):
+    """Actionable critique objection pointing to a specific dimension and file."""
+
+    dimension: str
+    file_path: str = ""
+    severity: str = "medium"
+    issue: str
+    concrete_fix: str = ""
+    resolved: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_fields(cls, data: Any) -> Any:
+        if not isinstance(data, Mapping):
+            return data
+        copied = dict(data)
+        raw_dim = str(copied.get("dimension") or "").strip().lower()
+        copied["dimension"] = _DIMENSION_ALIASES.get(raw_dim, raw_dim or "functional_completeness")
+        raw_sev = str(copied.get("severity") or "medium").strip().lower()
+        copied["severity"] = _SEVERITY_ALIASES.get(raw_sev, "medium")
+        return copied
+
+
+class DebateRoundRecord(BaseModel):
+    """Persistent record of one adversarial Critic vs. Builder debate round."""
+
+    round_number: int = 1
+    score_before: float = Field(ge=0.0, le=100.0)
+    score_after: float = Field(ge=0.0, le=100.0)
+    objections: list[DebateObjection] = Field(default_factory=list)
+    builder_response: str = ""
+    builder_instructions: str = ""
+    resolved_count: int = 0
+    kept: bool = True
+    diff_summary: str = ""
+    discard_reason: str = ""
+
+
+def summarize_debate_rounds(
+    rounds: Sequence[DebateRoundRecord | Mapping[str, Any]],
+    *,
+    final_global_score: float | None = None,
+) -> dict[str, Any] | None:
+    """Compute compact summary metrics across adversarial debate rounds."""
+    if not rounds:
+        return None
+    norm: list[dict[str, Any]] = []
+    for item in rounds:
+        if isinstance(item, DebateRoundRecord):
+            norm.append(item.model_dump(mode="python"))
+        elif isinstance(item, Mapping):
+            norm.append(dict(item))
+    if not norm:
+        return None
+    first_score = float(norm[0].get("score_before") or 0.0)
+    kept_list = [r for r in norm if bool(r.get("kept", True))]
+    if kept_list:
+        after_score = float(kept_list[-1].get("score_after") or first_score)
+    elif final_global_score is not None:
+        after_score = float(final_global_score)
+    else:
+        after_score = first_score
+    total_objections = sum(len(r.get("objections") or []) for r in norm)
+    resolved_total = sum(int(r.get("resolved_count") or 0) for r in kept_list)
+    return {
+        "rounds": len(norm),
+        "kept_rounds": len(kept_list),
+        "total_objections": total_objections,
+        "resolved_count": resolved_total,
+        "score_before": round(first_score, 2),
+        "score_after": round(after_score, 2),
+        "score_delta": round(after_score - first_score, 2),
+    }
 
 
 class SubAuditResult(BaseModel):
@@ -271,6 +385,11 @@ def ensure_scorecard_tier(scorecard: Mapping[str, Any]) -> dict[str, Any]:
     )
     copy["tier_id"] = raw_tier_id or tier_id
     copy["tier_label"] = raw_tier_lbl or tier_label
+    raw_debate = copy.get("debate_rounds")
+    if isinstance(raw_debate, Sequence) and not isinstance(raw_debate, (str, bytes)) and raw_debate and not copy.get("debate_summary"):
+        copy["debate_summary"] = summarize_debate_rounds(
+            raw_debate, final_global_score=global_score
+        )
     return copy
 
 
@@ -290,6 +409,8 @@ class QualityAuditReport(BaseModel):
     summary: str = ""
     findings: list[str] = Field(default_factory=list)
     improvements: list[str] = Field(default_factory=list)
+    objections: list[DebateObjection] = Field(default_factory=list)
+    debate_rounds: list[DebateRoundRecord] = Field(default_factory=list)
     markdown_report: str = ""
     source: str = "llm"
 
@@ -330,7 +451,35 @@ class QualityAuditReport(BaseModel):
                     ],
                 }
             )
-        return {
+        serialized_rounds: list[dict[str, Any]] = []
+        for rnd in self.debate_rounds:
+            serialized_rounds.append(
+                {
+                    "round_number": rnd.round_number,
+                    "score_before": round(rnd.score_before, 2),
+                    "score_after": round(rnd.score_after, 2),
+                    "objections": [
+                        {
+                            "dimension": obj.dimension,
+                            "file_path": redact_secrets(obj.file_path, extra_secrets=extra_secrets),
+                            "severity": obj.severity,
+                            "issue": redact_secrets(obj.issue, extra_secrets=extra_secrets),
+                            "concrete_fix": redact_secrets(obj.concrete_fix, extra_secrets=extra_secrets),
+                            "resolved": obj.resolved,
+                        }
+                        for obj in rnd.objections
+                    ],
+                    "builder_response": redact_secrets(rnd.builder_response, extra_secrets=extra_secrets),
+                    "resolved_count": rnd.resolved_count,
+                    "kept": rnd.kept,
+                    "diff_summary": redact_secrets(rnd.diff_summary, extra_secrets=extra_secrets),
+                    "discard_reason": redact_secrets(rnd.discard_reason, extra_secrets=extra_secrets),
+                }
+            )
+        debate_summary = summarize_debate_rounds(
+            serialized_rounds, final_global_score=self.global_score
+        )
+        out: dict[str, Any] = {
             "global_score": round(self.global_score, 2),
             "passed": self.passed,
             "tier_id": self.tier_id,
@@ -343,7 +492,11 @@ class QualityAuditReport(BaseModel):
             "source": self.source,
             "summary": redact_secrets(self.summary, extra_secrets=extra_secrets),
             "areas": areas,
+            "debate_rounds": serialized_rounds,
         }
+        if debate_summary is not None:
+            out["debate_summary"] = debate_summary
+        return out
 
 
 def _clamp_score(value: Any, *, default: float = 80.0) -> float:
@@ -735,17 +888,85 @@ def build_quality_markdown_report(
             for imp_item in sub.improvements:
                 lines.append(f"- {redact_secrets(imp_item, extra_secrets=extra_secrets)}")
 
+    if report.debate_rounds:
+        first_before = report.debate_rounds[0].score_before
+        delta = report.global_score - first_before
+        lines.extend(
+            [
+                "",
+                "## ⚔️ Debate de Calidad (Crítico vs. Constructor)",
+                "",
+                (
+                    f"- **Evolución:** `{first_before:.1f}%` → `{report.global_score:.1f}%` "
+                    f"(`{delta:+.1f}%` · `{len(report.debate_rounds)}` ronda(s))"
+                ),
+            ]
+        )
+        for rnd in report.debate_rounds:
+            total_obj = len(rnd.objections)
+            if rnd.kept:
+                status_lbl = (
+                    f"Aplicada · {rnd.resolved_count}/{total_obj} objeciones resueltas"
+                    if total_obj
+                    else "Aplicada"
+                )
+            else:
+                reason = redact_secrets(
+                    rnd.discard_reason or "regresión revertida",
+                    extra_secrets=extra_secrets,
+                )
+                status_lbl = f"Descartada ({reason})"
+            lines.extend(
+                [
+                    "",
+                    (
+                        f"### Ronda {rnd.round_number} — `{rnd.score_before:.1f}%` → "
+                        f"`{rnd.score_after:.1f}%` ({status_lbl})"
+                    ),
+                ]
+            )
+            if rnd.objections:
+                lines.append("**Objeciones del Crítico Adversario:**")
+                for obj in rnd.objections:
+                    file_tag = (
+                        f" en `{redact_secrets(obj.file_path, extra_secrets=extra_secrets)}`"
+                        if obj.file_path
+                        else ""
+                    )
+                    dim_lbl = QUALITY_DIMENSION_META.get(obj.dimension, {}).get(
+                        "label", obj.dimension
+                    )
+                    fix_part = (
+                        f" → Fix: {redact_secrets(obj.concrete_fix, extra_secrets=extra_secrets)}"
+                        if obj.concrete_fix
+                        else ""
+                    )
+                    lines.append(
+                        f"- [{dim_lbl} · {obj.severity}]{file_tag}: "
+                        f"{redact_secrets(obj.issue, extra_secrets=extra_secrets)}{fix_part}"
+                    )
+            if rnd.builder_response:
+                lines.append("**Respuesta del Constructor Refinador:**")
+                for resp_line in rnd.builder_response.splitlines():
+                    cleaned_line = redact_secrets(resp_line.strip(), extra_secrets=extra_secrets)
+                    if cleaned_line:
+                        lines.append(
+                            cleaned_line if cleaned_line.startswith("-") else f"- {cleaned_line}"
+                        )
+            if rnd.diff_summary:
+                lines.append(
+                    f"**Inspección de `git diff`:** {redact_secrets(rnd.diff_summary, extra_secrets=extra_secrets)}"
+                )
+
     return "\n".join(lines).strip()
 
 
-def format_refinement_feedback(
+def _select_target_dimensions(
     report: QualityAuditReport,
     *,
-    refinement_round: int,
-    max_rounds: int,
-    extra_secrets: Sequence[str] = (),
-) -> str:
-    """Build focused refinement instructions containing only penalized/failing dimensions (<70% or <85%)."""
+    objections: Sequence[DebateObjection] = (),
+    challenge_for_polish: bool = False,
+) -> list[SubAuditResult]:
     target_subs = [
         report.dimensions[dim]
         for dim in QUALITY_DIMENSION_ORDER
@@ -762,19 +983,53 @@ def format_refinement_feedback(
             ),
             key=lambda s: s.score,
         )
+    if not target_subs and objections:
+        obj_dims = {obj.dimension for obj in objections}
+        target_subs = [
+            report.dimensions[dim]
+            for dim in QUALITY_DIMENSION_ORDER
+            if dim in obj_dims and report.dimensions[dim].active
+        ]
     if not target_subs:
+        max_threshold = 100.0 if challenge_for_polish else 101.0
         target_subs = sorted(
-            (report.dimensions[dim] for dim in QUALITY_DIMENSION_ORDER if report.dimensions[dim].active),
+            (
+                report.dimensions[dim]
+                for dim in QUALITY_DIMENSION_ORDER
+                if report.dimensions[dim].active and report.dimensions[dim].score < max_threshold
+            ),
             key=lambda s: s.score,
         )[:2]
+    return target_subs
 
+
+def format_refinement_feedback(
+    report: QualityAuditReport,
+    *,
+    refinement_round: int,
+    max_rounds: int,
+    objections: Sequence[DebateObjection] = (),
+    challenge_for_polish: bool = False,
+    extra_secrets: Sequence[str] = (),
+) -> str:
+    """Build focused refinement instructions containing only penalized or challenged dimensions."""
+    target_subs = _select_target_dimensions(
+        report,
+        objections=objections,
+        challenge_for_polish=challenge_for_polish,
+    )
+    mode_tag = (
+        f"[DEBATE DE CALIDAD · PULIDO {refinement_round}/{max_rounds}]"
+        if challenge_for_polish and report.passed
+        else f"[AUDITORÍA DE CALIDAD · RONDA DE REFINAMIENTO {refinement_round}/{max_rounds}]"
+    )
     lines = [
-        f"[AUDITORÍA DE CALIDAD · RONDA DE REFINAMIENTO {refinement_round}/{max_rounds}]",
+        mode_tag,
         (
             f"Puntaje global actual: {report.global_score:.1f}% "
             f"(requerido >= {report.min_global_score:.0f}%, mínimo por área >= {report.min_area_score:.0f}%)."
         ),
-        "Corrige ÚNICAMENTE las áreas penalizadas manteniendo intactas todas las pruebas actuales:",
+        "Corrige ÚNICAMENTE las áreas señaladas manteniendo intactas todas las pruebas actuales:",
     ]
     for sub in target_subs:
         lines.append(f"- {sub.dimension} ({sub.label}): {sub.score:.1f}%")
@@ -782,11 +1037,89 @@ def format_refinement_feedback(
             lines.append(f"  * Hallazgo: {redact_secrets(f_txt, extra_secrets=extra_secrets)}")
         for imp_txt in sub.improvements[:4]:
             lines.append(f"  * Mejora: {redact_secrets(imp_txt, extra_secrets=extra_secrets)}")
+    target_dim_set = {sub.dimension for sub in target_subs}
+    relevant_objs = [obj for obj in objections if obj.dimension in target_dim_set] or list(objections)
+    if relevant_objs:
+        lines.append("Objeciones específicas por archivo:")
+        for obj in relevant_objs[:8]:
+            file_part = (
+                f"[{redact_secrets(obj.file_path, extra_secrets=extra_secrets)}] "
+                if obj.file_path
+                else ""
+            )
+            fix_part = (
+                f" -> {redact_secrets(obj.concrete_fix, extra_secrets=extra_secrets)}"
+                if obj.concrete_fix
+                else ""
+            )
+            lines.append(
+                f"  * ({obj.dimension} · {obj.severity}) {file_part}"
+                f"{redact_secrets(obj.issue, extra_secrets=extra_secrets)}{fix_part}"
+            )
     return "\n".join(lines)
 
 
-class ParentAuditor:
-    """Orchestrates Parent Auditor + 6 Sub-Auditors evaluation with tolerant parsing & fallback."""
+def _invoke_structured_llm(
+    llm: LLM | None,
+    messages: list[dict[str, str]],
+    *,
+    schema: type[BaseModel],
+    timeout_seconds: float,
+    agent_name: str,
+) -> Any:
+    """Invoke LLM with optional timeout_seconds forwarding and unified guard."""
+    if llm is None:
+        raise LLMError(f"No LLM configured for {agent_name}")
+    gen_fn = getattr(llm, "generate", None)
+    target_fn = gen_fn if callable(gen_fn) else llm.complete
+    try:
+        sig = inspect.signature(target_fn)
+        if "timeout_seconds" in sig.parameters:
+            return target_fn(
+                messages,
+                schema=schema,
+                timeout_seconds=timeout_seconds,
+            )
+    except (TypeError, ValueError):
+        pass
+    return target_fn(messages, schema=schema)
+
+
+def _infer_workspace_file_for_dimension(
+    workspace_dir: Path,
+    dimension: str,
+    hint_text: str = "",
+) -> str:
+    """Infer a real non-secret file path inside workspace_dir matching text or dimension heuristics."""
+    files = [
+        f
+        for f in list_workspace_files(Path(workspace_dir), max_files=180)
+        if not f.startswith(".agent-factory/") and f not in ("PROJECT_PROMPT.md", "manifest.json")
+    ]
+    if not files:
+        return ""
+    hint_low = hint_text.lower()
+    for rel in files:
+        base = Path(rel).name.lower()
+        if rel.lower() in hint_low or (base and base in hint_low):
+            return rel
+    if dimension == "ux_ui":
+        for ext in (".html", ".htm", ".css", ".scss", ".jsx", ".tsx", ".vue", ".svelte", ".js"):
+            for rel in files:
+                if rel.lower().endswith(ext) and not rel.startswith(("tests/", "test/")):
+                    return rel
+    if dimension == "testing_runtime":
+        for rel in files:
+            if rel.startswith(("tests/", "test/")) or rel == "requirements.txt":
+                return rel
+    for rel in files:
+        if not rel.startswith(("tests/", "test/")):
+            return rel
+    return files[0]
+
+
+class AdversarialCritic:
+    """Agent 1: Strict evidence-based quality critic with diff verification against 6 dimensions."""
 
     def __init__(
         self,
@@ -801,40 +1134,30 @@ class ParentAuditor:
         self.min_area_score = float(min_area_score)
         self.timeout_seconds = float(timeout_seconds)
 
-    def _invoke_llm(self, messages: list[dict[str, str]]) -> Any:
-        if self.llm is None:
-            raise LLMError("No LLM configured for ParentAuditor")
-        gen_fn = getattr(self.llm, "generate", None)
-        target_fn = gen_fn if callable(gen_fn) else self.llm.complete
-        try:
-            sig = inspect.signature(target_fn)
-            if "timeout_seconds" in sig.parameters:
-                return target_fn(
-                    messages,
-                    schema=ParentAuditLLMOutput,
-                    timeout_seconds=self.timeout_seconds,
-                )
-        except (TypeError, ValueError):
-            pass
-        return target_fn(messages, schema=ParentAuditLLMOutput)
-
     @staticmethod
-    def _extract_llm_dimensions(
+    def _extract_llm_payload(
         raw_resp: Any,
         *,
         extra_secrets: Sequence[str] = (),
-    ) -> tuple[dict[str, dict[str, Any]], float | None, str]:
+    ) -> tuple[dict[str, dict[str, Any]], float | None, str, list[dict[str, Any]], int | None, str]:
         if isinstance(raw_resp, ParentAuditLLMOutput):
             payload: dict[str, Any] = dict(raw_resp.raw_payload or {})
             if not payload:
                 payload = raw_resp.model_dump(mode="python")
         elif isinstance(raw_resp, Mapping):
             payload = dict(raw_resp.get("raw_payload") or raw_resp)
-            for k in ("dimensions", "summary", "global_score"):
+            for k in (
+                "dimensions",
+                "summary",
+                "global_score",
+                "objections",
+                "resolved_count",
+                "diff_summary",
+            ):
                 if k not in payload and k in raw_resp:
                     payload[k] = raw_resp[k]
         else:
-            return {}, None, ""
+            return {}, None, "", [], None, ""
 
         parsed_dims: dict[str, dict[str, Any]] = {}
         dims_container = (
@@ -873,8 +1196,25 @@ class ParentAuditor:
             if isinstance(raw_global, (int, float)) and not isinstance(raw_global, bool)
             else None
         )
-        summary = redact_secrets(str(payload.get("summary") or "").strip(), extra_secrets=extra_secrets)
-        return parsed_dims, explicit_global, summary
+        summary = redact_secrets(
+            str(payload.get("summary") or "").strip(), extra_secrets=extra_secrets
+        )
+        raw_objs = payload.get("objections") or payload.get("critiques") or []
+        parsed_objs: list[dict[str, Any]] = (
+            [dict(o) for o in raw_objs if isinstance(o, Mapping)]
+            if isinstance(raw_objs, list)
+            else []
+        )
+        raw_resolved = payload.get("resolved_count")
+        resolved_cnt = (
+            int(raw_resolved)
+            if isinstance(raw_resolved, int) and not isinstance(raw_resolved, bool)
+            else None
+        )
+        diff_summary = redact_secrets(
+            str(payload.get("diff_summary") or "").strip(), extra_secrets=extra_secrets
+        )
+        return parsed_dims, explicit_global, summary, parsed_objs, resolved_cnt, diff_summary
 
     def _build_audit_messages(
         self,
@@ -886,6 +1226,7 @@ class ParentAuditor:
         spec: Spec | None,
         plan: Plan | None,
         test_results: Mapping[str, bool] | None,
+        challenge_for_polish: bool = False,
         extra_secrets: Sequence[str],
     ) -> list[dict[str, str]]:
         code_ctx = collect_workspace_code_context(
@@ -906,10 +1247,20 @@ class ParentAuditor:
             for dim in QUALITY_DIMENSION_ORDER
             if weights[dim] > 0.0
         ]
+        polish_hint = (
+            "\nModo PULIDO ADVERSARIO activo: incluso si el proyecto supera 85%, desafía cualquier "
+            "punto mejorable (<100%) en UX/accesibilidad, robustez, pruebas o seguridad."
+            if challenge_for_polish
+            else ""
+        )
         sys_prompt = (
-            "Eres el Auditor Padre coordinando 6 Sub-Auditores de calidad de software en modo ESTRICTAMENTE DE SOLO LECTURA.\n"
-            "Evalúa cada dimensión activa de 0 a 100 puntos con hallazgos concretos y acciones de mejora.\n"
-            "Responde únicamente en formato JSON válido siguiendo el esquema solicitado."
+            "Eres el Agente 1 · Crítico Adversario coordinando 6 Sub-Auditores de calidad de software "
+            "en modo ESTRICTAMENTE DE SOLO LECTURA.\n"
+            "Evalúa cada dimensión activa de 0 a 100 puntos basándote SOLO en evidencia verificable del código "
+            "(nunca infles calificaciones sin respaldo).\n"
+            "Emite objeciones accionables en `objections` con: `dimension`, `file_path`, `severity`, `issue`, `concrete_fix`."
+            + polish_hint
+            + "\nResponde únicamente en formato JSON válido siguiendo el esquema solicitado."
         )
         user_prompt = redact_secrets(
             f"Proyecto: {project_id}\n"
@@ -926,70 +1277,194 @@ class ParentAuditor:
             {"role": "user", "content": user_prompt},
         ]
 
-    def audit_workspace(
+    def _build_diff_review_messages(
         self,
         project_id: str,
         workspace_dir: Path,
         *,
-        spec: Spec | None = None,
-        plan: Plan | None = None,
-        test_results: Mapping[str, bool] | None = None,
-        round_number: int = 1,
-        project_name: str = "",
-        version_label: str = "",
+        previous_report: QualityAuditReport,
+        prior_objections: Sequence[DebateObjection],
+        diff_text: str,
+        has_ui: bool,
+        weights: Mapping[str, float],
+        spec: Spec | None,
+        plan: Plan | None,
+        test_results: Mapping[str, bool] | None,
+        extra_secrets: Sequence[str],
+    ) -> list[dict[str, str]]:
+        code_ctx = collect_workspace_code_context(
+            workspace_dir,
+            max_chars=18000,
+            extra_secrets=extra_secrets,
+        )
+        obj_lines = [
+            (
+                f"{idx + 1}. [{obj.dimension} | {obj.file_path or 'workspace'} | {obj.severity}] "
+                f"{obj.issue} -> Fix esperado: {obj.concrete_fix}"
+            )
+            for idx, obj in enumerate(prior_objections)
+        ] or ["(Sin objeciones previas registradas)"]
+        spec_summary = (
+            spec.model_dump_json(indent=2)
+            if spec is not None
+            else (plan.summary if plan is not None else "N/D")
+        )
+        weights_desc = ", ".join(
+            f"{dim}: {weights[dim] * 100:.1f}%" for dim in QUALITY_DIMENSION_ORDER
+        )
+        sys_prompt = (
+            "Eres el Agente 1 · Crítico Adversario realizando una RE-EVALUACIÓN BASADA EN `git diff`.\n"
+            "Inspecciona el diff aplicado tras las correcciones del Constructor, comprueba cuántas objeciones "
+            "fueron resueltas (`resolved_count`), resume lo verificado (`diff_summary`) y recalcula las 6 dimensiones "
+            "con rigor de evidencia.\n"
+            "Responde únicamente en JSON válido."
+        )
+        user_prompt = redact_secrets(
+            f"Proyecto: {project_id}\n"
+            f"Puntaje previo: {previous_report.global_score:.1f}%\n"
+            f"UI detectada: {'Sí' if has_ui else 'No (API/CLI puro)'} | Pesos: {weights_desc}\n"
+            f"Resultados de pruebas actuales: {dict(test_results or {})}\n\n"
+            f"Objeciones planteadas anteriormente ({len(prior_objections)}):\n"
+            + "\n".join(obj_lines)
+            + "\n\nGit diff resultante tras la respuesta del Constructor:\n"
+            + (diff_text.strip() or "(Sin diff registrado)")
+            + f"\n\nSpec (resumen):\n{spec_summary[:2500]}\n\n"
+            + f"Estado actual del workspace:\n{code_ctx or '(Sin archivos detectados)'}",
+            extra_secrets=extra_secrets,
+        )
+        return [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    @staticmethod
+    def _coerce_objections(
+        raw_objs: Sequence[Mapping[str, Any]],
+        *,
+        workspace_dir: Path,
+        dimensions: Mapping[str, SubAuditResult],
         extra_secrets: Sequence[str] = (),
-    ) -> QualityAuditReport:
-        """Execute Parent Auditor + 6 Sub-Auditors evaluation with adaptive weights and fallback."""
-        ws = Path(workspace_dir)
-        has_ui = detect_workspace_has_ui(ws, plan=plan)
-        weights = compute_area_weights(has_ui)
-        deterministic_dims = _run_deterministic_audit(
-            ws,
-            has_ui=has_ui,
-            plan=plan,
-            test_results=test_results,
-            extra_secrets=extra_secrets,
-        )
-
-        llm_dims: dict[str, dict[str, Any]] = {}
-        explicit_global: float | None = None
-        summary = ""
-        source = "llm"
-
-        messages = self._build_audit_messages(
-            project_id,
-            ws,
-            has_ui=has_ui,
-            weights=weights,
-            spec=spec,
-            plan=plan,
-            test_results=test_results,
-            extra_secrets=extra_secrets,
-        )
-        try:
-            raw_resp = self._invoke_llm(messages)
-            llm_dims, explicit_global, summary = self._extract_llm_dimensions(
-                raw_resp,
+    ) -> list[DebateObjection]:
+        out: list[DebateObjection] = []
+        for item in raw_objs:
+            issue = redact_secrets(str(item.get("issue") or item.get("problem") or "").strip(), extra_secrets=extra_secrets)
+            if not issue:
+                continue
+            raw_dim = str(item.get("dimension") or "").strip().lower()
+            dim = _DIMENSION_ALIASES.get(raw_dim, raw_dim or "functional_completeness")
+            if dim not in dimensions:
+                dim = "functional_completeness"
+            if not dimensions[dim].active:
+                continue
+            file_path = redact_secrets(
+                str(item.get("file_path") or item.get("file") or "").strip(),
+                extra_secrets=extra_secrets,
+            ) or _infer_workspace_file_for_dimension(workspace_dir, dim, issue)
+            concrete_fix = redact_secrets(
+                str(item.get("concrete_fix") or item.get("fix") or item.get("improvement") or "").strip(),
                 extra_secrets=extra_secrets,
             )
-            if not llm_dims and explicit_global is None:
-                source = "deterministic_fallback"
-        except (
-            LLMError,
-            InvalidLLMResponseError,
-            CommandTimeoutError,
-            OSError,
-            RuntimeError,
-            ValueError,
-            TypeError,
-        ) as exc:
-            logger.warning(
-                "ParentAuditor falling back to deterministic evaluation for %r: %s",
-                project_id,
-                redact_secrets(str(exc), extra_secrets=extra_secrets),
+            out.append(
+                DebateObjection(
+                    dimension=dim,
+                    file_path=file_path,
+                    severity=str(item.get("severity") or "medium"),
+                    issue=issue,
+                    concrete_fix=concrete_fix,
+                )
             )
-            source = "deterministic_fallback"
+        return out
 
+    def build_objections(
+        self,
+        workspace_dir: Path,
+        report: QualityAuditReport,
+        *,
+        challenge_for_polish: bool = False,
+        extra_secrets: Sequence[str] = (),
+    ) -> list[DebateObjection]:
+        """Extract or synthesize concrete file-scoped objections from a QualityAuditReport."""
+        if report.objections:
+            return list(report.objections)
+        target_subs = _select_target_dimensions(
+            report, challenge_for_polish=challenge_for_polish
+        )
+        if not target_subs:
+            return []
+        synthesized: list[DebateObjection] = []
+        for sub in target_subs:
+            needs_work = (
+                sub.score < report.min_area_score
+                or report.global_score < report.min_global_score
+                or (challenge_for_polish and sub.score < 100.0)
+            )
+            if not needs_work:
+                continue
+            if sub.findings:
+                for idx, finding in enumerate(sub.findings[:3]):
+                    imp = sub.improvements[idx] if idx < len(sub.improvements) else (
+                        sub.improvements[0] if sub.improvements else ""
+                    )
+                    fp = _infer_workspace_file_for_dimension(
+                        workspace_dir, sub.dimension, f"{finding} {imp}"
+                    )
+                    synthesized.append(
+                        DebateObjection(
+                            dimension=sub.dimension,
+                            file_path=fp,
+                            severity="high" if sub.score < report.min_area_score else "medium",
+                            issue=redact_secrets(finding, extra_secrets=extra_secrets),
+                            concrete_fix=redact_secrets(imp, extra_secrets=extra_secrets),
+                        )
+                    )
+            elif sub.improvements:
+                for imp in sub.improvements[:2]:
+                    fp = _infer_workspace_file_for_dimension(workspace_dir, sub.dimension, imp)
+                    synthesized.append(
+                        DebateObjection(
+                            dimension=sub.dimension,
+                            file_path=fp,
+                            severity="medium",
+                            issue=f"Pulir {sub.label} ({sub.score:.1f}% < 100%)",
+                            concrete_fix=redact_secrets(imp, extra_secrets=extra_secrets),
+                        )
+                    )
+            elif challenge_for_polish and sub.score < 100.0 and (not report.passed or report.global_score < 93.0):
+                fp = _infer_workspace_file_for_dimension(workspace_dir, sub.dimension)
+                synthesized.append(
+                    DebateObjection(
+                        dimension=sub.dimension,
+                        file_path=fp,
+                        severity="low",
+                        issue=(
+                            f"Refinar detalles de {sub.label} ({sub.score:.1f}%) hacia nivel Excelencia"
+                        ),
+                        concrete_fix=(
+                            f"Fortalecer {QUALITY_DIMENSION_META[sub.dimension]['focus']}"
+                        ),
+                    )
+                )
+        return synthesized
+
+    def _assemble_report(
+        self,
+        project_id: str,
+        ws: Path,
+        *,
+        has_ui: bool,
+        weights: Mapping[str, float],
+        deterministic_dims: Mapping[str, dict[str, Any]],
+        llm_dims: Mapping[str, dict[str, Any]],
+        explicit_global: float | None,
+        summary: str,
+        raw_objs: Sequence[Mapping[str, Any]],
+        source: str,
+        round_number: int,
+        project_name: str,
+        version_label: str,
+        challenge_for_polish: bool,
+        extra_secrets: Sequence[str],
+    ) -> QualityAuditReport:
         active_dims = [dim for dim in QUALITY_DIMENSION_ORDER if weights[dim] > 0.0]
         all_active_supplied = bool(active_dims) and all(dim in llm_dims for dim in active_dims)
 
@@ -1061,6 +1536,22 @@ class ParentAuditor:
             improvements=all_improvements,
             source=source,
         )
+        explicit_objs = self._coerce_objections(
+            raw_objs,
+            workspace_dir=ws,
+            dimensions=dimensions,
+            extra_secrets=extra_secrets,
+        )
+        report.objections = (
+            explicit_objs
+            if explicit_objs
+            else self.build_objections(
+                ws,
+                report,
+                challenge_for_polish=challenge_for_polish,
+                extra_secrets=extra_secrets,
+            )
+        )
         report.markdown_report = build_quality_markdown_report(
             report,
             project_name=project_name or project_id,
@@ -1068,3 +1559,517 @@ class ParentAuditor:
             extra_secrets=extra_secrets,
         )
         return report
+
+    def _run_llm_audit_messages(
+        self,
+        project_id: str,
+        messages: list[dict[str, str]],
+        *,
+        extra_secrets: Sequence[str],
+    ) -> tuple[dict[str, dict[str, Any]], float | None, str, list[dict[str, Any]], int | None, str, str]:
+        try:
+            raw_resp = _invoke_structured_llm(
+                self.llm,
+                messages,
+                schema=ParentAuditLLMOutput,
+                timeout_seconds=self.timeout_seconds,
+                agent_name="AdversarialCritic",
+            )
+            llm_dims, explicit_global, summary, raw_objs, resolved_cnt, diff_summary = (
+                self._extract_llm_payload(raw_resp, extra_secrets=extra_secrets)
+            )
+            source = "llm" if (llm_dims or explicit_global is not None) else "deterministic_fallback"
+            return llm_dims, explicit_global, summary, raw_objs, resolved_cnt, diff_summary, source
+        except (
+            LLMError,
+            InvalidLLMResponseError,
+            CommandTimeoutError,
+            OSError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+        ) as exc:
+            logger.warning(
+                "AdversarialCritic falling back to deterministic evaluation for %r: %s",
+                project_id,
+                redact_secrets(str(exc), extra_secrets=extra_secrets),
+            )
+            return {}, None, "", [], None, "", "deterministic_fallback"
+
+    def evaluate_workspace(
+        self,
+        project_id: str,
+        workspace_dir: Path,
+        *,
+        spec: Spec | None = None,
+        plan: Plan | None = None,
+        test_results: Mapping[str, bool] | None = None,
+        round_number: int = 1,
+        project_name: str = "",
+        version_label: str = "",
+        challenge_for_polish: bool = False,
+        extra_secrets: Sequence[str] = (),
+    ) -> QualityAuditReport:
+        """Execute strict read-only Critic + 6 Sub-Auditors evaluation with fallback."""
+        ws = Path(workspace_dir)
+        has_ui = detect_workspace_has_ui(ws, plan=plan)
+        weights = compute_area_weights(has_ui)
+        deterministic_dims = _run_deterministic_audit(
+            ws,
+            has_ui=has_ui,
+            plan=plan,
+            test_results=test_results,
+            extra_secrets=extra_secrets,
+        )
+        messages = self._build_audit_messages(
+            project_id,
+            ws,
+            has_ui=has_ui,
+            weights=weights,
+            spec=spec,
+            plan=plan,
+            test_results=test_results,
+            challenge_for_polish=challenge_for_polish,
+            extra_secrets=extra_secrets,
+        )
+        llm_dims, explicit_global, summary, raw_objs, _, _, source = (
+            self._run_llm_audit_messages(project_id, messages, extra_secrets=extra_secrets)
+        )
+        return self._assemble_report(
+            project_id,
+            ws,
+            has_ui=has_ui,
+            weights=weights,
+            deterministic_dims=deterministic_dims,
+            llm_dims=llm_dims,
+            explicit_global=explicit_global,
+            summary=summary,
+            raw_objs=raw_objs,
+            source=source,
+            round_number=round_number,
+            project_name=project_name,
+            version_label=version_label,
+            challenge_for_polish=challenge_for_polish,
+            extra_secrets=extra_secrets,
+        )
+
+    def review_refinement_diff(
+        self,
+        project_id: str,
+        workspace_dir: Path,
+        *,
+        previous_report: QualityAuditReport,
+        prior_objections: Sequence[DebateObjection],
+        diff_text: str,
+        spec: Spec | None = None,
+        plan: Plan | None = None,
+        test_results: Mapping[str, bool] | None = None,
+        round_number: int = 2,
+        project_name: str = "",
+        version_label: str = "",
+        challenge_for_polish: bool = False,
+        extra_secrets: Sequence[str] = (),
+    ) -> tuple[QualityAuditReport, int, str]:
+        """Inspect resulting git diff against prior objections to count fixes and re-score."""
+        ws = Path(workspace_dir)
+        has_ui = detect_workspace_has_ui(ws, plan=plan)
+        weights = compute_area_weights(has_ui)
+        deterministic_dims = _run_deterministic_audit(
+            ws,
+            has_ui=has_ui,
+            plan=plan,
+            test_results=test_results,
+            extra_secrets=extra_secrets,
+        )
+        messages = self._build_diff_review_messages(
+            project_id,
+            ws,
+            previous_report=previous_report,
+            prior_objections=prior_objections,
+            diff_text=diff_text,
+            has_ui=has_ui,
+            weights=weights,
+            spec=spec,
+            plan=plan,
+            test_results=test_results,
+            extra_secrets=extra_secrets,
+        )
+        llm_dims, explicit_global, summary, raw_objs, explicit_resolved, diff_summary, source = (
+            self._run_llm_audit_messages(project_id, messages, extra_secrets=extra_secrets)
+        )
+        new_report = self._assemble_report(
+            project_id,
+            ws,
+            has_ui=has_ui,
+            weights=weights,
+            deterministic_dims=deterministic_dims,
+            llm_dims=llm_dims,
+            explicit_global=explicit_global,
+            summary=summary,
+            raw_objs=raw_objs,
+            source=source,
+            round_number=round_number,
+            project_name=project_name,
+            version_label=version_label,
+            challenge_for_polish=challenge_for_polish,
+            extra_secrets=extra_secrets,
+        )
+
+        if explicit_resolved is not None:
+            resolved_count = max(0, min(len(prior_objections), explicit_resolved))
+        elif not prior_objections:
+            resolved_count = 0
+        else:
+            diff_low = diff_text.lower()
+            resolved_count = 0
+            for obj in prior_objections:
+                prev_sub = previous_report.dimensions.get(obj.dimension)
+                new_sub = new_report.dimensions.get(obj.dimension)
+                score_rose = bool(
+                    prev_sub is not None and new_sub is not None and new_sub.score > prev_sub.score
+                )
+                file_touched = bool(
+                    obj.file_path
+                    and (
+                        obj.file_path.lower() in diff_low
+                        or Path(obj.file_path).name.lower() in diff_low
+                    )
+                )
+                if score_rose or (file_touched and new_report.global_score >= previous_report.global_score):
+                    resolved_count += 1
+        if not diff_summary:
+            diff_summary = (
+                f"Inspección de diff completada: {resolved_count}/{len(prior_objections)} "
+                f"objeción(es) atendida(s); puntaje {previous_report.global_score:.1f}% → {new_report.global_score:.1f}%."
+            )
+        return new_report, resolved_count, diff_summary
+
+
+class BuilderResponder:
+    """Agent 2: Translates Critic objections into point-by-point responses and surgical code instructions."""
+
+    def __init__(
+        self,
+        llm: LLM | None = None,
+        *,
+        timeout_seconds: float = 240.0,
+    ) -> None:
+        self.llm = llm
+        self.timeout_seconds = float(timeout_seconds)
+
+    def _can_invoke_llm(self) -> bool:
+        if self.llm is None:
+            return False
+        if self.llm.__class__.__name__ != "FakeLLM":
+            return True
+        queued = getattr(self.llm, "_responses", None)
+        if not isinstance(queued, list) or not queued:
+            return False
+        nxt = queued[0]
+        if isinstance(nxt, Mapping):
+            return any(k in nxt for k in ("builder_response", "surgical_instructions", "fixes"))
+        if isinstance(nxt, str):
+            try:
+                parsed = json.loads(nxt)
+                return isinstance(parsed, Mapping) and any(
+                    k in parsed for k in ("builder_response", "surgical_instructions", "fixes")
+                )
+            except (ValueError, TypeError):
+                return False
+        return False
+
+    @staticmethod
+    def _deterministic_response(
+        report: QualityAuditReport,
+        objections: Sequence[DebateObjection],
+        *,
+        refinement_round: int,
+        max_rounds: int,
+        challenge_for_polish: bool,
+        extra_secrets: Sequence[str],
+    ) -> tuple[str, str]:
+        resp_lines: list[str] = []
+        if objections:
+            for idx, obj in enumerate(objections, start=1):
+                target = redact_secrets(obj.file_path or "workspace", extra_secrets=extra_secrets)
+                fix_txt = redact_secrets(
+                    obj.concrete_fix or "Aplicar corrección alineada con el criterio",
+                    extra_secrets=extra_secrets,
+                )
+                issue_txt = redact_secrets(obj.issue, extra_secrets=extra_secrets)
+                resp_lines.append(
+                    f"{idx}. `{target}` ({obj.dimension}): ante «{issue_txt}», se aplicará {fix_txt}."
+                )
+        else:
+            for sub in _select_target_dimensions(
+                report, objections=objections, challenge_for_polish=challenge_for_polish
+            ):
+                fix_txt = (
+                    redact_secrets(sub.improvements[0], extra_secrets=extra_secrets)
+                    if sub.improvements
+                    else f"Mejorar {sub.label}"
+                )
+                resp_lines.append(f"- ({sub.dimension}): {fix_txt}")
+        builder_response = "\n".join(resp_lines).strip()
+        surgical_instructions = format_refinement_feedback(
+            report,
+            refinement_round=refinement_round,
+            max_rounds=max_rounds,
+            objections=objections,
+            challenge_for_polish=challenge_for_polish,
+            extra_secrets=extra_secrets,
+        )
+        return builder_response, surgical_instructions
+
+    def respond(
+        self,
+        project_id: str,
+        workspace_dir: Path,
+        report: QualityAuditReport,
+        objections: Sequence[DebateObjection],
+        *,
+        refinement_round: int = 1,
+        max_rounds: int = 2,
+        challenge_for_polish: bool = False,
+        extra_secrets: Sequence[str] = (),
+    ) -> tuple[str, str]:
+        """Generate structured point-by-point response and surgical instructions without touching tests/."""
+        base_response, base_instructions = self._deterministic_response(
+            report,
+            objections,
+            refinement_round=refinement_round,
+            max_rounds=max_rounds,
+            challenge_for_polish=challenge_for_polish,
+            extra_secrets=extra_secrets,
+        )
+        if not self._can_invoke_llm():
+            return base_response, base_instructions
+
+        obj_summary = "\n".join(
+            f"{idx + 1}. [{obj.dimension} | {obj.file_path or 'workspace'} | {obj.severity}] "
+            f"{obj.issue} | Fix: {obj.concrete_fix}"
+            for idx, obj in enumerate(objections)
+        ) or base_instructions
+        sys_prompt = (
+            "Eres el Agente 2 · Constructor Refinador en un debate técnico de calidad.\n"
+            "Responde punto por punto a las objeciones del Crítico Adversario explicando exactamente qué cambios "
+            "aplicarás en cada archivo afectado y genera instrucciones quirúrgicas claras sin modificar `tests/`.\n"
+            "Responde únicamente en JSON con campos: `builder_response` y `surgical_instructions`."
+        )
+        user_prompt = redact_secrets(
+            f"Proyecto: {project_id}\n"
+            f"Workspace: {Path(workspace_dir).name}\n"
+            f"Ronda: {refinement_round}/{max_rounds} | Puntaje actual: {report.global_score:.1f}%\n\n"
+            f"Objeciones del Crítico Adversario:\n{obj_summary}",
+            extra_secrets=extra_secrets,
+        )
+        try:
+            raw = _invoke_structured_llm(
+                self.llm,
+                [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                schema=BuilderResponseLLMOutput,
+                timeout_seconds=self.timeout_seconds,
+                agent_name="BuilderResponder",
+            )
+            if isinstance(raw, BuilderResponseLLMOutput):
+                raw_dict = raw.model_dump(mode="python")
+            elif isinstance(raw, Mapping):
+                raw_dict = dict(raw)
+            else:
+                return base_response, base_instructions
+            llm_resp = redact_secrets(
+                str(raw_dict.get("builder_response") or "").strip(),
+                extra_secrets=extra_secrets,
+            )
+            llm_instr = redact_secrets(
+                str(raw_dict.get("surgical_instructions") or "").strip(),
+                extra_secrets=extra_secrets,
+            )
+            eff_response = llm_resp or base_response
+            eff_instructions = (
+                f"{base_instructions}\n\nPlan quirúrgico del Constructor:\n{llm_instr}"
+                if llm_instr
+                else base_instructions
+            )
+            return eff_response, eff_instructions
+        except (
+            LLMError,
+            InvalidLLMResponseError,
+            CommandTimeoutError,
+            OSError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+        ) as exc:
+            logger.warning(
+                "BuilderResponder falling back to deterministic plan for %r: %s",
+                project_id,
+                redact_secrets(str(exc), extra_secrets=extra_secrets),
+            )
+            return base_response, base_instructions
+
+
+class ParentAuditor:
+    """Orchestrates AdversarialCritic + BuilderResponder + 6 Sub-Auditors evaluation cleanly."""
+
+    def __init__(
+        self,
+        llm: LLM | None,
+        *,
+        min_global_score: float = 85.0,
+        min_area_score: float = 70.0,
+        timeout_seconds: float = 240.0,
+        critic: AdversarialCritic | None = None,
+        builder_responder: BuilderResponder | None = None,
+    ) -> None:
+        self.llm = llm
+        self.min_global_score = float(min_global_score)
+        self.min_area_score = float(min_area_score)
+        self.timeout_seconds = float(timeout_seconds)
+        self.critic = (
+            critic
+            if critic is not None
+            else AdversarialCritic(
+                llm,
+                min_global_score=self.min_global_score,
+                min_area_score=self.min_area_score,
+                timeout_seconds=self.timeout_seconds,
+            )
+        )
+        self.builder_responder = (
+            builder_responder
+            if builder_responder is not None
+            else BuilderResponder(llm, timeout_seconds=self.timeout_seconds)
+        )
+
+    def _invoke_llm(self, messages: list[dict[str, str]]) -> Any:
+        return _invoke_structured_llm(
+            self.llm,
+            messages,
+            schema=ParentAuditLLMOutput,
+            timeout_seconds=self.timeout_seconds,
+            agent_name="ParentAuditor",
+        )
+
+    @staticmethod
+    def _extract_llm_dimensions(
+        raw_resp: Any,
+        *,
+        extra_secrets: Sequence[str] = (),
+    ) -> tuple[dict[str, dict[str, Any]], float | None, str]:
+        dims, explicit_global, summary, _, _, _ = AdversarialCritic._extract_llm_payload(
+            raw_resp, extra_secrets=extra_secrets
+        )
+        return dims, explicit_global, summary
+
+    def _build_audit_messages(
+        self,
+        project_id: str,
+        workspace_dir: Path,
+        *,
+        has_ui: bool,
+        weights: Mapping[str, float],
+        spec: Spec | None,
+        plan: Plan | None,
+        test_results: Mapping[str, bool] | None,
+        extra_secrets: Sequence[str],
+    ) -> list[dict[str, str]]:
+        return self.critic._build_audit_messages(
+            project_id,
+            workspace_dir,
+            has_ui=has_ui,
+            weights=weights,
+            spec=spec,
+            plan=plan,
+            test_results=test_results,
+            extra_secrets=extra_secrets,
+        )
+
+    def audit_workspace(
+        self,
+        project_id: str,
+        workspace_dir: Path,
+        *,
+        spec: Spec | None = None,
+        plan: Plan | None = None,
+        test_results: Mapping[str, bool] | None = None,
+        round_number: int = 1,
+        project_name: str = "",
+        version_label: str = "",
+        challenge_for_polish: bool = False,
+        extra_secrets: Sequence[str] = (),
+    ) -> QualityAuditReport:
+        """Execute AdversarialCritic + 6 Sub-Auditors evaluation with adaptive weights and fallback."""
+        return self.critic.evaluate_workspace(
+            project_id,
+            workspace_dir,
+            spec=spec,
+            plan=plan,
+            test_results=test_results,
+            round_number=round_number,
+            project_name=project_name,
+            version_label=version_label,
+            challenge_for_polish=challenge_for_polish,
+            extra_secrets=extra_secrets,
+        )
+
+    def review_refinement_diff(
+        self,
+        project_id: str,
+        workspace_dir: Path,
+        *,
+        previous_report: QualityAuditReport,
+        prior_objections: Sequence[DebateObjection],
+        diff_text: str,
+        spec: Spec | None = None,
+        plan: Plan | None = None,
+        test_results: Mapping[str, bool] | None = None,
+        round_number: int = 2,
+        project_name: str = "",
+        version_label: str = "",
+        challenge_for_polish: bool = False,
+        extra_secrets: Sequence[str] = (),
+    ) -> tuple[QualityAuditReport, int, str]:
+        """Delegate git-diff re-evaluation cleanly to AdversarialCritic."""
+        return self.critic.review_refinement_diff(
+            project_id,
+            workspace_dir,
+            previous_report=previous_report,
+            prior_objections=prior_objections,
+            diff_text=diff_text,
+            spec=spec,
+            plan=plan,
+            test_results=test_results,
+            round_number=round_number,
+            project_name=project_name,
+            version_label=version_label,
+            challenge_for_polish=challenge_for_polish,
+            extra_secrets=extra_secrets,
+        )
+
+    def respond_to_objections(
+        self,
+        project_id: str,
+        workspace_dir: Path,
+        report: QualityAuditReport,
+        objections: Sequence[DebateObjection],
+        *,
+        refinement_round: int = 1,
+        max_rounds: int = 2,
+        challenge_for_polish: bool = False,
+        extra_secrets: Sequence[str] = (),
+    ) -> tuple[str, str]:
+        """Delegate Builder point-by-point debate response cleanly to BuilderResponder."""
+        return self.builder_responder.respond(
+            project_id,
+            workspace_dir,
+            report,
+            objections,
+            refinement_round=refinement_round,
+            max_rounds=max_rounds,
+            challenge_for_polish=challenge_for_polish,
+            extra_secrets=extra_secrets,
+        )

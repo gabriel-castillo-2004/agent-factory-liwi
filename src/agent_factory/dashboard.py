@@ -990,8 +990,15 @@ class DashboardController:
             "status": summary,
         }
 
-    def improve_project_quality(self, project_id: str) -> dict[str, Any]:
-        """Launch bounded quality refinement (max 2 rounds) until reaching Producción (>=85%)."""
+    def improve_project_quality(
+        self,
+        project_id: str,
+        *,
+        force_polish: bool = False,
+    ) -> dict[str, Any]:
+        """Launch bounded 2-agent adversarial debate refinement until Producción (or Excelencia if force_polish=True)."""
+        if not isinstance(force_polish, bool):
+            raise TypeError("El campo 'force_polish' debe ser booleano.")
         self._require_project_events(project_id)
         with self._lock:
             if project_id in self._active_projects:
@@ -1022,7 +1029,7 @@ class DashboardController:
                     extra_secrets=self.secrets_to_redact,
                 )
                 sc = eval_res.get("scorecard") or {}
-                if sc.get("passed"):
+                if not force_polish and sc.get("passed"):
                     updated = self.orchestrator.get_status(project_id)
                     return {
                         "ok": True,
@@ -1053,6 +1060,7 @@ class DashboardController:
                         project_id,
                         build_worker=eff_worker,
                         chats_dir=self.chats_dir,
+                        force_polish=force_polish,
                         extra_secrets=self.secrets_to_redact,
                     )
                     sc = res.get("scorecard") or {}
@@ -6281,6 +6289,34 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       renderLiveActivityBanner();
     }
 
+    function buildVersionDebateBadgeHtml(sc, cp) {
+      if (!sc || typeof sc !== 'object') return '';
+      const roundsArr = Array.isArray(sc.debate_rounds) ? sc.debate_rounds : [];
+      const ds = (sc.debate_summary && typeof sc.debate_summary === 'object')
+        ? sc.debate_summary
+        : (cp && cp.debate_summary && typeof cp.debate_summary === 'object' ? cp.debate_summary : null);
+      if (!roundsArr.length && (!ds || !Number(ds.rounds || 0))) {
+        return '';
+      }
+      const resolvedCount = ds && typeof ds.resolved_count === 'number'
+        ? Number(ds.resolved_count)
+        : roundsArr.reduce((acc, r) => acc + (r && r.kept !== false ? Number(r.resolved_count || 0) : 0), 0);
+      const keptRounds = ds && typeof ds.kept_rounds === 'number'
+        ? Number(ds.kept_rounds)
+        : roundsArr.filter((r) => r && r.kept !== false).length;
+      const impNum = resolvedCount || keptRounds || roundsArr.length;
+      let deltaNum = 0;
+      if (ds && typeof ds.score_delta === 'number') {
+        deltaNum = Math.round(ds.score_delta);
+      } else if (roundsArr.length) {
+        deltaNum = Math.round(Number(sc.global_score || 0) - Number(roundsArr[0].score_before || 0));
+      }
+      const deltaTxt = (deltaNum >= 0 ? ('+' + deltaNum) : String(deltaNum)) + '%';
+      return '<span class="badge badge-info" title="Debate Crítico Adversario vs. Constructor">' +
+        '⚔️ Debate 2 agentes: ' + escapeHtml(String(impNum)) + ' mejoras · ' + escapeHtml(deltaTxt) +
+      '</span>';
+    }
+
     function buildHistoryVersionsSectionHtml(st, cps, wasDeliveredBefore, isRunning) {
       if (!wasDeliveredBefore && (!Array.isArray(cps) || !cps.length)) {
         return '';
@@ -6299,6 +6335,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             : null;
           const tier = classifyScorecardTier(sc);
           const tierText = sc ? (tier.label + ' · ' + tier.pct + '%') : tier.label;
+          const debateBadgeHtml = buildVersionDebateBadgeHtml(sc, c);
           const shaShort = c.short_sha || (c.commit_sha ? String(c.commit_sha).slice(0, 7) : '');
           const timeLbl = formatFriendlyTime(c.delivered_at);
           const curBadge = c.is_current ? '<span class="badge badge-ok">Actual</span>' : '';
@@ -6316,7 +6353,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             : '';
           const actionBtnsHtml = c.is_current
             ? '<button id="evaluate-quality-btn" class="btn btn-sm" type="button" data-quality-action="evaluate"' + busyAttr + '>🛡️ Re-evaluar calidad</button>' +
-              '<button id="improve-quality-btn" class="btn btn-primary btn-sm" type="button" data-quality-action="improve"' + busyAttr + '>✨ Mejorar hasta cumplir estándar</button>'
+              '<button id="improve-quality-btn" class="btn btn-primary btn-sm" type="button" data-quality-action="improve"' + busyAttr + '>✨ Mejorar hasta cumplir estándar</button>' +
+              '<button id="polish-debate-btn" class="btn btn-sm" type="button" data-quality-action="polish"' + busyAttr + '>⚔️ Pulir con debate</button>'
             : (c.commit_sha
                 ? '<button class="btn btn-sm btn-warn" type="button" data-history-rollback-sha="' + escapeHtml(c.commit_sha) + '"' + busyAttr + '>↩︎ Volver a esta versión</button>'
                 : '');
@@ -6328,6 +6366,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                   '<strong>' + escapeHtml(c.version_label || 'v1') + '</strong>' +
                   curBadge +
                   '<span class="badge ' + tier.cls + '">' + escapeHtml(tierText) + '</span>' +
+                  debateBadgeHtml +
                   rbTag +
                 '</span>' +
                 '<span class="muted" style="font-size:var(--fs-xs);">' + escapeHtml(timeLbl) + '</span>' +
@@ -6373,6 +6412,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           c.summary,
           c.quality_scorecard && c.quality_scorecard.global_score,
           c.quality_scorecard && c.quality_scorecard.tier_id,
+          c.quality_scorecard && Array.isArray(c.quality_scorecard.debate_rounds) ? c.quality_scorecard.debate_rounds.length : 0,
         ]),
       ]);
       if (state.lastEventsSignature === eventsSig) {
@@ -6504,6 +6544,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const improveBtn = eventsEl.querySelector('button[data-quality-action="improve"]');
       if (improveBtn) {
         improveBtn.addEventListener('click', () => submitImproveQuality(st.project_id, improveBtn));
+      }
+      const polishBtn = eventsEl.querySelector('button[data-quality-action="polish"]');
+      if (polishBtn) {
+        polishBtn.addEventListener('click', () => submitPolishWithDebate(st.project_id, polishBtn));
       }
       eventsEl.querySelectorAll('button[data-history-rollback-sha]').forEach((btn) => {
         btn.addEventListener('click', () => {
@@ -8105,25 +8149,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     async function submitQualityAction(pid, actionKind, triggerBtn) {
       if (!pid) return;
-      const isImprove = actionKind === 'improve';
+      const isPolish = actionKind === 'polish';
+      const isImprove = actionKind === 'improve' || isPolish;
+      const defaultBtnId = isPolish
+        ? 'polish-debate-btn'
+        : (isImprove ? 'improve-quality-btn' : 'evaluate-quality-btn');
+      const labelTxt = isPolish
+        ? 'Ejecutando debate adversario (Crítico vs. Constructor)...'
+        : (isImprove
+            ? 'Mejorando proyecto hasta estándar Producción...'
+            : 'Evaluando calidad integral (6 áreas)...');
+      const subTxt = isPolish
+        ? 'Crítico y Constructor refinan código, pruebas y git diff (máx. 2 rondas).'
+        : (isImprove
+            ? 'Refinamiento acotado (máx. 2 rondas), pytest y smoke test.'
+            : 'Inspeccionando el código en modo solo lectura.');
       await runTrackedOperation(
         {
           pid,
-          label: isImprove
-            ? 'Mejorando proyecto hasta estándar Producción...'
-            : 'Evaluando calidad integral (6 áreas)...',
-          subtext: isImprove
-            ? 'Refinamiento acotado (máx. 2 rondas), pytest y smoke test.'
-            : 'Inspeccionando el código en modo solo lectura.',
-          buttonEl: triggerBtn || (isImprove ? 'improve-quality-btn' : 'evaluate-quality-btn'),
+          label: labelTxt,
+          subtext: subTxt,
+          buttonEl: triggerBtn || defaultBtnId,
           inlineTargetId: 'history-quality-inline-status',
         },
         async () => {
           const endpoint = isImprove ? '/quality/improve' : '/quality/evaluate';
+          const reqBody = isPolish ? { force_polish: true } : {};
           const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + endpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({}),
+            body: JSON.stringify(reqBody),
           });
           if (res && Array.isArray(res.checkpoints)) {
             state.checkpointsByPid[pid] = res.checkpoints;
@@ -8134,7 +8189,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           state.lastModifySignature = null;
           state.lastBannerSignature = null;
           state.lastChatSig = null;
-          if (isImprove) {
+          if (isPolish) {
+            setNote('✓ Debate adversario de pulido iniciado para ' + pid + '.', 'ok');
+          } else if (isImprove) {
             if (res && res.already_passed) {
               const tier = classifyScorecardTier(res.scorecard || {});
               setNote('✓ El proyecto ya cumple el estándar (' + tier.label + ').', 'ok');
@@ -8159,6 +8216,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     function submitImproveQuality(pid, triggerBtn) {
       return submitQualityAction(pid, 'improve', triggerBtn);
+    }
+
+    function submitPolishWithDebate(pid, triggerBtn) {
+      return submitQualityAction(pid, 'polish', triggerBtn);
     }
 
     async function submitRollbackProject(pid, commitSha, triggerBtn, inlineTargetId) {
@@ -9010,11 +9071,18 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
 
         q_pid, q_action = self._parse_project_quality_route()
         if q_pid is not None and q_action is not None:
-            self._drain_body()
             if q_action == "evaluate":
+                self._drain_body()
                 self._send_controller_json(lambda: ctrl.evaluate_project_quality(q_pid))
             else:
-                self._send_controller_json(lambda: ctrl.improve_project_quality(q_pid))
+                def _run_quality_improve() -> dict[str, Any]:
+                    body = self._read_json_body()
+                    raw_force = body.get("force_polish", False)
+                    if not isinstance(raw_force, bool):
+                        raise TypeError("El campo 'force_polish' debe ser booleano.")
+                    return ctrl.improve_project_quality(q_pid, force_polish=raw_force)
+
+                self._send_controller_json(_run_quality_improve)
             return
 
         pid, action = self._parse_project_route()

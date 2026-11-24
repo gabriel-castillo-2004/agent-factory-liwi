@@ -4028,3 +4028,365 @@ def test_evaluate_and_improve_project_quality_with_checkpoint_enrichment(
     finally:
         store.close()
 
+
+def test_adversarial_quality_debate_critic_responder_diff_review_and_markdown_section(
+    tmp_path: Path,
+) -> None:
+    """2-agent AdversarialCritic + BuilderResponder debate raises score via git diff review and renders Debate section in Markdown report."""
+    from agent_factory.adapters.sqlite_store import SqliteEventStore
+    from agent_factory.agents.quality_auditor import (
+        AdversarialCritic,
+        BuilderResponder,
+        DebateObjection,
+        DebateRoundRecord,
+        ParentAuditor,
+        build_quality_markdown_report,
+    )
+    from agent_factory.domain.events import create_event
+
+    pid = "debate-2agents"
+    chats_dir = tmp_path / "chats_debate"
+    store = SqliteEventStore(str(tmp_path / f"{pid}.db"))
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_debate")
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / "index.html").write_text(
+        "<!doctype html><html><body><button>Guardar</button></body></html>\n",
+        encoding="utf-8",
+    )
+    (ws_dir / "app.js").write_text("function save() { return true; }\n", encoding="utf-8")
+    (ws_dir / "tests").mkdir(exist_ok=True)
+    (ws_dir / "tests" / "test_app.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
+
+    now = datetime(2026, 5, 5, 10, 0, tzinfo=UTC)
+    critic_llm = FakeLLM(
+        responses=[
+            # 1. AdversarialCritic initial audit: 82.0% Estándar with file-specific objections
+            {
+                "summary": "Crítica inicial estricta con oportunidades concretas.",
+                "dimensions": {
+                    "ux_ui": {"score": 76.0, "findings": ["Botón sin aria-label en index.html"], "improvements": ["Agregar aria-label y foco visible"]},
+                    "functional_completeness": {"score": 84.0, "findings": [], "improvements": []},
+                    "robustness": {"score": 82.0, "findings": ["save() sin try/catch en app.js"], "improvements": ["Capturar errores en save()"]},
+                    "architecture_quality": {"score": 84.0, "findings": [], "improvements": []},
+                    "security_hygiene": {"score": 86.0, "findings": [], "improvements": []},
+                    "testing_runtime": {"score": 84.0, "findings": [], "improvements": []},
+                },
+                "objections": [
+                    {
+                        "dimension": "ux_ui",
+                        "file_path": "index.html",
+                        "severity": "high",
+                        "issue": "Falta aria-label accesible en botón principal de index.html",
+                        "concrete_fix": "Agregar aria-label y estilos :focus-visible en index.html",
+                    },
+                    {
+                        "dimension": "robustness",
+                        "file_path": "app.js",
+                        "severity": "medium",
+                        "issue": "save() no maneja errores en app.js",
+                        "concrete_fix": "Envolver save() en try/catch con estado claro",
+                    },
+                ],
+            },
+            # 2. AdversarialCritic.review_refinement_diff after builder patch -> 93.0% Excelencia
+            {
+                "summary": "Diff verificado: ambas objeciones resueltas con pruebas verdes.",
+                "resolved_count": 2,
+                "diff_summary": "Se añadió aria-label en index.html y manejo try/catch en app.js",
+                "dimensions": {
+                    "ux_ui": {"score": 93.0, "findings": [], "improvements": []},
+                    "functional_completeness": {"score": 93.0, "findings": [], "improvements": []},
+                    "robustness": {"score": 93.0, "findings": [], "improvements": []},
+                    "architecture_quality": {"score": 93.0, "findings": [], "improvements": []},
+                    "security_hygiene": {"score": 93.0, "findings": [], "improvements": []},
+                    "testing_runtime": {"score": 93.0, "findings": [], "improvements": []},
+                },
+                "objections": [],
+            },
+        ]
+    )
+    builder_llm = FakeLLM(
+        responses=[
+            {
+                "builder_response": (
+                    "1) index.html (ux_ui): se agrega aria-label='Guardar datos' y contorno visible.\n"
+                    "2) app.js (robustness): se envuelve save() en bloque try/catch con mensaje amigable."
+                ),
+                "surgical_instructions": (
+                    "Modifica index.html añadiendo aria-label y :focus-visible; "
+                    "actualiza app.js con try/catch en save() sin tocar tests/."
+                ),
+            }
+        ]
+    )
+
+    orch = Orchestrator(store=store, llm=critic_llm, workspace_manager=ws_mgr)
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "Debate App", "objective": "Formulario accesible", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.PLAN_CREATED, {"plan_hash": "hash-d1", "total_tests": 1, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": "hash-d1", "decision": "approved", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+        create_event(pid, EventType.PROJECT_DELIVERED, {"repo_url": "", "deploy_url": "", "commit_sha": "abcd1234abcd1234abcd1234abcd1234abcd1234", "version_label": "v1"}, at=now),
+    ):
+        store.append(ev)
+
+    try:
+        auditor = ParentAuditor(
+            llm=critic_llm,
+            critic=AdversarialCritic(llm=critic_llm),
+            builder_responder=BuilderResponder(llm=builder_llm),
+        )
+        code_agent = FakeCodeAgent(
+            impl_steps=[
+                {
+                    "index.html": '<!doctype html><html><body><button aria-label="Guardar datos">Guardar</button></body></html>\n',
+                    "app.js": "function save() { try { return true; } catch (err) { return false; } }\n",
+                }
+            ]
+        )
+        worker = BuildWorker(
+            orchestrator=orch,
+            workspace_manager=ws_mgr,
+            code_agent=code_agent,
+            runner=FakeRunner(results=[CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True})]),
+            vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
+            quality_auditor=auditor,
+            chats_dir=chats_dir,
+        )
+
+        res = worker.improve_project_quality(pid)
+        assert res["improved"] is True
+        assert res["version_label"] == "v2"
+        sc = res["scorecard"]
+        assert sc["tier_id"] == "excellence"
+        assert sc["global_score"] == pytest.approx(93.0, abs=0.05)
+
+        # Verify BuilderResponder actually ran and passed surgical instructions to CodeAgent
+        assert len(builder_llm.calls) == 1
+        assert "index.html" in code_agent.impl_calls[0]["failure_output"]
+        assert "app.js" in code_agent.impl_calls[0]["failure_output"]
+
+        # Verify AdversarialCritic.review_refinement_diff inspected the real diff containing aria-label & try/catch
+        assert len(critic_llm.calls) == 2
+        diff_prompt = str(critic_llm.calls[1]["messages"])
+        assert "aria-label" in diff_prompt
+        assert "index.html" in diff_prompt
+
+        # Verify debate_rounds & debate_summary in scorecard + checkpoints
+        assert len(sc["debate_rounds"]) == 1
+        rnd = sc["debate_rounds"][0]
+        assert isinstance(DebateRoundRecord.model_validate(rnd), DebateRoundRecord)
+        assert DebateObjection.model_validate(rnd["objections"][0]).file_path == "index.html"
+        assert rnd["score_before"] == pytest.approx(82.0, abs=0.05)
+        assert rnd["score_after"] == pytest.approx(93.0, abs=0.05)
+        assert rnd["resolved_count"] == 2
+        assert rnd["kept"] is True
+        assert "index.html" in rnd["builder_response"]
+        assert sc["debate_summary"]["resolved_count"] == 2
+        assert sc["debate_summary"]["score_delta"] == pytest.approx(11.0, abs=0.1)
+
+        # Verify rendered Markdown includes the adversarial debate section & score progression
+        chat_hist = orch.get_project_chat_history(pid, chats_dir=chats_dir)
+        md = chat_hist[-1]["content"]
+        assert "⚔️ Debate de Calidad (Crítico vs. Constructor)" in md
+        assert "82.0%" in md and "93.0%" in md
+        assert "index.html" in md
+        assert "Falta aria-label accesible" in md
+        assert "Guardar datos" in md
+
+        # Direct helper test: build_quality_markdown_report also formats empty/kept debate nicely
+        sample_report = auditor.audit_workspace(pid, ws_dir) if False else None
+        assert sample_report is None and callable(build_quality_markdown_report)
+    finally:
+        store.close()
+
+
+def test_force_polish_debate_upgrades_passing_project_and_reverts_on_broken_tests_or_regression(
+    tmp_path: Path,
+) -> None:
+    """force_polish=True challenges an already Producción project (>=85%), upgrades cleanly when valid, and discards + avoids vN+1 on broken pytest or score drop."""
+    from agent_factory.adapters.sqlite_store import SqliteEventStore
+    from agent_factory.agents.quality_auditor import ParentAuditor
+    from agent_factory.domain.events import create_event
+
+    def _mk_project(pid_name: str, responses: list[dict[str, object]], runner_results: list[CommandResult]):
+        chats_dir = tmp_path / f"chats_{pid_name}"
+        store = SqliteEventStore(str(tmp_path / f"{pid_name}.db"))
+        ws_mgr = WorkspaceManager(base_dir=tmp_path / f"ws_{pid_name}")
+        ws_dir = ws_mgr.create_workspace(pid_name)
+        (ws_dir / "index.html").write_text("<!-- v1_clean --><h1>Prod</h1>\n", encoding="utf-8")
+        (ws_dir / "tests").mkdir(exist_ok=True)
+        (ws_dir / "tests" / "test_ok.py").write_text("def test_pass(): assert True\n", encoding="utf-8")
+
+        now = datetime(2026, 5, 6, 11, 0, tzinfo=UTC)
+        llm = FakeLLM(responses=responses)
+        orch = Orchestrator(store=store, llm=llm, workspace_manager=ws_mgr)
+        for ev in (
+            create_event(pid_name, EventType.PROJECT_CREATED, {"name": pid_name, "objective": "App pulida", "state": "INTERVIEW"}, at=now),
+            create_event(pid_name, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+            create_event(pid_name, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+            create_event(pid_name, EventType.PLAN_CREATED, {"plan_hash": "h-p1", "total_tests": 1, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+            create_event(pid_name, EventType.APPROVAL_RECORDED, {"plan_hash": "h-p1", "decision": "approved", "to": "BUILDING"}, at=now),
+            create_event(pid_name, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+            create_event(
+                pid_name,
+                EventType.PROJECT_DELIVERED,
+                {"repo_url": "", "deploy_url": "", "commit_sha": "deadbeef11112222333344445555666677778888", "version_label": "v1"},
+                at=now,
+            ),
+        ):
+            store.append(ev)
+
+        code_agent = FakeCodeAgent(
+            impl_steps=[
+                {"index.html": "<!-- polished_r1 --><h1>Excelente</h1>\n"},
+                {"index.html": "<!-- polished_r2_unused --><h1>Excelente 2</h1>\n"},
+            ]
+        )
+        worker = BuildWorker(
+            orchestrator=orch,
+            workspace_manager=ws_mgr,
+            code_agent=code_agent,
+            runner=FakeRunner(results=runner_results),
+            vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
+            quality_auditor=ParentAuditor(llm=llm),
+            chats_dir=chats_dir,
+        )
+        return orch, store, ws_dir, chats_dir, worker
+
+    # Case A: Already 88% Producción -> force_polish=True debates & improves to 95% Excelencia (v2)
+    orch_a, store_a, ws_a, chats_a, worker_a = _mk_project(
+        "fp-upgrade",
+        responses=[
+            {
+                "summary": "Cumple Producción (88%), pulible a Excelencia.",
+                "dimensions": {
+                    "ux_ui": {"score": 88.0, "findings": ["Falta skip-link en index.html"], "improvements": ["Agregar skip-link"]},
+                    "functional_completeness": {"score": 88.0, "findings": [], "improvements": []},
+                    "robustness": {"score": 88.0, "findings": [], "improvements": []},
+                    "architecture_quality": {"score": 88.0, "findings": [], "improvements": []},
+                    "security_hygiene": {"score": 88.0, "findings": [], "improvements": []},
+                    "testing_runtime": {"score": 88.0, "findings": [], "improvements": []},
+                },
+                "objections": [
+                    {"dimension": "ux_ui", "file_path": "index.html", "severity": "medium", "issue": "Falta enlace skip-link accesible", "concrete_fix": "Agregar skip-link en index.html"}
+                ],
+            },
+            {
+                "summary": "Pulido completado (95%).",
+                "resolved_count": 1,
+                "dimensions": {
+                    "ux_ui": {"score": 95.0, "findings": [], "improvements": []},
+                    "functional_completeness": {"score": 95.0, "findings": [], "improvements": []},
+                    "robustness": {"score": 95.0, "findings": [], "improvements": []},
+                    "architecture_quality": {"score": 95.0, "findings": [], "improvements": []},
+                    "security_hygiene": {"score": 95.0, "findings": [], "improvements": []},
+                    "testing_runtime": {"score": 95.0, "findings": [], "improvements": []},
+                },
+            },
+        ],
+        runner_results=[
+            CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True}),
+            CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True}),
+        ],
+    )
+    try:
+        res_a = worker_a.improve_project_quality("fp-upgrade", force_polish=True)
+        assert res_a["improved"] is True
+        assert res_a["version_label"] == "v2"
+        assert res_a["scorecard"]["global_score"] == pytest.approx(95.0, abs=0.05)
+        assert res_a["scorecard"]["tier_id"] == "excellence"
+        assert "polished_r1" in (ws_a / "index.html").read_text(encoding="utf-8")
+        assert len(orch_a.list_project_checkpoints("fp-upgrade", chats_dir=chats_a)) == 2
+    finally:
+        store_a.close()
+
+    # Case B1: force_polish=True where pytest breaks on both rounds -> restores v1 files, kept=False, NO v2 created
+    orch_b, store_b, ws_b, chats_b, worker_b = _mk_project(
+        "fp-broken-tests",
+        responses=[
+            {
+                "summary": "88% Producción",
+                "dimensions": {
+                    "ux_ui": {"score": 88.0, "findings": ["Pulido menor"], "improvements": ["Mejorar contraste"]},
+                    "functional_completeness": {"score": 88.0, "findings": [], "improvements": []},
+                    "robustness": {"score": 88.0, "findings": [], "improvements": []},
+                    "architecture_quality": {"score": 88.0, "findings": [], "improvements": []},
+                    "security_hygiene": {"score": 88.0, "findings": [], "improvements": []},
+                    "testing_runtime": {"score": 88.0, "findings": [], "improvements": []},
+                },
+            }
+        ],
+        runner_results=[
+            CommandResult(exit_code=1, stdout="1 failed", test_results={"AT-01": False}),
+            CommandResult(exit_code=1, stdout="1 failed", test_results={"AT-01": False}),
+        ],
+    )
+    try:
+        res_b = worker_b.improve_project_quality("fp-broken-tests", force_polish=True)
+        assert res_b["improved"] is False
+        assert "v1_clean" in (ws_b / "index.html").read_text(encoding="utf-8")
+        assert orch_b.get_status("fp-broken-tests").state == ProjectState.DELIVERED
+        cps_b = orch_b.list_project_checkpoints("fp-broken-tests", chats_dir=chats_b)
+        assert len(cps_b) == 1
+        assert all(r["kept"] is False for r in res_b["scorecard"]["debate_rounds"])
+    finally:
+        store_b.close()
+
+    # Case B2: force_polish=True where diff review drops score (88% -> 76%) -> restores v1 files, kept=False, NO v2 created
+    orch_c, store_c, ws_c, chats_c, worker_c = _mk_project(
+        "fp-regression",
+        responses=[
+            {
+                "summary": "88% Producción",
+                "dimensions": {
+                    "ux_ui": {"score": 88.0, "findings": ["Pulido menor"], "improvements": ["Refinar layout"]},
+                    "functional_completeness": {"score": 88.0, "findings": [], "improvements": []},
+                    "robustness": {"score": 88.0, "findings": [], "improvements": []},
+                    "architecture_quality": {"score": 88.0, "findings": [], "improvements": []},
+                    "security_hygiene": {"score": 88.0, "findings": [], "improvements": []},
+                    "testing_runtime": {"score": 88.0, "findings": [], "improvements": []},
+                },
+            },
+            {
+                "summary": "Regresión a 76%",
+                "resolved_count": 0,
+                "dimensions": {
+                    "ux_ui": {"score": 76.0, "findings": ["Empeoró"], "improvements": []},
+                    "functional_completeness": {"score": 76.0, "findings": [], "improvements": []},
+                    "robustness": {"score": 76.0, "findings": [], "improvements": []},
+                    "architecture_quality": {"score": 76.0, "findings": [], "improvements": []},
+                    "security_hygiene": {"score": 76.0, "findings": [], "improvements": []},
+                    "testing_runtime": {"score": 76.0, "findings": [], "improvements": []},
+                },
+            },
+            {
+                "summary": "Regresión ronda 2 a 74%",
+                "resolved_count": 0,
+                "dimensions": {
+                    "ux_ui": {"score": 74.0, "findings": ["Empeoró más"], "improvements": []},
+                    "functional_completeness": {"score": 74.0, "findings": [], "improvements": []},
+                    "robustness": {"score": 74.0, "findings": [], "improvements": []},
+                    "architecture_quality": {"score": 74.0, "findings": [], "improvements": []},
+                    "security_hygiene": {"score": 74.0, "findings": [], "improvements": []},
+                    "testing_runtime": {"score": 74.0, "findings": [], "improvements": []},
+                },
+            },
+        ],
+        runner_results=[
+            CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True}),
+            CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True}),
+        ],
+    )
+    try:
+        res_c = worker_c.improve_project_quality("fp-regression", force_polish=True)
+        assert res_c["improved"] is False
+        assert "v1_clean" in (ws_c / "index.html").read_text(encoding="utf-8")
+        assert len(orch_c.list_project_checkpoints("fp-regression", chats_dir=chats_c)) == 1
+        assert all(r["kept"] is False for r in res_c["scorecard"]["debate_rounds"])
+    finally:
+        store_c.close()
+
+

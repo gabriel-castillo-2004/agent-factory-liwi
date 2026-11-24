@@ -1,5 +1,6 @@
 """Local build worker, job queue, and write-test-fix loop (Section 7 Phase 2, INV-09, INV-13, INV-15, INV-17)."""
 
+import difflib
 import json
 import re
 import threading
@@ -18,10 +19,10 @@ from agent_factory.adapters.agy_cli_adapter import (
 from agent_factory.adapters.model_resolver import ACTIVITY_MESSAGES
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.agents.quality_auditor import (
+    DebateRoundRecord,
     ParentAuditor,
     QualityAuditReport,
     build_quality_markdown_report,
-    format_refinement_feedback,
 )
 from agent_factory.domain.events import Event, EventType, create_event
 from agent_factory.domain.models import (
@@ -48,6 +49,7 @@ from agent_factory.workspace import (
     ensure_workspace_favicon,
     ensure_workspace_pytest_ini,
     is_python_cache_path,
+    read_workspace_git_diff,
     read_workspace_git_head_sha,
     verify_and_restore_test_lock,
     verify_isolated_git_root,
@@ -1221,6 +1223,70 @@ class BuildWorker:
             return True, None, ()
         return False, self._redact(smoke_res.summary), tuple(smoke_res.failed_resources)
 
+    def _compute_round_diff_text(
+        self,
+        ws_dir: Path,
+        *,
+        pre_snapshot: Mapping[str, bytes],
+        pre_sha: str | None = None,
+    ) -> str:
+        """Compute bounded, secret-redacted diff for AdversarialCritic review across Git or snapshot workspaces."""
+        if (ws_dir / ".git").exists() and self.runner.__class__.__name__ != "FakeRunner":
+            if pre_sha:
+                try:
+                    ws_resolved = verify_isolated_git_root(ws_dir, self.runner)
+                    clean_env = build_sanitized_cli_env()
+                    diff_res = self.runner.run(
+                        ["git", "diff", pre_sha, "--no-color"],
+                        cwd=ws_resolved,
+                        timeout_seconds=15.0,
+                        env=clean_env,
+                    )
+                    if diff_res.exit_code == 0 and diff_res.stdout.strip():
+                        redacted = self._redact(diff_res.stdout.strip())
+                        return redacted[:24000]
+                except (CommandTimeoutError, SandboxViolationError, OSError, ValueError):
+                    pass
+            has_git, _, git_diff = read_workspace_git_diff(
+                ws_dir,
+                self.runner,
+                extra_secrets=self.secrets_to_redact,
+                max_chars=24000,
+            )
+            if has_git and git_diff and git_diff != "Sin diferencias registradas.":
+                return git_diff
+
+        cur_snapshot = self._snapshot_workspace_files(ws_dir)
+        all_paths = sorted(set(pre_snapshot) | set(cur_snapshot))
+        chunks: list[str] = []
+        for rel in all_paths:
+            old_raw = pre_snapshot.get(rel)
+            new_raw = cur_snapshot.get(rel)
+            if old_raw == new_raw:
+                continue
+            old_lines = (
+                old_raw.decode("utf-8", errors="replace").splitlines(keepends=True)
+                if old_raw is not None
+                else []
+            )
+            new_lines = (
+                new_raw.decode("utf-8", errors="replace").splitlines(keepends=True)
+                if new_raw is not None
+                else []
+            )
+            udiff = "".join(
+                difflib.unified_diff(
+                    old_lines,
+                    new_lines,
+                    fromfile=f"a/{rel}",
+                    tofile=f"b/{rel}",
+                )
+            )
+            if udiff.strip():
+                chunks.append(self._redact(udiff.strip()))
+        combined = "\n\n".join(chunks).strip() or "Sin diferencias detectadas en archivos."
+        return combined[:24000]
+
     def _run_quality_audit_and_refinement(
         self,
         project_id: str,
@@ -1236,8 +1302,9 @@ class BuildWorker:
         auditor_override: ParentAuditor | None = None,
         max_ref_rounds_override: int | None = None,
         skip_pytest_if_no_tests: bool = False,
+        force_polish: bool = False,
     ) -> tuple[QualityAuditReport | None, int, int, bool, float]:
-        """Run ParentAuditor + bounded 2-round refinement with anti-regression checkpointing."""
+        """Run 2-agent Adversarial Debate (Critic vs. Builder) + bounded 2-round refinement with anti-regression checkpointing."""
         auditor = auditor_override if auditor_override is not None else self._resolve_quality_auditor()
         if auditor is None:
             return None, tests_passed_count, tests_total_count, False, 0.0
@@ -1253,14 +1320,32 @@ class BuildWorker:
             else self.max_quality_refinement_rounds
         )
 
-        def _invoke_auditor(audit_round_num: int) -> QualityAuditReport:
+        def _record_critic_call(rep: QualityAuditReport, call_dur: float) -> None:
+            if rep.source != "llm":
+                return
+            cur_calls = self.orchestrator.circuit_breaker.get_calls(
+                project_id, ProjectState.BUILDING
+            )
+            if cur_calls < building_limit:
+                self.orchestrator.record_state_call(
+                    project_id,
+                    ProjectState.BUILDING,
+                    model=self._active_code_agent_model(),
+                    agent="quality_auditor",
+                    duration_seconds=call_dur,
+                    summary_short=self._bound_redacted(rep.summary, 180),
+                    outcome="ok" if rep.passed else "needs_refinement",
+                    extra_secrets=self.secrets_to_redact,
+                )
+
+        def _invoke_initial_critic() -> QualityAuditReport:
             cur_status = self.orchestrator.get_status(project_id)
             spec = self.orchestrator.get_spec(project_id)
             self._report_activity(
-                "Evaluando calidad integral (6 sub-auditores)...",
+                "Evaluando calidad integral (Crítico Adversario · 6 sub-auditores)...",
                 agents_count=6,
                 stage="VERIFYING",
-                detail=f"Auditoría ronda {audit_round_num}",
+                detail="Auditoría inicial",
                 tests_passed=tests_passed_count,
                 tests_total=tests_total_count,
                 build_round=build_round,
@@ -1273,29 +1358,15 @@ class BuildWorker:
                 spec=spec,
                 plan=job.plan,
                 test_results=job.test_results,
-                round_number=audit_round_num,
+                round_number=1,
                 project_name=cur_status.name or project_id,
+                challenge_for_polish=force_polish,
                 extra_secrets=self.secrets_to_redact,
             )
-            call_dur = round(max(0.0, time.monotonic() - call_t0), 3)
-            if rep.source == "llm":
-                cur_calls = self.orchestrator.circuit_breaker.get_calls(
-                    project_id, ProjectState.BUILDING
-                )
-                if cur_calls < building_limit:
-                    self.orchestrator.record_state_call(
-                        project_id,
-                        ProjectState.BUILDING,
-                        model=self._active_code_agent_model(),
-                        agent="quality_auditor",
-                        duration_seconds=call_dur,
-                        summary_short=self._bound_redacted(rep.summary, 180),
-                        outcome="ok" if rep.passed else "needs_refinement",
-                        extra_secrets=self.secrets_to_redact,
-                    )
+            _record_critic_call(rep, round(max(0.0, time.monotonic() - call_t0), 3))
             return rep
 
-        best_report = initial_report if initial_report is not None else _invoke_auditor(1)
+        best_report = initial_report if initial_report is not None else _invoke_initial_critic()
         best_test_results = dict(job.test_results)
         best_tests_passed = tests_passed_count
         best_tests_total = tests_total_count
@@ -1304,8 +1375,14 @@ class BuildWorker:
             project_id, ws_dir, f"quality checkpoint r0 ({best_report.global_score:.1f}%)"
         )
         restored_best = False
+        debate_records: list[DebateRoundRecord] = list(best_report.debate_rounds)
 
-        if best_report.passed or max_ref_rounds <= 0:
+        should_stop = (
+            max_ref_rounds <= 0
+            or (not force_polish and best_report.passed)
+            or (force_polish and best_report.passed and best_report.global_score >= 100.0)
+        )
+        if should_stop:
             total_dur = round(max(0.0, time.monotonic() - audit_t0), 2)
             return best_report, best_tests_passed, best_tests_total, restored_best, total_dur
 
@@ -1316,17 +1393,32 @@ class BuildWorker:
             if cur_calls >= building_limit:
                 break
 
-            feedback = format_refinement_feedback(
+            round_objections = auditor.critic.build_objections(
+                ws_dir,
                 best_report,
-                refinement_round=ref_round,
-                max_rounds=max_ref_rounds,
+                challenge_for_polish=force_polish,
                 extra_secrets=self.secrets_to_redact,
             )
+            if force_polish and best_report.passed and not round_objections:
+                break
+
+            builder_response, surgical_instructions = auditor.respond_to_objections(
+                project_id,
+                ws_dir,
+                best_report,
+                round_objections,
+                refinement_round=ref_round,
+                max_rounds=max_ref_rounds,
+                challenge_for_polish=force_polish,
+                extra_secrets=self.secrets_to_redact,
+            )
+            score_before_round = best_report.global_score
+
             self._report_activity(
-                f"Refinando calidad del proyecto (ronda {ref_round}/{max_ref_rounds})...",
-                agents_count=1,
+                f"Debate de calidad (ronda {ref_round}/{max_ref_rounds}): Crítico vs. Constructor...",
+                agents_count=2,
                 stage="BUILDING",
-                detail=f"Puntaje previo: {best_report.global_score:.1f}%",
+                detail=f"Puntaje previo: {score_before_round:.1f}%",
                 tests_passed=best_tests_passed,
                 tests_total=best_tests_total,
                 build_round=build_round + ref_round,
@@ -1337,7 +1429,7 @@ class BuildWorker:
                 impl_result = self.code_agent.implement_or_fix(
                     ws_dir,
                     effective_plan,
-                    failure_output=feedback,
+                    failure_output=surgical_instructions,
                     attempt=job.invocations_used + 1,
                 )
             except (QuotaExhaustedError, CodeAgentError, CommandTimeoutError):
@@ -1349,6 +1441,19 @@ class BuildWorker:
                 )
                 job.test_results = dict(best_test_results)
                 restored_best = True
+                debate_records.append(
+                    DebateRoundRecord(
+                        round_number=ref_round,
+                        score_before=score_before_round,
+                        score_after=score_before_round,
+                        objections=round_objections,
+                        builder_response=builder_response,
+                        builder_instructions=surgical_instructions,
+                        resolved_count=0,
+                        kept=False,
+                        discard_reason="code_agent_error",
+                    )
+                )
                 break
 
             ref_dur = round(max(0.0, time.monotonic() - ref_t0), 3)
@@ -1380,6 +1485,19 @@ class BuildWorker:
                 )
                 job.test_results = dict(best_test_results)
                 restored_best = True
+                debate_records.append(
+                    DebateRoundRecord(
+                        round_number=ref_round,
+                        score_before=score_before_round,
+                        score_after=score_before_round,
+                        objections=round_objections,
+                        builder_response=builder_response,
+                        builder_instructions=surgical_instructions,
+                        resolved_count=0,
+                        kept=False,
+                        discard_reason="test_lock_tampered",
+                    )
+                )
                 continue
 
             if (
@@ -1448,9 +1566,53 @@ class BuildWorker:
                             at=self.orchestrator._now(),
                         )
                     )
+                debate_records.append(
+                    DebateRoundRecord(
+                        round_number=ref_round,
+                        score_before=score_before_round,
+                        score_after=score_before_round,
+                        objections=round_objections,
+                        builder_response=builder_response,
+                        builder_instructions=surgical_instructions,
+                        resolved_count=0,
+                        kept=False,
+                        discard_reason="pytest_or_smoke_failed",
+                    )
+                )
                 continue
 
-            new_report = _invoke_auditor(ref_round + 1)
+            diff_text = self._compute_round_diff_text(
+                ws_dir, pre_snapshot=best_snapshot, pre_sha=best_sha
+            )
+            cur_status = self.orchestrator.get_status(project_id)
+            spec = self.orchestrator.get_spec(project_id)
+            self._report_activity(
+                "Crítico Adversario inspeccionando git diff...",
+                agents_count=6,
+                stage="VERIFYING",
+                detail=f"Revisión diff ronda {ref_round}",
+                tests_passed=cur_passed,
+                tests_total=cur_total,
+                build_round=build_round + ref_round,
+                max_rounds=max_code_rounds,
+            )
+            diff_t0 = time.monotonic()
+            new_report, resolved_count, diff_summary = auditor.review_refinement_diff(
+                project_id,
+                ws_dir,
+                previous_report=best_report,
+                prior_objections=round_objections,
+                diff_text=diff_text,
+                spec=spec,
+                plan=job.plan,
+                test_results=job.test_results,
+                round_number=ref_round + 1,
+                project_name=cur_status.name or project_id,
+                challenge_for_polish=force_polish,
+                extra_secrets=self.secrets_to_redact,
+            )
+            _record_critic_call(new_report, round(max(0.0, time.monotonic() - diff_t0), 3))
+
             improved_or_same = new_report.global_score >= best_report.global_score and (
                 not best_report.passed or new_report.passed
             )
@@ -1463,8 +1625,35 @@ class BuildWorker:
                 )
                 job.test_results = dict(best_test_results)
                 restored_best = True
+                debate_records.append(
+                    DebateRoundRecord(
+                        round_number=ref_round,
+                        score_before=score_before_round,
+                        score_after=new_report.global_score,
+                        objections=round_objections,
+                        builder_response=builder_response,
+                        builder_instructions=surgical_instructions,
+                        resolved_count=resolved_count,
+                        kept=False,
+                        diff_summary=diff_summary,
+                        discard_reason="score_regression",
+                    )
+                )
                 continue
 
+            debate_records.append(
+                DebateRoundRecord(
+                    round_number=ref_round,
+                    score_before=score_before_round,
+                    score_after=new_report.global_score,
+                    objections=round_objections,
+                    builder_response=builder_response,
+                    builder_instructions=surgical_instructions,
+                    resolved_count=resolved_count,
+                    kept=True,
+                    diff_summary=diff_summary,
+                )
+            )
             best_report = new_report
             best_test_results = dict(job.test_results)
             best_tests_passed = cur_passed
@@ -1476,9 +1665,28 @@ class BuildWorker:
                 f"quality checkpoint r{ref_round} ({best_report.global_score:.1f}%)",
             )
             restored_best = False
-            if best_report.passed:
+            if (not force_polish and best_report.passed) or (
+                force_polish
+                and best_report.passed
+                and (
+                    best_report.global_score >= 100.0
+                    or (
+                        best_report.tier_id == "excellence"
+                        and not best_report.objections
+                        and not best_report.findings
+                    )
+                )
+            ):
                 break
 
+        best_report.debate_rounds = debate_records
+        cur_meta_final = self.orchestrator.get_status(project_id)
+        best_report.markdown_report = build_quality_markdown_report(
+            best_report,
+            project_name=cur_meta_final.name or project_id,
+            restored_best_checkpoint=restored_best,
+            extra_secrets=self.secrets_to_redact,
+        )
         total_dur = round(max(0.0, time.monotonic() - audit_t0), 2)
         return best_report, best_tests_passed, best_tests_total, restored_best, total_dur
 
@@ -1596,8 +1804,9 @@ class BuildWorker:
         *,
         auditor: ParentAuditor | None = None,
         chats_dir: Path | None = None,
+        force_polish: bool = False,
     ) -> dict[str, Any]:
-        """Audit project quality and launch bounded 2-round refinement until Producción (>=85%) creating vN+1."""
+        """Audit project quality and run 2-agent adversarial debate until Producción (or Excelencia under force_polish)."""
         validate_project_id(project_id)
         events = self.orchestrator.store.get_events(project_id)
         if not events:
@@ -1653,10 +1862,15 @@ class BuildWorker:
             round_number=1,
             project_name=status.name or project_id,
             version_label=cur_version,
+            challenge_for_polish=force_polish,
             extra_secrets=self.secrets_to_redact,
         )
 
-        if initial_report.passed:
+        already_maxed = (
+            (not force_polish and initial_report.passed)
+            or (force_polish and initial_report.passed and initial_report.global_score >= 100.0)
+        )
+        if already_maxed:
             dur = round(max(0.0, time.monotonic() - t0), 2)
             if should_persist:
                 self.orchestrator.record_automated_quality_audit(
@@ -1691,7 +1905,7 @@ class BuildWorker:
             if existing_plan is not None
             else Plan(
                 summary=status.objective or f"Mejora de calidad {status.name or project_id}",
-                rationale="Refinamiento acotado de calidad hasta alcanzar nivel Producción.",
+                rationale="Refinamiento acotado de calidad mediante debate adversario de 2 agentes.",
                 template_id="static-web",
                 files=[],
                 acceptance_tests=[],
@@ -1699,11 +1913,18 @@ class BuildWorker:
                 deployment_target="local",
             )
         )
-        self.orchestrator.transition_for_quality_improvement(
-            project_id,
-            plan=effective_plan,
-            reason=f"Mejora de calidad ({initial_report.tier_label} · {initial_report.global_score:.0f}%)",
+        already_passing_polish = bool(force_polish and initial_report.passed)
+        reason_label = (
+            f"Pulido con debate ({initial_report.tier_label} · {initial_report.global_score:.0f}%)"
+            if already_passing_polish
+            else f"Mejora de calidad ({initial_report.tier_label} · {initial_report.global_score:.0f}%)"
         )
+        if not already_passing_polish:
+            self.orchestrator.transition_for_quality_improvement(
+                project_id,
+                plan=effective_plan,
+                reason=reason_label,
+            )
 
         ensure_workspace_pytest_ini(self.workspace_manager, project_id)
         lock_snapshot = compute_test_lock(ws_dir)
@@ -1735,8 +1956,54 @@ class BuildWorker:
                 auditor_override=eff_auditor,
                 max_ref_rounds_override=max_ref,
                 skip_pytest_if_no_tests=True,
+                force_polish=force_polish,
             )
             assert best_report is not None
+
+            has_kept_round = any(r.kept for r in best_report.debate_rounds)
+            if already_passing_polish and (not has_kept_round or not best_report.passed):
+                cur_meta = self.orchestrator.get_status(project_id)
+                best_report.markdown_report = build_quality_markdown_report(
+                    best_report,
+                    project_name=cur_meta.name or project_id,
+                    version_label=cur_version,
+                    restored_best_checkpoint=restored_best,
+                    extra_secrets=self.secrets_to_redact,
+                )
+                scorecard = best_report.to_scorecard_dict(extra_secrets=self.secrets_to_redact)
+                if should_persist:
+                    self.orchestrator.record_automated_quality_audit(
+                        project_id,
+                        report=best_report,
+                        commit_sha=cur_sha,
+                        version_label=cur_version,
+                        duration_seconds=quality_dur,
+                        chats_dir=eff_chats_dir,
+                        prompt_label=f"Debate de pulido sin cambios aplicados ({cur_version})",
+                        extra_secrets=self.secrets_to_redact,
+                    )
+                return {
+                    "ok": True,
+                    "project_id": project_id,
+                    "already_passed": True,
+                    "improved": False,
+                    "restored_best": restored_best,
+                    "version_label": cur_version,
+                    "commit_sha": cur_sha,
+                    "scorecard": scorecard,
+                    "quality_scorecard": scorecard,
+                    "checkpoints": self.orchestrator.list_project_checkpoints(
+                        project_id, chats_dir=eff_chats_dir, extra_secrets=self.secrets_to_redact
+                    ),
+                    "status": cur_meta,
+                }
+
+            if already_passing_polish:
+                self.orchestrator.transition_for_quality_improvement(
+                    project_id,
+                    plan=effective_plan,
+                    reason=reason_label,
+                )
 
             self.orchestrator.store.append(
                 create_event(
@@ -1774,8 +2041,9 @@ class BuildWorker:
                 extra_secrets=self.secrets_to_redact,
             )
             scorecard = best_report.to_scorecard_dict(extra_secrets=self.secrets_to_redact)
+            summary_prefix = "Debate de pulido" if force_polish else "Mejora de calidad"
             summary_txt = (
-                f"Mejora de calidad ({initial_report.tier_label} → {best_report.tier_label} · "
+                f"{summary_prefix} ({initial_report.tier_label} → {best_report.tier_label} · "
                 f"{best_report.global_score:.0f}%)"
             )
             delivered_pl: dict[str, object] = {
@@ -1797,6 +2065,11 @@ class BuildWorker:
                 )
             )
             if should_persist:
+                prompt_lbl = (
+                    f"Debate de calidad y pulido ({next_version})"
+                    if best_report.debate_rounds
+                    else f"Mejora automática hasta Producción ({next_version})"
+                )
                 self.orchestrator.record_automated_quality_audit(
                     project_id,
                     report=best_report,
@@ -1804,7 +2077,7 @@ class BuildWorker:
                     version_label=next_version,
                     duration_seconds=quality_dur,
                     chats_dir=eff_chats_dir,
-                    prompt_label=f"Mejora automática hasta Producción ({next_version})",
+                    prompt_label=prompt_lbl,
                     extra_secrets=self.secrets_to_redact,
                 )
             self._publish_registry_best_effort(project_id, job)
@@ -1814,6 +2087,7 @@ class BuildWorker:
                 "project_id": project_id,
                 "already_passed": False,
                 "improved": True,
+                "restored_best": restored_best,
                 "version_label": next_version,
                 "commit_sha": new_sha,
                 "scorecard": scorecard,

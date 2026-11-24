@@ -2229,6 +2229,8 @@ class Orchestrator:
                 "is_current": False,
                 "quality_scorecard": scorecard,
             }
+            if isinstance(scorecard, Mapping) and isinstance(scorecard.get("debate_summary"), Mapping):
+                cp_entry["debate_summary"] = dict(scorecard["debate_summary"])
             checkpoints.append(cp_entry)
         if checkpoints:
             checkpoints[-1]["is_current"] = True
@@ -2419,9 +2421,10 @@ class Orchestrator:
         build_worker: Any | None = None,
         auditor: Any | None = None,
         chats_dir: Path | None = None,
+        force_polish: bool = False,
         extra_secrets: Sequence[str] = (),
     ) -> dict[str, Any]:
-        """Audit project quality and run bounded 2-round refinement via BuildWorker when below Producción tier."""
+        """Audit project quality and run bounded 2-agent debate via BuildWorker when needed or under force_polish."""
         validate_project_id(project_id)
         eff_worker = build_worker if build_worker is not None else self.build_worker
         if eff_worker is not None:
@@ -2429,6 +2432,7 @@ class Orchestrator:
                 project_id,
                 auditor=auditor,
                 chats_dir=chats_dir,
+                force_polish=force_polish,
             )
         eval_res = self.evaluate_project_quality(
             project_id,
@@ -2436,7 +2440,7 @@ class Orchestrator:
             chats_dir=chats_dir,
             extra_secrets=extra_secrets,
         )
-        if eval_res["scorecard"].get("passed"):
+        if not force_polish and eval_res["scorecard"].get("passed"):
             return {
                 **eval_res,
                 "already_passed": True,

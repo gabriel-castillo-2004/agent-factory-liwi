@@ -4835,3 +4835,183 @@ def test_dashboard_quality_endpoints_and_history_versions_timeline(
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_quality_improve_force_polish_endpoint_and_debate_history_ui(
+    tmp_path: Path,
+) -> None:
+    """POST /quality/improve supports force_polish=true on already-passing projects, records debate_rounds/Markdown debate section, and GET / includes #polish-debate-btn + debate badge."""
+    import subprocess
+
+    from agent_factory.agents.quality_auditor import ParentAuditor
+    from agent_factory.builder import BuildWorker
+
+    store = SqliteEventStore(db_path=tmp_path / "polish_debate.db")
+    chats_dir = tmp_path / "chats_pd"
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_pd")
+    pid = "polish-debate-app"
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / "index.html").write_text("<!doctype html><html><body><h1>Prod v1</h1></body></html>\n", encoding="utf-8")
+    (ws_dir / "tests").mkdir(exist_ok=True)
+    (ws_dir / "tests" / "test_ok.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
+
+    subprocess.run(["git", "init"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "branch", "-M", "main"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "add", "-A"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@local", "commit", "-m", "init v1"],
+        cwd=ws_dir,
+        check=True,
+        capture_output=True,
+    )
+    sha_v1 = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ws_dir, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    llm = FakeLLM(
+        responses=[
+            # 1. force_polish initial Critic eval -> 88% Producción
+            {
+                "summary": "Cumple Producción (88%), pulible con debate.",
+                "dimensions": {
+                    "ux_ui": {"score": 86.0, "findings": ["Falta aria-label en index.html"], "improvements": ["Añadir aria-label"]},
+                    "functional_completeness": {"score": 88.0, "findings": [], "improvements": []},
+                    "robustness": {"score": 88.0, "findings": [], "improvements": []},
+                    "architecture_quality": {"score": 90.0, "findings": [], "improvements": []},
+                    "security_hygiene": {"score": 90.0, "findings": [], "improvements": []},
+                    "testing_runtime": {"score": 88.0, "findings": [], "improvements": []},
+                },
+                "objections": [
+                    {
+                        "dimension": "ux_ui",
+                        "file_path": "index.html",
+                        "severity": "medium",
+                        "issue": "Falta aria-label en botones de index.html",
+                        "concrete_fix": "Agregar aria-label accesible en index.html",
+                    }
+                ],
+            },
+            # 2. BuilderResponder response
+            {
+                "builder_response": "index.html: agregado aria-label y región main accesible.",
+                "surgical_instructions": "Actualiza index.html agregando main y aria-label.",
+            },
+            # 3. Critic diff review -> 95% Excelencia
+            {
+                "summary": "Pulido verificado con diff (95%).",
+                "resolved_count": 1,
+                "diff_summary": "Añadido aria-label en index.html",
+                "dimensions": {
+                    "ux_ui": {"score": 95.0, "findings": [], "improvements": []},
+                    "functional_completeness": {"score": 95.0, "findings": [], "improvements": []},
+                    "robustness": {"score": 95.0, "findings": [], "improvements": []},
+                    "architecture_quality": {"score": 95.0, "findings": [], "improvements": []},
+                    "security_hygiene": {"score": 95.0, "findings": [], "improvements": []},
+                    "testing_runtime": {"score": 95.0, "findings": [], "improvements": []},
+                },
+            },
+        ]
+    )
+    orch = Orchestrator(store=store, llm=llm, workspace_manager=ws_mgr)
+    now = datetime(2026, 5, 6, 15, 0, tzinfo=UTC)
+    plan_dict = _plan_payload("Polish Debate App")
+    plan_hash = Plan.model_validate(plan_dict).compute_hash()
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "Polish QA", "objective": "Portal accesible", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+        create_event(
+            pid,
+            EventType.PROJECT_DELIVERED,
+            {"repo_url": "", "deploy_url": "", "commit_sha": sha_v1, "version_label": "v1"},
+            at=now,
+        ),
+    ):
+        store.append(ev)
+
+    worker = BuildWorker(
+        orchestrator=orch,
+        workspace_manager=ws_mgr,
+        code_agent=FakeCodeAgent(
+            impl_steps=[
+                {"index.html": '<!doctype html><html><body><main aria-label="Portal"><h1>Pulido v2</h1></main></body></html>\n'}
+            ]
+        ),
+        runner=FakeRunner(results=[CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True})]),
+        vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
+        quality_auditor=ParentAuditor(llm=llm),
+        chats_dir=chats_dir,
+    )
+
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        build_worker=worker,
+        workspace_manager=ws_mgr,
+        chats_dir=chats_dir,
+    )
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            assert html_resp.status == 200
+            html = html_resp.read().decode("utf-8")
+
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+        for marker in (
+            'id="polish-debate-btn"',
+            "⚔️ Pulir con debate",
+            "force_polish",
+            "⚔️ Debate 2 agentes",
+            "submitPolishWithDebate",
+        ):
+            assert marker in html
+
+        # Non-boolean force_polish returns 400 (INV-22)
+        assert (
+            _http_json(
+                f"{base_url}/api/projects/{pid}/quality/improve",
+                method="POST",
+                body={"force_polish": "yes"},
+            )[0]
+            == 400
+        )
+
+        # force_polish=true runs adversarial debate even when starting at 88% Producción
+        c_imp, r_imp = _http_json(
+            f"{base_url}/api/projects/{pid}/quality/improve",
+            method="POST",
+            body={"force_polish": True},
+            timeout=15.0,
+        )
+        assert c_imp == 200
+        assert r_imp["ok"] is True
+        assert server.controller.wait_for_idle(timeout=15.0)
+
+        c_cp, r_cp = _http_json(f"{base_url}/api/projects/{pid}/checkpoints")
+        assert c_cp == 200
+        assert len(r_cp["checkpoints"]) == 2
+        v2_cp = r_cp["checkpoints"][0]
+        assert v2_cp["version_label"] == "v2"
+        sc_v2 = v2_cp["quality_scorecard"]
+        assert sc_v2["tier_id"] == "excellence"
+        assert sc_v2["global_score"] == pytest.approx(95.0, abs=0.05)
+        assert len(sc_v2["debate_rounds"]) == 1
+        assert sc_v2["debate_summary"]["resolved_count"] == 1
+        assert v2_cp["debate_summary"]["resolved_count"] == 1
+
+        c_chat, r_chat = _http_json(f"{base_url}/api/projects/{pid}/chat")
+        assert c_chat == 200
+        latest_audit = [m for m in r_chat["messages"] if m.get("mode") == "audit"][-1]
+        assert "⚔️ Debate de Calidad (Crítico vs. Constructor)" in latest_audit["content"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
