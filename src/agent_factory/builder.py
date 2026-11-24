@@ -7,6 +7,7 @@ import time
 from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -287,6 +288,8 @@ class BuildWorker:
         self.quality_audit_enabled = quality_audit_enabled
         self.chats_dir: Path | None = Path(chats_dir).resolve() if chats_dir is not None else None
         self.max_quality_refinement_rounds = max(0, min(2, int(max_quality_refinement_rounds)))
+        if getattr(orchestrator, "build_worker", None) is None:
+            orchestrator.build_worker = self
 
     @staticmethod
     def _extract_modification_context(events: Sequence[Event]) -> tuple[str | None, list[str]]:
@@ -1229,9 +1232,13 @@ class BuildWorker:
         effective_plan: Plan,
         tests_passed_count: int,
         tests_total_count: int,
+        initial_report: QualityAuditReport | None = None,
+        auditor_override: ParentAuditor | None = None,
+        max_ref_rounds_override: int | None = None,
+        skip_pytest_if_no_tests: bool = False,
     ) -> tuple[QualityAuditReport | None, int, int, bool, float]:
         """Run ParentAuditor + bounded 2-round refinement with anti-regression checkpointing."""
-        auditor = self._resolve_quality_auditor()
+        auditor = auditor_override if auditor_override is not None else self._resolve_quality_auditor()
         if auditor is None:
             return None, tests_passed_count, tests_total_count, False, 0.0
 
@@ -1240,7 +1247,11 @@ class BuildWorker:
         building_limit = (
             self.orchestrator.circuit_breaker.get_limit(ProjectState.BUILDING) or 15
         )
-        max_ref_rounds = self.max_quality_refinement_rounds
+        max_ref_rounds = (
+            max(0, min(2, int(max_ref_rounds_override)))
+            if max_ref_rounds_override is not None
+            else self.max_quality_refinement_rounds
+        )
 
         def _invoke_auditor(audit_round_num: int) -> QualityAuditReport:
             cur_status = self.orchestrator.get_status(project_id)
@@ -1284,7 +1295,7 @@ class BuildWorker:
                     )
             return rep
 
-        best_report = _invoke_auditor(1)
+        best_report = initial_report if initial_report is not None else _invoke_auditor(1)
         best_test_results = dict(job.test_results)
         best_tests_passed = tests_passed_count
         best_tests_total = tests_total_count
@@ -1371,21 +1382,30 @@ class BuildWorker:
                 restored_best = True
                 continue
 
-            try:
-                (
-                    tests_ok,
-                    cur_passed,
-                    cur_total,
-                    _failing,
-                    _raw_res,
-                    _t0,
-                ) = self._run_local_pytest(
-                    project_id, job, ws_dir, build_round=build_round + ref_round
-                )
-            except (CommandTimeoutError, OSError, RuntimeError, ValueError):
-                tests_ok = False
-                cur_passed = 0
+            if (
+                skip_pytest_if_no_tests
+                and self.runner.__class__.__name__ != "FakeRunner"
+                and not workspace_nonempty_test_files(ws_dir)
+            ):
+                tests_ok = True
+                cur_passed = best_tests_passed
                 cur_total = best_tests_total
+            else:
+                try:
+                    (
+                        tests_ok,
+                        cur_passed,
+                        cur_total,
+                        _failing,
+                        _raw_res,
+                        _t0,
+                    ) = self._run_local_pytest(
+                        project_id, job, ws_dir, build_round=build_round + ref_round
+                    )
+                except (CommandTimeoutError, OSError, RuntimeError, ValueError):
+                    tests_ok = False
+                    cur_passed = 0
+                    cur_total = best_tests_total
 
             smoke_ok = False
             if tests_ok:
@@ -1461,6 +1481,353 @@ class BuildWorker:
 
         total_dur = round(max(0.0, time.monotonic() - audit_t0), 2)
         return best_report, best_tests_passed, best_tests_total, restored_best, total_dur
+
+    def _publish_registry_best_effort(
+        self,
+        project_id: str,
+        job: BuildJob,
+    ) -> str | None:
+        """Notify RegistryPublisher best-effort after PROJECT_DELIVERED and record failure events cleanly."""
+        if self.registry_publisher is None:
+            return None
+        try:
+            same_pub = (
+                getattr(self.orchestrator, "publisher", None) is self.registry_publisher
+            )
+            if same_pub:
+                delivered_status = self.orchestrator.get_status(
+                    project_id, notify_publisher=False
+                )
+            else:
+                delivered_status = self.orchestrator.get_status(project_id)
+            events = self.orchestrator.store.get_events(project_id)
+            self.registry_publisher.publish_project(delivered_status, events=events)
+            if same_pub and hasattr(self.orchestrator, "mark_status_published"):
+                self.orchestrator.mark_status_published(delivered_status)
+            return None
+        except (RegistryPublishError, OSError, RuntimeError, ValueError) as reg_exc:
+            clean_reg_err = self._redact(str(reg_exc))
+            registry_warning = f"Registry publish failed (best-effort): {clean_reg_err}"
+            job.last_failure_output = registry_warning
+            self.orchestrator.store.append(
+                create_event(
+                    project_id=project_id,
+                    event_type=EventType.REGISTRY_PUBLISH_FAILED,
+                    payload={"reason": registry_warning},
+                    at=self.orchestrator._now(),
+                )
+            )
+            return registry_warning
+
+    def _push_quality_improvement(
+        self,
+        project_id: str,
+        ws_dir: Path,
+        *,
+        status_repo_url: str | None,
+        status_deploy_url: str | None,
+    ) -> tuple[str | None, str | None]:
+        """Push verified post-refinement commit cleanly to origin or FakeVCS."""
+        from agent_factory.adapters.github_vcs_adapter import build_git_push_env
+
+        repo_url = status_repo_url
+        deploy_url = status_deploy_url
+        if self.vcs.__class__.__name__ == "FakeVCS":
+            self.vcs.push_branch(project_id, ws_dir, branch="work")
+            ci_res = self.vcs.get_ci_result(project_id, branch="work")
+            self.orchestrator.store.append(
+                create_event(
+                    project_id=project_id,
+                    event_type=EventType.CI_ROUND_COMPLETED,
+                    payload={
+                        "ci_rounds": 1,
+                        "summary": self._redact(ci_res.summary),
+                        "duration_seconds": 0.0,
+                    },
+                    at=self.orchestrator._now(),
+                )
+            )
+            merged_repo, merged_deploy = self.vcs.merge_and_deploy(project_id, branch="work")
+            return repo_url or merged_repo, deploy_url or merged_deploy
+
+        git_cfg = ws_dir / ".git" / "config"
+        has_origin = False
+        if git_cfg.is_file():
+            try:
+                has_origin = '[remote "origin"]' in git_cfg.read_text(
+                    encoding="utf-8", errors="ignore"
+                )
+            except OSError:
+                has_origin = False
+        if has_origin and self.runner.__class__.__name__ != "FakeRunner":
+            ws_resolved = verify_isolated_git_root(ws_dir, self.runner)
+            clean_env = build_sanitized_cli_env()
+            cur_branch = "main"
+            head_file = ws_resolved / ".git" / "HEAD"
+            if head_file.is_file():
+                try:
+                    htxt = head_file.read_text(encoding="utf-8", errors="ignore").strip()
+                    if htxt.startswith("ref: refs/heads/"):
+                        cur_branch = htxt[len("ref: refs/heads/") :].strip() or "main"
+                except OSError:
+                    pass
+            gh_tok = str(getattr(self.vcs, "github_token", "") or "")
+            repo_base = str(getattr(self.vcs, "repo_base_url", "") or "https://github.com")
+            push_env, push_secrets = build_git_push_env(
+                clean_env, gh_tok, repo_base_url=repo_base
+            )
+            push_res = self.runner.run(
+                ["git", "push", "-u", "origin", cur_branch],
+                cwd=ws_resolved,
+                timeout_seconds=20.0,
+                env=push_env,
+            )
+            if push_res.exit_code != 0:
+                detail = redact_secrets(
+                    (push_res.stderr or push_res.stdout or "git push failed").strip(),
+                    extra_secrets=(*self.secrets_to_redact, *push_secrets),
+                )
+                raise RuntimeError(f"Error publicando mejora de calidad a origin: {detail}")
+        return repo_url, deploy_url
+
+    def improve_project_quality(
+        self,
+        project_id: str,
+        *,
+        auditor: ParentAuditor | None = None,
+        chats_dir: Path | None = None,
+    ) -> dict[str, Any]:
+        """Audit project quality and launch bounded 2-round refinement until Producción (>=85%) creating vN+1."""
+        validate_project_id(project_id)
+        events = self.orchestrator.store.get_events(project_id)
+        if not events:
+            raise ValueError(f"Project '{project_id}' does not exist")
+        status = self.orchestrator.get_status(project_id)
+        if status.state != ProjectState.DELIVERED:
+            raise IllegalTransition(status.state, ProjectState.CHANGE_REQUEST)
+
+        if status.workspace_path and not self.workspace_manager.is_external_workspace(project_id):
+            self.workspace_manager.register_external_workspace(project_id, status.workspace_path)
+        ws_dir = self.orchestrator._resolve_project_workspace_dir(
+            project_id, status=status, workspace_manager=self.workspace_manager
+        )
+        if ws_dir is None or not ws_dir.is_dir():
+            raise ValueError(f"El workspace del proyecto '{project_id}' no existe.")
+
+        eff_chats_dir = chats_dir if chats_dir is not None else self.chats_dir
+        should_persist = bool(
+            eff_chats_dir is not None
+            or (
+                getattr(self.orchestrator.store, "db_path", None)
+                and str(getattr(self.orchestrator.store, "db_path", "")) != ":memory:"
+            )
+        )
+        checkpoints = self.orchestrator.list_project_checkpoints(
+            project_id, chats_dir=eff_chats_dir, extra_secrets=self.secrets_to_redact
+        )
+        cur_cp = next(
+            (c for c in checkpoints if c.get("is_current")),
+            checkpoints[0] if checkpoints else None,
+        )
+        prior_delivered = sum(1 for ev in events if ev.type == EventType.PROJECT_DELIVERED)
+        cur_version = (cur_cp.get("version_label") if cur_cp else "") or f"v{max(1, prior_delivered)}"
+        cur_sha = (cur_cp.get("commit_sha") if cur_cp else "") or (
+            read_workspace_git_head_sha(ws_dir, runner=self.runner) or ""
+        )
+
+        eff_auditor = (
+            auditor
+            or self._resolve_quality_auditor()
+            or ParentAuditor(getattr(self.orchestrator, "llm", None))
+        )
+        initial_test_results: dict[str, bool] = (
+            {"suite": status.tests.failed == 0} if status.tests.total > 0 else {}
+        )
+        t0 = time.monotonic()
+        initial_report = eff_auditor.audit_workspace(
+            project_id,
+            ws_dir,
+            spec=self.orchestrator.get_spec(project_id),
+            plan=self.orchestrator.get_plan(project_id),
+            test_results=initial_test_results or None,
+            round_number=1,
+            project_name=status.name or project_id,
+            version_label=cur_version,
+            extra_secrets=self.secrets_to_redact,
+        )
+
+        if initial_report.passed:
+            dur = round(max(0.0, time.monotonic() - t0), 2)
+            if should_persist:
+                self.orchestrator.record_automated_quality_audit(
+                    project_id,
+                    report=initial_report,
+                    commit_sha=cur_sha,
+                    version_label=cur_version,
+                    duration_seconds=dur,
+                    chats_dir=eff_chats_dir,
+                    prompt_label=f"Verificación de calidad ({cur_version})",
+                    extra_secrets=self.secrets_to_redact,
+                )
+            scorecard = initial_report.to_scorecard_dict(extra_secrets=self.secrets_to_redact)
+            return {
+                "ok": True,
+                "project_id": project_id,
+                "already_passed": True,
+                "improved": False,
+                "version_label": cur_version,
+                "commit_sha": cur_sha,
+                "scorecard": scorecard,
+                "quality_scorecard": scorecard,
+                "checkpoints": self.orchestrator.list_project_checkpoints(
+                    project_id, chats_dir=eff_chats_dir, extra_secrets=self.secrets_to_redact
+                ),
+                "status": self.orchestrator.get_status(project_id),
+            }
+
+        existing_plan = self.orchestrator.get_plan(project_id)
+        effective_plan = (
+            existing_plan
+            if existing_plan is not None
+            else Plan(
+                summary=status.objective or f"Mejora de calidad {status.name or project_id}",
+                rationale="Refinamiento acotado de calidad hasta alcanzar nivel Producción.",
+                template_id="static-web",
+                files=[],
+                acceptance_tests=[],
+                risks=[],
+                deployment_target="local",
+            )
+        )
+        self.orchestrator.transition_for_quality_improvement(
+            project_id,
+            plan=effective_plan,
+            reason=f"Mejora de calidad ({initial_report.tier_label} · {initial_report.global_score:.0f}%)",
+        )
+
+        ensure_workspace_pytest_ini(self.workspace_manager, project_id)
+        lock_snapshot = compute_test_lock(ws_dir)
+        job = BuildJob(
+            project_id=project_id,
+            plan=effective_plan,
+            state=JobState.RUNNING,
+            lock_snapshot=lock_snapshot,
+            test_results=dict(initial_test_results),
+        )
+        max_ref = max(1, min(2, int(self.max_quality_refinement_rounds or 2)))
+        try:
+            (
+                best_report,
+                _tests_passed_count,
+                _tests_total_count,
+                restored_best,
+                quality_dur,
+            ) = self._run_quality_audit_and_refinement(
+                project_id,
+                job,
+                ws_dir,
+                build_round=1,
+                max_code_rounds=max_ref + 1,
+                effective_plan=effective_plan,
+                tests_passed_count=status.tests.passed,
+                tests_total_count=status.tests.total,
+                initial_report=initial_report,
+                auditor_override=eff_auditor,
+                max_ref_rounds_override=max_ref,
+                skip_pytest_if_no_tests=True,
+            )
+            assert best_report is not None
+
+            self.orchestrator.store.append(
+                create_event(
+                    project_id=project_id,
+                    event_type=EventType.STATE_TRANSITIONED,
+                    payload={
+                        "from": ProjectState.BUILDING.value,
+                        "to": ProjectState.VERIFYING.value,
+                    },
+                    at=self.orchestrator._now(),
+                )
+            )
+            if existing_plan is not None:
+                self._write_manifest(project_id, ws_dir, job)
+            self._commit_git_checkpoint(
+                project_id,
+                ws_dir,
+                f"quality refined ({best_report.tier_label} {best_report.global_score:.1f}%)",
+            )
+            repo_url, deploy_url = self._push_quality_improvement(
+                project_id,
+                ws_dir,
+                status_repo_url=status.links.repo if status.links else None,
+                status_deploy_url=status.links.deploy if status.links else None,
+            )
+
+            next_version = f"v{prior_delivered + 1}"
+            new_sha = read_workspace_git_head_sha(ws_dir, runner=self.runner) or cur_sha
+            cur_meta = self.orchestrator.get_status(project_id)
+            best_report.markdown_report = build_quality_markdown_report(
+                best_report,
+                project_name=cur_meta.name or project_id,
+                version_label=next_version,
+                restored_best_checkpoint=restored_best,
+                extra_secrets=self.secrets_to_redact,
+            )
+            scorecard = best_report.to_scorecard_dict(extra_secrets=self.secrets_to_redact)
+            summary_txt = (
+                f"Mejora de calidad ({initial_report.tier_label} → {best_report.tier_label} · "
+                f"{best_report.global_score:.0f}%)"
+            )
+            delivered_pl: dict[str, object] = {
+                "repo_url": repo_url,
+                "deploy_url": deploy_url,
+                "duration_seconds": quality_dur,
+                "version_label": next_version,
+                "summary": summary_txt,
+                "quality_scorecard": scorecard,
+            }
+            if new_sha:
+                delivered_pl["commit_sha"] = new_sha
+            self.orchestrator.store.append(
+                create_event(
+                    project_id=project_id,
+                    event_type=EventType.PROJECT_DELIVERED,
+                    payload=delivered_pl,
+                    at=self.orchestrator._now(),
+                )
+            )
+            if should_persist:
+                self.orchestrator.record_automated_quality_audit(
+                    project_id,
+                    report=best_report,
+                    commit_sha=new_sha or "",
+                    version_label=next_version,
+                    duration_seconds=quality_dur,
+                    chats_dir=eff_chats_dir,
+                    prompt_label=f"Mejora automática hasta Producción ({next_version})",
+                    extra_secrets=self.secrets_to_redact,
+                )
+            self._publish_registry_best_effort(project_id, job)
+            job.state = JobState.COMPLETED
+            return {
+                "ok": True,
+                "project_id": project_id,
+                "already_passed": False,
+                "improved": True,
+                "version_label": next_version,
+                "commit_sha": new_sha,
+                "scorecard": scorecard,
+                "quality_scorecard": scorecard,
+                "checkpoints": self.orchestrator.list_project_checkpoints(
+                    project_id, chats_dir=eff_chats_dir, extra_secrets=self.secrets_to_redact
+                ),
+                "status": self.orchestrator.get_status(project_id),
+            }
+        except Exception as exc:
+            cur_state = self.orchestrator.get_status(project_id).state
+            if cur_state not in (ProjectState.FAILED, ProjectState.DELIVERED):
+                self._fail_job(project_id, job, exc, failed_state=cur_state)
+            raise
 
     def run_job(
         self,
@@ -1997,45 +2364,7 @@ class BuildWorker:
                     deploy_url=deploy_url,
                 )
 
-                registry_warning: str | None = None
-                if self.registry_publisher is not None:
-                    try:
-                        same_pub = (
-                            getattr(self.orchestrator, "publisher", None)
-                            is self.registry_publisher
-                        )
-                        if same_pub:
-                            delivered_status = self.orchestrator.get_status(
-                                project_id, notify_publisher=False
-                            )
-                        else:
-                            delivered_status = self.orchestrator.get_status(project_id)
-                        events = self.orchestrator.store.get_events(project_id)
-                        self.registry_publisher.publish_project(
-                            delivered_status,
-                            events=events,
-                        )
-                        if same_pub and hasattr(self.orchestrator, "mark_status_published"):
-                            self.orchestrator.mark_status_published(delivered_status)
-                    except (
-                        RegistryPublishError,
-                        OSError,
-                        RuntimeError,
-                        ValueError,
-                    ) as reg_exc:
-                        clean_reg_err = self._redact(str(reg_exc))
-                        registry_warning = (
-                            f"Registry publish failed (best-effort): {clean_reg_err}"
-                        )
-                        job.last_failure_output = registry_warning
-                        self.orchestrator.store.append(
-                            create_event(
-                                project_id=project_id,
-                                event_type=EventType.REGISTRY_PUBLISH_FAILED,
-                                payload={"reason": registry_warning},
-                                at=self.orchestrator._now(),
-                            )
-                        )
+                registry_warning = self._publish_registry_best_effort(project_id, job)
 
                 job.state = JobState.COMPLETED
                 report = BuildReport(

@@ -4633,3 +4633,205 @@ def test_dashboard_5_themes_selector_clean_sidebar_compact_delivered_and_audit_b
             thread.join(timeout=2.0)
         store.close()
 
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_quality_endpoints_and_history_versions_timeline(
+    tmp_path: Path,
+) -> None:
+    """POST /quality/evaluate & /quality/improve endpoints validate state/INV-22, update version scorecards, and GET / renders Historial de versiones in Simple & Dev modes."""
+    import subprocess
+
+    from agent_factory.agents.quality_auditor import ParentAuditor
+    from agent_factory.builder import BuildWorker
+
+    store = SqliteEventStore(db_path=tmp_path / "quality_timeline.db")
+    chats_dir = tmp_path / "chats_qt"
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_qt")
+    pid = "quality-timeline-app"
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / "index.html").write_text("<!doctype html><html><body><h1>Base v1</h1></body></html>\n", encoding="utf-8")
+    (ws_dir / "tests").mkdir(exist_ok=True)
+    (ws_dir / "tests" / "test_basic.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
+
+    subprocess.run(["git", "init"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "branch", "-M", "main"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "add", "-A"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@local",
+            "commit",
+            "-m",
+            "init v1",
+        ],
+        cwd=ws_dir,
+        check=True,
+        capture_output=True,
+    )
+    sha_v1 = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ws_dir, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    def _audit_json(ux: float, other: float) -> dict[str, object]:
+        return {
+            "summary": "Auditoría de calidad",
+            "dimensions": {
+                "ux_ui": {"score": ux, "findings": [] if ux >= 70 else ["Ajustar contraste"], "improvements": [] if ux >= 70 else ["Mejorar UI"]},
+                "functional_completeness": {"score": other, "findings": [], "improvements": []},
+                "robustness": {"score": other, "findings": [], "improvements": []},
+                "architecture_quality": {"score": other, "findings": [], "improvements": []},
+                "security_hygiene": {"score": other, "findings": [], "improvements": []},
+                "testing_runtime": {"score": other, "findings": [], "improvements": []},
+            },
+        }
+
+    llm = FakeLLM(
+        responses=[
+            # 1. POST /quality/evaluate -> Estándar (80%)
+            _audit_json(72.0, 82.0),
+            # 2. POST /quality/improve initial audit -> Básico (70%)
+            _audit_json(64.0, 72.0),
+            # 3. POST /quality/improve after round 1 -> Producción (89%)
+            _audit_json(90.0, 89.0),
+        ]
+    )
+    orch = Orchestrator(store=store, llm=llm, workspace_manager=ws_mgr)
+    now = datetime(2026, 5, 2, 12, 0, tzinfo=UTC)
+    plan_dict = _plan_payload("Quality Timeline App")
+    plan_hash = Plan.model_validate(plan_dict).compute_hash()
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "Timeline QA", "objective": "Sitio web de recetas saludables", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+        create_event(
+            pid,
+            EventType.PROJECT_DELIVERED,
+            {"repo_url": "", "deploy_url": "", "commit_sha": sha_v1, "version_label": "v1"},
+            at=now,
+        ),
+    ):
+        store.append(ev)
+
+    worker = BuildWorker(
+        orchestrator=orch,
+        workspace_manager=ws_mgr,
+        code_agent=FakeCodeAgent(
+            impl_steps=[
+                {"index.html": '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"></head><body><h1>Mejorado v2</h1></body></html>\n'}
+            ]
+        ),
+        runner=FakeRunner(results=[CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True})]),
+        vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI green")]),
+        quality_auditor=ParentAuditor(llm=llm),
+        chats_dir=chats_dir,
+    )
+
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        build_worker=worker,
+        workspace_manager=ws_mgr,
+        chats_dir=chats_dir,
+    )
+    try:
+        # 1. HTML includes Historial de versiones (visible in Simple & Dev), tier badges, actions, and endpoints
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            assert html_resp.status == 200
+            html = html_resp.read().decode("utf-8")
+
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+
+        for marker in (
+            'id="history-versions-section"',
+            "Historial de versiones",
+            "⚪ Sin evaluar",
+            "🥉 Básico",
+            "🥈 Estándar",
+            "🥇 Producción",
+            "💎 Excelencia",
+            "version-quality-bars",
+            "↩︎ Volver a esta versión",
+            "🛡️ Re-evaluar calidad",
+            "✨ Mejorar hasta cumplir estándar",
+            'id="evaluate-quality-btn"',
+            'id="improve-quality-btn"',
+            "/quality/evaluate",
+            "/quality/improve",
+            "runTrackedOperation",
+            "askCustomConfirm",
+        ):
+            assert marker in html
+
+        # Verify Historial de versiones section is visible in Simple AND Dev modes (only SHA/Copiar hash is tech-only)
+        ver_fn_start = html.index("function buildHistoryVersionsSectionHtml(")
+        ver_fn_end = html.index("function renderEventsTab(", ver_fn_start)
+        ver_fn_body = html[ver_fn_start:ver_fn_end]
+        assert 'class="history-versions-section"' in ver_fn_body
+        assert 'history-versions-section tech-only' not in ver_fn_body
+        assert 'version-sha-wrap tech-only' in ver_fn_body
+
+        # 2. INV-22 / 404 guards on /quality/evaluate & /quality/improve
+        assert _http_json(f"{base_url}/api/projects/..%2Fbad/quality/evaluate", method="POST")[0] == 400
+        assert _http_json(f"{base_url}/api/projects/Bad%20ID!/quality/improve", method="POST")[0] == 400
+        assert _http_json(f"{base_url}/api/projects/no-existe/quality/evaluate", method="POST")[0] == 404
+        assert _http_json(f"{base_url}/api/projects/no-existe/quality/improve", method="POST")[0] == 404
+
+        # Project not in DELIVERED state returns 409 Conflict
+        pending_pid = "pending-qa-check"
+        store.append(create_event(pending_pid, EventType.PROJECT_CREATED, {"name": "Pending", "objective": "Test", "state": "INTERVIEW"}, at=now))
+        assert _http_json(f"{base_url}/api/projects/{pending_pid}/quality/evaluate", method="POST")[0] == 409
+        assert _http_json(f"{base_url}/api/projects/{pending_pid}/quality/improve", method="POST")[0] == 409
+
+        # 3. Unevaluated v1 exposes summary + quality_scorecard=None in GET /checkpoints
+        c_cp0, r_cp0 = _http_json(f"{base_url}/api/projects/{pid}/checkpoints")
+        assert c_cp0 == 200
+        assert r_cp0["checkpoints"][0]["quality_scorecard"] is None
+        assert "recetas saludables" in r_cp0["checkpoints"][0]["summary"]
+
+        # 4. POST /quality/evaluate updates v1 scorecard read-only without changing files
+        html_before = (ws_dir / "index.html").read_text(encoding="utf-8")
+        c_eval, r_eval = _http_json(f"{base_url}/api/projects/{pid}/quality/evaluate", method="POST", timeout=15.0)
+        assert c_eval == 200
+        assert r_eval["ok"] is True
+        assert (ws_dir / "index.html").read_text(encoding="utf-8") == html_before
+        assert r_eval["scorecard"]["tier_id"] == "standard"
+        assert r_eval["scorecard"]["tier_label"] == "🥈 Estándar"
+        assert r_eval["checkpoints"][0]["quality_scorecard"]["tier_id"] == "standard"
+
+        c_chat, r_chat = _http_json(f"{base_url}/api/projects/{pid}/chat")
+        assert c_chat == 200
+        assert any(m.get("mode") == "audit" and m.get("version_label") == "v1" for m in r_chat["messages"])
+
+        # 5. POST /quality/improve runs bounded refinement and delivers v2 Producción
+        c_imp, r_imp = _http_json(f"{base_url}/api/projects/{pid}/quality/improve", method="POST", timeout=15.0)
+        assert c_imp == 200
+        assert r_imp["ok"] is True
+        assert server.controller.wait_for_idle(timeout=15.0)
+
+        c_cp1, r_cp1 = _http_json(f"{base_url}/api/projects/{pid}/checkpoints")
+        assert c_cp1 == 200
+        assert len(r_cp1["checkpoints"]) == 2
+        v2_cp = r_cp1["checkpoints"][0]
+        assert v2_cp["version_label"] == "v2"
+        assert v2_cp["is_current"] is True
+        assert v2_cp["quality_scorecard"]["tier_id"] == "production"
+        assert v2_cp["quality_scorecard"]["tier_label"] == "🥇 Producción"
+        assert v2_cp["quality_scorecard"]["global_score"] >= 85.0
+        assert "Mejorado v2" in (ws_dir / "index.html").read_text(encoding="utf-8")
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+

@@ -3713,3 +3713,318 @@ def test_quality_auditor_respects_max_2_refinements_and_restores_best_checkpoint
         assert deliv_b.payload["quality_scorecard"]["global_score"] == expected_r1_b
     finally:
         store_b.close()
+
+
+def test_quality_tier_classification_boundaries_and_pending_area(tmp_path: Path) -> None:
+    """Quality tiers classify Básico (<75), Estándar (75-84.9 or active area <70), Producción (85-92.9), and Excelencia (>=93)."""
+    from agent_factory.agents.quality_auditor import ParentAuditor, classify_quality_tier
+    from agent_factory.domain.models import Spec
+
+    # Direct boundary checks of classify_quality_tier
+    assert classify_quality_tier(74.9, failed_dimensions=[]) == ("basic", "🥉 Básico")
+    assert classify_quality_tier(75.0, failed_dimensions=[]) == ("standard", "🥈 Estándar")
+    assert classify_quality_tier(84.9, failed_dimensions=[]) == ("standard", "🥈 Estándar")
+    assert classify_quality_tier(85.0, failed_dimensions=[]) == ("production", "🥇 Producción")
+    assert classify_quality_tier(92.9, failed_dimensions=[]) == ("production", "🥇 Producción")
+    assert classify_quality_tier(93.0, failed_dimensions=[]) == ("excellence", "💎 Excelencia")
+    assert classify_quality_tier(88.5, failed_dimensions=["ux_ui"]) == (
+        "standard",
+        "🥈 Estándar (área pendiente)",
+    )
+
+    ui_ws = tmp_path / "ws_tier_ui"
+    ui_ws.mkdir(parents=True)
+    (ui_ws / "index.html").write_text("<!doctype html><html><body><h1>Tier</h1></body></html>", encoding="utf-8")
+    (ui_ws / "tests").mkdir()
+    (ui_ws / "tests" / "test_ui.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
+
+    cli_ws = tmp_path / "ws_tier_cli"
+    (cli_ws / "src").mkdir(parents=True)
+    (cli_ws / "tests").mkdir(parents=True)
+    (cli_ws / "src" / "main.py").write_text("def calc(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
+    (cli_ws / "tests" / "test_cli.py").write_text("def test_cli(): assert True\n", encoding="utf-8")
+
+    spec = Spec(objective="Evaluar categorías de calidad", users=["Usuario"], features=["Core"])
+    llm = FakeLLM(
+        responses=[
+            # 1. Básico (<75.0)
+            _build_full_audit_payload(
+                ux_ui=74.0,
+                functional_completeness=75.0,
+                robustness=75.0,
+                architecture_quality=75.0,
+                security_hygiene=75.0,
+                testing_runtime=75.0,
+            ),
+            # 2. Estándar (75.0..84.9)
+            _build_full_audit_payload(
+                ux_ui=80.0,
+                functional_completeness=80.0,
+                robustness=80.0,
+                architecture_quality=80.0,
+                security_hygiene=80.0,
+                testing_runtime=80.0,
+            ),
+            # 3. Producción (85.0..92.9 and all >=70)
+            _build_full_audit_payload(
+                ux_ui=88.0,
+                functional_completeness=88.0,
+                robustness=88.0,
+                architecture_quality=88.0,
+                security_hygiene=88.0,
+                testing_runtime=88.0,
+            ),
+            # 4. Excelencia (>=93.0 and all >=70)
+            _build_full_audit_payload(
+                ux_ui=94.0,
+                functional_completeness=94.0,
+                robustness=94.0,
+                architecture_quality=94.0,
+                security_hygiene=94.0,
+                testing_runtime=94.0,
+            ),
+            # 5. Global >=85.0 (87.0) with active ux_ui=60.0 (<70.0) -> Estándar (área pendiente)
+            _build_full_audit_payload(
+                ux_ui=60.0,
+                functional_completeness=96.0,
+                robustness=96.0,
+                architecture_quality=96.0,
+                security_hygiene=96.0,
+                testing_runtime=96.0,
+            ),
+            # 6. CLI project with ux_ui inactive=40.0 and all active >=93.0 -> Excelencia
+            _build_full_audit_payload(
+                ux_ui=40.0,
+                functional_completeness=94.0,
+                robustness=94.0,
+                architecture_quality=94.0,
+                security_hygiene=94.0,
+                testing_runtime=94.0,
+            ),
+        ]
+    )
+    auditor = ParentAuditor(llm=llm)
+
+    expected_cases = [
+        (ui_ws, 74.75, False, "basic", "🥉 Básico"),
+        (ui_ws, 80.0, False, "standard", "🥈 Estándar"),
+        (ui_ws, 88.0, True, "production", "🥇 Producción"),
+        (ui_ws, 94.0, True, "excellence", "💎 Excelencia"),
+        (ui_ws, 87.0, False, "standard", "🥈 Estándar (área pendiente)"),
+        (cli_ws, 94.0, True, "excellence", "💎 Excelencia"),
+    ]
+    for idx, (ws_dir, exp_score, exp_passed, exp_tier_id, exp_tier_label) in enumerate(expected_cases, start=1):
+        rep = auditor.audit_workspace(f"tier-case-{idx}", ws_dir, spec=spec)
+        assert rep.global_score == pytest.approx(exp_score, abs=0.05)
+        assert rep.passed is exp_passed
+        assert rep.tier_id == exp_tier_id
+        assert rep.tier_label == exp_tier_label
+        sc = rep.to_scorecard_dict()
+        assert sc["tier_id"] == exp_tier_id
+        assert sc["tier_label"] == exp_tier_label
+
+
+def test_evaluate_and_improve_project_quality_with_checkpoint_enrichment(
+    tmp_path: Path,
+) -> None:
+    """evaluate_project_quality audits read-only without modifying files; improve_project_quality refines <85% project to vN+1 Producción; list_project_checkpoints enriches summary & quality_scorecard."""
+    from agent_factory.adapters.sqlite_store import SqliteEventStore
+    from agent_factory.agents.quality_auditor import ParentAuditor
+    from agent_factory.domain.events import create_event
+
+    pid = "qa-on-demand"
+    chats_dir = tmp_path / "chats_ondemand"
+    store = SqliteEventStore(str(tmp_path / f"{pid}.db"))
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_ondemand")
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / "index.html").write_text("<!doctype html><html><body><h1>Inicial</h1></body></html>\n", encoding="utf-8")
+    (ws_dir / "tests").mkdir(exist_ok=True)
+    (ws_dir / "tests" / "test_app.py").write_text("def test_at_01(): assert True\n", encoding="utf-8")
+
+    now = datetime(2026, 5, 1, 10, 0, tzinfo=UTC)
+    llm = FakeLLM(
+        responses=[
+            # 1. evaluate_project_quality (read-only audit -> 72.0% Básico)
+            _build_full_audit_payload(
+                ux_ui=64.0,
+                functional_completeness=80.0,
+                robustness=72.0,
+                architecture_quality=72.0,
+                security_hygiene=72.0,
+                testing_runtime=72.0,
+                ux_findings=["Sin viewport móvil"],
+                ux_improvements=["Añadir viewport y contraste accesible"],
+            ),
+            # 2. improve_project_quality initial audit -> 72.0% Básico
+            _build_full_audit_payload(
+                ux_ui=64.0,
+                functional_completeness=80.0,
+                robustness=72.0,
+                architecture_quality=72.0,
+                security_hygiene=72.0,
+                testing_runtime=72.0,
+                ux_findings=["Sin viewport móvil"],
+                ux_improvements=["Añadir viewport y contraste accesible"],
+            ),
+            # 3. improve_project_quality post-refinement round 1 -> 89.0% Producción
+            _build_full_audit_payload(
+                ux_ui=90.0,
+                functional_completeness=90.0,
+                robustness=88.0,
+                architecture_quality=88.0,
+                security_hygiene=88.0,
+                testing_runtime=88.0,
+            ),
+            # 4. second improve_project_quality call -> already >=85% (93.0% Excelencia), no v3 created
+            _build_full_audit_payload(
+                ux_ui=93.0,
+                functional_completeness=93.0,
+                robustness=93.0,
+                architecture_quality=93.0,
+                security_hygiene=93.0,
+                testing_runtime=93.0,
+            ),
+        ]
+    )
+    orch = Orchestrator(store=store, llm=llm, workspace_manager=ws_mgr)
+    sha_v1 = "1111222233334444555566667777888899990000"
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "App Demo", "objective": "Tablero de notas diario", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(
+            pid,
+            EventType.PLAN_CREATED,
+            {
+                "plan_hash": "hash-v1",
+                "total_tests": 1,
+                "from": "MEDIATION",
+                "to": "WAITING_APPROVAL",
+            },
+            at=now,
+        ),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": "hash-v1", "decision": "approved", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+        create_event(
+            pid,
+            EventType.PROJECT_DELIVERED,
+            {"repo_url": "", "deploy_url": "", "commit_sha": sha_v1, "version_label": "v1"},
+            at=now,
+        ),
+    ):
+        store.append(ev)
+
+    try:
+        # Before evaluating, v1 has enriched objective summary and quality_scorecard=None
+        cps_before = orch.list_project_checkpoints(pid, chats_dir=chats_dir)
+        assert len(cps_before) == 1
+        assert cps_before[0]["version_label"] == "v1"
+        assert "Tablero de notas diario" in cps_before[0]["summary"]
+        assert cps_before[0]["quality_scorecard"] is None
+
+        # Read-only quality evaluation must NOT alter workspace files and updates checkpoint + chat history
+        before_html = (ws_dir / "index.html").read_text(encoding="utf-8")
+        eval_res = orch.evaluate_project_quality(pid, chats_dir=chats_dir)
+        assert (ws_dir / "index.html").read_text(encoding="utf-8") == before_html
+        assert eval_res["version_label"] == "v1"
+        assert eval_res["scorecard"]["tier_id"] == "basic"
+        assert eval_res["scorecard"]["tier_label"] == "🥉 Básico"
+
+        cps_after_eval = orch.list_project_checkpoints(pid, chats_dir=chats_dir)
+        assert cps_after_eval[0]["quality_scorecard"] is not None
+        assert cps_after_eval[0]["quality_scorecard"]["tier_id"] == "basic"
+        chat_hist = orch.get_project_chat_history(pid, chats_dir=chats_dir)
+        assert any(m.get("mode") == "audit" and m.get("version_label") == "v1" for m in chat_hist)
+
+        # Improve quality via BuildWorker (bounded max 2 rounds -> reaches Producción 89% -> v2)
+        worker = BuildWorker(
+            orchestrator=orch,
+            workspace_manager=ws_mgr,
+            code_agent=FakeCodeAgent(
+                impl_steps=[
+                    {
+                        "index.html": '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"></head><body><h1>Mejorado</h1></body></html>\n',
+                    }
+                ]
+            ),
+            runner=FakeRunner(
+                results=[CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True})]
+            ),
+            vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
+            quality_auditor=ParentAuditor(llm=llm),
+            chats_dir=chats_dir,
+        )
+        imp_res = worker.improve_project_quality(pid)
+        assert imp_res["improved"] is True
+        assert imp_res["already_passed"] is False
+        assert imp_res["version_label"] == "v2"
+        assert imp_res["scorecard"]["passed"] is True
+        assert imp_res["scorecard"]["tier_id"] == "production"
+        assert imp_res["scorecard"]["tier_label"] == "🥇 Producción"
+        assert "Mejorado" in (ws_dir / "index.html").read_text(encoding="utf-8")
+        assert orch.get_status(pid).state == ProjectState.DELIVERED
+
+        cps_v2 = orch.list_project_checkpoints(pid, chats_dir=chats_dir)
+        assert len(cps_v2) == 2
+        assert cps_v2[0]["version_label"] == "v2"
+        assert cps_v2[0]["is_current"] is True
+        assert cps_v2[0]["quality_scorecard"]["tier_id"] == "production"
+        assert cps_v2[0]["summary"]
+        assert cps_v2[1]["version_label"] == "v1"
+        assert cps_v2[1]["quality_scorecard"]["tier_id"] == "basic"
+
+        # Calling improve_project_quality when already >=85% avoids creating extra version
+        noop_res = worker.improve_project_quality(pid)
+        assert noop_res["already_passed"] is True
+        assert noop_res["improved"] is False
+        assert len(orch.list_project_checkpoints(pid, chats_dir=chats_dir)) == 2
+
+        # Verify CHANGE_REQUEST & rollback_from enrichment in list_project_checkpoints summary
+        for ev in (
+            create_event(
+                pid,
+                EventType.STATE_TRANSITIONED,
+                {"from": "DELIVERED", "to": "CHANGE_REQUEST", "reason": "Agregar exportación CSV"},
+                at=now,
+            ),
+            create_event(pid, EventType.STATE_TRANSITIONED, {"from": "CHANGE_REQUEST", "to": "INTERVIEW"}, at=now),
+            create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+            create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+            create_event(pid, EventType.STATE_TRANSITIONED, {"from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+            create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": "hash-v1", "decision": "approved", "to": "BUILDING"}, at=now),
+            create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+            create_event(
+                pid,
+                EventType.PROJECT_DELIVERED,
+                {"repo_url": "", "deploy_url": "", "commit_sha": "aaaabbbbccccddddeeeeffff0000111122223333", "version_label": "v3"},
+                at=now,
+            ),
+            create_event(
+                pid,
+                EventType.STATE_TRANSITIONED,
+                {"from": "DELIVERED", "to": "CHANGE_REQUEST", "reason": "Rollback"},
+                at=now,
+            ),
+            create_event(pid, EventType.STATE_TRANSITIONED, {"from": "CHANGE_REQUEST", "to": "INTERVIEW"}, at=now),
+            create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+            create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+            create_event(pid, EventType.STATE_TRANSITIONED, {"from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+            create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": "hash-v1", "decision": "approved", "to": "BUILDING"}, at=now),
+            create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+            create_event(
+                pid,
+                EventType.PROJECT_DELIVERED,
+                {"repo_url": "", "deploy_url": "", "commit_sha": sha_v1, "rollback_from": sha_v1, "version_label": "v4"},
+                at=now,
+            ),
+        ):
+            store.append(ev)
+        cps_enriched = orch.list_project_checkpoints(pid, chats_dir=chats_dir)
+        by_lbl = {cp["version_label"]: cp for cp in cps_enriched}
+        assert "Agregar exportación CSV" in by_lbl["v3"]["summary"]
+        assert by_lbl["v3"]["quality_scorecard"] is None
+        assert "Restaurado desde 1111222" in by_lbl["v4"]["summary"]
+        assert by_lbl["v4"]["rollback_from"] == sha_v1
+    finally:
+        store.close()
+

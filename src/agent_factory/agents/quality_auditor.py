@@ -203,6 +203,77 @@ class SubAuditResult(BaseModel):
     improvements: list[str] = Field(default_factory=list)
 
 
+def classify_quality_tier(
+    global_score: float,
+    failed_dimensions: Sequence[str] = (),
+    dimensions: Mapping[str, Any] | None = None,
+    *,
+    min_area_score: float = 70.0,
+) -> tuple[str, str]:
+    """Classify global_score and active area scores into (tier_id, tier_label)."""
+    score = round(float(global_score), 2)
+    has_failed_area = bool(failed_dimensions)
+    if not has_failed_area and isinstance(dimensions, Mapping):
+        for item in dimensions.values():
+            if isinstance(item, SubAuditResult):
+                active = item.active
+                area_score = item.score
+            elif isinstance(item, Mapping):
+                active = item.get("active", True) is not False
+                area_score = _clamp_score(item.get("score"), default=0.0)
+            else:
+                continue
+            if active and area_score < min_area_score:
+                has_failed_area = True
+                break
+    if score < 75.0:
+        return "basic", "🥉 Básico"
+    if score < 85.0:
+        return "standard", "🥈 Estándar"
+    if has_failed_area:
+        return "standard", "🥈 Estándar (área pendiente)"
+    if score < 93.0:
+        return "production", "🥇 Producción"
+    return "excellence", "💎 Excelencia"
+
+
+def ensure_scorecard_tier(scorecard: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a shallow copy of scorecard guaranteed to include tier_id and tier_label."""
+    copy = dict(scorecard)
+    raw_tier_id = str(copy.get("tier_id") or "").strip()
+    raw_tier_lbl = str(copy.get("tier_label") or "").strip()
+    if raw_tier_id and raw_tier_lbl:
+        return copy
+    min_area = _clamp_score(copy.get("min_area_score"), default=70.0)
+    global_score = _clamp_score(copy.get("global_score"), default=0.0)
+    failed_dims = list(copy.get("failed_dimensions") or [])
+    dims_map: dict[str, Mapping[str, Any]] = {}
+    raw_areas = copy.get("areas")
+    if isinstance(raw_areas, Sequence) and not isinstance(raw_areas, (str, bytes)):
+        for idx, area in enumerate(raw_areas):
+            if isinstance(area, Mapping):
+                dim_key = str(area.get("dimension") or f"area_{idx}")
+                dims_map[dim_key] = area
+                if (
+                    area.get("active", True) is not False
+                    and (
+                        area.get("passed") is False
+                        or _clamp_score(area.get("score"), default=0.0) < min_area
+                    )
+                    and dim_key not in failed_dims
+                ):
+                    failed_dims.append(dim_key)
+    tier_id, tier_label = classify_quality_tier(
+        global_score,
+        failed_dimensions=failed_dims,
+        dimensions=dims_map or None,
+        min_area_score=min_area,
+    )
+    copy["tier_id"] = raw_tier_id or tier_id
+    copy["tier_label"] = raw_tier_lbl or tier_label
+    return copy
+
+
 class QualityAuditReport(BaseModel):
     """Aggregated quality evaluation report produced by ParentAuditor."""
 
@@ -212,6 +283,8 @@ class QualityAuditReport(BaseModel):
     min_global_score: float = 85.0
     min_area_score: float = 70.0
     round_number: int = 1
+    tier_id: str = ""
+    tier_label: str = ""
     dimensions: dict[str, SubAuditResult]
     failed_dimensions: list[str] = Field(default_factory=list)
     summary: str = ""
@@ -219,6 +292,19 @@ class QualityAuditReport(BaseModel):
     improvements: list[str] = Field(default_factory=list)
     markdown_report: str = ""
     source: str = "llm"
+
+    @model_validator(mode="after")
+    def _ensure_tier(self) -> QualityAuditReport:
+        if not self.tier_id or not self.tier_label:
+            tier_id, tier_label = classify_quality_tier(
+                self.global_score,
+                failed_dimensions=self.failed_dimensions,
+                dimensions=self.dimensions,
+                min_area_score=self.min_area_score,
+            )
+            self.tier_id = self.tier_id or tier_id
+            self.tier_label = self.tier_label or tier_label
+        return self
 
     def to_scorecard_dict(self, *, extra_secrets: Sequence[str] = ()) -> dict[str, Any]:
         """Serialize compact, secret-redacted scorecard for PROJECT_DELIVERED and Dashboard."""
@@ -247,6 +333,8 @@ class QualityAuditReport(BaseModel):
         return {
             "global_score": round(self.global_score, 2),
             "passed": self.passed,
+            "tier_id": self.tier_id,
+            "tier_label": self.tier_label,
             "has_ui": self.has_ui,
             "round_number": self.round_number,
             "min_global_score": self.min_global_score,
@@ -599,6 +687,7 @@ def build_quality_markdown_report(
         f"# Auditoría Integral de Calidad — {redact_secrets(project_name, extra_secrets=extra_secrets)}{ver_suffix}",
         "",
         f"- **Calificación Global:** `{report.global_score:.1f}%` ({verdict})",
+        f"- **Categoría de Calidad:** {report.tier_label}",
         f"- **Umbrales:** Global `>= {report.min_global_score:.0f}%` · Área activa `>= {report.min_area_score:.0f}%`",
         f"- **Perfil detectado:** {ui_label}",
         f"- **Ronda de evaluación:** {report.round_number}",
@@ -943,11 +1032,17 @@ class ParentAuditor:
             dim for dim in active_dims if dimensions[dim].score < self.min_area_score
         ]
         passed = (global_score >= self.min_global_score) and (len(failed_dims) == 0)
+        tier_id, tier_label = classify_quality_tier(
+            global_score,
+            failed_dimensions=failed_dims,
+            dimensions=dimensions,
+            min_area_score=self.min_area_score,
+        )
 
         if not summary:
             summary = (
                 f"Auditoría {'aprobada' if passed else 'con observaciones'} "
-                f"({global_score:.1f}% global)."
+                f"({tier_label} · {global_score:.1f}%)."
             )
 
         report = QualityAuditReport(
@@ -957,6 +1052,8 @@ class ParentAuditor:
             min_global_score=self.min_global_score,
             min_area_score=self.min_area_score,
             round_number=round_number,
+            tier_id=tier_id,
+            tier_label=tier_label,
             dimensions=dimensions,
             failed_dimensions=failed_dims,
             summary=summary,

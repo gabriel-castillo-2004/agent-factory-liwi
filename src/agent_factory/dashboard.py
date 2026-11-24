@@ -846,10 +846,11 @@ class DashboardController:
         return events
 
     def get_project_checkpoints(self, project_id: str) -> dict[str, Any]:
-        """Return delivered version checkpoints (newest first) for Rollback panel."""
+        """Return delivered version checkpoints (newest first) for Rollback and Historial panels."""
         self._require_project_events(project_id)
         checkpoints = self.orchestrator.list_project_checkpoints(
             project_id,
+            chats_dir=self.chats_dir,
             extra_secrets=self.secrets_to_redact,
         )
         return {
@@ -923,13 +924,185 @@ class DashboardController:
             has_plan=(self.orchestrator.get_plan(project_id) is not None),
         )
         checkpoints = self.orchestrator.list_project_checkpoints(
-            project_id, extra_secrets=self.secrets_to_redact
+            project_id, chats_dir=self.chats_dir, extra_secrets=self.secrets_to_redact
         )
         return {
             "ok": True,
             "project_id": project_id,
             "checkpoint": cp_info,
             "checkpoints": checkpoints,
+            "status": summary,
+        }
+
+    def evaluate_project_quality(self, project_id: str) -> dict[str, Any]:
+        """Run read-only ParentAuditor evaluation, update current version scorecard, and persist report."""
+        self._require_project_events(project_id)
+        with self._lock:
+            if project_id in self._active_projects:
+                raise ProjectConflictError(
+                    f"Project '{project_id}' already has an active background operation"
+                )
+            self._active_projects.add(project_id)
+            ws_mgr = self._sync_external_workspace(project_id)
+            auditor = getattr(self.build_worker, "quality_auditor", None)
+        try:
+            try:
+                res = self.orchestrator.evaluate_project_quality(
+                    project_id,
+                    auditor=auditor,
+                    workspace_manager=ws_mgr,
+                    chats_dir=self.chats_dir,
+                    extra_secrets=self.secrets_to_redact,
+                )
+            except IllegalTransition as exc:
+                clean_msg = redact_secrets(str(exc), extra_secrets=self.secrets_to_redact)
+                raise ProjectConflictError(clean_msg) from exc
+        finally:
+            with self._lock:
+                self._active_projects.discard(project_id)
+
+        report_obj = res.get("report")
+        report_payload = (
+            report_obj.model_dump(mode="json")
+            if hasattr(report_obj, "model_dump")
+            else (report_obj if isinstance(report_obj, dict) else {})
+        )
+        updated = self.orchestrator.get_status(project_id)
+        summary = self._serialize_summary(
+            project_id,
+            updated,
+            self.orchestrator.store.get_events(project_id),
+            has_plan=(self.orchestrator.get_plan(project_id) is not None),
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "version_label": res.get("version_label", ""),
+            "commit_sha": res.get("commit_sha", ""),
+            "scorecard": _scrub_value(res.get("scorecard") or {}, self.secrets_to_redact),
+            "quality_scorecard": _scrub_value(
+                res.get("quality_scorecard") or res.get("scorecard") or {},
+                self.secrets_to_redact,
+            ),
+            "report": _scrub_value(report_payload, self.secrets_to_redact),
+            "chat_entry": _scrub_value(res.get("chat_entry") or {}, self.secrets_to_redact),
+            "checkpoints": _scrub_value(res.get("checkpoints") or [], self.secrets_to_redact),
+            "status": summary,
+        }
+
+    def improve_project_quality(self, project_id: str) -> dict[str, Any]:
+        """Launch bounded quality refinement (max 2 rounds) until reaching Producción (>=85%)."""
+        self._require_project_events(project_id)
+        with self._lock:
+            if project_id in self._active_projects:
+                raise ProjectConflictError(
+                    f"Project '{project_id}' already has an active background operation"
+                )
+            current_status = self.orchestrator.get_status(project_id)
+            if current_status.state != ProjectState.DELIVERED:
+                raise ProjectConflictError(
+                    str(IllegalTransition(current_status.state, ProjectState.CHANGE_REQUEST))
+                )
+            ws_mgr = self._sync_external_workspace(project_id, current_status)
+            ws_dir = self.orchestrator._resolve_project_workspace_dir(
+                project_id, status=current_status, workspace_manager=ws_mgr
+            )
+            if ws_dir is None or not ws_dir.is_dir():
+                raise ValueError(f"El workspace del proyecto '{project_id}' no existe.")
+            eff_worker = (
+                self.build_worker
+                if self.build_worker is not None
+                else getattr(self.orchestrator, "build_worker", None)
+            )
+            if eff_worker is None:
+                eval_res = self.orchestrator.evaluate_project_quality(
+                    project_id,
+                    workspace_manager=ws_mgr,
+                    chats_dir=self.chats_dir,
+                    extra_secrets=self.secrets_to_redact,
+                )
+                sc = eval_res.get("scorecard") or {}
+                if sc.get("passed"):
+                    updated = self.orchestrator.get_status(project_id)
+                    return {
+                        "ok": True,
+                        "project_id": project_id,
+                        "already_passed": True,
+                        "improved": False,
+                        "background_started": False,
+                        "scorecard": _scrub_value(sc, self.secrets_to_redact),
+                        "checkpoints": _scrub_value(
+                            eval_res.get("checkpoints") or [], self.secrets_to_redact
+                        ),
+                        "status": self._serialize_summary(
+                            project_id,
+                            updated,
+                            self.orchestrator.store.get_events(project_id),
+                            has_plan=(self.orchestrator.get_plan(project_id) is not None),
+                        ),
+                    }
+                raise ProjectConflictError(
+                    "No hay un BuildWorker configurado para refinar automáticamente el proyecto."
+                )
+
+            self.local_runner.stop(project_id)
+
+            def _run_improve() -> None:
+                try:
+                    res = self.orchestrator.improve_project_quality(
+                        project_id,
+                        build_worker=eff_worker,
+                        chats_dir=self.chats_dir,
+                        extra_secrets=self.secrets_to_redact,
+                    )
+                    sc = res.get("scorecard") or {}
+                    tier_lbl = sc.get("tier_label") or "🥇 Producción"
+                    pct = sc.get("global_score")
+                    ver_lbl = res.get("version_label") or ""
+                    self._notify_chat_best_effort(
+                        project_id,
+                        f"Calidad evaluada/refinada para {project_id} ({ver_lbl}): {tier_lbl} ({pct}%).",
+                    )
+                except (
+                    SandboxViolationError,
+                    IllegalTransition,
+                    CodeAgentError,
+                    CommandTimeoutError,
+                    ApprovalError,
+                    ValueError,
+                    TypeError,
+                    LookupError,
+                    TimeoutError,
+                    OSError,
+                    RuntimeError,
+                ) as exc:
+                    cur = self.orchestrator.get_status(project_id).state
+                    if cur not in (ProjectState.FAILED, ProjectState.DELIVERED):
+                        self.orchestrator.record_phase_failure(
+                            project_id,
+                            failed_state=cur,
+                            error=exc,
+                            agent="dashboard_quality_improve",
+                            extra_secrets=self.secrets_to_redact,
+                        )
+                    self._notify_chat_best_effort(
+                        project_id,
+                        f"Error mejorando calidad de {project_id}: "
+                        f"{redact_secrets(str(exc), extra_secrets=self.secrets_to_redact)}",
+                    )
+
+            background_started = self._start_background(project_id, _run_improve)
+
+        summary = self._serialize_summary(
+            project_id,
+            self.orchestrator.get_status(project_id),
+            self.orchestrator.store.get_events(project_id),
+            has_plan=(self.orchestrator.get_plan(project_id) is not None),
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "background_started": background_started,
             "status": summary,
         }
 
@@ -3551,6 +3724,73 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       flex-wrap: wrap;
       gap: 6px;
     }
+    .badge-muted {
+      background: var(--surface-alt);
+      color: var(--muted);
+      border-color: var(--border);
+    }
+    .badge-excellence {
+      background: var(--info-bg);
+      color: var(--accent);
+      border-color: var(--accent);
+    }
+    .history-versions-section {
+      border: 1px solid var(--border);
+      background: var(--surface);
+      border-radius: 12px;
+      padding: 14px 16px;
+      margin-bottom: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .history-versions-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .history-versions-header h4 {
+      margin: 0;
+      font-size: var(--fs-md);
+      font-weight: 700;
+      color: var(--text);
+    }
+    .history-versions-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding-left: 14px;
+      border-left: 2px solid var(--border);
+    }
+    .version-card.current-version {
+      border-color: var(--ok);
+      box-shadow: 0 0 0 1px var(--ok-bg);
+    }
+    .version-quality-row {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .version-quality-bars {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 6px 12px;
+      padding: 6px 0 2px;
+    }
+    @media (max-width: 720px) {
+      .version-quality-bars {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+    .version-sha-wrap {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
   </style>
 </head>
 <body>
@@ -6001,160 +6241,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           '</div>';
       }
 
-      // Events tab ("Historial" grouped into 5 clear lifecycle phases)
       const isDelivered = st.state === 'DELIVERED' || st.state === 'COMPLETED';
-      const isFailed = st.state === 'FAILED' || st.state === 'ERROR';
-      const eventsSig = JSON.stringify([
-        st.project_id,
-        st.state,
-        isRunning,
-        activeModel,
-        events.length,
-        st.last_event_at,
-        st.last_error,
-        info.stage,
-      ]);
-      if (state.lastEventsSignature !== eventsSig) {
-        state.lastEventsSignature = eventsSig;
-        const LIFECYCLE_PHASES = [
-          { num: 1, id: 'idea', title: '1. Idea y requisitos' },
-          { num: 2, id: 'design', title: '2. Diseño de la solución' },
-          { num: 3, id: 'approval', title: '3. Aprobación del plan' },
-          { num: 4, id: 'build', title: '4. Construcción y pruebas' },
-          { num: 5, id: 'delivery', title: '5. Entrega final' },
-        ];
-
-        const splitRes = splitProjectAttempts(events);
-        const activeEnriched = splitRes.activeEvents.map((ev) => ({
-          ev,
-          phaseNum: phaseNumForEvent(ev),
-        }));
-
-        const activePhaseNum = isDelivered ? 6 : info.stage;
-
-        const phasesHtml = '<div class="phase-list">' + LIFECYCLE_PHASES.map((ph) => {
-          const phaseItems = activeEnriched.filter((it) => it.phaseNum === ph.num);
-          let phaseStatus = 'pending';
-          if (isDelivered) {
-            phaseStatus = 'completed';
-          } else if (isFailed) {
-            if (ph.num < activePhaseNum) phaseStatus = 'completed';
-            else if (ph.num === activePhaseNum) phaseStatus = 'error';
-            else phaseStatus = 'pending';
-          } else {
-            if (ph.num < activePhaseNum) phaseStatus = 'completed';
-            else if (ph.num === activePhaseNum) phaseStatus = 'active';
-            else phaseStatus = 'pending';
-          }
-
-          if (phaseStatus === 'pending') {
-            return '<div class="phase-card phase-pending">' +
-              '<div class="phase-summary">' +
-                '<span class="phase-summary-left">' +
-                  '<span class="phase-circle">' + ph.num + '</span>' +
-                  '<span class="phase-title">' + escapeHtml(ph.title) + '</span>' +
-                '</span>' +
-                '<span class="phase-meta-badge">Pendiente</span>' +
-              '</div>' +
-            '</div>';
-          }
-
-          let badgeLabel = 'En curso';
-          let circleHtml = String(ph.num);
-          if (phaseStatus === 'completed') {
-            const durStr = computePhaseDuration(ph.num, phaseItems, activeEnriched);
-            badgeLabel = durStr ? ('Completado en ' + durStr) : 'Completado';
-            circleHtml = '✓';
-          } else if (phaseStatus === 'error') {
-            badgeLabel = 'Requiere atención';
-            circleHtml = '!';
-          }
-
-          const stateKey = st.project_id + ':' + ph.id;
-          const defaultOpen = (phaseStatus === 'active' || phaseStatus === 'error');
-          const isOpen = (stateKey in state.phaseOpen) ? state.phaseOpen[stateKey] : defaultOpen;
-          const openAttr = isOpen ? ' open' : '';
-
-          const phaseRawEvents = phaseItems.map((it) => it.ev);
-          const grouped = pairAndGroupPhaseEvents(phaseRawEvents);
-          const hasVisible = grouped.some((g) => g.kind !== 'tech_only');
-          const emptyFallback = !hasVisible
-            ? '<div class="muted" style="font-size:0.86rem;">' + (phaseStatus === 'completed' ? 'Etapa completada.' : 'En progreso en esta fase...') + '</div>'
-            : '';
-          const stepsHtml = grouped.length
-            ? (emptyFallback + '<div class="timeline">' + grouped.map(renderTimelineEntry).join('') + '</div>')
-            : '<div class="muted" style="font-size:0.86rem;">En progreso en esta fase...</div>';
-
-          return '<details class="phase-card phase-' + phaseStatus + '" data-phase-key="' + escapeHtml(stateKey) + '"' + openAttr + '>' +
-            '<summary class="phase-summary">' +
-              '<span class="phase-summary-left">' +
-                '<span class="phase-circle">' + circleHtml + '</span>' +
-                '<span class="phase-title">' + escapeHtml(ph.title) + '</span>' +
-              '</span>' +
-              '<span class="phase-meta-badge">' + escapeHtml(badgeLabel) + '</span>' +
-            '</summary>' +
-            '<div class="phase-steps">' + stepsHtml + '</div>' +
-          '</details>';
-        }).join('') + '</div>';
-
-        let priorHtml = '';
-        if (splitRes.priorGroups.length) {
-          const priorKey = st.project_id + ':prior';
-          const priorOpenAttr = state.priorOpen[priorKey] ? ' open' : '';
-          const attemptsMarkup = splitRes.priorGroups.map((grp, idx) => {
-            const grpGrouped = pairAndGroupPhaseEvents(grp);
-            const lbl = splitRes.priorGroups.length > 1 ? ('Intento ' + (idx + 1)) : 'Intento anterior';
-            return '<div style="margin-top:10px;">' +
-              '<div class="muted" style="font-size:0.8rem; font-weight:600; margin-bottom:6px;">' + escapeHtml(lbl) + '</div>' +
-              '<div class="timeline">' + grpGrouped.map(renderTimelineEntry).join('') + '</div>' +
-            '</div>';
-          }).join('');
-          priorHtml = '<details class="prior-attempts-box" data-prior-key="' + escapeHtml(priorKey) + '"' + priorOpenAttr + '>' +
-            '<summary>Ver intentos anteriores (' + splitRes.priorGroups.length + ')</summary>' +
-            attemptsMarkup +
-          '</details>';
-        }
-
-        const toolbarHtml = '<div class="history-toolbar">' +
-          '<span class="muted tech-only">ID: <code>' + escapeHtml(st.project_id) + '</code></span>' +
-          '<button id="copy-diag-btn" class="btn btn-sm tech-only" type="button">Copiar diagnóstico</button>' +
-        '</div>';
-
-        const eventsEl = document.getElementById('tab-events');
-        eventsEl.innerHTML = toolbarHtml + phasesHtml + priorHtml;
-
-        eventsEl.querySelectorAll('details.phase-card[data-phase-key]').forEach((det) => {
-          det.addEventListener('toggle', () => {
-            state.phaseOpen[det.getAttribute('data-phase-key')] = det.open;
-          });
-        });
-        eventsEl.querySelectorAll('details.prior-attempts-box[data-prior-key]').forEach((det) => {
-          det.addEventListener('toggle', () => {
-            state.priorOpen[det.getAttribute('data-prior-key')] = det.open;
-          });
-        });
-
-        const copyDiagBtn = document.getElementById('copy-diag-btn');
-        if (copyDiagBtn) {
-          copyDiagBtn.addEventListener('click', () => {
-            const diagPayload = JSON.stringify({
-              project_id: st.project_id,
-              state: st.state,
-              is_running: isRunning,
-              active_model: activeModel,
-              tests: st.tests || null,
-              last_error: st.last_error || null,
-              events_count: events.length,
-              events: events,
-            }, null, 2);
-            copyToClipboard(diagPayload, '✓ Diagnóstico copiado al portapapeles.');
-          });
-        }
-      }
-
       const wasDeliveredBefore = isDelivered || events.some((ev) =>
         ev && (ev.type === 'PROJECT_DELIVERED' || ev.type === 'PROJECT_COMPLETED' || ev.type === 'COMPLETED')
       );
+      renderEventsTab(st, events, info, isRunning, activeModel, wasDeliveredBefore);
+
       const readOnlyAuditModifying = wasDeliveredBefore && !isDelivered;
       const auditTabBtn = document.getElementById('tab-audit-btn');
       const modifyTabBtn = document.getElementById('tab-modify-btn');
@@ -6187,6 +6279,261 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       renderTabs();
       renderLiveActivityBanner();
+    }
+
+    function buildHistoryVersionsSectionHtml(st, cps, wasDeliveredBefore, isRunning) {
+      if (!wasDeliveredBefore && (!Array.isArray(cps) || !cps.length)) {
+        return '';
+      }
+      const isReadOnly = Boolean(
+        isRunning || (st && st.state !== 'DELIVERED' && st.state !== 'COMPLETED')
+      );
+      const busyAttr = isReadOnly ? ' disabled title="Disponible al finalizar la operación en curso"' : '';
+      let bodyHtml = '';
+      if (!Array.isArray(cps) || !cps.length) {
+        bodyHtml = '<div class="muted" style="font-size:var(--fs-xs);">Cargando historial de versiones…</div>';
+      } else {
+        bodyHtml = '<div class="history-versions-list">' + cps.map((c) => {
+          const sc = (c && c.quality_scorecard && typeof c.quality_scorecard === 'object')
+            ? c.quality_scorecard
+            : null;
+          const tier = classifyScorecardTier(sc);
+          const tierText = sc ? (tier.label + ' · ' + tier.pct + '%') : tier.label;
+          const shaShort = c.short_sha || (c.commit_sha ? String(c.commit_sha).slice(0, 7) : '');
+          const timeLbl = formatFriendlyTime(c.delivered_at);
+          const curBadge = c.is_current ? '<span class="badge badge-ok">Actual</span>' : '';
+          const rbTag = c.rollback_from
+            ? '<span class="model-pill">Restaurado desde ' + escapeHtml(String(c.rollback_from).slice(0, 7)) + '</span>'
+            : '';
+          const barsHtml = (sc && Array.isArray(sc.areas) && sc.areas.length)
+            ? '<div class="version-quality-bars">' + buildQualityAreaBarsHtml(sc) + '</div>'
+            : '<div class="muted" style="font-size:var(--fs-xs);">Sin evaluación detallada por áreas en esta versión.</div>';
+          const shaHtml = shaShort
+            ? '<span class="version-sha-wrap tech-only">' +
+                '<code class="file-chip">' + escapeHtml(shaShort) + '</code>' +
+                '<button class="btn btn-sm" type="button" data-copy-version-sha="' + escapeHtml(shaShort) + '">Copiar hash</button>' +
+              '</span>'
+            : '';
+          const actionBtnsHtml = c.is_current
+            ? '<button id="evaluate-quality-btn" class="btn btn-sm" type="button" data-quality-action="evaluate"' + busyAttr + '>🛡️ Re-evaluar calidad</button>' +
+              '<button id="improve-quality-btn" class="btn btn-primary btn-sm" type="button" data-quality-action="improve"' + busyAttr + '>✨ Mejorar hasta cumplir estándar</button>'
+            : (c.commit_sha
+                ? '<button class="btn btn-sm btn-warn" type="button" data-history-rollback-sha="' + escapeHtml(c.commit_sha) + '"' + busyAttr + '>↩︎ Volver a esta versión</button>'
+                : '');
+          return '<div class="version-node' + (c.is_current ? ' current' : '') + '">' +
+            '<div class="version-dot"></div>' +
+            '<div class="version-card' + (c.is_current ? ' current-version' : '') + '">' +
+              '<div class="version-head">' +
+                '<span class="version-quality-row">' +
+                  '<strong>' + escapeHtml(c.version_label || 'v1') + '</strong>' +
+                  curBadge +
+                  '<span class="badge ' + tier.cls + '">' + escapeHtml(tierText) + '</span>' +
+                  rbTag +
+                '</span>' +
+                '<span class="muted" style="font-size:var(--fs-xs);">' + escapeHtml(timeLbl) + '</span>' +
+              '</div>' +
+              (c.summary ? '<div class="muted" style="font-size:var(--fs-xs);">' + escapeHtml(c.summary) + '</div>' : '') +
+              barsHtml +
+              '<div class="version-actions">' +
+                actionBtnsHtml +
+                shaHtml +
+              '</div>' +
+            '</div>' +
+          '</div>';
+        }).join('') + '</div>';
+      }
+      return '<section id="history-versions-section" class="history-versions-section">' +
+        '<div class="history-versions-header">' +
+          '<h4>Historial de versiones</h4>' +
+          '<span id="history-quality-inline-status"></span>' +
+        '</div>' +
+        bodyHtml +
+      '</section>';
+    }
+
+    function renderEventsTab(st, events, info, isRunning, activeModel, wasDeliveredBefore) {
+      if (!st) return;
+      const isDelivered = st.state === 'DELIVERED' || st.state === 'COMPLETED';
+      const isFailed = st.state === 'FAILED' || st.state === 'ERROR';
+      const cps = (state.checkpointsByPid && state.checkpointsByPid[st.project_id]) || [];
+      const eventsSig = JSON.stringify([
+        st.project_id,
+        st.state,
+        isRunning,
+        activeModel,
+        events.length,
+        st.last_event_at,
+        st.last_error,
+        info.stage,
+        Boolean(wasDeliveredBefore),
+        cps.map((c) => [
+          c.version_label,
+          c.commit_sha,
+          c.is_current,
+          c.summary,
+          c.quality_scorecard && c.quality_scorecard.global_score,
+          c.quality_scorecard && c.quality_scorecard.tier_id,
+        ]),
+      ]);
+      if (state.lastEventsSignature === eventsSig) {
+        return;
+      }
+      state.lastEventsSignature = eventsSig;
+      const LIFECYCLE_PHASES = [
+        { num: 1, id: 'idea', title: '1. Idea y requisitos' },
+        { num: 2, id: 'design', title: '2. Diseño de la solución' },
+        { num: 3, id: 'approval', title: '3. Aprobación del plan' },
+        { num: 4, id: 'build', title: '4. Construcción y pruebas' },
+        { num: 5, id: 'delivery', title: '5. Entrega final' },
+      ];
+
+      const splitRes = splitProjectAttempts(events);
+      const activeEnriched = splitRes.activeEvents.map((ev) => ({
+        ev,
+        phaseNum: phaseNumForEvent(ev),
+      }));
+      const activePhaseNum = isDelivered ? 6 : info.stage;
+
+      const phasesHtml = '<div class="phase-list">' + LIFECYCLE_PHASES.map((ph) => {
+        const phaseItems = activeEnriched.filter((it) => it.phaseNum === ph.num);
+        let phaseStatus = 'pending';
+        if (isDelivered) {
+          phaseStatus = 'completed';
+        } else if (isFailed) {
+          if (ph.num < activePhaseNum) phaseStatus = 'completed';
+          else if (ph.num === activePhaseNum) phaseStatus = 'error';
+          else phaseStatus = 'pending';
+        } else {
+          if (ph.num < activePhaseNum) phaseStatus = 'completed';
+          else if (ph.num === activePhaseNum) phaseStatus = 'active';
+          else phaseStatus = 'pending';
+        }
+
+        if (phaseStatus === 'pending') {
+          return '<div class="phase-card phase-pending">' +
+            '<div class="phase-summary">' +
+              '<span class="phase-summary-left">' +
+                '<span class="phase-circle">' + ph.num + '</span>' +
+                '<span class="phase-title">' + escapeHtml(ph.title) + '</span>' +
+              '</span>' +
+              '<span class="phase-meta-badge">Pendiente</span>' +
+            '</div>' +
+          '</div>';
+        }
+
+        let badgeLabel = 'En curso';
+        let circleHtml = String(ph.num);
+        if (phaseStatus === 'completed') {
+          const durStr = computePhaseDuration(ph.num, phaseItems, activeEnriched);
+          badgeLabel = durStr ? ('Completado en ' + durStr) : 'Completado';
+          circleHtml = '✓';
+        } else if (phaseStatus === 'error') {
+          badgeLabel = 'Requiere atención';
+          circleHtml = '!';
+        }
+
+        const stateKey = st.project_id + ':' + ph.id;
+        const defaultOpen = (phaseStatus === 'active' || phaseStatus === 'error');
+        const isOpen = (stateKey in state.phaseOpen) ? state.phaseOpen[stateKey] : defaultOpen;
+        const openAttr = isOpen ? ' open' : '';
+
+        const phaseRawEvents = phaseItems.map((it) => it.ev);
+        const grouped = pairAndGroupPhaseEvents(phaseRawEvents);
+        const hasVisible = grouped.some((g) => g.kind !== 'tech_only');
+        const emptyFallback = !hasVisible
+          ? '<div class="muted" style="font-size:0.86rem;">' + (phaseStatus === 'completed' ? 'Etapa completada.' : 'En progreso en esta fase...') + '</div>'
+          : '';
+        const stepsHtml = grouped.length
+          ? (emptyFallback + '<div class="timeline">' + grouped.map(renderTimelineEntry).join('') + '</div>')
+          : '<div class="muted" style="font-size:0.86rem;">En progreso en esta fase...</div>';
+
+        return '<details class="phase-card phase-' + phaseStatus + '" data-phase-key="' + escapeHtml(stateKey) + '"' + openAttr + '>' +
+          '<summary class="phase-summary">' +
+            '<span class="phase-summary-left">' +
+              '<span class="phase-circle">' + circleHtml + '</span>' +
+              '<span class="phase-title">' + escapeHtml(ph.title) + '</span>' +
+            '</span>' +
+            '<span class="phase-meta-badge">' + escapeHtml(badgeLabel) + '</span>' +
+          '</summary>' +
+          '<div class="phase-steps">' + stepsHtml + '</div>' +
+        '</details>';
+      }).join('') + '</div>';
+
+      let priorHtml = '';
+      if (splitRes.priorGroups.length) {
+        const priorKey = st.project_id + ':prior';
+        const priorOpenAttr = state.priorOpen[priorKey] ? ' open' : '';
+        const attemptsMarkup = splitRes.priorGroups.map((grp, idx) => {
+          const grpGrouped = pairAndGroupPhaseEvents(grp);
+          const lbl = splitRes.priorGroups.length > 1 ? ('Intento ' + (idx + 1)) : 'Intento anterior';
+          return '<div style="margin-top:10px;">' +
+            '<div class="muted" style="font-size:0.8rem; font-weight:600; margin-bottom:6px;">' + escapeHtml(lbl) + '</div>' +
+            '<div class="timeline">' + grpGrouped.map(renderTimelineEntry).join('') + '</div>' +
+          '</div>';
+        }).join('');
+        priorHtml = '<details class="prior-attempts-box" data-prior-key="' + escapeHtml(priorKey) + '"' + priorOpenAttr + '>' +
+          '<summary>Ver intentos anteriores (' + splitRes.priorGroups.length + ')</summary>' +
+          attemptsMarkup +
+        '</details>';
+      }
+
+      const versionsSectionHtml = buildHistoryVersionsSectionHtml(st, cps, wasDeliveredBefore, isRunning);
+      const toolbarHtml = '<div class="history-toolbar">' +
+        '<span class="muted tech-only">ID: <code>' + escapeHtml(st.project_id) + '</code></span>' +
+        '<button id="copy-diag-btn" class="btn btn-sm tech-only" type="button">Copiar diagnóstico</button>' +
+      '</div>';
+
+      const eventsEl = document.getElementById('tab-events');
+      eventsEl.innerHTML = versionsSectionHtml + toolbarHtml + phasesHtml + priorHtml;
+
+      eventsEl.querySelectorAll('details.phase-card[data-phase-key]').forEach((det) => {
+        det.addEventListener('toggle', () => {
+          state.phaseOpen[det.getAttribute('data-phase-key')] = det.open;
+        });
+      });
+      eventsEl.querySelectorAll('details.prior-attempts-box[data-prior-key]').forEach((det) => {
+        det.addEventListener('toggle', () => {
+          state.priorOpen[det.getAttribute('data-prior-key')] = det.open;
+        });
+      });
+
+      const evalBtn = eventsEl.querySelector('button[data-quality-action="evaluate"]');
+      if (evalBtn) {
+        evalBtn.addEventListener('click', () => submitEvaluateQuality(st.project_id, evalBtn));
+      }
+      const improveBtn = eventsEl.querySelector('button[data-quality-action="improve"]');
+      if (improveBtn) {
+        improveBtn.addEventListener('click', () => submitImproveQuality(st.project_id, improveBtn));
+      }
+      eventsEl.querySelectorAll('button[data-history-rollback-sha]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const sha = btn.getAttribute('data-history-rollback-sha');
+          if (!sha) return;
+          submitRollbackProject(st.project_id, sha, btn, 'history-quality-inline-status');
+        });
+      });
+      eventsEl.querySelectorAll('button[data-copy-version-sha]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          copyToClipboard(btn.getAttribute('data-copy-version-sha'), '✓ Hash copiado al portapapeles.');
+        });
+      });
+
+      const copyDiagBtn = document.getElementById('copy-diag-btn');
+      if (copyDiagBtn) {
+        copyDiagBtn.addEventListener('click', () => {
+          const diagPayload = JSON.stringify({
+            project_id: st.project_id,
+            state: st.state,
+            is_running: isRunning,
+            active_model: activeModel,
+            tests: st.tests || null,
+            last_error: st.last_error || null,
+            events_count: events.length,
+            events: events,
+          }, null, 2);
+          copyToClipboard(diagPayload, '✓ Diagnóstico copiado al portapapeles.');
+        });
+      }
     }
 
     function unquoteGitDiffPath(raw) {
@@ -6833,23 +7180,56 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       return null;
     }
 
-    function renderQualityScorecardHtml(rep, cps) {
-      const sc = resolveAuditScorecard(rep, cps);
-      if (!sc) return '';
-      const pct = Math.round(Number(sc.global_score || 0));
-      const passed = Boolean(sc.passed);
-      const badgeCls = passed ? 'badge-ok' : 'badge-warn';
-      const verdictText = passed ? 'Aprobado' : 'Con observaciones';
-      const defaultLabels = {
-        ux_ui: 'UX/UI',
-        functional_completeness: 'Funcionalidad',
-        robustness: 'Robustez',
-        architecture_quality: 'Arquitectura',
-        security_hygiene: 'Seguridad',
-        testing_runtime: 'Pruebas',
-      };
-      const barsHtml = (sc.areas || []).map((area) => {
-        const label = area.label || defaultLabels[area.dimension] || area.dimension || '';
+    const QUALITY_DIMENSION_LABELS = {
+      ux_ui: 'UX/UI',
+      functional_completeness: 'Funcionalidad',
+      robustness: 'Robustez',
+      architecture_quality: 'Arquitectura',
+      security_hygiene: 'Seguridad',
+      testing_runtime: 'Pruebas',
+    };
+
+    function classifyScorecardTier(sc) {
+      if (!sc || typeof sc !== 'object') {
+        return { id: 'none', label: '⚪ Sin evaluar', cls: 'badge-muted', pct: null };
+      }
+      const rawScore = Number(sc.global_score || 0);
+      const pct = Math.round(rawScore);
+      let tierId = sc.tier_id ? String(sc.tier_id).trim() : '';
+      let tierLabel = sc.tier_label ? String(sc.tier_label).trim() : '';
+      if (!tierId || !tierLabel) {
+        const minArea = Number(sc.min_area_score || 70);
+        const areas = Array.isArray(sc.areas) ? sc.areas : [];
+        const hasPendingArea = (Array.isArray(sc.failed_dimensions) && sc.failed_dimensions.length > 0) ||
+          areas.some((a) => a && a.active !== false && (a.passed === false || Number(a.score || 0) < minArea));
+        if (rawScore < 75.0) {
+          tierId = 'basic';
+          tierLabel = '🥉 Básico';
+        } else if (rawScore < 85.0) {
+          tierId = 'standard';
+          tierLabel = '🥈 Estándar';
+        } else if (hasPendingArea) {
+          tierId = 'standard';
+          tierLabel = '🥈 Estándar (área pendiente)';
+        } else if (rawScore < 93.0) {
+          tierId = 'production';
+          tierLabel = '🥇 Producción';
+        } else {
+          tierId = 'excellence';
+          tierLabel = '💎 Excelencia';
+        }
+      }
+      let cls = 'badge-warn';
+      if (tierId === 'excellence') cls = 'badge-excellence';
+      else if (tierId === 'production') cls = 'badge-ok';
+      else if (tierId === 'basic') cls = 'badge-err';
+      return { id: tierId, label: tierLabel, cls, pct };
+    }
+
+    function buildQualityAreaBarsHtml(sc) {
+      if (!sc || !Array.isArray(sc.areas)) return '';
+      return sc.areas.map((area) => {
+        const label = area.label || QUALITY_DIMENSION_LABELS[area.dimension] || area.dimension || '';
         const isActive = area.active !== false;
         const scoreNum = isActive ? Math.max(0, Math.min(100, Math.round(Number(area.score || 0)))) : 0;
         const barCls = !isActive ? 'na' : (scoreNum >= 85 ? '' : (scoreNum >= 70 ? 'warn' : 'fail'));
@@ -6859,10 +7239,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           '<div class="quality-bar-track"><div class="quality-bar-fill ' + barCls + '" style="width:' + scoreNum + '%;"></div></div>' +
         '</div>';
       }).join('');
+    }
+
+    function renderQualityScorecardHtml(rep, cps) {
+      const sc = resolveAuditScorecard(rep, cps);
+      if (!sc) return '';
+      const pct = Math.round(Number(sc.global_score || 0));
+      const passed = Boolean(sc.passed);
+      const tier = classifyScorecardTier(sc);
+      const verdictText = passed ? 'Aprobado' : 'Con observaciones';
+      const barsHtml = buildQualityAreaBarsHtml(sc);
       return '<div class="quality-scorecard">' +
         '<div class="quality-scorecard-head">' +
           '<span>Global: ' + escapeHtml(String(pct)) + '% · ' + escapeHtml(verdictText) + '</span>' +
-          '<span class="badge ' + badgeCls + '">' + escapeHtml(verdictText) + '</span>' +
+          '<span style="display:inline-flex; gap:6px; flex-wrap:wrap;">' +
+            '<span class="badge ' + tier.cls + '">' + escapeHtml(tier.label) + '</span>' +
+            '<span class="badge ' + (passed ? 'badge-ok' : 'badge-warn') + '">' + escapeHtml(verdictText) + '</span>' +
+          '</span>' +
         '</div>' +
         '<div class="quality-bars-grid">' + barsHtml + '</div>' +
       '</div>';
@@ -6872,8 +7265,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const typeLabel = rep.mode === 'audit' ? '🔍 Auditoría' : '📄 Documento .md';
       const statusBadgeHtml = renderAuditStatusBadge(rep);
       const sc = resolveAuditScorecard(rep, cps);
+      const tier = sc ? classifyScorecardTier(sc) : null;
       const scBadgeHtml = sc
-        ? '<span class="badge ' + (sc.passed ? 'badge-ok' : 'badge-warn') + '">Global: ' +
+        ? '<span class="badge ' + tier.cls + '">' +
+            escapeHtml(tier.label) + ' · Global: ' +
             escapeHtml(String(Math.round(Number(sc.global_score || 0)))) + '% · ' +
             escapeHtml(sc.passed ? 'Aprobado' : 'Con observaciones') +
           '</span>'
@@ -7586,7 +7981,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
         if (state.detail && state.detail.project_id === pid) {
           state.lastModifySignature = null;
-          renderModifyTab(state.detail.status);
+          state.lastEventsSignature = null;
+          state.lastChatSig = null;
+          renderDetail();
         }
       } catch (_) {}
     }
@@ -7706,7 +8103,65 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       );
     }
 
-    async function submitRollbackProject(pid, commitSha, triggerBtn) {
+    async function submitQualityAction(pid, actionKind, triggerBtn) {
+      if (!pid) return;
+      const isImprove = actionKind === 'improve';
+      await runTrackedOperation(
+        {
+          pid,
+          label: isImprove
+            ? 'Mejorando proyecto hasta estándar Producción...'
+            : 'Evaluando calidad integral (6 áreas)...',
+          subtext: isImprove
+            ? 'Refinamiento acotado (máx. 2 rondas), pytest y smoke test.'
+            : 'Inspeccionando el código en modo solo lectura.',
+          buttonEl: triggerBtn || (isImprove ? 'improve-quality-btn' : 'evaluate-quality-btn'),
+          inlineTargetId: 'history-quality-inline-status',
+        },
+        async () => {
+          const endpoint = isImprove ? '/quality/improve' : '/quality/evaluate';
+          const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({}),
+          });
+          if (res && Array.isArray(res.checkpoints)) {
+            state.checkpointsByPid[pid] = res.checkpoints;
+          }
+          delete state.chatLoadedFor[pid];
+          delete state.devMetaLoadedSig[pid];
+          state.lastEventsSignature = null;
+          state.lastModifySignature = null;
+          state.lastBannerSignature = null;
+          state.lastChatSig = null;
+          if (isImprove) {
+            if (res && res.already_passed) {
+              const tier = classifyScorecardTier(res.scorecard || {});
+              setNote('✓ El proyecto ya cumple el estándar (' + tier.label + ').', 'ok');
+            } else {
+              setNote('✓ Ciclo de mejora de calidad iniciado para ' + pid + '.', 'ok');
+            }
+          } else {
+            const sc = (res && (res.scorecard || res.quality_scorecard)) || {};
+            const tier = classifyScorecardTier(sc);
+            const pctStr = tier.pct !== null ? (' · ' + tier.pct + '%') : '';
+            setNote('✓ Evaluación de calidad completada: ' + tier.label + pctStr + '.', 'ok');
+            await loadProjectChatHistory(pid);
+          }
+          await loadProjects();
+        }
+      );
+    }
+
+    function submitEvaluateQuality(pid, triggerBtn) {
+      return submitQualityAction(pid, 'evaluate', triggerBtn);
+    }
+
+    function submitImproveQuality(pid, triggerBtn) {
+      return submitQualityAction(pid, 'improve', triggerBtn);
+    }
+
+    async function submitRollbackProject(pid, commitSha, triggerBtn, inlineTargetId) {
       if (!commitSha) return;
       const confirmed = await askCustomConfirm({
         title: 'Restaurar versión estable',
@@ -7720,7 +8175,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           label: 'Restaurando versión estable y ejecutando pruebas...',
           subtext: 'Verificando que el proyecto pase pruebas tras el rollback.',
           buttonEl: triggerBtn || 'rollback-version-btn',
-          inlineTargetId: 'modify-inline-status',
+          inlineTargetId: inlineTargetId || 'modify-inline-status',
         },
         async () => {
           const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/rollback', {
@@ -7736,6 +8191,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           delete state.previewRenderedUrl[pid];
           state.lastBannerSignature = null;
           state.lastModifySignature = null;
+          state.lastEventsSignature = null;
           setNote('✓ Versión restaurada con éxito.', 'ok');
           await loadProjects();
         }
@@ -8432,6 +8888,18 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             )
         return None, None, None
 
+    def _parse_project_quality_route(self) -> tuple[str | None, str | None]:
+        """Parse /api/projects/<project_id>/quality/<evaluate|improve> safely (INV-22)."""
+        raw_path = urllib.parse.urlsplit(self.path).path
+        prefix = "/api/projects/"
+        if not raw_path.startswith(prefix):
+            return None, None
+        rest = raw_path[len(prefix) :]
+        parts = rest.split("/")
+        if len(parts) >= 3 and parts[-2] == "quality" and parts[-1] in {"evaluate", "improve"}:
+            return urllib.parse.unquote("/".join(parts[:-2])), parts[-1]
+        return None, None
+
     def do_GET(self) -> None:
         path = urllib.parse.urlsplit(self.path).path
         ctrl = self.server.controller
@@ -8538,6 +9006,15 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_controller_json(
                 lambda: ctrl.retry_project_chat_entry(chat_pid, chat_entry_id)
             )
+            return
+
+        q_pid, q_action = self._parse_project_quality_route()
+        if q_pid is not None and q_action is not None:
+            self._drain_body()
+            if q_action == "evaluate":
+                self._send_controller_json(lambda: ctrl.evaluate_project_quality(q_pid))
+            else:
+                self._send_controller_json(lambda: ctrl.improve_project_quality(q_pid))
             return
 
         pid, action = self._parse_project_route()

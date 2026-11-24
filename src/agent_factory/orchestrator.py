@@ -29,6 +29,7 @@ from agent_factory.agents.mediator import (
     run_debate_pipeline,
 )
 from agent_factory.agents.pragmatist import PragmatistProposal
+from agent_factory.agents.quality_auditor import ParentAuditor, ensure_scorecard_tier
 from agent_factory.agents.structuralist import StructuralistCritique
 from agent_factory.domain.events import Event, EventType, create_event
 from agent_factory.domain.models import (
@@ -868,6 +869,7 @@ class Orchestrator:
         self._project_locks: dict[str, threading.RLock] = {}
         self._specs: dict[str, Spec] = {}
         self._last_published_status: dict[str, tuple[object, ...]] = {}
+        self.build_worker: Any | None = None
 
     def _project_lock(self, project_id: str) -> threading.RLock:
         with self._lock:
@@ -1246,6 +1248,7 @@ class Orchestrator:
         version_label: str = "",
         duration_seconds: float | None = None,
         chats_dir: Path | None = None,
+        prompt_label: str | None = None,
         extra_secrets: Sequence[str] = (),
     ) -> dict[str, Any]:
         """Persist automatic ParentAuditor Markdown report and scorecard into project audit history."""
@@ -1269,6 +1272,8 @@ class Orchestrator:
                 else {}
             )
         )
+        if isinstance(scorecard, Mapping) and scorecard:
+            scorecard = ensure_scorecard_tier(scorecard)
         raw_markdown = (
             str(getattr(report, "markdown_report", "") or "")
             if not isinstance(report, Mapping)
@@ -1289,11 +1294,16 @@ class Orchestrator:
         doc_title = f"{project_id}-auditoria{ver_suffix}.md"
         now_iso = self._now().isoformat()
         entry_id = f"qa-{uuid.uuid4().hex[:10]}"
+        eff_prompt = (
+            redact_secrets(prompt_label.strip(), extra_secrets=extra_secrets)
+            if isinstance(prompt_label, str) and prompt_label.strip()
+            else f"Auditoría integral automática ({clean_ver or 'entrega'})"
+        )
         entry: dict[str, Any] = {
             "id": entry_id,
             "role": "assistant",
             "mode": "audit",
-            "prompt": f"Auditoría integral automática ({clean_ver or 'entrega'})",
+            "prompt": eff_prompt,
             "content": clean_markdown,
             "suggested_changes": suggested,
             "document_title": doc_title,
@@ -1470,7 +1480,9 @@ class Orchestrator:
         spec = self._get_spec(project_id)
         eff_chats_dir = self._resolve_chats_dir(chats_dir)
 
-        checkpoints = self.list_project_checkpoints(project_id, extra_secrets=extra_secrets)
+        checkpoints = self.list_project_checkpoints(
+            project_id, chats_dir=eff_chats_dir, extra_secrets=extra_secrets
+        )
         current_sha = str(checkpoints[0].get("commit_sha") or "") if checkpoints else ""
         current_version = str(checkpoints[0].get("version_label") or "") if checkpoints else ""
 
@@ -2076,25 +2088,93 @@ class Orchestrator:
             "diff": diff_text,
         }
 
+    def _load_audit_scorecards_index(
+        self,
+        project_id: str,
+        *,
+        chats_dir: Path | None = None,
+        extra_secrets: Sequence[str] = (),
+    ) -> tuple[dict[str, tuple[str, dict[str, Any]]], dict[str, tuple[str, dict[str, Any]]]]:
+        """Read latest completed ParentAuditor scorecards indexed by version_label and short commit SHA without creating files."""
+        eff_dir = self._resolve_chats_dir(chats_dir)
+        chat_file = self._chat_file_path(project_id, eff_dir)
+        if not chat_file.is_file():
+            return {}, {}
+        with self._chat_io_lock:
+            raw_entries, _ = self._read_raw_chat_entries(project_id, eff_dir)
+        by_ver: dict[str, tuple[str, dict[str, Any]]] = {}
+        by_sha: dict[str, tuple[str, dict[str, Any]]] = {}
+        for entry in raw_entries:
+            if entry.get("role") != "assistant" or entry.get("mode") != "audit":
+                continue
+            if str(entry.get("status") or "completed") != "completed":
+                continue
+            raw_sc = entry.get("quality_scorecard")
+            if not isinstance(raw_sc, Mapping) or not isinstance(raw_sc.get("areas"), Sequence):
+                continue
+            sc_clean = ensure_scorecard_tier(self._scrub_chat_value(raw_sc, extra_secrets))
+            ts = str(entry.get("completed_at") or entry.get("created_at") or "")
+            ver = str(entry.get("version_label") or "").strip().lower()
+            sha_short = str(entry.get("commit_sha") or "").strip().lower()[:7]
+            if ver:
+                prev = by_ver.get(ver)
+                if prev is None or ts >= prev[0]:
+                    by_ver[ver] = (ts, sc_clean)
+            if sha_short:
+                prev_s = by_sha.get(sha_short)
+                if prev_s is None or ts >= prev_s[0]:
+                    by_sha[sha_short] = (ts, sc_clean)
+        return by_ver, by_sha
+
+    @staticmethod
+    def _clean_checkpoint_summary(text: str, *, extra_secrets: Sequence[str] = (), limit: int = 200) -> str:
+        collapsed = " ".join(str(text or "").split()).strip()
+        if not collapsed:
+            return ""
+        redacted = redact_secrets(collapsed, extra_secrets=extra_secrets)
+        return redacted if len(redacted) <= limit else f"{redacted[: limit - 3]}..."
+
     def list_project_checkpoints(
         self,
         project_id: str,
         *,
+        chats_dir: Path | None = None,
         extra_secrets: Sequence[str] = (),
     ) -> list[dict[str, Any]]:
-        """List delivered checkpoints in reverse chronological order with redacted metadata (INV-11, INV-19)."""
+        """List delivered checkpoints in reverse chronological order enriched with summary & quality_scorecard (INV-11, INV-19)."""
         validate_project_id(project_id)
         events = self.store.get_events(project_id)
         if not events:
             raise ValueError(f"Project '{project_id}' does not exist")
 
+        audit_by_ver, audit_by_sha = self._load_audit_scorecards_index(
+            project_id, chats_dir=chats_dir, extra_secrets=extra_secrets
+        )
+
         checkpoints: list[dict[str, Any]] = []
         idx = 0
+        initial_objective = ""
+        pending_change_reason = ""
         for ev in events:
+            pl = ev.payload or {}
+            if ev.type == EventType.PROJECT_CREATED:
+                initial_objective = str(pl.get("objective") or pl.get("name") or initial_objective).strip()
+            elif ev.type == EventType.STATE_TRANSITIONED:
+                if str(pl.get("to") or "") == ProjectState.CHANGE_REQUEST.value:
+                    cand = str(pl.get("instructions") or pl.get("reason") or "").strip()
+                    if cand:
+                        pending_change_reason = cand
+            elif ev.type == EventType.SPEC_UPDATED:
+                chg = str(pl.get("change_instructions") or "").strip()
+                if chg:
+                    pending_change_reason = chg
+                elif not initial_objective and isinstance(pl.get("spec"), Mapping):
+                    initial_objective = str(pl["spec"].get("objective") or "").strip()
+
             if ev.type != EventType.PROJECT_DELIVERED:
                 continue
+
             idx += 1
-            pl = ev.payload or {}
             raw_sha = str(pl.get("commit_sha") or "").strip()
             clean_sha = ""
             if raw_sha:
@@ -2107,12 +2187,35 @@ class Orchestrator:
                 extra_secrets=extra_secrets,
             )
             rollback_from = str(pl.get("rollback_from") or "").strip() or None
+
+            explicit_summary = str(pl.get("summary") or "").strip()
+            if explicit_summary:
+                raw_summary = explicit_summary
+            elif rollback_from:
+                raw_summary = f"Restaurado desde {rollback_from[:7]}"
+            elif idx > 1 and pending_change_reason:
+                raw_summary = pending_change_reason
+            elif initial_objective:
+                raw_summary = initial_objective
+            else:
+                raw_summary = f"Entrega inicial ({label})"
+            pending_change_reason = ""
+
             raw_scorecard = pl.get("quality_scorecard")
-            scorecard = (
-                self._scrub_chat_value(raw_scorecard, extra_secrets)
+            scorecard: dict[str, Any] | None = (
+                ensure_scorecard_tier(self._scrub_chat_value(raw_scorecard, extra_secrets))
                 if isinstance(raw_scorecard, Mapping)
                 else None
             )
+            audit_cand = audit_by_ver.get(label.lower())
+            if audit_cand is None and clean_sha:
+                audit_cand = audit_by_sha.get(clean_sha[:7].lower())
+            if audit_cand is not None:
+                audit_ts, audit_sc = audit_cand
+                ev_ts = ev.at.isoformat()
+                if scorecard is None or audit_ts >= ev_ts:
+                    scorecard = audit_sc
+
             cp_entry: dict[str, Any] = {
                 "version_label": label,
                 "commit_sha": clean_sha,
@@ -2121,16 +2224,227 @@ class Orchestrator:
                 "repo_url": redact_secrets(str(pl.get("repo_url") or ""), extra_secrets=extra_secrets),
                 "deploy_url": redact_secrets(str(pl.get("deploy_url") or ""), extra_secrets=extra_secrets),
                 "rollback_from": rollback_from,
-                "summary": redact_secrets(str(pl.get("summary") or ""), extra_secrets=extra_secrets),
+                "summary": self._clean_checkpoint_summary(raw_summary, extra_secrets=extra_secrets),
                 "can_rollback": bool(clean_sha),
                 "is_current": False,
+                "quality_scorecard": scorecard,
             }
-            if scorecard is not None:
-                cp_entry["quality_scorecard"] = scorecard
             checkpoints.append(cp_entry)
         if checkpoints:
             checkpoints[-1]["is_current"] = True
         return list(reversed(checkpoints))
+
+    def evaluate_project_quality(
+        self,
+        project_id: str,
+        *,
+        auditor: Any | None = None,
+        workspace_dir: Path | None = None,
+        workspace_manager: WorkspaceManager | None = None,
+        chats_dir: Path | None = None,
+        extra_secrets: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """Execute ParentAuditor in read-only mode on current workspace, update current scorecard, and persist report."""
+        validate_project_id(project_id)
+        with self._project_lock(project_id):
+            events = self.store.get_events(project_id)
+            if not events:
+                raise ValueError(f"Project '{project_id}' does not exist")
+            status = self.get_status(project_id)
+            if status.state != ProjectState.DELIVERED:
+                raise IllegalTransition(status.state, ProjectState.CHANGE_REQUEST)
+
+            ws_dir = self._resolve_project_workspace_dir(
+                project_id,
+                status=status,
+                workspace_dir=workspace_dir,
+                workspace_manager=workspace_manager,
+            )
+            if ws_dir is None or not ws_dir.is_dir():
+                raise ValueError(f"El workspace del proyecto '{project_id}' no existe.")
+
+            eff_chats_dir = self._resolve_chats_dir(chats_dir)
+            checkpoints = self.list_project_checkpoints(
+                project_id, chats_dir=eff_chats_dir, extra_secrets=extra_secrets
+            )
+            cur_cp = next((c for c in checkpoints if c.get("is_current")), checkpoints[0] if checkpoints else None)
+            prior_deliv = sum(1 for ev in events if ev.type == EventType.PROJECT_DELIVERED)
+            current_version = (cur_cp.get("version_label") if cur_cp else "") or f"v{max(1, prior_deliv)}"
+            commit_sha = (cur_cp.get("commit_sha") if cur_cp else "") or (
+                read_git_head_sha_from_disk(ws_dir) or ""
+            )
+
+            eff_auditor = auditor if auditor is not None else ParentAuditor(self.llm)
+            test_results: dict[str, bool] | None = (
+                {"suite": status.tests.failed == 0} if status.tests.total > 0 else None
+            )
+            t0 = time.monotonic()
+            report = eff_auditor.audit_workspace(
+                project_id,
+                ws_dir,
+                spec=self.get_spec(project_id),
+                plan=self.get_plan(project_id),
+                test_results=test_results,
+                round_number=1,
+                project_name=status.name or project_id,
+                version_label=current_version,
+                extra_secrets=extra_secrets,
+            )
+            dur = round(max(0.0, time.monotonic() - t0), 2)
+
+            entry = self.record_automated_quality_audit(
+                project_id,
+                report=report,
+                commit_sha=commit_sha,
+                version_label=current_version,
+                duration_seconds=dur,
+                chats_dir=eff_chats_dir,
+                prompt_label=f"Re-evaluación de calidad ({current_version})",
+                extra_secrets=extra_secrets,
+            )
+            scorecard = ensure_scorecard_tier(
+                report.to_scorecard_dict(extra_secrets=extra_secrets)
+            )
+            updated_checkpoints = self.list_project_checkpoints(
+                project_id, chats_dir=eff_chats_dir, extra_secrets=extra_secrets
+            )
+            return {
+                "ok": True,
+                "project_id": project_id,
+                "version_label": current_version,
+                "commit_sha": commit_sha,
+                "scorecard": scorecard,
+                "quality_scorecard": scorecard,
+                "report": report,
+                "chat_entry": self._scrub_chat_value(entry, extra_secrets),
+                "checkpoints": updated_checkpoints,
+            }
+
+    def transition_for_quality_improvement(
+        self,
+        project_id: str,
+        *,
+        plan: Plan,
+        reason: str,
+    ) -> str:
+        """Transition a DELIVERED project canonically via CHANGE_REQUEST to BUILDING for quality refinement (INV-04, INV-11)."""
+        validate_project_id(project_id)
+        with self._project_lock(project_id):
+            events = self.store.get_events(project_id)
+            if not events:
+                raise ValueError(f"Project '{project_id}' does not exist")
+            current_status = self.get_status(project_id)
+            if current_status.state != ProjectState.DELIVERED:
+                raise IllegalTransition(current_status.state, ProjectState.CHANGE_REQUEST)
+
+            now = self._now()
+            for src_state, dst_state, extra_pl in (
+                (
+                    ProjectState.DELIVERED,
+                    ProjectState.CHANGE_REQUEST,
+                    {"reason": reason, "mode": "quality_improve"},
+                ),
+                (ProjectState.CHANGE_REQUEST, ProjectState.INTERVIEW, {}),
+                (ProjectState.INTERVIEW, ProjectState.DEBATE, {}),
+                (ProjectState.DEBATE, ProjectState.MEDIATION, {}),
+            ):
+                validate_transition(src_state, dst_state)
+                self.store.append(
+                    create_event(
+                        project_id=project_id,
+                        event_type=EventType.STATE_TRANSITIONED,
+                        payload={"from": src_state.value, "to": dst_state.value, **extra_pl},
+                        at=now,
+                    )
+                )
+
+            eff_plan_hash = current_status.plan_hash
+            if eff_plan_hash:
+                validate_transition(ProjectState.MEDIATION, ProjectState.WAITING_APPROVAL)
+                self.store.append(
+                    create_event(
+                        project_id=project_id,
+                        event_type=EventType.STATE_TRANSITIONED,
+                        payload={
+                            "from": ProjectState.MEDIATION.value,
+                            "to": ProjectState.WAITING_APPROVAL.value,
+                        },
+                        at=now,
+                    )
+                )
+            else:
+                eff_plan_hash = plan.compute_hash()
+                validate_transition(ProjectState.MEDIATION, ProjectState.WAITING_APPROVAL)
+                self.store.append(
+                    create_event(
+                        project_id=project_id,
+                        event_type=EventType.PLAN_CREATED,
+                        payload={
+                            "plan": plan.model_dump(mode="json"),
+                            "plan_hash": eff_plan_hash,
+                            "total_tests": len(plan.acceptance_tests),
+                            "from": ProjectState.MEDIATION.value,
+                            "to": ProjectState.WAITING_APPROVAL.value,
+                        },
+                        at=now,
+                    )
+                )
+
+            self.circuit_breaker.reset(project_id, ProjectState.BUILDING)
+            self.circuit_breaker.reset(project_id, ProjectState.VERIFYING)
+
+            validate_transition(ProjectState.WAITING_APPROVAL, ProjectState.BUILDING)
+            self.store.append(
+                create_event(
+                    project_id=project_id,
+                    event_type=EventType.APPROVAL_RECORDED,
+                    payload={
+                        "plan_hash": eff_plan_hash,
+                        "decision": "approved",
+                        "timestamp": now.isoformat(),
+                        "from": ProjectState.WAITING_APPROVAL.value,
+                        "to": ProjectState.BUILDING.value,
+                        "mode": "quality_improve",
+                        "instructions": reason,
+                    },
+                    at=now,
+                )
+            )
+            return eff_plan_hash
+
+    def improve_project_quality(
+        self,
+        project_id: str,
+        *,
+        build_worker: Any | None = None,
+        auditor: Any | None = None,
+        chats_dir: Path | None = None,
+        extra_secrets: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """Audit project quality and run bounded 2-round refinement via BuildWorker when below Producción tier."""
+        validate_project_id(project_id)
+        eff_worker = build_worker if build_worker is not None else self.build_worker
+        if eff_worker is not None:
+            return eff_worker.improve_project_quality(
+                project_id,
+                auditor=auditor,
+                chats_dir=chats_dir,
+            )
+        eval_res = self.evaluate_project_quality(
+            project_id,
+            auditor=auditor,
+            chats_dir=chats_dir,
+            extra_secrets=extra_secrets,
+        )
+        if eval_res["scorecard"].get("passed"):
+            return {
+                **eval_res,
+                "already_passed": True,
+                "improved": False,
+            }
+        raise RuntimeError(
+            "No hay un BuildWorker configurado para ejecutar el refinamiento de calidad."
+        )
 
     @staticmethod
     def _run_rollback_git(
