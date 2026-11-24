@@ -4535,3 +4535,101 @@ def test_quality_auditor_adaptive_weights_ui_vs_cli_and_dashboard_renders_scorec
             thread.join(timeout=2.0)
         store.close()
 
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_5_themes_selector_clean_sidebar_compact_delivered_and_audit_bar(
+    tmp_path: Path,
+) -> None:
+    """Dashboard exposes 5-theme selector (#themes-menu-btn/#themes-popover), cleaner sidebar, compact DELIVERED card with #project-more-menu & clickable logo, unified audit bar, and hides audit filters for <2 entries."""
+    store = SqliteEventStore(db_path=tmp_path / "themes_clean_ui.db")
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_themes_clean")
+    orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        workspace_manager=ws_mgr,
+    )
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            assert html_resp.status == 200
+            html = html_resp.read().decode("utf-8")
+
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+
+        # 1. Dedicated 5-theme selector in header + CSS variables + af_theme compatibility with #theme-btn
+        for theme_marker in (
+            'id="themes-menu-btn"',
+            'id="themes-popover"',
+            'data-theme="dark"',
+            'html[data-theme="light"]',
+            'html[data-theme="emerald"]',
+            'html[data-theme="sunset"]',
+            'html[data-theme="lavender"]',
+            'data-theme-choice="dark"',
+            'data-theme-choice="light"',
+            'data-theme-choice="emerald"',
+            'data-theme-choice="sunset"',
+            'data-theme-choice="lavender"',
+            "Noche Profunda (Oscuro)",
+            "Luz Editorial (Claro)",
+            "Bosque Esmeralda",
+            "Atardecer Terracota",
+            "Grafito Lavanda",
+            'id="theme-btn"',
+            "af_theme",
+        ):
+            assert theme_marker in html
+
+        # 2. Cleaner sidebar: compact secondary Import in panel-header and full-width primary + Nuevo proyecto above list
+        sidebar_start = html.index('id="sidebar-panel"')
+        sidebar_end = html.index('id="import-project-modal"', sidebar_start)
+        sidebar_html = html[sidebar_start:sidebar_end]
+        hdr_start = sidebar_html.index('<div class="panel-header">')
+        hdr_end = sidebar_html.index('<div id="sidebar-projects-body">', hdr_start)
+        sidebar_hdr = sidebar_html[hdr_start:hdr_end]
+        assert 'id="toggle-import-project-btn"' in sidebar_hdr
+        assert 'id="toggle-new-project-btn"' not in sidebar_hdr
+        body_html = sidebar_html[hdr_end:]
+        assert 'id="toggle-new-project-btn"' in body_html
+        assert body_html.index('id="toggle-new-project-btn"') < body_html.index('id="project-list"')
+
+        # 3. Clickable logo icon (no noisy standalone >Cambiar logo< button) and compact DELIVERED card with #project-more-menu
+        assert ">Cambiar logo<" not in html
+        assert 'title="Cambiar logo"' in html
+        fn_start = html.index("function buildGuidanceBanner(")
+        fn_end = html.index("function renderDetail()", fn_start)
+        delivered_block = html[fn_start:fn_end].split("st.state === 'DELIVERED'", 1)[1]
+        assert "delivered-compact" in delivered_block
+        assert 'id="project-more-menu"' in delivered_block
+        assert "Encender en local" in delivered_block
+        assert "Abrir repositorio en GitHub" in delivered_block
+        assert "Ver despliegue en vivo" in delivered_block
+        assert "Eliminar proyecto" in delivered_block
+
+        # Footer #detail-secondary no longer renders bottom "Eliminar proyecto" button
+        render_start = html.index("function renderDetail()")
+        render_end = html.index("function unquoteGitDiffPath(", render_start)
+        render_body = html[render_start:render_end]
+        sec_chunk = render_body.split("detail-secondary", 1)[1].split("lastSpecSignature", 1)[0]
+        assert "Eliminar proyecto" not in sec_chunk
+
+        # 4. Unified single audit toolbar & conditional filters hidden when reportEntries.length < 2
+        audit_fn_start = html.index("function renderAuditChatTab(")
+        audit_fn_end = html.index("async function loadProjectChatHistory(", audit_fn_start)
+        audit_body = html[audit_fn_start:audit_fn_end]
+        assert "audit-unified-bar" in audit_body
+        assert 'data-chat-mode="audit"' in audit_body
+        assert 'data-chat-mode="chat"' in audit_body
+        assert 'data-chat-mode="document"' in audit_body
+        assert "audit-more-actions-btn" in audit_body
+        assert "reportEntries.length >= 2" in audit_body
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+

@@ -1549,6 +1549,72 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       --err-bg: #fee2e2;
       --info-bg: #e0f2fe;
     }
+    html[data-theme="emerald"] {
+      --bg: #0b1915;
+      --surface: #112620;
+      --surface-alt: #163229;
+      --border: #244f42;
+      --text: #ecfdf5;
+      --muted: #a7d9c6;
+      --accent: #34d399;
+      --accent-hover: #10b981;
+      --btn-primary-fg: #032217;
+      --ok: #4ade80;
+      --ok-btn: #15803d;
+      --ok-btn-hover: #166534;
+      --ok-bg: rgba(52, 211, 153, 0.14);
+      --warn: #fbbf24;
+      --warn-btn: #b45309;
+      --warn-btn-hover: #92400e;
+      --warn-bg: rgba(251, 191, 36, 0.14);
+      --err: #fca5a5;
+      --err-bg: rgba(248, 113, 113, 0.15);
+      --info-bg: rgba(52, 211, 153, 0.12);
+    }
+    html[data-theme="sunset"] {
+      --bg: #1b1311;
+      --surface: #271b18;
+      --surface-alt: #332420;
+      --border: #523932;
+      --text: #fff7ed;
+      --muted: #e2bfb0;
+      --accent: #fb923c;
+      --accent-hover: #f97316;
+      --btn-primary-fg: #2b1102;
+      --ok: #4ade80;
+      --ok-btn: #15803d;
+      --ok-btn-hover: #166534;
+      --ok-bg: rgba(74, 222, 128, 0.14);
+      --warn: #fbbf24;
+      --warn-btn: #b45309;
+      --warn-btn-hover: #92400e;
+      --warn-bg: rgba(251, 191, 36, 0.15);
+      --err: #fda4af;
+      --err-bg: rgba(251, 113, 133, 0.16);
+      --info-bg: rgba(251, 146, 60, 0.14);
+    }
+    html[data-theme="lavender"] {
+      --bg: #14141f;
+      --surface: #1d1d2e;
+      --surface-alt: #27273d;
+      --border: #3d3d5c;
+      --text: #f5f3ff;
+      --muted: #c4b5fd;
+      --accent: #a78bfa;
+      --accent-hover: #8b5cf6;
+      --btn-primary-fg: #1b0f3b;
+      --ok: #4ade80;
+      --ok-btn: #15803d;
+      --ok-btn-hover: #166534;
+      --ok-bg: rgba(74, 222, 128, 0.14);
+      --warn: #fbbf24;
+      --warn-btn: #b45309;
+      --warn-btn-hover: #92400e;
+      --warn-bg: rgba(251, 191, 36, 0.14);
+      --err: #fda4af;
+      --err-bg: rgba(244, 63, 94, 0.16);
+      --info-bg: rgba(167, 139, 250, 0.14);
+    }
     * { box-sizing: border-box; }
     :focus-visible {
       outline: 2px solid var(--accent);
@@ -1657,8 +1723,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .layout {
       display: grid;
       grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
-      gap: var(--sp-5);
-      padding: var(--sp-5) var(--sp-6);
+      gap: var(--sp-6);
+      padding: var(--sp-6) 28px;
       max-width: 1440px;
       margin: 0 auto;
     }
@@ -1673,18 +1739,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 12px;
-      padding: 18px;
+      padding: 22px;
     }
     .panel-header {
       display: flex;
       justify-content: space-between;
       align-items: center;
+      gap: 10px;
+    }
+    .sidebar-new-btn {
+      width: 100%;
+      margin-top: 12px;
+      padding: 10px 14px;
+      font-weight: 600;
     }
     .project-card {
       border: 1px solid var(--border);
       border-radius: 12px;
-      padding: 16px;
-      margin-bottom: 12px;
+      padding: 16px 18px;
+      margin-bottom: 14px;
       cursor: pointer;
       background: var(--surface);
       transition: all 0.2s ease;
@@ -1878,10 +1951,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
     .tabs {
       display: flex;
-      gap: 6px;
+      gap: 8px;
       border-bottom: 1px solid var(--border);
-      padding-bottom: 8px;
-      margin-bottom: 16px;
+      padding-bottom: 10px;
+      margin-bottom: 20px;
     }
     .tab-btn {
       background: transparent;
@@ -2169,6 +2242,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       flex-shrink: 0;
       border: 1px solid var(--border);
       background: var(--surface-alt);
+      display: block;
+    }
+    .logo-icon-btn {
+      padding: 0;
+      border: 0;
+      background: transparent;
+      border-radius: 10px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+    .logo-icon-btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 0 0 2px var(--accent);
     }
     .btn-icon {
       border: 1px solid transparent;
@@ -2600,23 +2690,119 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       color: var(--text);
       box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
     }
-    .settings-menu-wrap {
+    .themes-menu-wrap,
+    .settings-menu-wrap,
+    .more-menu-wrap {
       position: relative;
+      display: inline-flex;
+      align-items: center;
     }
-    .settings-popover {
+    .themes-popover,
+    .settings-popover,
+    .more-popover {
       position: absolute;
       top: calc(100% + 8px);
       right: 0;
-      min-width: 260px;
+      min-width: 240px;
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 10px;
-      padding: 12px;
+      padding: 10px;
       box-shadow: 0 12px 28px rgba(0, 0, 0, 0.38);
       display: flex;
       flex-direction: column;
+      gap: 6px;
+      z-index: 35;
+    }
+    .settings-popover {
+      min-width: 260px;
+      padding: 12px;
       gap: 10px;
       z-index: 30;
+    }
+    .theme-option,
+    .more-menu-item {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 10px;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      background: transparent;
+      color: var(--text);
+      font-size: 0.85rem;
+      font-weight: 500;
+      text-align: left;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .theme-option:hover,
+    .more-menu-item:hover {
+      background: var(--surface-alt);
+      border-color: var(--border);
+    }
+    .theme-option.active {
+      background: var(--info-bg);
+      border-color: var(--accent);
+      color: var(--accent);
+      font-weight: 600;
+    }
+    .theme-swatch {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      border: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .more-menu-item.danger {
+      color: var(--err);
+    }
+    .more-menu-item.danger:hover {
+      background: var(--err-bg);
+      border-color: rgba(239, 68, 68, 0.35);
+    }
+    .guidance-banner.delivered-compact {
+      flex-direction: row;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+      padding: 14px 16px;
+    }
+    .delivered-compact-info {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 200px;
+      flex: 1 1 240px;
+    }
+    .delivered-compact-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .audit-unified-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 10px;
+      margin-bottom: 16px;
+    }
+    .audit-unified-bar .audit-subtabs {
+      border-bottom: 0;
+      padding-bottom: 0;
+      margin-bottom: 0;
+    }
+    .audit-primary-split {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      position: relative;
     }
     .settings-item {
       display: flex;
@@ -2997,16 +3183,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     #audit-index {
       display: flex;
       flex-direction: column;
-      gap: 10px;
+      gap: 14px;
     }
     .audit-card {
       border: 1px solid var(--border);
       background: var(--surface-alt);
       border-radius: 10px;
-      padding: 12px 14px;
+      padding: 14px 16px;
       display: flex;
       flex-direction: column;
-      gap: 6px;
+      gap: 8px;
     }
     .audit-card-head {
       display: flex;
@@ -3381,6 +3567,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <button id="view-mode-dev" type="button" class="seg-btn" data-view-mode="dev" aria-label="Vista Desarrollador">Desarrollador</button>
         <input id="tech-mode-toggle" type="checkbox" class="sr-only" aria-label="Modo técnico" />
       </div>
+      <div class="themes-menu-wrap">
+        <button id="themes-menu-btn" class="btn btn-sm" type="button" aria-expanded="false" aria-controls="themes-popover">🎨 Temas</button>
+        <div id="themes-popover" class="themes-popover" role="menu" aria-label="Temas de color" style="display:none">
+          <button type="button" class="theme-option active" data-theme-choice="dark" role="menuitemradio" aria-checked="true">
+            <span class="theme-swatch" style="background:linear-gradient(135deg,#0b0f19 50%,#38bdf8 50%);"></span>
+            <span>Noche Profunda (Oscuro)</span>
+          </button>
+          <button type="button" class="theme-option" data-theme-choice="light" role="menuitemradio" aria-checked="false">
+            <span class="theme-swatch" style="background:linear-gradient(135deg,#f8fafc 50%,#0369a1 50%);"></span>
+            <span>Luz Editorial (Claro)</span>
+          </button>
+          <button type="button" class="theme-option" data-theme-choice="emerald" role="menuitemradio" aria-checked="false">
+            <span class="theme-swatch" style="background:linear-gradient(135deg,#0b1915 50%,#34d399 50%);"></span>
+            <span>Bosque Esmeralda</span>
+          </button>
+          <button type="button" class="theme-option" data-theme-choice="sunset" role="menuitemradio" aria-checked="false">
+            <span class="theme-swatch" style="background:linear-gradient(135deg,#1b1311 50%,#fb923c 50%);"></span>
+            <span>Atardecer Terracota</span>
+          </button>
+          <button type="button" class="theme-option" data-theme-choice="lavender" role="menuitemradio" aria-checked="false">
+            <span class="theme-swatch" style="background:linear-gradient(135deg,#14141f 50%,#a78bfa 50%);"></span>
+            <span>Grafito Lavanda</span>
+          </button>
+        </div>
+      </div>
       <div class="settings-menu-wrap">
         <button id="settings-menu-btn" class="btn btn-sm" type="button" aria-expanded="false" aria-controls="settings-popover">⚙️ Ajustes</button>
         <div id="settings-popover" class="settings-popover" style="display:none">
@@ -3430,12 +3641,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
       <div class="panel-header">
         <h2 style="margin:0; font-size:var(--fs-lg);">Tus proyectos</h2>
-        <div style="display:flex; gap:6px; flex-wrap:wrap;">
-          <button id="toggle-import-project-btn" class="btn btn-sm" type="button">Importar proyecto</button>
-          <button id="toggle-new-project-btn" class="btn btn-sm" type="button">+ Nuevo proyecto</button>
-        </div>
+        <button id="toggle-import-project-btn" class="btn btn-sm" type="button">Importar proyecto</button>
       </div>
       <div id="sidebar-projects-body">
+        <button id="toggle-new-project-btn" class="btn btn-primary sidebar-new-btn" type="button">+ Nuevo proyecto</button>
         <form id="new-project-form" class="new-project-form" style="display:none">
           <div id="example-prompts" class="example-prompts">
             <span class="muted" style="font-size:var(--fs-xs);">Ejemplos:</span>
@@ -3489,10 +3698,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div class="detail-header">
               <div class="detail-titles">
                 <div class="title-row">
-                  <img id="detail-logo-img" class="detail-logo" src="" alt="Logo del proyecto" style="display:none" />
+                  <button id="change-logo-btn" class="logo-icon-btn" type="button" title="Cambiar logo" aria-label="Cambiar logo">
+                    <img id="detail-logo-img" class="detail-logo" src="" alt="Logo del proyecto" style="display:none" />
+                  </button>
                   <h2 id="detail-title" class="detail-title"></h2>
                   <button id="edit-title-btn" class="btn-icon" type="button" title="Editar título" aria-label="Editar título">✏️</button>
-                  <button id="change-logo-btn" class="btn btn-sm" type="button" title="Subir logo propio">Cambiar logo</button>
                   <input id="logo-file-input" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" style="display:none" />
                 </div>
                 <form id="edit-title-form" class="edit-title-form" style="display:none">
@@ -3506,7 +3716,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                   <button id="cancel-title-btn" class="btn btn-sm" type="button">Cancelar</button>
                 </form>
               </div>
-              <span id="detail-badge" class="badge"></span>
+              <div style="display:flex; align-items:center; gap:8px;">
+                <span id="detail-badge" class="badge"></span>
+                <span id="detail-header-more"></span>
+              </div>
             </div>
             <div id="detail-segments" class="stage-segments"></div>
             <div id="detail-time" class="muted" style="font-size:0.78rem; margin:-2px 0 10px 0; text-align:right;"></div>
@@ -3901,13 +4114,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       el.appendChild(box);
     }
 
+    const VALID_THEMES = ['dark', 'light', 'emerald', 'sunset', 'lavender'];
+    const THEME_LABELS = {
+      dark: 'Noche Profunda',
+      light: 'Luz Editorial',
+      emerald: 'Bosque Esmeralda',
+      sunset: 'Atardecer Terracota',
+      lavender: 'Grafito Lavanda',
+    };
+
     function applyTheme(theme) {
-      document.documentElement.setAttribute('data-theme', theme);
+      const cleanTheme = VALID_THEMES.includes(theme) ? theme : 'dark';
+      document.documentElement.setAttribute('data-theme', cleanTheme);
       const btn = document.getElementById('theme-btn');
       if (btn) {
-        btn.textContent = theme === 'dark' ? 'Modo claro' : 'Modo oscuro';
+        btn.textContent = cleanTheme === 'light' ? 'Modo oscuro' : 'Modo claro';
       }
-      try { localStorage.setItem('af_theme', theme); } catch (_) {}
+      document.querySelectorAll('.theme-option[data-theme-choice]').forEach((opt) => {
+        const isAct = opt.getAttribute('data-theme-choice') === cleanTheme;
+        opt.classList.toggle('active', isAct);
+        opt.setAttribute('aria-checked', isAct ? 'true' : 'false');
+      });
+      try { localStorage.setItem('af_theme', cleanTheme); } catch (_) {}
     }
 
     (function initTheme() {
@@ -3921,12 +4149,58 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     document.getElementById('theme-btn').addEventListener('click', () => {
       const cur = document.documentElement.getAttribute('data-theme') || 'dark';
-      const next = cur === 'dark' ? 'light' : 'dark';
+      const next = cur === 'light' ? 'dark' : 'light';
       applyTheme(next);
       const label = next === 'light' ? 'Modo claro activado' : 'Modo oscuro activado';
       showSettingsFeedback('✓ ' + label);
       setNote('✓ ' + label, 'ok');
     });
+
+    function closeFloatingDropdowns() {
+      document.querySelectorAll('.more-popover, .themes-popover, .settings-popover').forEach((pop) => {
+        pop.style.display = 'none';
+      });
+      document.querySelectorAll('[aria-controls="project-more-popover"], [aria-controls="header-more-popover"], [aria-controls="audit-more-actions-menu"], #themes-menu-btn, #settings-menu-btn').forEach((b) => {
+        b.setAttribute('aria-expanded', 'false');
+      });
+    }
+
+    document.addEventListener('click', (ev) => {
+      const target = ev.target;
+      const insideWrap = target && target.closest ? target.closest('.themes-menu-wrap, .settings-menu-wrap, .more-menu-wrap, .audit-primary-split') : null;
+      if (!insideWrap) {
+        closeFloatingDropdowns();
+      }
+    });
+    document.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape') {
+        closeFloatingDropdowns();
+      }
+    });
+
+    (function initThemesPopover() {
+      const btn = document.getElementById('themes-menu-btn');
+      const pop = document.getElementById('themes-popover');
+      if (!btn || !pop) return;
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const isOpen = pop.style.display !== 'none';
+        closeFloatingDropdowns();
+        if (!isOpen) {
+          pop.style.display = 'flex';
+          btn.setAttribute('aria-expanded', 'true');
+        }
+      });
+      pop.querySelectorAll('.theme-option[data-theme-choice]').forEach((opt) => {
+        opt.addEventListener('click', () => {
+          const chosen = opt.getAttribute('data-theme-choice') || 'dark';
+          applyTheme(chosen);
+          closeFloatingDropdowns();
+          const title = THEME_LABELS[chosen] || chosen;
+          setNote('✓ Tema aplicado: ' + title, 'ok');
+        });
+      });
+    })();
 
     function applyTechMode(enabled) {
       const on = Boolean(enabled);
@@ -3971,29 +4245,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const btn = document.getElementById('settings-menu-btn');
       const pop = document.getElementById('settings-popover');
       if (!btn || !pop) return;
-      function closeMenu() {
-        pop.style.display = 'none';
-        btn.setAttribute('aria-expanded', 'false');
-      }
       btn.addEventListener('click', (ev) => {
         ev.stopPropagation();
         const isOpen = pop.style.display !== 'none';
-        if (isOpen) {
-          closeMenu();
-        } else {
+        closeFloatingDropdowns();
+        if (!isOpen) {
           pop.style.display = 'flex';
           btn.setAttribute('aria-expanded', 'true');
-        }
-      });
-      document.addEventListener('click', (ev) => {
-        if (pop.style.display === 'none') return;
-        if (!pop.contains(ev.target) && ev.target !== btn) {
-          closeMenu();
-        }
-      });
-      document.addEventListener('keydown', (ev) => {
-        if (ev.key === 'Escape' && pop.style.display !== 'none') {
-          closeMenu();
         }
       });
     })();
@@ -4974,43 +5232,53 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const pid = st.project_id;
         const localApp = st.local_app || { running: false, url: null, app_type: 'unknown' };
         const isPrevOpen = Boolean(state.previewOpen && state.previewOpen[pid] && localApp.running && localApp.url);
-        const repoBtn = (st.links && st.links.repo)
-          ? '<a href="' + escapeHtml(st.links.repo) + '" target="_blank" rel="noopener noreferrer" class="btn">Abrir repositorio en GitHub</a>'
+        const repoItem = (st.links && st.links.repo)
+          ? '<a href="' + escapeHtml(st.links.repo) + '" target="_blank" rel="noopener noreferrer" class="more-menu-item">🔗 Abrir repositorio en GitHub</a>'
           : '';
-        const deployBtn = (localApp.app_type === 'static' && st.links && st.links.deploy)
-          ? '<a href="' + escapeHtml(st.links.deploy) + '" target="_blank" rel="noopener noreferrer" class="btn">Ver despliegue en vivo</a>'
+        const deployItem = (localApp.app_type === 'static' && st.links && st.links.deploy)
+          ? '<a href="' + escapeHtml(st.links.deploy) + '" target="_blank" rel="noopener noreferrer" class="more-menu-item">🌐 Ver despliegue en vivo</a>'
           : '';
+        const deleteItem = '<button class="more-menu-item danger" type="button" data-dact="delete">🗑️ Eliminar proyecto</button>';
+        const moreMenuHtml =
+          '<div id="project-more-menu" class="more-menu-wrap">' +
+            '<button id="project-more-btn" class="btn btn-sm" type="button" aria-expanded="false" aria-controls="project-more-popover">⋯ Más</button>' +
+            '<div id="project-more-popover" class="more-popover" style="display:none">' +
+              repoItem +
+              deployItem +
+              deleteItem +
+            '</div>' +
+          '</div>';
         const lanBtn = (localApp.running && localApp.lan_url)
           ? '<a href="' + escapeHtml(localApp.lan_url) + '" target="_blank" rel="noopener noreferrer" class="btn btn-sm">Abrir desde celular</a>' +
-            '<span class="model-pill">' + escapeHtml(localApp.lan_url) + '</span>'
+            '<span class="model-pill tech-only">' + escapeHtml(localApp.lan_url) + '</span>'
           : '';
         const prevBtn = (localApp.running && localApp.url)
           ? '<button id="toggle-preview-btn" class="btn btn-sm" type="button" data-dact="toggle-preview">' +
             (isPrevOpen ? 'Ocultar vista previa' : 'Mostrar vista previa aquí') + '</button>'
           : '';
         const localBtns = (localApp.running && localApp.url)
-          ? '<a href="' + escapeHtml(localApp.url) + '" target="_blank" rel="noopener noreferrer" class="btn btn-success">Abrir app en local</a>' +
+          ? '<a href="' + escapeHtml(localApp.url) + '" target="_blank" rel="noopener noreferrer" class="btn btn-success btn-sm">Abrir app en local</a>' +
             prevBtn +
-            '<button class="btn btn-warn" data-dact="local-stop">Apagar</button>' +
+            '<button class="btn btn-warn btn-sm" data-dact="local-stop">Apagar</button>' +
             '<span class="model-pill tech-only">' + escapeHtml(localApp.url) + '</span>' +
             lanBtn
           : '<button class="btn btn-primary" data-dact="local-start">Encender en local</button>';
         const descMsg = localApp.app_type === 'python_local'
-          ? 'Proyecto local con servidor Python listo para ejecutarse en tu computadora.'
-          : 'El proyecto ha sido construido y verificado exitosamente.';
-        return '<div class="guidance-banner banner-ok">' +
-          '<div class="banner-content">' +
+          ? 'Servidor local Python listo para ejecutarse.'
+          : 'Proyecto verificado y listo para usarse.';
+        return '<div class="guidance-banner banner-ok delivered-compact">' +
+          '<div class="delivered-compact-info">' +
             '<div class="banner-icon">🎉</div>' +
             '<div class="banner-body">' +
-              '<div class="banner-title">¡Proyecto terminado con éxito!</div>' +
-              '<div class="banner-desc">' + escapeHtml(descMsg) + '</div>' +
+              '<div class="banner-title" style="margin-bottom:2px;">¡Proyecto terminado con éxito!</div>' +
+              '<div class="banner-desc" style="font-size:var(--fs-xs);">' + escapeHtml(descMsg) + '</div>' +
+              '<div id="local-inline-status"></div>' +
             '</div>' +
           '</div>' +
-          '<div class="banner-actions">' +
+          '<div class="delivered-compact-actions">' +
             '<div class="local-controls-row">' + localBtns + '</div>' +
-            repoBtn + deployBtn +
+            moreMenuHtml +
           '</div>' +
-          '<div id="local-inline-status"></div>' +
         '</div>';
       }
 
@@ -5542,8 +5810,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         state.lastBannerSignature = bannerSig;
 
         guidanceEl.querySelectorAll('button[data-dact]').forEach((btn) => {
-          btn.addEventListener('click', () => handleAction(btn.dataset.dact, st.project_id, btn));
+          btn.addEventListener('click', () => {
+            closeFloatingDropdowns();
+            handleAction(btn.dataset.dact, st.project_id, btn);
+          });
         });
+        const projectMoreBtn = document.getElementById('project-more-btn');
+        const projectMorePop = document.getElementById('project-more-popover');
+        if (projectMoreBtn && projectMorePop) {
+          projectMoreBtn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            const isOpen = projectMorePop.style.display !== 'none';
+            closeFloatingDropdowns();
+            if (!isOpen) {
+              projectMorePop.style.display = 'flex';
+              projectMoreBtn.setAttribute('aria-expanded', 'true');
+            }
+          });
+        }
 
         const replyInput = document.getElementById('interview-reply-input');
         const replyBtn = document.getElementById('interview-reply-btn');
@@ -5599,16 +5883,48 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
       renderLivePreviewPanel(st);
 
-      // Secondary action (Delete)
-      const secEl = document.getElementById('detail-secondary');
-      secEl.innerHTML =
-        '<div class="secondary-actions">' +
-          '<button class="btn-subtle-danger" data-dact="delete">Eliminar proyecto</button>' +
-        '</div>';
+      const headerMoreEl = document.getElementById('detail-header-more');
+      const isDeliveredState = st.state === 'DELIVERED' || st.state === 'COMPLETED';
+      if (headerMoreEl) {
+        const headerMoreSig = String(st.project_id || '') + '|' + (isDeliveredState ? '1' : '0');
+        if (headerMoreEl.dataset.sig !== headerMoreSig) {
+          headerMoreEl.dataset.sig = headerMoreSig;
+          if (isDeliveredState) {
+            headerMoreEl.innerHTML = '';
+          } else {
+            headerMoreEl.innerHTML =
+              '<div class="more-menu-wrap">' +
+                '<button id="header-more-btn" class="btn btn-sm" type="button" aria-expanded="false" aria-controls="header-more-popover">⋯ Más</button>' +
+                '<div id="header-more-popover" class="more-popover" style="display:none">' +
+                  '<button class="more-menu-item danger" type="button" data-dact="delete">🗑️ Eliminar proyecto</button>' +
+                '</div>' +
+              '</div>';
+            const hdrMoreBtn = document.getElementById('header-more-btn');
+            const hdrMorePop = document.getElementById('header-more-popover');
+            if (hdrMoreBtn && hdrMorePop) {
+              hdrMoreBtn.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                const isOpen = hdrMorePop.style.display !== 'none';
+                closeFloatingDropdowns();
+                if (!isOpen) {
+                  hdrMorePop.style.display = 'flex';
+                  hdrMoreBtn.setAttribute('aria-expanded', 'true');
+                }
+              });
+            }
+            headerMoreEl.querySelectorAll('button[data-dact]').forEach((btn) => {
+              btn.addEventListener('click', () => {
+                closeFloatingDropdowns();
+                handleAction(btn.dataset.dact, st.project_id, btn);
+              });
+            });
+          }
+        }
+      }
 
-      secEl.querySelectorAll('button[data-dact]').forEach((btn) => {
-        btn.addEventListener('click', () => handleAction(btn.dataset.dact, st.project_id, btn));
-      });
+      // Secondary footer cleared; delete option is grouped inside ⋯ Más menu
+      const secEl = document.getElementById('detail-secondary');
+      if (secEl) secEl.innerHTML = '';
 
       // Unified "Resumen y Plan" tab (signature-guarded to avoid 5s DOM flicker)
       const spec = state.detail.spec || {};
@@ -6697,15 +7013,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             readerHtml +
           '</div>';
       } else {
+        const effFilter = reportEntries.length >= 2 ? activeFilter : 'all';
         const filteredReports = reportEntries.filter((r) =>
-          activeFilter === 'all' ? true : (r.entry.mode === activeFilter)
+          effFilter === 'all' ? true : (r.entry.mode === effFilter)
         );
-        const filtersHtml =
-          '<div class="audit-filters">' +
-            '<button type="button" class="audit-filter-btn' + (activeFilter === 'all' ? ' active' : '') + '" data-audit-filter="all">Todas (' + reportEntries.length + ')</button>' +
-            '<button type="button" class="audit-filter-btn' + (activeFilter === 'audit' ? ' active' : '') + '" data-audit-filter="audit">Auditorías</button>' +
-            '<button type="button" class="audit-filter-btn' + (activeFilter === 'document' ? ' active' : '') + '" data-audit-filter="document">Documentos</button>' +
-          '</div>';
+        const filtersHtml = reportEntries.length >= 2
+          ? ('<div class="audit-filters">' +
+              '<button type="button" class="audit-filter-btn' + (activeFilter === 'all' ? ' active' : '') + '" data-audit-filter="all">Todas (' + reportEntries.length + ')</button>' +
+              '<button type="button" class="audit-filter-btn' + (activeFilter === 'audit' ? ' active' : '') + '" data-audit-filter="audit">Auditorías</button>' +
+              '<button type="button" class="audit-filter-btn' + (activeFilter === 'document' ? ' active' : '') + '" data-audit-filter="document">Documentos</button>' +
+            '</div>')
+          : '';
         const cardsHtml = filteredReports.length
           ? filteredReports.map((r) => {
               const rep = r.entry;
@@ -6792,16 +7110,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         : 'Haz una pregunta sobre el proyecto, su arquitectura o posibles mejoras...';
 
       container.innerHTML =
-        '<div class="muted" style="font-size:0.84rem; margin-bottom:10px;"><strong>Consultar y Auditar proyecto</strong> — Inspección de solo lectura y generación de documentación.</div>' +
         readonlyNoticeHtml +
-        '<div class="audit-toolbar">' +
-          '<button id="audit-quick-audit-btn" class="btn btn-sm" type="button"' + disabledAttr + '>🔍 Auditar código</button>' +
-          '<button id="audit-quick-explain-btn" class="btn btn-sm" type="button"' + disabledAttr + '>📖 Explicar funcionamiento</button>' +
-          '<button id="audit-quick-doc-btn" class="btn btn-sm" type="button"' + disabledAttr + '>📄 Generar documento (.md)</button>' +
-        '</div>' +
-        '<div class="audit-subtabs">' +
-          '<button type="button" class="audit-subtab' + (activeSub === 'index' ? ' active' : '') + '" data-audit-sub="index">📑 Auditorías y documentos (' + reportEntries.length + ')</button>' +
-          '<button type="button" class="audit-subtab' + (activeSub === 'questions' ? ' active' : '') + '" data-audit-sub="questions">💬 Preguntas (' + chatEntries.length + ')</button>' +
+        '<div class="audit-unified-bar">' +
+          '<div class="audit-subtabs">' +
+            '<button type="button" class="audit-subtab' + (activeSub === 'index' ? ' active' : '') + '" data-audit-sub="index" aria-label="Auditorías y documentos" title="Auditorías y documentos">📑 Auditorías y docs (' + reportEntries.length + ')</button>' +
+            '<button type="button" class="audit-subtab' + (activeSub === 'questions' ? ' active' : '') + '" data-audit-sub="questions">💬 Preguntas (' + chatEntries.length + ')</button>' +
+          '</div>' +
+          '<div class="audit-primary-split">' +
+            '<button id="audit-quick-audit-btn" class="btn btn-primary btn-sm" type="button" data-chat-mode="audit"' + disabledAttr + '>🔍 Auditar código</button>' +
+            '<div class="more-menu-wrap">' +
+              '<button id="audit-more-actions-btn" class="btn btn-sm" type="button" aria-expanded="false" aria-controls="audit-more-actions-menu" title="Más acciones de análisis"' + disabledAttr + '>▾</button>' +
+              '<div id="audit-more-actions-menu" class="more-popover" style="display:none">' +
+                '<button id="audit-quick-explain-btn" class="more-menu-item" type="button" data-chat-mode="chat"' + disabledAttr + '>📖 Explicar funcionamiento</button>' +
+                '<button id="audit-quick-doc-btn" class="more-menu-item" type="button" data-chat-mode="document"' + disabledAttr + '>📄 Generar documento (.md)</button>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
         '</div>' +
         '<div id="audit-index" style="display:' + (activeSub === 'index' ? 'flex' : 'none') + ';">' + indexBodyHtml + '</div>' +
         '<div id="audit-questions-pane" style="display:' + (activeSub === 'questions' ? 'block' : 'none') + ';">' +
@@ -6878,18 +7202,38 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       });
 
       const quickAuditBtn = document.getElementById('audit-quick-audit-btn');
+      const moreActionsBtn = document.getElementById('audit-more-actions-btn');
+      const moreActionsMenu = document.getElementById('audit-more-actions-menu');
       const quickExplainBtn = document.getElementById('audit-quick-explain-btn');
       const quickDocBtn = document.getElementById('audit-quick-doc-btn');
+      if (moreActionsBtn && moreActionsMenu && !isReadOnly) {
+        moreActionsBtn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          const isOpen = moreActionsMenu.style.display !== 'none';
+          closeFloatingDropdowns();
+          if (!isOpen) {
+            moreActionsMenu.style.display = 'flex';
+            moreActionsBtn.setAttribute('aria-expanded', 'true');
+          }
+        });
+      }
       if (quickAuditBtn && !isReadOnly) {
-        quickAuditBtn.addEventListener('click', () => submitProjectChat(pid, '', 'audit', quickAuditBtn));
+        quickAuditBtn.addEventListener('click', () => {
+          closeFloatingDropdowns();
+          submitProjectChat(pid, '', 'audit', quickAuditBtn);
+        });
       }
       if (quickExplainBtn && !isReadOnly) {
-        quickExplainBtn.addEventListener('click', () =>
-          submitProjectChat(pid, 'Explica cómo funciona este proyecto, sus archivos clave y cómo utilizarlo.', 'chat', quickExplainBtn)
-        );
+        quickExplainBtn.addEventListener('click', () => {
+          closeFloatingDropdowns();
+          submitProjectChat(pid, 'Explica cómo funciona este proyecto, sus archivos clave y cómo utilizarlo.', 'chat', quickExplainBtn);
+        });
       }
       if (quickDocBtn && !isReadOnly) {
-        quickDocBtn.addEventListener('click', () => submitProjectChat(pid, '', 'document', quickDocBtn));
+        quickDocBtn.addEventListener('click', () => {
+          closeFloatingDropdowns();
+          submitProjectChat(pid, '', 'document', quickDocBtn);
+        });
       }
       if (sendBtn && inputEl && !isReadOnly) {
         sendBtn.addEventListener('click', () => submitProjectChat(pid, inputEl.value, 'chat', sendBtn));
