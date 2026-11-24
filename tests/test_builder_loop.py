@@ -2942,6 +2942,9 @@ def test_agy_llm_adapter_resolves_windows_cmd_shim_and_spaced_temp_paths(
             "import json, sys\n"
             "idx = sys.argv.index('-p')\n"
             "p_arg = sys.argv[idx + 1]\n"
+            "if p_arg == 'ping':\n"
+            "    print('Available models: gemini-2.5-flash')\n"
+            "    sys.exit(0)\n"
             "assert 'Pagina responsiva' in p_arg, f'Truncated -p: {p_arg!r}'\n"
             "assert 'InterviewRoundOutput' in p_arg or 'JSON Schema:' in p_arg\n"
             "print(json.dumps({'spec': {'objective': 'Pagina responsiva'}, 'questions': ['¿Para qué usuarios?']}))\n",
@@ -2955,7 +2958,7 @@ def test_agy_llm_adapter_resolves_windows_cmd_shim_and_spaced_temp_paths(
         monkeypatch.setattr(
             shutil,
             "which",
-            lambda b: str(interview_cmd) if b == "agy" else None,
+            lambda b, **_kw: str(interview_cmd) if b == "agy" else None,
         )
         from agent_factory.agents.interviewer import InterviewRoundOutput
 

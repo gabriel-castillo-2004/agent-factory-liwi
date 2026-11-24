@@ -2934,22 +2934,33 @@ class Orchestrator:
             return self.get_status(project_id)
 
     @staticmethod
-    def _has_active_interview_questions(events: Sequence[Event]) -> bool:
-        """Return True if the latest active INTERVIEW phase already produced non-empty questions."""
+    def _extract_active_interview_questions(events: Sequence[Event]) -> list[str]:
+        """Extract cleaned non-empty questions from the latest active INTERVIEW_ROUND."""
         for ev in reversed(events):
             if ev.type == EventType.INTERVIEW_ROUND:
                 pl = ev.payload or {}
-                questions = pl.get("questions") if isinstance(pl, Mapping) else None
-                if isinstance(questions, Sequence) and not isinstance(questions, str):
-                    return any(str(q).strip() for q in questions)
-                return False
-            if ev.type == EventType.STATE_TRANSITIONED:
+                raw_questions = pl.get("questions") if isinstance(pl, Mapping) else None
+                if isinstance(raw_questions, Sequence) and not isinstance(
+                    raw_questions, (str, bytes)
+                ):
+                    return [
+                        q.strip()
+                        for q in raw_questions
+                        if isinstance(q, str) and q.strip()
+                    ]
+                return []
+            if ev.type in {EventType.STATE_TRANSITIONED, EventType.PROJECT_RETRIED}:
                 pl = ev.payload or {}
                 if pl.get("to") == ProjectState.INTERVIEW.value:
-                    return False
+                    return []
             elif ev.type == EventType.PROJECT_CREATED:
-                return False
-        return False
+                return []
+        return []
+
+    @classmethod
+    def _has_active_interview_questions(cls, events: Sequence[Event]) -> bool:
+        """Return True if the latest active INTERVIEW phase already produced non-empty questions."""
+        return bool(cls._extract_active_interview_questions(events))
 
     @staticmethod
     def _resolve_interview_retry_prompt(
@@ -3260,3 +3271,28 @@ class Orchestrator:
             if event.type == EventType.PLAN_CREATED and "plan" in event.payload:
                 return Plan.model_validate(event.payload["plan"])
         return None
+
+    def get_project_detail(self, project_id: str) -> dict[str, Any]:
+        """Return status, Spec, Plan, cleaned active interview questions, and events for project_id."""
+        validate_project_id(project_id)
+        events = self.store.get_events(project_id)
+        if not events:
+            raise ValueError(f"Project '{project_id}' does not exist")
+
+        status = self.get_status(project_id)
+        spec = self.get_spec(project_id)
+        plan = self.get_plan(project_id)
+        raw_questions = (
+            self._extract_active_interview_questions(events)
+            if status.state == ProjectState.INTERVIEW
+            else []
+        )
+        questions = [q.strip() for q in raw_questions if isinstance(q, str) and q.strip()]
+        return {
+            "project_id": project_id,
+            "status": status,
+            "spec": spec,
+            "plan": plan,
+            "questions": questions,
+            "events": list(events),
+        }

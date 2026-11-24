@@ -4148,7 +4148,7 @@ def test_dashboard_failed_interview_retry_regenerates_questions_and_empty_interv
         _, after_int = fn_body.split("if (st.state === 'INTERVIEW')", 1)
         interview_block, _ = after_int.split("if (st.state === 'WAITING_APPROVAL')", 1)
         assert "if (!questions.length)" in interview_block
-        empty_q_branch, populated_q_branch = interview_block.split("if (!questions.length)", 1)
+        _empty_q_branch, populated_q_branch = interview_block.split("if (!questions.length)", 1)
         populated_after_empty = populated_q_branch.split("return '<div class=\"guidance-banner", 2)
         empty_return = populated_after_empty[1]
         assert "Aún no se han generado las preguntas de aclaración" in empty_return
@@ -4223,13 +4223,144 @@ def test_dashboard_failed_interview_retry_regenerates_questions_and_empty_interv
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_normalizes_empty_and_null_interview_questions_and_keeps_generate_button_and_textarea(
+    tmp_path: Path,
+) -> None:
+    """Backend/UI strip blank or null INTERVIEW questions ([""]/None -> []), keep #generate-questions-btn above an enabled textarea, and handle aged PROJECT_RETRIED."""
+    store = SqliteEventStore(db_path=tmp_path / "clean_questions.db")
+    old_at = datetime(2026, 4, 20, 8, 0, tzinfo=UTC)
 
+    # 1. Project in INTERVIEW whose latest INTERVIEW_ROUND has only blank/null entries
+    pid_blank = "pagina-responsiva-vacia"
+    store.append(
+        create_event(
+            pid_blank,
+            EventType.PROJECT_CREATED,
+            {"name": "Pagina responsiva", "objective": "Sitio web responsive", "state": "INTERVIEW"},
+            at=old_at,
+        )
+    )
+    store.append(
+        create_event(
+            pid_blank,
+            EventType.INTERVIEW_ROUND,
+            {"questions": ["", "   ", None], "is_complete": False, "terminated_by_limit": False},
+            at=old_at,
+        )
+    )
 
+    # 2. Project in INTERVIEW with None questions after a prior failed retry aged several hours
+    pid_none_retried = "pagina-responsiva-none"
+    store.append(
+        create_event(
+            pid_none_retried,
+            EventType.PROJECT_CREATED,
+            {"name": "Pagina responsiva 2", "objective": "Landing responsive", "state": "INTERVIEW"},
+            at=old_at,
+        )
+    )
+    store.append(
+        create_event(
+            pid_none_retried,
+            EventType.INTERVIEW_ROUND,
+            {"questions": None, "is_complete": False, "terminated_by_limit": False},
+            at=old_at,
+        )
+    )
+    store.append(
+        create_event(
+            pid_none_retried,
+            EventType.PROJECT_FAILED,
+            {"failed_from": "INTERVIEW", "reason": "Fallo previo"},
+            at=old_at,
+        )
+    )
+    store.append(
+        create_event(
+            pid_none_retried,
+            EventType.PROJECT_RETRIED,
+            {"from": "FAILED", "to": "INTERVIEW", "failed_from": "INTERVIEW"},
+            at=old_at,
+        )
+    )
 
+    # 3. Project with mixed whitespace/null + real questions keeps only clean trimmed strings
+    pid_mixed = "pagina-responsiva-mix"
+    store.append(
+        create_event(
+            pid_mixed,
+            EventType.PROJECT_CREATED,
+            {"name": "Pagina mix", "objective": "Sitio mixto", "state": "INTERVIEW"},
+            at=old_at,
+        )
+    )
+    store.append(
+        create_event(
+            pid_mixed,
+            EventType.INTERVIEW_ROUND,
+            {
+                "questions": ["", None, "  ¿Qué secciones necesitas?  ", "   "],
+                "is_complete": False,
+                "terminated_by_limit": False,
+            },
+            at=old_at,
+        )
+    )
 
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        # Orchestrator.get_project_detail returns normalized clean list[str]
+        orch_blank = orch.get_project_detail(pid_blank)
+        assert orch_blank["questions"] == []
+        orch_none = orch.get_project_detail(pid_none_retried)
+        assert orch_none["questions"] == []
+        orch_mixed = orch.get_project_detail(pid_mixed)
+        assert orch_mixed["questions"] == ["¿Qué secciones necesitas?"]
 
+        # GET /api/projects/<id> mirrors clean questions=[] for [""] and None
+        c1, d1 = _http_json(f"{base_url}/api/projects/{pid_blank}")
+        assert c1 == 200
+        assert d1["questions"] == []
+        c2, d2 = _http_json(f"{base_url}/api/projects/{pid_none_retried}")
+        assert c2 == 200
+        assert d2["questions"] == []
+        c3, d3 = _http_json(f"{base_url}/api/projects/{pid_mixed}")
+        assert c3 == 200
+        assert d3["questions"] == ["¿Qué secciones necesitas?"]
 
+        # GET / UI filters d.questions (even [""] / null), renders #generate-questions-btn above enabled textarea
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            assert html_resp.status == 200
+            html = html_resp.read().decode("utf-8")
 
+        fn_start = html.index("function buildGuidanceBanner(")
+        fn_end = html.index("function renderDetail()", fn_start)
+        fn_body = html[fn_start:fn_end]
+        _, after_int = fn_body.split("if (st.state === 'INTERVIEW')", 1)
+        interview_block, _ = after_int.split("if (st.state === 'WAITING_APPROVAL')", 1)
 
+        assert "cleanQuestions" in interview_block
+        assert "Array.isArray(d.questions)" in interview_block
+        assert ".filter(Boolean)" in interview_block
 
+        _, populated_q_branch = interview_block.split("if (!questions.length)", 1)
+        populated_after_empty = populated_q_branch.split("return '<div class=\"guidance-banner", 2)
+        empty_return = populated_after_empty[1]
+        assert "Aún no se han generado las preguntas de aclaración" in empty_return
+        assert 'id="generate-questions-btn"' in empty_return
+        assert "Generar preguntas ahora" in empty_return
+        assert 'id="interview-reply-input"' in empty_return
+        assert 'id="interview-reply-btn"' in empty_return
+        assert empty_return.index("generate-questions-btn") < empty_return.index("interview-reply-input")
+        assert "Esperando tus respuestas" not in empty_return
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
 

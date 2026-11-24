@@ -460,6 +460,22 @@ class DashboardController:
         self._sync_external_workspace(project_id, status)
         spec = self.orchestrator.get_spec(project_id)
         plan = self.orchestrator.get_plan(project_id)
+        if hasattr(self.orchestrator, "get_project_detail"):
+            orch_detail = self.orchestrator.get_project_detail(project_id)
+            raw_questions = orch_detail.get("questions", [])
+        else:
+            raw_questions = (
+                Orchestrator._extract_active_interview_questions(events)
+                if status.state == ProjectState.INTERVIEW
+                else []
+            )
+        clean_questions = (
+            [q.strip() for q in raw_questions if isinstance(q, str) and q.strip()]
+            if isinstance(raw_questions, Sequence)
+            and not isinstance(raw_questions, (str, bytes))
+            and status.state == ProjectState.INTERVIEW
+            else []
+        )
 
         serialized_events = [
             {
@@ -478,6 +494,7 @@ class DashboardController:
         return {
             "project_id": project_id,
             "status": summary,
+            "questions": _scrub_value(clean_questions, self.secrets_to_redact),
             "is_running": summary["is_running"],
             "local_app": summary["local_app"],
             "logo_url": summary["logo_url"],
@@ -4458,11 +4475,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (!Array.isArray(events)) return [];
       for (let i = events.length - 1; i >= 0; i--) {
         const ev = events[i];
-        if (ev.type === 'STATE_TRANSITIONED' && ev.payload && ev.payload.to === 'INTERVIEW') {
+        if (
+          (ev.type === 'STATE_TRANSITIONED' || ev.type === 'PROJECT_RETRIED')
+          && ev.payload
+          && ev.payload.to === 'INTERVIEW'
+        ) {
           return [];
         }
         if (ev.type === 'INTERVIEW_ROUND' && ev.payload) {
-          return Array.isArray(ev.payload.questions) ? ev.payload.questions : [];
+          const raw = Array.isArray(ev.payload.questions) ? ev.payload.questions : [];
+          return raw.map((q) => (typeof q === 'string' ? q.trim() : '')).filter(Boolean);
         }
       }
       return [];
@@ -4716,7 +4738,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       renderLiveActivityBanner();
     }
 
-    function buildGuidanceBanner(st, events) {
+    function buildGuidanceBanner(st, events, detail) {
       const isRunning = Boolean(st.is_running || st.busy);
       if (isRunning) {
         if (state.activeOp) {
@@ -4764,30 +4786,49 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
 
       if (st.state === 'INTERVIEW') {
-        const questions = extractLatestQuestions(events);
+        const d = (detail && typeof detail === 'object')
+          ? detail
+          : ((state.detail && state.detail.project_id === st.project_id) ? state.detail : {});
+        const fallbackQs = (detail === undefined && !('questions' in d))
+          ? extractLatestQuestions(events)
+          : [];
+        const cleanQuestions = (Array.isArray(d.questions) ? d.questions : fallbackQs)
+          .map((q) => String(q || '').trim())
+          .filter(Boolean);
+        const questions = cleanQuestions;
         const inact = formatInactivityNote(st.last_event_at);
         const inactHtml = inact ? '<div class="inactivity-note">' + escapeHtml(inact) + '</div>' : '';
         const pendingHtml = (state.interviewPendingByPid && state.interviewPendingByPid[st.project_id])
           ? '<div class="optimistic-sent-pill">✓ Respuesta enviada · Analizando…</div>'
           : '';
+        const draft = escapeHtml((state.replyDrafts && state.replyDrafts[st.project_id]) || '');
         if (!questions.length) {
           return '<div class="guidance-banner banner-warn">' +
             '<div class="banner-content">' +
               '<div class="banner-icon">⚠️</div>' +
               '<div class="banner-body">' +
                 '<div class="banner-title">Aún no se han generado las preguntas de aclaración</div>' +
-                '<div class="banner-desc">La entrevista inicial no produjo preguntas. Genera las preguntas de aclaración antes de continuar.</div>' +
+                '<div class="banner-desc">La entrevista inicial no produjo preguntas. Genera las preguntas de aclaración o escribe los detalles directamente abajo.</div>' +
                 inactHtml +
                 pendingHtml +
               '</div>' +
             '</div>' +
-            '<div class="banner-actions">' +
+            '<div class="banner-actions" style="margin-bottom:10px;">' +
               '<button id="generate-questions-btn" class="btn btn-primary" type="button" data-dact="retry-interview">Generar preguntas ahora</button>' +
               '<span id="interview-retry-inline-status"></span>' +
             '</div>' +
+            '<div class="banner-form">' +
+              '<div class="input-row-with-mic">' +
+                '<textarea id="interview-reply-input" class="input-field" rows="3" placeholder="Escribe los detalles de tu proyecto aquí (opcional sin preguntas)...">' + draft + '</textarea>' +
+                '<button id="interview-mic-btn" class="btn btn-sm mic-btn" type="button" title="Dictar respuesta por voz (es-MX)">🎤</button>' +
+              '</div>' +
+              '<div class="banner-actions">' +
+                '<button id="interview-reply-btn" class="btn btn-primary" type="button">Enviar respuesta</button>' +
+                '<span id="interview-inline-status"></span>' +
+              '</div>' +
+            '</div>' +
           '</div>';
         }
-        const draft = escapeHtml((state.replyDrafts && state.replyDrafts[st.project_id]) || '');
         return '<div class="guidance-banner banner-info">' +
           '<div class="banner-content">' +
             '<div class="banner-icon">💬</div>' +
@@ -5407,7 +5448,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         build_round: buildRound,
         max_rounds: maxRounds,
       });
-      const questions = extractLatestQuestions(events);
+      const rawDetailQs = Array.isArray(state.detail.questions)
+        ? state.detail.questions
+        : (('questions' in state.detail) ? [] : extractLatestQuestions(events));
+      const questions = (Array.isArray(rawDetailQs) ? rawDetailQs : [])
+        .map((q) => String(q || '').trim())
+        .filter(Boolean);
       const inact = st.state === 'INTERVIEW' && !isRunning ? formatInactivityNote(st.last_event_at) : '';
       const bannerSig = JSON.stringify([
         st.project_id,
@@ -5440,7 +5486,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       const guidanceEl = document.getElementById('detail-guidance');
       if (bannerSig !== state.lastBannerSignature) {
-        guidanceEl.innerHTML = buildGuidanceBanner(statusForBanner, events);
+        guidanceEl.innerHTML = buildGuidanceBanner(statusForBanner, events, state.detail);
         state.lastBannerSignature = bannerSig;
 
         guidanceEl.querySelectorAll('button[data-dact]').forEach((btn) => {
