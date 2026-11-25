@@ -1771,7 +1771,11 @@ class BuildWorker:
         status_deploy_url: str | None,
     ) -> tuple[str | None, str | None]:
         """Push verified post-refinement commit cleanly to origin or FakeVCS."""
-        from agent_factory.adapters.github_vcs_adapter import build_git_push_env
+        from agent_factory.adapters.github_vcs_adapter import (
+            build_git_push_env,
+            fetch_origin_for_lease_push,
+            work_branch_push_args,
+        )
 
         repo_url = status_repo_url
         deploy_url = status_deploy_url
@@ -1819,8 +1823,16 @@ class BuildWorker:
             push_env, push_secrets = build_git_push_env(
                 clean_env, gh_tok, repo_base_url=repo_base
             )
+            push_args = work_branch_push_args(cur_branch)
+            if "--force-with-lease" in push_args:
+                fetch_origin_for_lease_push(
+                    self.runner,
+                    cwd=ws_resolved,
+                    env=push_env,
+                    timeout_seconds=15.0,
+                )
             push_res = self.runner.run(
-                ["git", "push", "-u", "origin", cur_branch],
+                ["git", *push_args],
                 cwd=ws_resolved,
                 timeout_seconds=20.0,
                 env=push_env,

@@ -1476,3 +1476,124 @@ def test_github_vcs_real_urllib_transport_preserves_post_and_put_across_301_redi
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_push_branch_work_fetches_origin_and_uses_force_with_lease_on_diverged_retry(
+    tmp_path: Path,
+) -> None:
+    """INV-03 / INV-23: push_branch on 'work' runs git fetch origin first and uses --force-with-lease so diverged retries succeed while protecting main and unseen concurrent commits."""
+    bare_remote = tmp_path / "work-retry-remote.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare_remote)], check=True, capture_output=True)
+
+    # Seed remote with main + diverged work commit (simulating previous failed attempt / pre-rollback remote work)
+    seed_dir = tmp_path / "seed"
+    seed_dir.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=seed_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Seed"], cwd=seed_dir, check=True)
+    subprocess.run(["git", "config", "user.email", "seed@local"], cwd=seed_dir, check=True)
+    (seed_dir / "app.txt").write_text("main-v1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=seed_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "main v1"], cwd=seed_dir, check=True, capture_output=True)
+    subprocess.run(["git", "push", "-u", str(bare_remote), "main:main"], cwd=seed_dir, check=True, capture_output=True)
+
+    subprocess.run(["git", "checkout", "-b", "work"], cwd=seed_dir, check=True, capture_output=True)
+    (seed_dir / "app.txt").write_text("stale-failed-work\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=seed_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "stale work"], cwd=seed_dir, check=True, capture_output=True)
+    subprocess.run(["git", "push", str(bare_remote), "work:work"], cwd=seed_dir, check=True, capture_output=True)
+    stale_work_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=seed_dir, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    # Local workspace on diverged 'work' without refs/remotes/origin/work fetched yet
+    ws_dir = tmp_path / "ws" / "work-retry-app"
+    ws_dir.mkdir(parents=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare_remote)], cwd=ws_dir, check=True)
+    subprocess.run(["git", "config", "user.name", "Worker"], cwd=ws_dir, check=True)
+    subprocess.run(["git", "config", "user.email", "worker@local"], cwd=ws_dir, check=True)
+    (ws_dir / "app.txt").write_text("diverged-main-base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=ws_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "local main base"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "checkout", "-b", "work"], cwd=ws_dir, check=True, capture_output=True)
+    (ws_dir / "app.txt").write_text("clean-retry-work\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=ws_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "retry work commit"], cwd=ws_dir, check=True, capture_output=True)
+    local_work_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ws_dir, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    assert local_work_sha != stale_work_sha
+
+    recorded_cmds: list[list[str]] = []
+    real_runner = SubprocessRunner(default_timeout_seconds=15.0)
+    inject_concurrent_race = {"enabled": False}
+
+    class _SpyRunner(SubprocessRunner):
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            recorded_cmds.append(list(command))
+            if (
+                inject_concurrent_race["enabled"]
+                and len(command) >= 2
+                and command[0] == "git"
+                and command[1] == "push"
+            ):
+                # Concurrent remote update after fetch -> --force-with-lease MUST reject overwriting it
+                (seed_dir / "app.txt").write_text("concurrent-peer-commit\n", encoding="utf-8")
+                subprocess.run(["git", "add", "-A"], cwd=seed_dir, check=True)
+                subprocess.run(["git", "commit", "-m", "peer update"], cwd=seed_dir, check=True, capture_output=True)
+                subprocess.run(["git", "push", "--force", str(bare_remote), "work:work"], cwd=seed_dir, check=True, capture_output=True)
+                inject_concurrent_race["enabled"] = False
+            return real_runner.run(command, cwd, timeout_seconds=timeout_seconds, env=env)
+
+    vcs = GitHubVCSAdapter(runner=_SpyRunner(), repo_base_url=str(tmp_path))
+
+    # 1. Retry push on diverged 'work' succeeds after fetch origin + --force-with-lease
+    pushed = vcs.push_branch("work-retry-app", ws_dir, branch="work")
+    assert "work" in pushed
+
+    fetch_idxs = [i for i, c in enumerate(recorded_cmds) if c[:3] == ["git", "fetch", "origin"]]
+    push_idxs = [
+        i
+        for i, c in enumerate(recorded_cmds)
+        if len(c) >= 2 and c[0] == "git" and c[1] == "push" and "work" in c
+    ]
+    assert fetch_idxs and push_idxs
+    assert fetch_idxs[-1] < push_idxs[-1]
+    assert "--force-with-lease" in recorded_cmds[push_idxs[-1]]
+
+    after_push_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ws_dir, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    remote_work_sha = subprocess.run(
+        ["git", "-C", str(bare_remote), "rev-parse", "refs/heads/work"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert remote_work_sha == after_push_head
+    assert remote_work_sha != stale_work_sha
+
+    # 2. Lease safety (negative): concurrent update between fetch and push rejects instead of blind force
+    (ws_dir / "app.txt").write_text("retry-after-race\n", encoding="utf-8")
+    inject_concurrent_race["enabled"] = True
+    with pytest.raises(VcsError, match="Git push failed"):
+        vcs.push_branch("work-retry-app", ws_dir, branch="work")
+
+    # 3. Default branch 'main' is never force-pushed
+    main_cmds_before = len(recorded_cmds)
+    subprocess.run(["git", "checkout", "main"], cwd=ws_dir, check=True, capture_output=True)
+    (ws_dir / "app.txt").write_text("diverged-local-main\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=ws_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "diverged main"], cwd=ws_dir, check=True, capture_output=True)
+    with pytest.raises(VcsError, match="Git push failed"):
+        vcs.push_branch("work-retry-app", ws_dir, branch="main")
+    main_pushes = [
+        c for c in recorded_cmds[main_cmds_before:] if len(c) >= 2 and c[0] == "git" and c[1] == "push"
+    ]
+    assert main_pushes and "--force-with-lease" not in main_pushes[-1]

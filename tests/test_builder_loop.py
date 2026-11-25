@@ -4898,4 +4898,113 @@ def test_workspace_pytest_configurable_timeout_cli_isolation_env_and_per_test_ti
     assert failing == []
 
 
+def test_push_quality_improvement_work_branch_fetches_and_pushes_force_with_lease(
+    tmp_path: Path,
+) -> None:
+    """_push_quality_improvement runs git fetch origin and push --force-with-lease when workspace branch is 'work', while never force-pushing 'main'."""
+    import subprocess
+
+    from agent_factory.adapters.github_vcs_adapter import GitHubVCSAdapter
+    from agent_factory.adapters.subprocess_runner import SubprocessRunner
+
+    bare_remote = tmp_path / "qi-bare.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare_remote)], check=True, capture_output=True)
+
+    seed = tmp_path / "seed_qi"
+    seed.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=seed, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Seed"], cwd=seed, check=True)
+    subprocess.run(["git", "config", "user.email", "seed@local"], cwd=seed, check=True)
+    (seed / "index.html").write_text("<h1>v1</h1>\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=seed, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=seed, check=True, capture_output=True)
+    subprocess.run(["git", "push", str(bare_remote), "main:main"], cwd=seed, check=True, capture_output=True)
+    subprocess.run(["git", "checkout", "-b", "work"], cwd=seed, check=True, capture_output=True)
+    (seed / "index.html").write_text("<h1>old-work</h1>\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=seed, check=True)
+    subprocess.run(["git", "commit", "-m", "old work"], cwd=seed, check=True, capture_output=True)
+    subprocess.run(["git", "push", str(bare_remote), "work:work"], cwd=seed, check=True, capture_output=True)
+
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_qi")
+    pid = "proj-qi-work-push"
+    ws_dir = ws_mgr.create_workspace(pid)
+    subprocess.run(["git", "init", "-b", "main"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare_remote)], cwd=ws_dir, check=True)
+    subprocess.run(["git", "config", "user.name", "Worker"], cwd=ws_dir, check=True)
+    subprocess.run(["git", "config", "user.email", "worker@local"], cwd=ws_dir, check=True)
+    (ws_dir / "index.html").write_text("<h1>local-main</h1>\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=ws_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "local main"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "checkout", "-b", "work"], cwd=ws_dir, check=True, capture_output=True)
+    (ws_dir / "index.html").write_text("<h1>polished-work</h1>\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=ws_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "polished work"], cwd=ws_dir, check=True, capture_output=True)
+    local_work_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ws_dir, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    recorded: list[list[str]] = []
+    real_runner = SubprocessRunner(default_timeout_seconds=15.0)
+
+    class _SpySubRunner(SubprocessRunner):
+        def run(
+            self,
+            command: list[str] | tuple[str, ...],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: dict[str, str] | None = None,
+        ) -> CommandResult:
+            recorded.append(list(command))
+            return real_runner.run(command, cwd, timeout_seconds=timeout_seconds, env=env)
+
+    orch, _ = _create_approved_project(pid, num_tests=1, approve=True)
+    spy_runner = _SpySubRunner()
+    worker = BuildWorker(
+        orchestrator=orch,
+        workspace_manager=ws_mgr,
+        code_agent=FakeCodeAgent(),
+        runner=spy_runner,
+        vcs=GitHubVCSAdapter(runner=spy_runner, repo_base_url=str(tmp_path)),
+    )
+
+    worker._push_quality_improvement(
+        pid,
+        ws_dir,
+        status_repo_url=str(bare_remote),
+        status_deploy_url="",
+    )
+
+    fetch_idxs = [i for i, c in enumerate(recorded) if c[:3] == ["git", "fetch", "origin"]]
+    push_idxs = [i for i, c in enumerate(recorded) if len(c) >= 2 and c[0] == "git" and c[1] == "push"]
+    assert fetch_idxs and push_idxs
+    assert fetch_idxs[-1] < push_idxs[-1]
+    assert "--force-with-lease" in recorded[push_idxs[-1]]
+    assert "work" in recorded[push_idxs[-1]]
+    assert (
+        subprocess.run(
+            ["git", "-C", str(bare_remote), "rev-parse", "refs/heads/work"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == local_work_sha
+    )
+
+    # Also verify 'main' branch is NOT force-pushed when workspace HEAD points to main
+    subprocess.run(["git", "checkout", "main"], cwd=ws_dir, check=True, capture_output=True)
+    (ws_dir / "index.html").write_text("<h1>diverged-main</h1>\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=ws_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "diverged main"], cwd=ws_dir, check=True, capture_output=True)
+    before_main_idx = len(recorded)
+    with pytest.raises(RuntimeError, match="Error publicando mejora de calidad a origin"):
+        worker._push_quality_improvement(
+            pid,
+            ws_dir,
+            status_repo_url=str(bare_remote),
+            status_deploy_url="",
+        )
+    main_pushes = [c for c in recorded[before_main_idx:] if len(c) >= 2 and c[0] == "git" and c[1] == "push"]
+    assert main_pushes and "--force-with-lease" not in main_pushes[-1]
+
+
 

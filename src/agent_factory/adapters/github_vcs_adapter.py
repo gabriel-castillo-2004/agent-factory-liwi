@@ -51,6 +51,35 @@ def build_git_push_env(
     return push_env, (cleaned_tok, b64_auth)
 
 
+def work_branch_push_args(branch: str, *, default_branch: str = "main") -> list[str]:
+    """Build git push arguments using --force-with-lease for non-default work branches only."""
+    if branch not in (default_branch, "main", "master"):
+        return ["push", "--force-with-lease", "-u", "origin", branch]
+    return ["push", "-u", "origin", branch]
+
+
+def fetch_origin_for_lease_push(
+    runner: Runner,
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    timeout_seconds: float | None = None,
+) -> None:
+    """Refresh origin remote-tracking refs prior to --force-with-lease push without masking push errors."""
+    try:
+        if timeout_seconds is None:
+            runner.run(["git", "fetch", "origin"], cwd=cwd, env=env)
+        else:
+            runner.run(
+                ["git", "fetch", "origin"],
+                cwd=cwd,
+                timeout_seconds=timeout_seconds,
+                env=env,
+            )
+    except (CommandTimeoutError, OSError, RuntimeError, ValueError):
+        pass
+
+
 def is_local_remote_url(url: str) -> bool:
     """Return True if remote URL refers to a local directory or file:// URI rather than a network host."""
     low = url.strip().lower()
@@ -792,7 +821,7 @@ class GitHubVCSAdapter(VCS):
                     context="Git commit failed",
                 )
         res = self._run_git(
-            ["push", "-u", "origin", valid_branch],
+            work_branch_push_args(valid_branch, default_branch=self.default_branch),
             cwd=workspace_dir,
             env=clean_env,
             context="Git push failed",
@@ -862,8 +891,11 @@ class GitHubVCSAdapter(VCS):
             self.github_token,
             repo_base_url=self.repo_base_url,
         )
+        push_args = work_branch_push_args(valid_branch, default_branch=self.default_branch)
+        if "--force-with-lease" in push_args:
+            fetch_origin_for_lease_push(self.runner, cwd=workspace_dir, env=push_env)
         res = self._run_git(
-            ["push", "-u", "origin", valid_branch],
+            push_args,
             cwd=workspace_dir,
             env=push_env,
             context="Git push failed",
