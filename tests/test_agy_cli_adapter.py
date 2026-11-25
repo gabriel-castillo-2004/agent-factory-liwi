@@ -1442,6 +1442,46 @@ def test_agy_cli_adapter_implement_prompt_requires_reading_tests_without_modifyi
     assert "inv-13" in lower_prompt
 
 
+def test_agy_cli_adapter_resolves_which_shim_and_wraps_missing_binary_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AgyCliAdapter resolves bare CLI via shutil.which and converts FileNotFoundError to CodeAgentError cleanly."""
+    import shutil
+
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces_cli")
+    ws_dir = ws_mgr.create_workspace("proj-cli-missing-bin")
+    plan = _sample_static_web_plan()
+
+    resolved_shim = str(tmp_path / "shims" / ("agy.cmd" if sys.platform == "win32" else "agy"))
+    monkeypatch.setattr(shutil, "which", lambda binary: resolved_shim if binary == "agy" else None)
+
+    fake_runner = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=0,
+                stdout=json.dumps({"files_written": ["tests/test_app.py"], "summary": "ok"}),
+            )
+        ]
+    )
+    adapter = AgyCliAdapter(workspace_manager=ws_mgr, runner=fake_runner, cli_command=("agy",))
+    res = adapter.update_tests(ws_dir, plan.acceptance_tests, "Add export feature")
+    assert res.files_written == ["tests/test_app.py"]
+    assert fake_runner.calls[0]["command"][0] == resolved_shim
+    assert "--mode" in fake_runner.calls[0]["command"]
+    assert fake_runner.calls[0]["command"][fake_runner.calls[0]["command"].index("--mode") + 1] == "auto"
+
+    # Real SubprocessRunner with nonexistent binary must raise CodeAgentError instead of raw FileNotFoundError
+    real_runner = SubprocessRunner(default_timeout_seconds=5.0)
+    missing_adapter = AgyCliAdapter(
+        workspace_manager=ws_mgr,
+        runner=real_runner,
+        cli_command=("definitely_nonexistent_agy_binary_xyz",),
+    )
+    with pytest.raises(CodeAgentError):
+        missing_adapter.update_tests(ws_dir, plan.acceptance_tests, "Add export feature")
+
+
 
 
 

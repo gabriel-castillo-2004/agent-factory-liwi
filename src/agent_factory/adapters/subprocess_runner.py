@@ -4,27 +4,113 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from agent_factory.ports.runner import CommandResult, CommandTimeoutError, Runner
 
+_PYTHON_VENV_TOOLS: frozenset[str] = frozenset({"pytest", "ruff", "uvicorn", "pip"})
 
-def _resolve_command(
+
+def _safe_which(exe: str, search_path: str | None = None) -> str | None:
+    """Call shutil.which while remaining compatible with 1-arg test monkeypatches."""
+    if search_path is None:
+        return shutil.which(exe)
+    try:
+        return shutil.which(exe, path=search_path)
+    except TypeError:
+        return shutil.which(exe)
+
+
+def _extra_bin_dirs(exe_stem: str) -> list[str]:
+    """Return active Python Scripts/bin directory for unresolved Python CLI tools."""
+    if exe_stem in _PYTHON_VENV_TOOLS:
+        py_dir = str(Path(sys.executable).resolve().parent)
+        if py_dir:
+            return [py_dir]
+    return []
+
+
+def _inspect_env_path(env: Mapping[str, str] | None) -> tuple[bool, str | None]:
+    """Return (restricted_path, effective_search_path) inspecting env PATH case-insensitively."""
+    if env is None:
+        return False, None
+    found_path: str | None = None
+    has_key = False
+    for k, v in env.items():
+        if k.upper() == "PATH":
+            has_key = True
+            found_path = v
+            break
+    if not has_key:
+        return False, None
+    host_path = os.environ.get("PATH", "")
+    assert found_path is not None
+    restricted = found_path != host_path and not (bool(host_path) and found_path.endswith(host_path))
+    return restricted, found_path
+
+
+def resolve_executable(
+    binary: str,
+    env: Mapping[str, str] | None = None,
+    *,
+    include_host_fallbacks: bool = True,
+) -> str | None:
+    """Resolve an executable via shutil.which (supporting Windows shims and local venv/agy dirs)."""
+    clean = str(binary or "").strip()
+    if not clean:
+        return None
+    if os.sep in clean or (os.altsep is not None and os.altsep in clean):
+        resolved_path = _safe_which(clean)
+        if resolved_path:
+            return resolved_path
+        return clean if Path(clean).is_file() else None
+
+    restricted_path, search_path = _inspect_env_path(env)
+    exe_stem = Path(clean).stem.lower()
+    if (
+        include_host_fallbacks
+        and not restricted_path
+        and env is None
+        and exe_stem in _PYTHON_VENV_TOOLS
+    ):
+        py_resolved = _safe_which(clean, str(Path(sys.executable).resolve().parent))
+        if py_resolved:
+            return py_resolved
+
+    resolved = _safe_which(clean, search_path)
+    if resolved:
+        return resolved
+
+    if include_host_fallbacks and not restricted_path:
+        extra_dirs = _extra_bin_dirs(exe_stem)
+        if extra_dirs:
+            return _safe_which(clean, os.pathsep.join(extra_dirs))
+    return None
+
+
+def resolve_command(
     command: Sequence[str],
-    env: Mapping[str, str] | None,
+    env: Mapping[str, str] | None = None,
+    *,
+    include_host_fallbacks: bool = True,
 ) -> list[str]:
-    """Resolve bare executable names (such as .cmd shims on Windows) via effective PATH."""
-    cmd_list = list(command)
-    exe = cmd_list[0]
-    if os.sep not in exe and (os.altsep is None or os.altsep not in exe):
-        search_path: str | None = None
-        if env is not None:
-            search_path = next((v for k, v in env.items() if k.upper() == "PATH"), "")
-        resolved = shutil.which(exe, path=search_path)
-        if resolved:
-            cmd_list[0] = resolved
+    """Resolve bare argv[0] executables (such as .cmd shims on Windows) via effective PATH."""
+    cmd_list = [str(part) for part in command]
+    if not cmd_list:
+        return cmd_list
+    resolved = resolve_executable(
+        cmd_list[0],
+        env=env,
+        include_host_fallbacks=include_host_fallbacks,
+    )
+    if resolved:
+        cmd_list[0] = resolved
     return cmd_list
+
+
+_resolve_command = resolve_command
 
 
 def _close_pipes(proc: subprocess.Popen[str]) -> None:
@@ -91,11 +177,15 @@ class SubprocessRunner(Runner):
                     timed_out=False,
                 )
             except subprocess.TimeoutExpired as exc:
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    capture_output=True,
-                    check=False,
-                )
+                taskkill_cmd = resolve_command(["taskkill", "/F", "/T", "/PID", str(proc.pid)])
+                try:
+                    subprocess.run(
+                        taskkill_cmd,
+                        capture_output=True,
+                        check=False,
+                    )
+                except OSError:
+                    pass
                 try:
                     proc.wait(timeout=2.0)
                 except subprocess.TimeoutExpired:

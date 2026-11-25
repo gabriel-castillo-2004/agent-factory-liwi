@@ -3,6 +3,7 @@
 import difflib
 import json
 import re
+import sys
 import threading
 import time
 from collections.abc import Mapping, Sequence
@@ -17,7 +18,7 @@ from agent_factory.adapters.agy_cli_adapter import (
     sanitize_agent_summary,
 )
 from agent_factory.adapters.model_resolver import ACTIVITY_MESSAGES
-from agent_factory.adapters.subprocess_runner import SubprocessRunner
+from agent_factory.adapters.subprocess_runner import SubprocessRunner, resolve_executable
 from agent_factory.agents.quality_auditor import (
     DebateRoundRecord,
     ParentAuditor,
@@ -1063,8 +1064,12 @@ class BuildWorker:
     ) -> tuple[bool, int, int, list[str], CommandResult, float]:
         """Run pytest inside ws_dir, parse test counts, update job results, and emit TESTS_UPDATED."""
         pytest_ini_path = self.workspace_manager.resolve_safe_path(project_id, "pytest.ini")
+        pytest_prefix: list[str] = ["pytest"]
+        if isinstance(self.runner, SubprocessRunner):
+            resolved_pytest = resolve_executable("pytest")
+            pytest_prefix = [resolved_pytest] if resolved_pytest else [sys.executable, "-m", "pytest"]
         pytest_cmd = [
-            "pytest",
+            *pytest_prefix,
             "-v",
             "--tb=short",
             "-ra",

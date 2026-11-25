@@ -123,3 +123,44 @@ def test_subprocess_runner_decodes_utf8_and_replaces_invalid_bytes(tmp_path: Pat
     assert "Ãº" not in res.stdout
     assert "Aviso UTF-8: á" in res.stderr
     assert "\ufffd" in res.stderr
+
+
+def test_subprocess_runner_resolves_without_path_in_env_and_checks_venv_scripts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SubprocessRunner resolves bare executables via host PATH when env omits PATH, and resolves active venv Python CLIs via sys.executable parent."""
+    from agent_factory.adapters.subprocess_runner import resolve_command
+
+    bin_dir = tmp_path / "host_bin"
+    bin_dir.mkdir()
+    runner = SubprocessRunner(default_timeout_seconds=5.0)
+
+    if os.name == "nt":
+        tool = bin_dir / "noenvpath_tool.cmd"
+        tool.write_text("@echo off\r\necho no-path-key-ok\r\n", encoding="utf-8")
+        agy_shim = bin_dir / "agy_shim.cmd"
+        agy_shim.write_text("@echo off\r\necho agy-path-ok\r\n", encoding="utf-8")
+    else:
+        tool = bin_dir / "noenvpath_tool"
+        tool.write_text("#!/bin/sh\necho no-path-key-ok\n", encoding="utf-8")
+        tool.chmod(0o755)
+        agy_shim = bin_dir / "agy_shim"
+        agy_shim.write_text("#!/bin/sh\necho agy-path-ok\n", encoding="utf-8")
+        agy_shim.chmod(0o755)
+
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    # 1. env dict without 'PATH' key must still resolve bare tool via host PATH instead of ''
+    res = runner.run(command=["noenvpath_tool"], cwd=tmp_path, env={"CUSTOM_FLAG": "1"})
+    assert res.exit_code == 0
+    assert "no-path-key-ok" in res.stdout
+
+    # 2. Bare CLI shim resolves via shutil.which before Popen (including .cmd on Windows)
+    resolved_shim = resolve_command([agy_shim.stem, "--version"])
+    assert Path(resolved_shim[0]).resolve() == agy_shim.resolve()
+
+    # 3. Python CLI tool ('pytest') resolves cleanly via active interpreter Scripts/bin even with minimal host PATH
+    monkeypatch.setenv("PATH", str(bin_dir))
+    resolved_pytest = resolve_command(["pytest", "--version"])
+    assert Path(resolved_pytest[0]).parent.resolve() == Path(sys.executable).resolve().parent

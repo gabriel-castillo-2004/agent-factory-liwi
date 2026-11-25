@@ -6,7 +6,6 @@ import inspect
 import json
 import logging
 import re
-import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -20,7 +19,7 @@ from agent_factory.adapters.model_resolver import (
     is_retryable_model_or_quota_error,
     read_configured_model_for_stage,
 )
-from agent_factory.adapters.subprocess_runner import SubprocessRunner
+from agent_factory.adapters.subprocess_runner import SubprocessRunner, resolve_executable
 from agent_factory.ports.llm import LLM, InvalidLLMResponseError, LLMError
 from agent_factory.ports.runner import CommandResult, CommandTimeoutError, Runner
 from agent_factory.secrets import redact_secrets
@@ -288,16 +287,19 @@ class AgyLLMAdapter:
         )
 
     @staticmethod
-    def _resolve_binary_path(binary: str) -> str:
+    def _resolve_binary_path(binary: str, *, include_host_fallbacks: bool = False) -> str:
         """Resolve executable path via shutil.which (handles Windows .cmd/.bat shims), keeping mock binaries when unresolved."""
-        resolved = shutil.which(binary)
+        resolved = resolve_executable(binary, include_host_fallbacks=include_host_fallbacks)
         return resolved if resolved else binary
 
     def _build_base_command(self) -> list[str]:
         """Build CLI command prefix resolving argv[0] via _resolve_binary_path."""
         command = list(self.cli_command)
         if command:
-            command[0] = self._resolve_binary_path(command[0])
+            command[0] = self._resolve_binary_path(
+                command[0],
+                include_host_fallbacks=isinstance(self.runner, SubprocessRunner),
+            )
         return command
 
     def _invoke_cli_prompt(

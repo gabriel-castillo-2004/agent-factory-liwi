@@ -27,6 +27,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from agent_factory.adapters.subprocess_runner import resolve_command
 from agent_factory.domain.models import validate_project_id
 from agent_factory.secrets import redact_secrets, sanitize_subprocess_env
 from agent_factory.workspace import (
@@ -490,7 +491,7 @@ def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
         if os.name == "nt":
             try:
                 subprocess.run(
-                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    resolve_command(["taskkill", "/PID", str(proc.pid), "/T", "/F"]),
                     capture_output=True,
                     check=False,
                     timeout=5.0,
@@ -862,9 +863,10 @@ class LocalAppRunner:
         context: str,
     ) -> None:
         """Run isolated venv/pip command synchronously with timeout and redact any stderr on error."""
+        resolved_cmd = resolve_command([str(part) for part in cmd], env=env)
         try:
             res = self._dep_command_runner(
-                [str(part) for part in cmd],
+                resolved_cmd,
                 cwd=str(cwd),
                 env=dict(env),
                 capture_output=True,
@@ -1126,6 +1128,7 @@ class LocalAppRunner:
                 pythonpath=eff_pythonpath,
                 venv_dir=venv_dir,
             )
+            cmd = resolve_command(cmd, env=sub_env)
 
             try:
                 proc = subprocess.Popen(

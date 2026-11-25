@@ -4545,4 +4545,77 @@ def test_local_app_runner_readiness_timeout_stderr_diagnostics_and_uvicorn_port_
         runner_nomain.stop_all()
 
 
+def test_local_app_runner_and_build_worker_resolve_bare_cli_commands_and_pytest_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LocalAppRunner._run_dep_command resolves bare CLI names via PATH/which, and BuildWorker._run_local_pytest falls back to sys.executable -m pytest when pytest is absent from PATH."""
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    from agent_factory.adapters.subprocess_runner import SubprocessRunner
+    from agent_factory.builder import BuildJob, BuildWorker
+    from agent_factory.runtime_runner import LocalAppRunner
+
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_cli_res")
+    pid = "proj-cli-resolve"
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / "tests").mkdir(parents=True)
+    (ws_dir / "tests" / "test_ok.py").write_text("def test_pass():\n    assert 1 == 1\n", encoding="utf-8")
+
+    # 1. LocalAppRunner._run_dep_command resolves bare executable in env PATH
+    dep_bin = tmp_path / "dep_bin"
+    dep_bin.mkdir()
+    if os.name == "nt":
+        dummy_dep = dep_bin / "dummydep.cmd"
+        dummy_dep.write_text("@echo off\r\necho ok\r\n", encoding="utf-8")
+    else:
+        dummy_dep = dep_bin / "dummydep"
+        dummy_dep.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+        dummy_dep.chmod(0o755)
+
+    recorded_dep_cmds: list[list[str]] = []
+
+    def _rec_dep(cmd, **_kwargs):
+        recorded_dep_cmds.append([str(c) for c in cmd])
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    app_runner = LocalAppRunner(workspace_manager=ws_mgr, dep_command_runner=_rec_dep)
+    app_runner._run_dep_command(
+        ["dummydep", "--check"],
+        cwd=ws_dir,
+        env={"PATH": str(dep_bin)},
+        timeout_seconds=5.0,
+        context="dep check",
+    )
+    assert Path(recorded_dep_cmds[0][0]).resolve() == dummy_dep.resolve()
+
+    # 2. BuildWorker._run_local_pytest falls back cleanly when shutil.which("pytest") is None
+    orch, _store = _create_approved_project(pid, num_tests=1, approve=True)
+    plan = orch.get_plan(pid)
+    assert plan is not None
+    job = BuildJob(project_id=pid, plan=plan)
+    worker = BuildWorker(
+        orchestrator=orch,
+        workspace_manager=ws_mgr,
+        code_agent=FakeCodeAgent(),
+        runner=SubprocessRunner(default_timeout_seconds=10.0),
+        vcs=FakeVCS(),
+    )
+    monkeypatch.setattr(shutil, "which", lambda _binary, **_kw: None)
+    passed, passed_cnt, total_cnt, failing, _res, _t0 = worker._run_local_pytest(
+        pid,
+        job,
+        ws_dir,
+        build_round=1,
+    )
+    assert passed is True
+    assert passed_cnt >= 1
+    assert total_cnt >= 1
+    assert failing == []
+    _ = sys.executable
+
+
 

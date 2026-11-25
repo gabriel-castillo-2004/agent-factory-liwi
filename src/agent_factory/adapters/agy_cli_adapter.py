@@ -13,7 +13,7 @@ from agent_factory.adapters.model_resolver import (
     is_model_selection_error,
     is_quota_error,
 )
-from agent_factory.adapters.subprocess_runner import SubprocessRunner
+from agent_factory.adapters.subprocess_runner import SubprocessRunner, resolve_executable
 from agent_factory.domain.models import AcceptanceTest, Plan
 from agent_factory.ports.code_agent import (
     CodeAgent,
@@ -465,6 +465,12 @@ class AgyCliAdapter(CodeAgent):
             "plan": plan.model_dump(mode="json"),
         }
 
+    @staticmethod
+    def _resolve_binary_path(binary: str, *, include_host_fallbacks: bool = False) -> str:
+        """Resolve executable path via shutil.which, keeping unresolved mock names intact."""
+        resolved = resolve_executable(binary, include_host_fallbacks=include_host_fallbacks)
+        return resolved if resolved else binary
+
     def _build_cli_command(
         self,
         ws_path: Path,
@@ -472,10 +478,18 @@ class AgyCliAdapter(CodeAgent):
         mode_arg: str,
         active_model: str | None,
     ) -> list[str]:
-        is_real_agy = Path(self.cli_command[0]).stem.lower() == "agy"
-        cmd = list(self.cli_command) + [
+        command = list(self.cli_command)
+        is_real_agy = bool(command) and Path(command[0]).stem.lower() == "agy"
+        if command:
+            command[0] = self._resolve_binary_path(
+                command[0],
+                include_host_fallbacks=isinstance(self.runner, SubprocessRunner),
+            )
+        is_batch_shim = bool(command and command[0].lower().endswith((".cmd", ".bat")))
+        safe_prompt = re.sub(r"[\r\n]+", " ", prompt).strip() if is_batch_shim else prompt
+        cmd = command + [
             "-p",
-            prompt,
+            safe_prompt,
             "--add-dir",
             str(ws_path),
             "--dangerously-skip-permissions",
@@ -609,6 +623,14 @@ class AgyCliAdapter(CodeAgent):
             except CommandTimeoutError as exc:
                 clean_timeout = redact_secrets(str(exc), extra_secrets=self.secrets)
                 raise CommandTimeoutError(clean_timeout) from None
+            except OSError as exc:
+                clean_err = redact_secrets(
+                    str(exc) or type(exc).__name__,
+                    extra_secrets=self.secrets,
+                )
+                raise CodeAgentError(
+                    f"CLI execution failed for '{cmd[0]}': {clean_err}"
+                ) from None
 
             combined_output = f"{res.stdout}\n{res.stderr}".strip()
             if res.exit_code == 0:
