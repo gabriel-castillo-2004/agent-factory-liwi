@@ -10,7 +10,7 @@ from agent_factory.adapters.fake_llm import FakeLLM
 from agent_factory.adapters.fake_runner import FakeRunner
 from agent_factory.adapters.fake_vcs import FakeVCS
 from agent_factory.adapters.memory_store import MemoryEventStore
-from agent_factory.builder import BuildWorker, JobState, LocalJobQueue
+from agent_factory.builder import BuildJob, BuildWorker, JobState, LocalJobQueue
 from agent_factory.domain.events import EventType
 from agent_factory.domain.models import ApprovalEvent
 from agent_factory.domain.progress import project_status_from_events
@@ -4762,6 +4762,140 @@ def test_build_worker_passes_browser_smoke_findings_to_adversarial_critic_and_tr
         _ = run_http_smoke_test
     finally:
         local_runner.stop_all()
+
+
+def test_workspace_pytest_configurable_timeout_cli_isolation_env_and_per_test_timeout_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BuildWorker uses FactorySettings.workspace_pytest_timeout (default 180s / WORKSPACE_PYTEST_TIMEOUT), isolates CLIs via env (AGY_CLI_DISABLED=1, AGY_BIN=__disabled_in_pytest__), and adds --timeout=15 when pytest_timeout is installed."""
+    import importlib.util
+
+    from agent_factory.adapters.subprocess_runner import SubprocessRunner
+    from agent_factory.config import FactorySettings
+
+    monkeypatch.delenv("WORKSPACE_PYTEST_TIMEOUT", raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "SECRET_WS_PYTEST_TOKEN")
+    monkeypatch.setenv("CUSTOM_HOST_VAR", "keep-in-ws-pytest")
+
+    # 1. FactorySettings defaults to 180.0 and parses WORKSPACE_PYTEST_TIMEOUT
+    assert FactorySettings().workspace_pytest_timeout == 180.0
+    monkeypatch.setenv("WORKSPACE_PYTEST_TIMEOUT", "245.5")
+    assert FactorySettings().workspace_pytest_timeout == 245.5
+    with pytest.raises(ValueError):
+        FactorySettings.from_env({"WORKSPACE_PYTEST_TIMEOUT": "0"})
+    with pytest.raises(ValueError):
+        FactorySettings.from_env({"WORKSPACE_PYTEST_TIMEOUT": "bad_float"})
+
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_cfg_pytest")
+    pid = "proj-ws-pytest-cfg"
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / "tests").mkdir(parents=True)
+    (ws_dir / "tests" / "test_env_isolation.py").write_text(
+        "import os\n\n"
+        "def test_isolated_cli_env():\n"
+        "    assert os.environ.get('AGY_CLI_DISABLED') == '1'\n"
+        "    assert os.environ.get('AGY_BIN') == '__disabled_in_pytest__'\n"
+        "    assert os.environ.get('CUSTOM_HOST_VAR') == 'keep-in-ws-pytest'\n"
+        "    assert 'TELEGRAM_BOT_TOKEN' not in os.environ\n",
+        encoding="utf-8",
+    )
+
+    # 2. FakeRunner inspects default 180s -> overridden 245.5s, isolated env, and --timeout=15 toggle
+    monkeypatch.delenv("WORKSPACE_PYTEST_TIMEOUT", raising=False)
+    orch_def, _ = _create_approved_project(f"{pid}-def", num_tests=1, approve=True)
+    plan_def = orch_def.get_plan(f"{pid}-def")
+    assert plan_def is not None
+    fake_runner = FakeRunner(
+        results=[
+            CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True}),
+            CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True}),
+        ]
+    )
+    worker_def = BuildWorker(
+        orchestrator=orch_def,
+        workspace_manager=ws_mgr,
+        code_agent=FakeCodeAgent(),
+        runner=fake_runner,
+        vcs=FakeVCS(),
+    )
+    assert worker_def.workspace_pytest_timeout == 180.0
+
+    orig_find_spec = importlib.util.find_spec
+
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            importlib.util,
+            "find_spec",
+            lambda name, package=None: (
+                object() if name == "pytest_timeout" else orig_find_spec(name, package)
+            ),
+        )
+        worker_def._run_local_pytest(
+            f"{pid}-def",
+            BuildJob(project_id=f"{pid}-def", plan=plan_def),
+            ws_dir,
+            build_round=1,
+        )
+
+    call_with_plugin = fake_runner.calls[0]
+    assert call_with_plugin["timeout_seconds"] == 180.0
+    assert "--timeout=15" in call_with_plugin["command"]
+    assert call_with_plugin["env"] is not None
+    assert call_with_plugin["env"]["AGY_CLI_DISABLED"] == "1"
+    assert call_with_plugin["env"]["AGY_BIN"] == "__disabled_in_pytest__"
+    assert call_with_plugin["env"]["CUSTOM_HOST_VAR"] == "keep-in-ws-pytest"
+    assert "TELEGRAM_BOT_TOKEN" not in call_with_plugin["env"]
+
+    # Without pytest_timeout installed -> --timeout=15 omitted; WORKSPACE_PYTEST_TIMEOUT respected
+    monkeypatch.setenv("WORKSPACE_PYTEST_TIMEOUT", "245.5")
+    worker_custom = BuildWorker(
+        orchestrator=orch_def,
+        workspace_manager=ws_mgr,
+        code_agent=FakeCodeAgent(),
+        runner=fake_runner,
+        vcs=FakeVCS(),
+    )
+    assert worker_custom.workspace_pytest_timeout == 245.5
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            importlib.util,
+            "find_spec",
+            lambda name, package=None: None if name == "pytest_timeout" else orig_find_spec(name, package),
+        )
+        worker_custom._run_local_pytest(
+            f"{pid}-def",
+            BuildJob(project_id=f"{pid}-def", plan=plan_def),
+            ws_dir,
+            build_round=2,
+        )
+
+    call_no_plugin = fake_runner.calls[1]
+    assert call_no_plugin["timeout_seconds"] == 245.5
+    assert "--timeout=15" not in call_no_plugin["command"]
+
+    # 3. Real SubprocessRunner executes workspace pytest with env isolation and --timeout=15 end-to-end
+    monkeypatch.setenv("WORKSPACE_PYTEST_TIMEOUT", "180")
+    orch_real, _ = _create_approved_project(pid, num_tests=1, approve=True)
+    plan_real = orch_real.get_plan(pid)
+    assert plan_real is not None
+    worker_real = BuildWorker(
+        orchestrator=orch_real,
+        workspace_manager=ws_mgr,
+        code_agent=FakeCodeAgent(),
+        runner=SubprocessRunner(default_timeout_seconds=10.0),
+        vcs=FakeVCS(),
+    )
+    passed, passed_cnt, total_cnt, failing, _res, _t0 = worker_real._run_local_pytest(
+        pid,
+        BuildJob(project_id=pid, plan=plan_real),
+        ws_dir,
+        build_round=1,
+    )
+    assert passed is True
+    assert passed_cnt == 1
+    assert total_cnt == 1
+    assert failing == []
 
 
 

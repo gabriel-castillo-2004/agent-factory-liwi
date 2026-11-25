@@ -72,7 +72,6 @@ def resolve_executable(
     if (
         include_host_fallbacks
         and not restricted_path
-        and env is None
         and exe_stem in _PYTHON_VENV_TOOLS
     ):
         py_resolved = _safe_which(clean, str(Path(sys.executable).resolve().parent))

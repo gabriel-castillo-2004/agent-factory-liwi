@@ -29,6 +29,11 @@ from agent_factory.adapters.static_deploy_publisher import StaticDeployPublisher
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.adapters.telegram_client import TelegramHttpClient, UrllibHttpTransport
 from agent_factory.builder import BuildWorker
+from agent_factory.config import (
+    DEFAULT_WORKSPACE_PYTEST_TIMEOUT,
+    parse_positive_timeout,
+    parse_workspace_pytest_timeout,
+)
 from agent_factory.dashboard import DashboardHTTPServer, start_dashboard_server
 from agent_factory.orchestrator import CircuitBreaker, Orchestrator, load_limits
 from agent_factory.ports.clock import Clock
@@ -291,6 +296,7 @@ class CliConfig(BaseModel):
     llm_provider: str = "auto"
     llm_fallback_to_agy: bool = True
     agy_cli_timeout_seconds: float = 300.0
+    workspace_pytest_timeout: float = DEFAULT_WORKSPACE_PYTEST_TIMEOUT
     dashboard_port: int = 8000
     lan_mode: bool = False
 
@@ -483,25 +489,30 @@ def load_cli_config(env: Mapping[str, str] | None = None) -> CliConfig:
         err_fb.__context__ = None
         raise err_fb
 
-    agy_cli_timeout_seconds = 300.0
-    err_agy_timeout: CliConfigError | None = None
+    secrets_seq = (token,) if token else ()
     try:
-        raw_agy_timeout = effective.get("AGY_CLI_TIMEOUT_SECONDS", "300.0").strip() or "300.0"
-        agy_cli_timeout_seconds = float(raw_agy_timeout)
-        if not math.isfinite(agy_cli_timeout_seconds) or agy_cli_timeout_seconds <= 0:
-            err_agy_timeout = CliConfigError(
-                "AGY_CLI_TIMEOUT_SECONDS must be a finite positive number"
-            )
-    except ValueError as exc:
-        clean_err = redact_secrets(
-            f"Invalid AGY_CLI_TIMEOUT_SECONDS: {exc}",
-            extra_secrets=(token,) if token else (),
+        agy_cli_timeout_seconds = parse_positive_timeout(
+            effective.get("AGY_CLI_TIMEOUT_SECONDS"),
+            env_var_name="AGY_CLI_TIMEOUT_SECONDS",
+            default=300.0,
+            extra_secrets=secrets_seq,
         )
-        err_agy_timeout = CliConfigError(clean_err)
-    if err_agy_timeout is not None:
-        err_agy_timeout.__cause__ = None
-        err_agy_timeout.__context__ = None
-        raise err_agy_timeout
+    except ValueError as exc:
+        err_agy = CliConfigError(str(exc))
+        err_agy.__cause__ = None
+        err_agy.__context__ = None
+        raise err_agy from None
+
+    try:
+        workspace_pytest_timeout = parse_workspace_pytest_timeout(
+            effective,
+            extra_secrets=secrets_seq,
+        )
+    except ValueError as exc:
+        err_ws_pt = CliConfigError(str(exc))
+        err_ws_pt.__cause__ = None
+        err_ws_pt.__context__ = None
+        raise err_ws_pt from None
 
     dashboard_port = 8000
     err_port: CliConfigError | None = None
@@ -545,6 +556,7 @@ def load_cli_config(env: Mapping[str, str] | None = None) -> CliConfig:
         llm_provider=raw_provider,
         llm_fallback_to_agy=llm_fallback_to_agy,
         agy_cli_timeout_seconds=agy_cli_timeout_seconds,
+        workspace_pytest_timeout=workspace_pytest_timeout,
         dashboard_port=dashboard_port,
         lan_mode=lan_mode,
     )
@@ -791,6 +803,7 @@ def build_runtime(
             local_app_runner=(
                 local_runner if isinstance(effective_runner, SubprocessRunner) else None
             ),
+            workspace_pytest_timeout=config.workspace_pytest_timeout,
         )
 
         effective_tg_client = (

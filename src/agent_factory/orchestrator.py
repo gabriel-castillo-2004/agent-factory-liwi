@@ -2830,9 +2830,14 @@ class Orchestrator:
 
     @staticmethod
     def _run_rollback_pytest(runner: Any, ws_dir: Path, extra_secrets: Sequence[str]) -> None:
-        import shutil
         import sys
 
+        from agent_factory.adapters.subprocess_runner import resolve_executable
+        from agent_factory.config import (
+            FactorySettings,
+            build_workspace_pytest_env,
+            workspace_pytest_timeout_args,
+        )
         from agent_factory.workspace import is_python_cache_path
 
         tests_dir = ws_dir / "tests"
@@ -2846,10 +2851,13 @@ class Orchestrator:
         if not has_tests:
             return
 
+        resolved_pytest = (
+            "pytest"
+            if runner.__class__.__name__ == "FakeRunner"
+            else resolve_executable("pytest")
+        )
         pytest_bin: list[str] = (
-            ["pytest"]
-            if runner.__class__.__name__ == "FakeRunner" or shutil.which("pytest")
-            else [sys.executable, "-m", "pytest"]
+            [resolved_pytest] if resolved_pytest else [sys.executable, "-m", "pytest"]
         )
         ws_ini = ws_dir / "pytest.ini"
         tmp_ini: Path | None = None
@@ -2874,12 +2882,14 @@ class Orchestrator:
                     "no:cacheprovider",
                     "-o",
                     "addopts=",
+                    *workspace_pytest_timeout_args(),
                     "-c",
                     str(ini_arg),
                     f"--rootdir={ws_dir}",
                 ],
                 cwd=ws_dir,
-                timeout_seconds=30.0,
+                timeout_seconds=FactorySettings().workspace_pytest_timeout,
+                env=build_workspace_pytest_env(),
             )
         finally:
             if tmp_ini is not None:

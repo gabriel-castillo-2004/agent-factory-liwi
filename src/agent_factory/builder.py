@@ -26,6 +26,12 @@ from agent_factory.agents.quality_auditor import (
     QualityAuditReport,
     build_quality_markdown_report,
 )
+from agent_factory.config import (
+    FactorySettings,
+    build_workspace_pytest_env,
+    parse_positive_timeout,
+    workspace_pytest_timeout_args,
+)
 from agent_factory.domain.events import Event, EventType, create_event
 from agent_factory.domain.models import (
     AcceptanceTest,
@@ -273,6 +279,8 @@ class BuildWorker:
         quality_audit_enabled: bool | None = None,
         chats_dir: Path | None = None,
         max_quality_refinement_rounds: int = 2,
+        workspace_pytest_timeout: float | None = None,
+        settings: FactorySettings | None = None,
     ) -> None:
         self.orchestrator = orchestrator
         self.workspace_manager = workspace_manager
@@ -292,6 +300,16 @@ class BuildWorker:
         self.quality_audit_enabled = quality_audit_enabled
         self.chats_dir: Path | None = Path(chats_dir).resolve() if chats_dir is not None else None
         self.max_quality_refinement_rounds = max(0, min(2, int(max_quality_refinement_rounds)))
+        if workspace_pytest_timeout is not None:
+            self.workspace_pytest_timeout = parse_positive_timeout(
+                workspace_pytest_timeout,
+                env_var_name="workspace_pytest_timeout",
+                default=180.0,
+            )
+        elif settings is not None:
+            self.workspace_pytest_timeout = float(settings.workspace_pytest_timeout)
+        else:
+            self.workspace_pytest_timeout = FactorySettings().workspace_pytest_timeout
         if getattr(orchestrator, "build_worker", None) is None:
             orchestrator.build_worker = self
 
@@ -1076,6 +1094,7 @@ class BuildWorker:
             "-ra",
             "-o",
             "addopts=",
+            *workspace_pytest_timeout_args(),
             *(["-c", str(pytest_ini_path)] if pytest_ini_path.is_file() else []),
             f"--rootdir={ws_dir}",
         ]
@@ -1083,7 +1102,8 @@ class BuildWorker:
         runner_result = self.runner.run(
             command=pytest_cmd,
             cwd=ws_dir,
-            timeout_seconds=30.0,
+            timeout_seconds=self.workspace_pytest_timeout,
+            env=build_workspace_pytest_env(),
         )
         local_test_duration = round(max(0.0, time.monotonic() - verify_t0), 3)
         required_test_ids = [at.id for at in job.plan.acceptance_tests]
