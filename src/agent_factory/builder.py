@@ -7,7 +7,7 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -47,6 +47,7 @@ from agent_factory.ports.code_agent import CodeAgent, CodeAgentError, QuotaExhau
 from agent_factory.ports.publisher import RegistryPublisher, RegistryPublishError
 from agent_factory.ports.runner import CommandResult, CommandTimeoutError, Runner
 from agent_factory.ports.vcs import VCS
+from agent_factory.recovery_agent import RecoveryAgent, RecoveryResult
 from agent_factory.runtime_runner import LocalAppRunner, detect_workspace_app, run_http_smoke_test
 from agent_factory.secrets import redact_secrets
 from agent_factory.workspace import (
@@ -281,6 +282,7 @@ class BuildWorker:
         max_quality_refinement_rounds: int = 2,
         workspace_pytest_timeout: float | None = None,
         settings: FactorySettings | None = None,
+        recovery_agent: RecoveryAgent | None = None,
     ) -> None:
         self.orchestrator = orchestrator
         self.workspace_manager = workspace_manager
@@ -310,6 +312,8 @@ class BuildWorker:
             self.workspace_pytest_timeout = float(settings.workspace_pytest_timeout)
         else:
             self.workspace_pytest_timeout = FactorySettings().workspace_pytest_timeout
+        self.recovery_agent: RecoveryAgent | None = recovery_agent
+        self._auto_recovery_agent: RecoveryAgent | None = None
         if getattr(orchestrator, "build_worker", None) is None:
             orchestrator.build_worker = self
 
@@ -633,6 +637,65 @@ class BuildWorker:
                 max_rounds=max_rounds,
             )
 
+    def _effective_recovery_agent(self) -> RecoveryAgent | None:
+        """Return explicit Doctor Agent, orchestrator-attached instance, or lazy real-runner instance."""
+        if self.recovery_agent is not None:
+            return self.recovery_agent
+        orch_doc = getattr(self.orchestrator, "recovery_agent", None)
+        if isinstance(orch_doc, RecoveryAgent):
+            return orch_doc
+        if not isinstance(self.runner, SubprocessRunner):
+            return None
+        if self._auto_recovery_agent is None:
+            store = self.orchestrator.store
+            sqlite_store = store if hasattr(store, "_conn") and hasattr(store, "_lock") else None
+            self._auto_recovery_agent = RecoveryAgent(
+                sqlite_store=sqlite_store,
+                workspace_manager=self.workspace_manager,
+                runner=self.runner,
+                clock=self.clock,
+                secrets_to_redact=self.secrets_to_redact,
+            )
+        return self._auto_recovery_agent
+
+    def _attempt_build_recovery(
+        self,
+        project_id: str,
+        *,
+        stage: str,
+        error: BaseException | str,
+        ws_dir: Path,
+        retry_fn: Callable[[], Any] | None = None,
+        recent_logs: str = "",
+        traceback_text: str | None = None,
+    ) -> RecoveryResult | None:
+        """Invoke Doctor Agent recovery prior to FAILED/NEEDS_ATTENTION and persist timeline event on success."""
+        doctor = self._effective_recovery_agent()
+        if doctor is None:
+            return None
+        gh_tok = str(getattr(self.vcs, "github_token", "") or "")
+        repo_base = str(getattr(self.vcs, "repo_base_url", "") or "https://github.com")
+        res = doctor.attempt_recovery(
+            project_id=project_id,
+            stage=stage,
+            error=error,
+            workspace_dir=ws_dir,
+            retry_fn=retry_fn,
+            recent_logs=recent_logs,
+            traceback_text=traceback_text,
+            github_token=gh_tok,
+            repo_base_url=repo_base,
+            extra_secrets=self.secrets_to_redact,
+        )
+        if res.recovered:
+            self.orchestrator.record_doctor_recovery(
+                project_id,
+                res,
+                stage=stage,
+                extra_secrets=self.secrets_to_redact,
+            )
+        return res
+
     def _fail_job(
         self,
         project_id: str,
@@ -641,6 +704,7 @@ class BuildWorker:
         *,
         emit_event: bool = True,
         failed_state: ProjectState | None = None,
+        recovery: Any | None = None,
     ) -> BuildReport:
         """Sanitize reason, emit optional PHASE_ERROR + PROJECT_FAILED, mark job FAILED, and build report."""
         raw_reason = str(reason) if str(reason).strip() else type(reason).__name__
@@ -653,6 +717,7 @@ class BuildWorker:
                 error=reason,
                 agent="build_worker",
                 extra_secrets=self.secrets_to_redact,
+                recovery=recovery,
             )
         if failed_state != ProjectState.BUILDING or not job.last_failure_output:
             job.last_failure_output = clean_reason
@@ -2473,9 +2538,35 @@ class BuildWorker:
                     build_round=build_round,
                 )
             except (CommandTimeoutError, OSError, RuntimeError, ValueError) as err:
-                return self._fail_job(
-                    project_id, job, err, failed_state=ProjectState.BUILDING
+                rec_pytest_exc = self._attempt_build_recovery(
+                    project_id,
+                    stage="VERIFYING",
+                    error=err,
+                    ws_dir=ws_dir,
+                    retry_fn=lambda br=build_round: self._run_local_pytest(
+                        project_id,
+                        job,
+                        ws_dir,
+                        build_round=br,
+                    ),
                 )
+                if rec_pytest_exc is not None and rec_pytest_exc.recovered and rec_pytest_exc.recovered_value is not None:
+                    (
+                        local_tests_passed,
+                        tests_passed_count,
+                        tests_total_count,
+                        failing_tests,
+                        runner_result,
+                        verify_t0,
+                    ) = rec_pytest_exc.recovered_value
+                else:
+                    return self._fail_job(
+                        project_id,
+                        job,
+                        err,
+                        failed_state=ProjectState.BUILDING,
+                        recovery=rec_pytest_exc,
+                    )
 
             self._save_round_checkpoint(
                 project_id,
@@ -2485,6 +2576,47 @@ class BuildWorker:
                 tests_passed_count,
                 tests_total_count,
             )
+
+            if not local_tests_passed:
+                output = runner_result.stdout
+                if runner_result.stderr:
+                    output = f"{output}\n{runner_result.stderr}".strip()
+                job.last_failure_output = output
+
+                def _retry_pytest_until_green(
+                    br: int = build_round,
+                ) -> tuple[bool, int, int, list[str], CommandResult, float]:
+                    res_tuple = self._run_local_pytest(
+                        project_id,
+                        job,
+                        ws_dir,
+                        build_round=br,
+                    )
+                    if not res_tuple[0]:
+                        out_tail = f"{res_tuple[4].stdout}\n{res_tuple[4].stderr}".strip()
+                        raise RuntimeError(out_tail or "Workspace pytest still failing")
+                    return res_tuple
+
+                missing_mod_err = "no module named" in output.lower() or "modulenotfounderror" in output.lower()
+                if missing_mod_err and self._effective_recovery_agent() is not None:
+                    rec_mod = self._attempt_build_recovery(
+                        project_id,
+                        stage="VERIFYING",
+                        error=output,
+                        ws_dir=ws_dir,
+                        recent_logs=output,
+                        retry_fn=_retry_pytest_until_green,
+                    )
+                    if rec_mod is not None and rec_mod.recovered and rec_mod.recovered_value is not None:
+                        (
+                            local_tests_passed,
+                            tests_passed_count,
+                            tests_total_count,
+                            failing_tests,
+                            runner_result,
+                            verify_t0,
+                        ) = rec_mod.recovered_value
+                        job.last_failure_output = ""
 
             if not local_tests_passed:
                 output = runner_result.stdout
@@ -2505,16 +2637,39 @@ class BuildWorker:
                         stagnation_reason = self._summarize_stagnation_cause(
                             runner_result, failing_tests
                         )
-                        return self._fail_job(
+                        rec_stag = self._attempt_build_recovery(
                             project_id,
-                            job,
-                            stagnation_reason,
-                            failed_state=ProjectState.BUILDING,
+                            stage="VERIFYING",
+                            error=stagnation_reason,
+                            ws_dir=ws_dir,
+                            recent_logs=output,
+                            retry_fn=_retry_pytest_until_green,
                         )
+                        if rec_stag is not None and rec_stag.recovered and rec_stag.recovered_value is not None:
+                            (
+                                local_tests_passed,
+                                tests_passed_count,
+                                tests_total_count,
+                                failing_tests,
+                                runner_result,
+                                verify_t0,
+                            ) = rec_stag.recovered_value
+                            consecutive_noop_rounds = 0
+                            last_failure_sig = None
+                            job.last_failure_output = ""
+                        else:
+                            return self._fail_job(
+                                project_id,
+                                job,
+                                stagnation_reason,
+                                failed_state=ProjectState.BUILDING,
+                                recovery=rec_stag,
+                            )
                 else:
                     consecutive_noop_rounds = 0
                     last_failure_sig = current_sig
-                continue
+                if not local_tests_passed:
+                    continue
 
             # Ensure clean favicon.svg exists before smoke check / publishing (prevents 404 in browser console)
             cur_meta = self.orchestrator.get_status(project_id)
@@ -2538,6 +2693,40 @@ class BuildWorker:
             if not smoke_passed:
                 assert smoke_err is not None
                 job.last_failure_output = smoke_err
+
+                def _retry_smoke_must_pass(
+                    br: int = build_round,
+                    mr: int = max_code_rounds,
+                    tp: int = tests_passed_count,
+                    tt: int = tests_total_count,
+                ) -> tuple[bool, str | None, tuple[str, ...], tuple[str, ...]]:
+                    s_res = self._run_local_smoke_test(
+                        project_id,
+                        ws_dir,
+                        build_round=br,
+                        max_code_rounds=mr,
+                        tests_passed_count=tp,
+                        tests_total_count=tt,
+                    )
+                    if not s_res[0]:
+                        raise RuntimeError(s_res[1] or "Local HTTP smoke test failed")
+                    return s_res
+
+                if "no module named" in smoke_err.lower() or "modulenotfounderror" in smoke_err.lower():
+                    rec_smoke_mod = self._attempt_build_recovery(
+                        project_id,
+                        stage="VERIFYING",
+                        error=smoke_err,
+                        ws_dir=ws_dir,
+                        recent_logs=smoke_err,
+                        retry_fn=_retry_smoke_must_pass,
+                    )
+                    if rec_smoke_mod is not None and rec_smoke_mod.recovered and rec_smoke_mod.recovered_value is not None:
+                        smoke_passed, smoke_err, smoke_failed_resources, smoke_browser_findings = rec_smoke_mod.recovered_value
+
+            if not smoke_passed:
+                assert smoke_err is not None
+                job.last_failure_output = smoke_err
                 smoke_sig = (-1, smoke_failed_resources, smoke_err)
                 if not impl_files:
                     same_failure = last_failure_sig is None or smoke_sig == last_failure_sig
@@ -2546,16 +2735,31 @@ class BuildWorker:
                     )
                     last_failure_sig = smoke_sig
                     if consecutive_noop_rounds >= 2:
-                        return self._fail_job(
+                        rec_smoke = self._attempt_build_recovery(
                             project_id,
-                            job,
-                            f"Proceso detenido automáticamente tras 2 rondas consecutivas sin cambios ({self._bound_redacted(smoke_err, limit=180)}).",
-                            failed_state=ProjectState.BUILDING,
+                            stage="VERIFYING",
+                            error=smoke_err,
+                            ws_dir=ws_dir,
+                            recent_logs=smoke_err,
+                            retry_fn=_retry_smoke_must_pass,
                         )
+                        if rec_smoke is not None and rec_smoke.recovered and rec_smoke.recovered_value is not None:
+                            smoke_passed, smoke_err, smoke_failed_resources, smoke_browser_findings = rec_smoke.recovered_value
+                            consecutive_noop_rounds = 0
+                            last_failure_sig = None
+                        else:
+                            return self._fail_job(
+                                project_id,
+                                job,
+                                f"Proceso detenido automáticamente tras 2 rondas consecutivas sin cambios ({self._bound_redacted(smoke_err, limit=180)}).",
+                                failed_state=ProjectState.BUILDING,
+                                recovery=rec_smoke,
+                            )
                 else:
                     consecutive_noop_rounds = 0
                     last_failure_sig = smoke_sig
-                continue
+                if not smoke_passed:
+                    continue
 
             # Parent Auditor + 6 Sub-Auditors + bounded 2-round quality refinement before delivery
             (
@@ -2592,18 +2796,32 @@ class BuildWorker:
                 )
             )
 
-            try:
-                # Write portable manifest before commit/push in Git
+            def _push_and_get_ci() -> Any:
                 self._write_manifest(project_id, ws_dir, job)
-                # Push branch
                 self.vcs.push_branch(project_id, ws_dir, branch="work")
+                return self.vcs.get_ci_result(project_id, branch="work")
 
-                # Get CI result
-                ci_result = self.vcs.get_ci_result(project_id, branch="work")
+            try:
+                ci_result = _push_and_get_ci()
             except (CommandTimeoutError, OSError, RuntimeError, ValueError) as err:
-                return self._fail_job(
-                    project_id, job, err, failed_state=ProjectState.VERIFYING
+                rec_ci = self._attempt_build_recovery(
+                    project_id,
+                    stage="VERIFYING",
+                    error=err,
+                    ws_dir=ws_dir,
+                    recent_logs=job.last_failure_output,
+                    retry_fn=_push_and_get_ci,
                 )
+                if rec_ci is not None and rec_ci.recovered and rec_ci.recovered_value is not None:
+                    ci_result = rec_ci.recovered_value
+                else:
+                    return self._fail_job(
+                        project_id,
+                        job,
+                        err,
+                        failed_state=ProjectState.VERIFYING,
+                        recovery=rec_ci,
+                    )
 
             job.ci_rounds_used += 1
             ci_duration = round(max(0.0, time.monotonic() - verify_t0), 3)
@@ -2638,9 +2856,26 @@ class BuildWorker:
                         project_id, branch="work"
                     )
                 except (CommandTimeoutError, OSError, RuntimeError, ValueError) as err:
-                    return self._fail_job(
-                        project_id, job, err, failed_state=ProjectState.VERIFYING
+                    rec_pub = self._attempt_build_recovery(
+                        project_id,
+                        stage="PUBLISHING",
+                        error=err,
+                        ws_dir=ws_dir,
+                        recent_logs=clean_ci_summary,
+                        retry_fn=lambda: self.vcs.merge_and_deploy(
+                            project_id, branch="work"
+                        ),
                     )
+                    if rec_pub is not None and rec_pub.recovered and rec_pub.recovered_value is not None:
+                        repo_url, deploy_url = rec_pub.recovered_value
+                    else:
+                        return self._fail_job(
+                            project_id,
+                            job,
+                            err,
+                            failed_state=ProjectState.VERIFYING,
+                            recovery=rec_pub,
+                        )
 
                 pub_duration = round(max(0.0, time.monotonic() - pub_t0), 3)
                 prior_delivered = sum(

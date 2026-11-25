@@ -49,6 +49,7 @@ from agent_factory.ports.publisher import RegistryPublisher
 from agent_factory.ports.runner import Runner
 from agent_factory.ports.store import EventStore
 from agent_factory.ports.vcs import VCS
+from agent_factory.recovery_agent import RecoveryAgent
 from agent_factory.runtime_runner import LocalAppRunner
 from agent_factory.scaffold import TemplateScaffold
 from agent_factory.secrets import redact_secrets
@@ -791,6 +792,15 @@ def build_runtime(
             lan_mode=config.lan_mode,
         )
 
+        recovery_agent = RecoveryAgent(
+            sqlite_store=store if isinstance(store, SqliteEventStore) else None,
+            workspace_manager=workspace_manager,
+            runner=effective_runner,
+            clock=clock,
+            secrets_to_redact=active_secrets,
+        )
+        orchestrator.recovery_agent = recovery_agent
+
         build_worker = BuildWorker(
             orchestrator=orchestrator,
             workspace_manager=workspace_manager,
@@ -804,6 +814,7 @@ def build_runtime(
                 local_runner if isinstance(effective_runner, SubprocessRunner) else None
             ),
             workspace_pytest_timeout=config.workspace_pytest_timeout,
+            recovery_agent=recovery_agent,
         )
 
         effective_tg_client = (

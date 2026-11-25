@@ -12,7 +12,7 @@ import logging
 import threading
 import urllib.parse
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -515,6 +515,25 @@ class DashboardController:
                     return redact_secrets(reason, extra_secrets=self.secrets_to_redact)
         return None
 
+    def _extract_last_recovery(
+        self,
+        status: ProjectStatus,
+        events: Sequence[Event],
+    ) -> dict[str, Any] | None:
+        """Return latest secret-redacted Doctor Agent recovery/diagnostic record for the active attempt."""
+        _ = status
+        for ev in reversed(events):
+            if ev.type == EventType.PROJECT_RETRIED:
+                break
+            pl = ev.payload or {}
+            if ev.type == EventType.DOCTOR_RECOVERY and isinstance(pl, Mapping):
+                return _scrub_value(dict(pl), self.secrets_to_redact)
+            if ev.type in (EventType.PHASE_ERROR, EventType.PROJECT_FAILED):
+                rec = pl.get("recovery")
+                if isinstance(rec, Mapping):
+                    return _scrub_value(dict(rec), self.secrets_to_redact)
+        return None
+
     def _sync_external_workspace(
         self,
         project_id: str,
@@ -603,6 +622,7 @@ class DashboardController:
         else:
             running, active_op, _ = reconciled
         last_error = self._extract_last_error(status, events)
+        last_recovery = self._extract_last_recovery(status, events)
         last_event_at = events[-1].at.isoformat() if events else None
         live_info = self._get_live_status_info(running)
         if running and active_op:
@@ -636,6 +656,7 @@ class DashboardController:
                 raw["step_started_at"] = op_started_at
         raw["op_started_at"] = op_started_at
         raw["last_error"] = last_error
+        raw["last_recovery"] = last_recovery
         raw["has_plan"] = has_plan
         raw["busy"] = running
         raw["is_running"] = running
@@ -2437,6 +2458,37 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       word-break: break-word;
       color: var(--err);
       border: 1px solid var(--border);
+    }
+    .doctor-recovery-card {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      font-size: 0.86rem;
+    }
+    .doctor-recovery-badges {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-bottom: 6px;
+    }
+    .doctor-prompt-box {
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px dashed var(--border);
+    }
+    .doctor-prompt-pre {
+      margin: 6px 0;
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      font-size: 0.8rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--text);
     }
     .secondary-actions {
       display: flex;
@@ -5328,6 +5380,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         'PROJECT_DELIVERED': '¡Proyecto entregado con éxito!',
         'BACKGROUND_OP_STARTED': 'Operación en segundo plano',
         'BACKGROUND_OP_FINISHED': 'Operación finalizada',
+        'DOCTOR_RECOVERY': 'Diagnóstico del Agente Doctor',
         'REGISTRY_PUBLISH_FAILED': 'Error al publicar registro',
       };
       return labels[type] || type;
@@ -5389,6 +5442,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             : 'Operación en segundo plano completada';
         case 'REGISTRY_PUBLISH_FAILED':
           return 'Aviso al publicar registro';
+        case 'DOCTOR_RECOVERY':
+          if (pl.recovered) {
+            return '🩺 Agente Doctor: recuperación automática exitosa';
+          }
+          if (pl.scope === 'factory') {
+            return '🩺 Agente Doctor: diagnóstico interno de la fábrica';
+          }
+          return '🩺 Agente Doctor: intento de recuperación (' + (pl.attempts || 0) + '/' + (pl.max_attempts || 2) + ')';
         case 'STATE_TRANSITIONED':
           return pl.to ? ('Avanzó a ' + friendlyStateName(pl.to)) : 'Cambio de etapa';
         default:
@@ -5439,6 +5500,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         case 'BACKGROUND_OP_STARTED':
         case 'BACKGROUND_OP_FINISHED':
           return pl.stage ? stateToPhaseNum(pl.stage) : 5;
+        case 'DOCTOR_RECOVERY':
+          return pl.stage ? stateToPhaseNum(pl.stage) : 4;
         default:
           return 1;
       }
@@ -5801,6 +5864,67 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       renderLiveActivityBanner();
     }
 
+    function renderDoctorRecoveryHtml(rec) {
+      if (!rec || typeof rec !== 'object') return '';
+      const attempts = Number(rec.attempts || 0);
+      const maxAtt = Number(rec.max_attempts || 2);
+      const usedLesson = Boolean(rec.used_lesson);
+      const learnedLesson = Boolean(rec.learned_new_lesson);
+      const isFactory = rec.scope === 'factory';
+      const lessonType = rec.lesson_applied_type ? String(rec.lesson_applied_type) : '';
+      let lessonText = 'Sin lección previa coincidente';
+      if (usedLesson) {
+        lessonText = 'Lección aplicada' + (lessonType ? (' (' + lessonType + ')') : '');
+      } else if (learnedLesson) {
+        lessonText = 'Nueva lección aprendida y guardada';
+      } else if (isFactory) {
+        lessonText = 'Solo lectura (error interno de fábrica)';
+      }
+      const attemptsBadge = isFactory
+        ? '<span class="model-pill">0 modificaciones (solo lectura)</span>'
+        : '<span class="model-pill">Intentos: ' + escapeHtml(String(attempts) + '/' + String(maxAtt)) + '</span>';
+      const statusBadge = rec.recovered
+        ? '<span class="test-badge ok">Auto-recuperado</span>'
+        : '<span class="model-pill">' + escapeHtml(lessonText) + '</span>';
+      const lessonPill = (rec.recovered && (usedLesson || learnedLesson))
+        ? '<span class="model-pill">' + escapeHtml(lessonText) + '</span>'
+        : '';
+      const diagHtml = rec.diagnosis
+        ? '<div class="round-summary" style="margin-top:4px;"><strong>Diagnóstico:</strong> ' + escapeHtml(String(rec.diagnosis)) + '</div>'
+        : '';
+      const promptHtml = (isFactory && rec.suggested_prompt)
+        ? '<div class="doctor-prompt-box">' +
+            '<div style="font-weight:600; font-size:0.82rem;">Prompt sugerido para reparar la fábrica:</div>' +
+            '<pre class="doctor-prompt-pre">' + escapeHtml(String(rec.suggested_prompt)) + '</pre>' +
+            '<button type="button" class="btn btn-sm" data-copy-doctor-prompt="1">Copiar prompt sugerido</button>' +
+          '</div>'
+        : '';
+      return '<div class="doctor-recovery-card">' +
+        '<div class="doctor-recovery-badges">' +
+          '<span style="font-weight:600;">🩺 Agente Doctor</span>' +
+          statusBadge +
+          lessonPill +
+          attemptsBadge +
+        '</div>' +
+        diagHtml +
+        promptHtml +
+      '</div>';
+    }
+
+    function wireCopyDoctorPromptButtons(container) {
+      if (!container) return;
+      container.querySelectorAll('button[data-copy-doctor-prompt]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const box = btn.closest('.doctor-prompt-box');
+          const pre = box ? box.querySelector('.doctor-prompt-pre') : null;
+          const txt = pre ? pre.textContent : '';
+          if (txt) {
+            copyToClipboard(txt, '✓ Prompt sugerido copiado al portapapeles.');
+          }
+        });
+      });
+    }
+
     function buildGuidanceBanner(st, events, detail) {
       const isRunning = Boolean(st.is_running || st.busy);
       if (isRunning) {
@@ -5971,12 +6095,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       if (st.state === 'FAILED' || st.state === 'ERROR') {
         const friendlyErr = humanizeError(st.last_error);
+        const doctorHtml = renderDoctorRecoveryHtml(st.last_recovery);
         return '<div class="guidance-banner banner-err">' +
           '<div class="banner-content">' +
             '<div class="banner-icon">⚠️</div>' +
             '<div class="banner-body">' +
               '<div class="banner-title">Se requiere atención</div>' +
               '<div class="banner-desc">' + escapeHtml(friendlyErr) + '</div>' +
+              doctorHtml +
               '<details class="tech-details tech-only">' +
                 '<summary>Ver detalle técnico</summary>' +
                 '<pre>' + escapeHtml(st.last_error || 'Sin detalle técnico disponible.') + '</pre>' +
@@ -6329,6 +6455,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           ? { phase_error: item.causeEv.payload || {}, project_failed: ev.payload || {} }
           : (ev.payload || {});
         const techText = item.rawError ? (String(item.rawError) + '\\n\\n' + JSON.stringify(techPayload, null, 2)) : JSON.stringify(techPayload, null, 2);
+        const recObj = (ev && ev.payload && ev.payload.recovery) || (item.causeEv && item.causeEv.payload && item.causeEv.payload.recovery) || null;
+        const doctorTimelineHtml = renderDoctorRecoveryHtml(recObj);
         const durPill = item.durSecs !== null ? '<span class="duration-pill">Tardó ' + escapeHtml(formatDurationHuman(item.durSecs, '< 1s')) + '</span>' : '';
         return '<div class="timeline-item">' +
           '<div class="timeline-dot err"></div>' +
@@ -6340,6 +6468,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             '<span class="timeline-time" title="' + escapeHtml(rawDate) + '">' + friendlyDate + '</span>' +
           '</div>' +
           '<div class="round-summary">' + escapeHtml(item.msg) + '</div>' +
+          doctorTimelineHtml +
           '<details class="tech-details tech-only" style="margin-top:4px;"><summary>Ver detalle técnico</summary><pre style="margin:4px 0 0 0;">' + escapeHtml(techText) + '</pre></details>' +
         '</div>';
       }
@@ -6417,9 +6546,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         '</div>';
       }
 
-      const isSuccess = ev.type === 'PROJECT_DELIVERED' || ev.type === 'PROJECT_COMPLETED' || ev.type === 'COMPLETED';
+      const isSuccess = ev.type === 'PROJECT_DELIVERED' || ev.type === 'PROJECT_COMPLETED' || ev.type === 'COMPLETED' || (ev.type === 'DOCTOR_RECOVERY' && pl.recovered);
       const hasPayload = ev.payload && Object.keys(ev.payload).length > 0;
       const actionTitle = friendlyEventAction(ev);
+      const doctorItemHtml = ev.type === 'DOCTOR_RECOVERY' ? renderDoctorRecoveryHtml(pl) : '';
       const modelPill = pl.model ? '<span class="model-pill tech-only">' + escapeHtml(String(pl.model)) + '</span>' : '';
       const durPill = item.durSecs !== null ? '<span class="duration-pill">Tardó ' + escapeHtml(formatDurationHuman(item.durSecs, '< 1s')) + '</span>' : '';
       return '<div class="timeline-item">' +
@@ -6432,6 +6562,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           '</span>' +
           '<span class="timeline-time" title="' + escapeHtml(rawDate) + '">' + friendlyDate + '</span>' +
         '</div>' +
+        doctorItemHtml +
         (hasPayload ? '<details class="tech-details tech-only" style="margin-top:4px;"><summary>Ver datos técnicos</summary><pre style="margin:4px 0 0 0;">' + escapeHtml(JSON.stringify(ev.payload, null, 2)) + '</pre></details>' : '') +
       '</div>';
     }
@@ -6557,6 +6688,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         st.op_started_at,
         st.last_event_at,
         st.last_error,
+        JSON.stringify(st.last_recovery || null),
         questions,
         inact,
         st.links,
@@ -6573,6 +6705,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (bannerSig !== state.lastBannerSignature) {
         guidanceEl.innerHTML = buildGuidanceBanner(statusForBanner, events, state.detail);
         state.lastBannerSignature = bannerSig;
+        wireCopyDoctorPromptButtons(guidanceEl);
 
         guidanceEl.querySelectorAll('button[data-dact]').forEach((btn) => {
           btn.addEventListener('click', () => {
@@ -7058,6 +7191,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       const eventsEl = document.getElementById('tab-events');
       eventsEl.innerHTML = versionsSectionHtml + toolbarHtml + phasesHtml + priorHtml;
+      wireCopyDoctorPromptButtons(eventsEl);
 
       eventsEl.querySelectorAll('details.phase-card[data-phase-key]').forEach((det) => {
         det.addEventListener('toggle', () => {

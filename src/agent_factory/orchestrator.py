@@ -852,6 +852,7 @@ class Orchestrator:
         valid_templates: AbstractSet[str] = VALID_TEMPLATES,
         workspace_manager: WorkspaceManager | None = None,
         vcs: Any | None = None,
+        recovery_agent: Any | None = None,
     ) -> None:
         self.store = store
         self.llm = llm
@@ -864,6 +865,7 @@ class Orchestrator:
         self.valid_templates = valid_templates
         self.workspace_manager = workspace_manager
         self.vcs = vcs
+        self.recovery_agent = recovery_agent
         self._lock = threading.RLock()
         self._chat_io_lock = threading.RLock()
         self._bg_op_heal_lock = threading.RLock()
@@ -922,6 +924,59 @@ class Orchestrator:
         validate_project_id(project_id)
         return self._get_spec(project_id)
 
+    @staticmethod
+    def _serialize_recovery_payload(
+        recovery: Any,
+        *,
+        stage: str,
+        extra_secrets: Sequence[str] = (),
+    ) -> dict[str, Any] | None:
+        """Normalize RecoveryResult or dict into a secret-redacted dict for incident events."""
+        if recovery is None:
+            return None
+        if hasattr(recovery, "to_incident_dict"):
+            data = dict(recovery.to_incident_dict(extra_secrets=extra_secrets))
+        elif isinstance(recovery, Mapping):
+            data = {
+                k: (
+                    redact_secrets(v, extra_secrets=extra_secrets)
+                    if isinstance(v, str)
+                    else v
+                )
+                for k, v in recovery.items()
+            }
+        else:
+            return None
+        data.setdefault("stage", stage)
+        return data
+
+    def record_doctor_recovery(
+        self,
+        project_id: str,
+        recovery: Any,
+        *,
+        stage: str,
+        extra_secrets: Sequence[str] = (),
+    ) -> dict[str, Any] | None:
+        """Append a redacted DOCTOR_RECOVERY timeline event and return its serialized dict."""
+        validate_project_id(project_id)
+        payload = self._serialize_recovery_payload(
+            recovery,
+            stage=stage,
+            extra_secrets=extra_secrets,
+        )
+        if payload is None:
+            return None
+        self.store.append(
+            create_event(
+                project_id=project_id,
+                event_type=EventType.DOCTOR_RECOVERY,
+                payload=payload,
+                at=self._now(),
+            )
+        )
+        return payload
+
     def record_phase_failure(
         self,
         project_id: str,
@@ -930,23 +985,58 @@ class Orchestrator:
         error: BaseException | str,
         agent: str = "",
         extra_secrets: Sequence[str] = (),
+        recovery: Any | None = None,
+        traceback_text: str | None = None,
     ) -> ProjectStatus:
         """Record redacted PHASE_ERROR detail event and transition project cleanly to FAILED."""
         validate_project_id(project_id)
         err_type = type(error).__name__ if isinstance(error, BaseException) else "Error"
         raw_msg = str(error).strip() or err_type
         clean_msg = redact_secrets(raw_msg, extra_secrets=extra_secrets)
+        stage_label = failed_state.value if isinstance(failed_state, ProjectState) else str(failed_state)
+
+        effective_recovery = recovery
+        if effective_recovery is None and self.recovery_agent is not None:
+            from agent_factory.recovery_agent import _classify_error_scope, _extract_traceback_text
+
+            tb_txt = _extract_traceback_text(error, traceback_text)
+            if _classify_error_scope(error, tb_txt, error_text=clean_msg) == "factory":
+                effective_recovery = self.recovery_agent.diagnose_factory_error(
+                    stage=stage_label,
+                    error=error,
+                    traceback_text=tb_txt,
+                    extra_secrets=extra_secrets,
+                )
+
+        recovery_payload = self._serialize_recovery_payload(
+            effective_recovery,
+            stage=stage_label,
+            extra_secrets=extra_secrets,
+        )
+        if recovery_payload is not None:
+            self.store.append(
+                create_event(
+                    project_id=project_id,
+                    event_type=EventType.DOCTOR_RECOVERY,
+                    payload=recovery_payload,
+                    at=self._now(),
+                )
+            )
+
+        phase_payload: dict[str, Any] = {
+            "state": stage_label,
+            "agent": agent,
+            "error_type": err_type,
+            "detail": clean_msg,
+        }
+        if recovery_payload is not None:
+            phase_payload["recovery"] = recovery_payload
 
         self.store.append(
             create_event(
                 project_id=project_id,
                 event_type=EventType.PHASE_ERROR,
-                payload={
-                    "state": failed_state.value if isinstance(failed_state, ProjectState) else str(failed_state),
-                    "agent": agent,
-                    "error_type": err_type,
-                    "detail": clean_msg,
-                },
+                payload=phase_payload,
                 at=self._now(),
             )
         )
@@ -954,15 +1044,18 @@ class Orchestrator:
         current_status = self.get_status(project_id)
         if current_status.state != ProjectState.FAILED:
             validate_transition(current_status.state, ProjectState.FAILED)
+            failed_payload: dict[str, Any] = {
+                "reason": clean_msg,
+                "failed_from": current_status.state.value,
+                "error_type": err_type,
+            }
+            if recovery_payload is not None:
+                failed_payload["recovery"] = recovery_payload
             self.store.append(
                 create_event(
                     project_id=project_id,
                     event_type=EventType.PROJECT_FAILED,
-                    payload={
-                        "reason": clean_msg,
-                        "failed_from": current_status.state.value,
-                        "error_type": err_type,
-                    },
+                    payload=failed_payload,
                     at=self._now(),
                 )
             )
