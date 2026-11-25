@@ -48,7 +48,7 @@ ALLOWED_TRANSITIONS: dict[ProjectState, frozenset[ProjectState]] = {
             ProjectState.FAILED,
         }
     ),
-    ProjectState.DELIVERED: frozenset({ProjectState.CHANGE_REQUEST}),
+    ProjectState.DELIVERED: frozenset({ProjectState.CHANGE_REQUEST, ProjectState.VERIFYING}),
     ProjectState.CHANGE_REQUEST: frozenset({ProjectState.INTERVIEW, ProjectState.FAILED}),
     ProjectState.FAILED: frozenset(),
 }

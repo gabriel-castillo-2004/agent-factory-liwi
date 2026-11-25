@@ -7,8 +7,9 @@ import pytest
 
 from agent_factory.adapters.fake_llm import FakeLLM
 from agent_factory.adapters.memory_store import MemoryEventStore
-from agent_factory.domain.events import EventType
+from agent_factory.domain.events import Event, EventType
 from agent_factory.domain.models import ApprovalEvent
+from agent_factory.domain.progress import project_status_from_events
 from agent_factory.domain.states import (
     IllegalTransition,
     ProjectState,
@@ -17,7 +18,7 @@ from agent_factory.domain.states import (
 )
 from agent_factory.orchestrator import Orchestrator
 
-# Hand-written oracle for all 19 valid state transitions (INV-23, Section 4)
+# Hand-written oracle for all 20 valid state transitions (INV-23, Section 4)
 EXPECTED_VALID_TRANSITIONS: tuple[tuple[ProjectState, ProjectState], ...] = (
     (ProjectState.IDLE, ProjectState.INTERVIEW),
     (ProjectState.INTERVIEW, ProjectState.DEBATE),
@@ -36,11 +37,12 @@ EXPECTED_VALID_TRANSITIONS: tuple[tuple[ProjectState, ProjectState], ...] = (
     (ProjectState.VERIFYING, ProjectState.DELIVERED),
     (ProjectState.VERIFYING, ProjectState.FAILED),
     (ProjectState.DELIVERED, ProjectState.CHANGE_REQUEST),
+    (ProjectState.DELIVERED, ProjectState.VERIFYING),
     (ProjectState.CHANGE_REQUEST, ProjectState.INTERVIEW),
     (ProjectState.CHANGE_REQUEST, ProjectState.FAILED),
 )
 
-# Hand-written oracle for all 81 illegal state transitions in the 10x10 matrix (INV-23)
+# Hand-written oracle for all 80 illegal state transitions in the 10x10 matrix (INV-23)
 EXPECTED_ILLEGAL_TRANSITIONS: tuple[tuple[ProjectState, ProjectState], ...] = (
     # From IDLE (9 illegal)
     (ProjectState.IDLE, ProjectState.IDLE),
@@ -103,14 +105,13 @@ EXPECTED_ILLEGAL_TRANSITIONS: tuple[tuple[ProjectState, ProjectState], ...] = (
     (ProjectState.VERIFYING, ProjectState.WAITING_APPROVAL),
     (ProjectState.VERIFYING, ProjectState.VERIFYING),
     (ProjectState.VERIFYING, ProjectState.CHANGE_REQUEST),
-    # From DELIVERED (9 illegal)
+    # From DELIVERED (8 illegal)
     (ProjectState.DELIVERED, ProjectState.IDLE),
     (ProjectState.DELIVERED, ProjectState.INTERVIEW),
     (ProjectState.DELIVERED, ProjectState.DEBATE),
     (ProjectState.DELIVERED, ProjectState.MEDIATION),
     (ProjectState.DELIVERED, ProjectState.WAITING_APPROVAL),
     (ProjectState.DELIVERED, ProjectState.BUILDING),
-    (ProjectState.DELIVERED, ProjectState.VERIFYING),
     (ProjectState.DELIVERED, ProjectState.DELIVERED),
     (ProjectState.DELIVERED, ProjectState.FAILED),
     # From FAILED (10 illegal - terminal state)
@@ -353,3 +354,99 @@ def test_orchestrator_record_state_call_when_already_failed_is_rejected_without_
     ]
     assert len(failed_events_after) == 1
     assert orchestrator.get_status(project_id).state == ProjectState.FAILED
+
+
+def test_delivered_to_verifying_reverification_transition_and_event_projection() -> None:
+    """INV-04 / INV-11: validate_transition and project_status_from_events allow DELIVERED -> VERIFYING for post-delivery re-verification."""
+    assert validate_transition(ProjectState.DELIVERED, ProjectState.VERIFYING) == ProjectState.VERIFYING
+
+    project_id = "proj-delivered-reverify"
+    base_time = datetime(2026, 11, 25, 15, 0, tzinfo=UTC)
+    events: list[Event] = [
+        Event(
+            id="evt-1",
+            project_id=project_id,
+            type=EventType.PROJECT_CREATED,
+            payload={
+                "name": "Reverify App",
+                "objective": "Verify post-delivery transition",
+                "state": ProjectState.INTERVIEW,
+            },
+            at=base_time,
+        ),
+        Event(
+            id="evt-2",
+            project_id=project_id,
+            type=EventType.STATE_TRANSITIONED,
+            payload={"from": ProjectState.INTERVIEW, "to": ProjectState.DEBATE},
+            at=datetime(2026, 11, 25, 15, 1, tzinfo=UTC),
+        ),
+        Event(
+            id="evt-3",
+            project_id=project_id,
+            type=EventType.STATE_TRANSITIONED,
+            payload={"from": ProjectState.DEBATE, "to": ProjectState.MEDIATION},
+            at=datetime(2026, 11, 25, 15, 2, tzinfo=UTC),
+        ),
+        Event(
+            id="evt-4",
+            project_id=project_id,
+            type=EventType.PLAN_CREATED,
+            payload={
+                "plan_hash": "hash-reverify-01",
+                "total_tests": 2,
+                "to": ProjectState.WAITING_APPROVAL,
+            },
+            at=datetime(2026, 11, 25, 15, 3, tzinfo=UTC),
+        ),
+        Event(
+            id="evt-5",
+            project_id=project_id,
+            type=EventType.APPROVAL_RECORDED,
+            payload={
+                "plan_hash": "hash-reverify-01",
+                "decision": "approved",
+                "to": ProjectState.BUILDING,
+            },
+            at=datetime(2026, 11, 25, 15, 4, tzinfo=UTC),
+        ),
+        Event(
+            id="evt-6",
+            project_id=project_id,
+            type=EventType.STATE_TRANSITIONED,
+            payload={"from": ProjectState.BUILDING, "to": ProjectState.VERIFYING},
+            at=datetime(2026, 11, 25, 15, 5, tzinfo=UTC),
+        ),
+        Event(
+            id="evt-7",
+            project_id=project_id,
+            type=EventType.PROJECT_DELIVERED,
+            payload={"repo_url": "https://github.com/org/reverify", "commit_sha": "abc1234"},
+            at=datetime(2026, 11, 25, 15, 6, tzinfo=UTC),
+        ),
+        Event(
+            id="evt-8",
+            project_id=project_id,
+            type=EventType.STATE_TRANSITIONED,
+            payload={"from": ProjectState.DELIVERED, "to": ProjectState.VERIFYING},
+            at=datetime(2026, 11, 25, 15, 7, tzinfo=UTC),
+        ),
+    ]
+
+    status_verifying = project_status_from_events(project_id, events)
+    assert status_verifying.state == ProjectState.VERIFYING
+    assert status_verifying.progress_pct == 95
+    assert status_verifying.plan_hash == "hash-reverify-01"
+
+    events.append(
+        Event(
+            id="evt-9",
+            project_id=project_id,
+            type=EventType.PROJECT_DELIVERED,
+            payload={"repo_url": "https://github.com/org/reverify", "commit_sha": "def5678"},
+            at=datetime(2026, 11, 25, 15, 8, tzinfo=UTC),
+        )
+    )
+    status_redelivered = project_status_from_events(project_id, events)
+    assert status_redelivered.state == ProjectState.DELIVERED
+    assert status_redelivered.progress_pct == 100
