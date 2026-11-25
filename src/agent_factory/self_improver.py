@@ -32,6 +32,7 @@ from agent_factory.supervisor import RESTART_EXIT_CODE
 if TYPE_CHECKING:
     from agent_factory.adapters.sqlite_store import SqliteEventStore
 
+DEFAULT_SELF_IMPROVE_CONSULT_TIMEOUT_SECONDS: float = 180.0
 DEFAULT_SELF_IMPROVE_TIMEOUT_SECONDS: float = 600.0
 DEFAULT_RESTART_DELAY_SECONDS: float = 1.0
 MAX_UPLOAD_IMAGE_BYTES: int = 5 * 1024 * 1024
@@ -303,7 +304,7 @@ class FactorySelfImprover:
         agy_command: Sequence[str] = ("agy",),
         model: str | None = None,
         secrets_to_redact: Sequence[str] = (),
-        consult_timeout_seconds: float = 120.0,
+        consult_timeout_seconds: float = DEFAULT_SELF_IMPROVE_CONSULT_TIMEOUT_SECONDS,
         apply_timeout_seconds: float = DEFAULT_SELF_IMPROVE_TIMEOUT_SECONDS,
         restart_fn: Callable[[int], Any] | None = None,
         restart_delay_seconds: float = DEFAULT_RESTART_DELAY_SECONDS,

@@ -462,3 +462,43 @@ def test_factory_assistant_apply_commits_pushes_and_triggers_exit_42_when_checks
                 thread.join(timeout=2.0)
     finally:
         store.close()
+
+
+def test_consult_message_invokes_agy_with_at_least_180s_timeout_and_dashboard_client_waits_185s(
+    tmp_path: Path,
+) -> None:
+    """consult_message passes >= 180.0s timeout to agy and dashboard HTML sets 185000 ms for /api/factory/assistant/message."""
+    from agent_factory.dashboard import DASHBOARD_HTML
+
+    recorded_timeouts: list[float] = []
+
+    class _TimeoutSpyRunner:
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            del command, cwd, env
+            recorded_timeouts.append(timeout_seconds)
+            return CommandResult(
+                exit_code=0,
+                stdout=json.dumps({"reply": "Listo", "new_memory_rules": [], "actionable_proposal": None}),
+            )
+
+    repo_root = tmp_path / "repo_timeout"
+    (repo_root / "src" / "agent_factory").mkdir(parents=True, exist_ok=True)
+    improver = FactorySelfImprover(
+        db_path=tmp_path / "timeout.db",
+        repo_root=repo_root,
+        uploads_dir=tmp_path / "uploads_to",
+        runner=_TimeoutSpyRunner(),
+    )
+    res = improver.consult_message("Analiza posibles mejoras de rendimiento.")
+    assert res["ok"] is True
+    assert len(recorded_timeouts) == 1
+    assert recorded_timeouts[0] >= 180.0
+    assert "185000" in DASHBOARD_HTML
+    assert "/api/factory/assistant/message" in DASHBOARD_HTML
+

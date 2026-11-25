@@ -5429,6 +5429,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (typeof explicitMs === 'number' && explicitMs > 0) return explicitMs;
       const u = String(url || '');
       if (u.indexOf('/chat') >= 0) return 250000;
+      if (u.indexOf('/api/factory/assistant/message') >= 0) return 185000;
       if (/\\/(?:runtime\\/)?start\\b/.test(u)) return 180000;
       if (/\\/(modify|rollback|import|retry)\\b/.test(u)) return 120000;
       return 30000;
@@ -10005,6 +10006,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             await apiFetch('/api/factory/assistant/message', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
+              timeoutMs: 185000,
               body: JSON.stringify({ message: msgTxt, images: payloadImages }),
             });
             if (inputEl) inputEl.value = '';
