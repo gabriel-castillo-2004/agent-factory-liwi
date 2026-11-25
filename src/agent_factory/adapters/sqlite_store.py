@@ -52,8 +52,10 @@ class SqliteEventStore:
                     """
                 )
         from agent_factory.recovery_agent import init_error_lessons_table
+        from agent_factory.self_improver import init_factory_self_improver_tables
 
         init_error_lessons_table(self._conn, self._lock)
+        init_factory_self_improver_tables(self._conn, self._lock)
 
     def append(self, event: Event) -> None:
         """Append an event to the SQLite database."""

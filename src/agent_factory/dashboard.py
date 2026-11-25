@@ -37,6 +37,7 @@ from agent_factory.ports.runner import CommandTimeoutError, Runner
 from agent_factory.runtime_runner import LocalAppError, LocalAppRunner
 from agent_factory.scaffold import TemplateScaffold
 from agent_factory.secrets import redact_secrets
+from agent_factory.self_improver import FactorySelfImprover
 from agent_factory.telegram_bot import TelegramBotService, _slugify
 from agent_factory.workspace import (
     LOGO_MIME_BY_EXT,
@@ -88,6 +89,7 @@ class DashboardController:
         chats_dir: Path | None = None,
         vcs: Any | None = None,
         runner: Runner | None = None,
+        self_improver: FactorySelfImprover | None = None,
         secrets_to_redact: Sequence[str] = (),
     ) -> None:
         self.orchestrator = orchestrator
@@ -156,6 +158,7 @@ class DashboardController:
         self._project_threads: dict[str, threading.Thread] = {}
         self._op_seq = 0
         self._threads: list[threading.Thread] = []
+        self._self_improver: FactorySelfImprover | None = self_improver
 
     def _get_live_status_info(self, running: bool) -> dict[str, Any]:
         """Return live active model, stage, activity summary/detail, test progress, and timer."""
@@ -2003,6 +2006,86 @@ class DashboardController:
 
         return {"ok": True, "deleted": project_id}
 
+    def _effective_self_improver(self) -> FactorySelfImprover:
+        with self._lock:
+            if self._self_improver is not None:
+                if self._self_improver.pre_exit_hook is None:
+                    self._self_improver.pre_exit_hook = lambda: self.local_runner.stop_all()
+                return self._self_improver
+            store = self.orchestrator.store
+            sqlite_store = store if hasattr(store, "_conn") and hasattr(store, "_lock") else None
+            eff_runner = (
+                self.runner
+                if self.runner is not None
+                else getattr(self.build_worker, "runner", None)
+            )
+            eff_model = None
+            if self.model_resolver is not None and hasattr(self.model_resolver, "resolve_model"):
+                try:
+                    eff_model = self.model_resolver.resolve_model("INTERVIEW")
+                except (RuntimeError, ValueError, OSError):
+                    eff_model = None
+            self._self_improver = FactorySelfImprover(
+                sqlite_store=sqlite_store,
+                uploads_dir=self.chats_dir.parent / "factory_chat_uploads",
+                runner=eff_runner,
+                model=eff_model,
+                secrets_to_redact=self.secrets_to_redact,
+                pre_exit_hook=lambda: self.local_runner.stop_all(),
+            )
+            return self._self_improver
+
+    def get_factory_assistant_history(self) -> dict[str, Any]:
+        """Return Liwi self-improvement chat history and persistent memory rules."""
+        return _scrub_value(self._effective_self_improver().get_history(), self.secrets_to_redact)
+
+    def get_factory_assistant_upload(self, filename: str) -> tuple[str, bytes]:
+        """Serve a validated screenshot uploaded to factory_chat_uploads."""
+        try:
+            return self._effective_self_improver().get_uploaded_image(filename)
+        except FileNotFoundError as exc:
+            raise ProjectNotFoundError(str(exc)) from exc
+
+    def post_factory_assistant_message(
+        self,
+        message: str,
+        *,
+        images: Sequence[Mapping[str, Any]] = (),
+    ) -> dict[str, Any]:
+        """Consult Liwi self-improvement assistant in read-only mode with optional screenshots."""
+        res = self._effective_self_improver().consult_message(message, images=images)
+        return _scrub_value(res, self.secrets_to_redact)
+
+    def delete_factory_assistant_rule(self, rule_id: str) -> dict[str, Any]:
+        """Delete a rule from factory_memory_rules."""
+        try:
+            res = self._effective_self_improver().delete_memory_rule(rule_id)
+        except KeyError as exc:
+            raise ProjectNotFoundError(f"Regla '{rule_id}' no encontrada.") from exc
+        return _scrub_value(res, self.secrets_to_redact)
+
+    def apply_factory_assistant_proposal(
+        self,
+        proposal_prompt: str,
+        *,
+        proposal_title: str = "",
+        message_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Execute proposal on Liwi with git savepoint, ruff+pytest gate, rollback or exit 42."""
+        gh_tok = str(getattr(self.vcs, "github_token", "") or "")
+        try:
+            res = self._effective_self_improver().apply_proposal(
+                proposal_prompt,
+                proposal_title=proposal_title,
+                message_id=message_id,
+                github_token=gh_tok,
+            )
+        except RuntimeError as exc:
+            if "ejecución" in str(exc).lower():
+                raise ProjectConflictError(str(exc)) from exc
+            raise ValueError(redact_secrets(str(exc), extra_secrets=self.secrets_to_redact)) from exc
+        return _scrub_value(res, self.secrets_to_redact)
+
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="es" data-theme="dark">
@@ -2489,6 +2572,97 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       white-space: pre-wrap;
       word-break: break-word;
       color: var(--text);
+    }
+    .factory-chat-modal {
+      max-width: 780px;
+      width: 94vw;
+      max-height: 86vh;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .factory-chat-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 10px;
+    }
+    .factory-memory-panel {
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      max-height: 180px;
+      overflow-y: auto;
+      font-size: 0.84rem;
+    }
+    .factory-memory-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 0;
+      border-bottom: 1px dashed var(--border);
+    }
+    .factory-memory-item:last-child {
+      border-bottom: none;
+    }
+    .factory-chat-stream {
+      flex: 1 1 auto;
+      min-height: 240px;
+      max-height: 46vh;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 10px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    .factory-proposal-card {
+      margin-top: 8px;
+      padding: 10px;
+      border-radius: 8px;
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+    }
+    .factory-paste-previews {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .factory-paste-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      border-radius: 6px;
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      font-size: 0.78rem;
+    }
+    .factory-paste-chip img {
+      width: 28px;
+      height: 28px;
+      object-fit: cover;
+      border-radius: 4px;
+    }
+    .factory-chat-thumbs {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 6px;
+    }
+    .factory-chat-thumbs img {
+      max-width: 140px;
+      max-height: 90px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
     }
     .secondary-actions {
       display: flex;
@@ -4325,6 +4499,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </button>
         </div>
       </div>
+      <button id="improve-factory-btn" class="btn btn-sm" type="button" title="Abrir chat padre de auto-mejora de Liwi">🏭 Mejorar Fábrica</button>
       <div class="settings-menu-wrap">
         <button id="settings-menu-btn" class="btn btn-sm" type="button" aria-expanded="false" aria-controls="settings-popover">⚙️ Ajustes</button>
         <div id="settings-popover" class="settings-popover" style="display:none">
@@ -4362,6 +4537,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div id="live-activity-stall" class="live-activity-stall" style="display:none" role="alert">
         <span>La operación está tardando más de lo esperado (puede seguir procesando o haberse bloqueado)</span>
         <button id="live-activity-reload-btn" class="btn btn-sm btn-warn" type="button">Reintentar / Recargar estado</button>
+      </div>
+    </div>
+    <div id="factory-restart-banner" class="live-activity-banner" style="display:none; margin-top:8px;" role="status" aria-live="polite">
+      <div class="live-activity-main">
+        <svg class="live-spinner-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true">
+          <circle cx="12" cy="12" r="9" opacity="0.25"></circle>
+          <path d="M21 12a9 9 0 0 0-9-9" stroke-linecap="round"></path>
+        </svg>
+        <div>
+          <div style="font-size:0.9rem; font-weight:600;">🔄 Liwi se está reiniciando para aplicar la mejora...</div>
+          <div id="factory-restart-subtext" class="muted" style="font-size:0.78rem;">Esperando reconexión automática con el servidor supervisado.</div>
+        </div>
       </div>
     </div>
   </div>
@@ -4413,6 +4600,34 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
         </div>
       </form>
+    </div>
+
+    <div id="factory-improve-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="factory-improve-title" style="display:none">
+      <div class="modal-card factory-chat-modal">
+        <div class="factory-chat-head">
+          <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+            <h3 id="factory-improve-title" style="margin:0;">🏭 Mejorar Fábrica (Liwi)</h3>
+            <button id="factory-memory-toggle" type="button" class="model-pill" aria-expanded="false" aria-controls="factory-memory-panel">🧠 Memoria de Liwi (0)</button>
+          </div>
+          <button id="close-factory-improve-btn" class="btn btn-sm" type="button" aria-label="Cerrar chat de auto-mejora">✕</button>
+        </div>
+        <div id="factory-memory-panel" class="factory-memory-panel" style="display:none"></div>
+        <div id="factory-chat-stream" class="factory-chat-stream">
+          <div class="muted">Cargando historial del asistente...</div>
+        </div>
+        <div id="factory-paste-previews" class="factory-paste-previews"></div>
+        <form id="factory-chat-form" style="display:flex; flex-direction:column; gap:8px;">
+          <textarea id="factory-chat-input" class="input-field" rows="3" placeholder="Consulta o describe una mejora para Liwi (puedes pegar capturas con Ctrl+V)..."></textarea>
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+            <div style="display:flex; align-items:center; gap:8px;">
+              <input id="factory-image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple style="display:none" />
+              <button id="factory-attach-btn" class="btn btn-sm" type="button">📎 Adjuntar / Ctrl+V captura</button>
+              <span id="factory-inline-status" class="muted" style="font-size:0.8rem;"></span>
+            </div>
+            <button id="factory-chat-send-btn" class="btn btn-primary btn-sm" type="submit">Consultar a Liwi</button>
+          </div>
+        </form>
+      </div>
     </div>
 
     <section class="panel" id="detail-panel">
@@ -5896,7 +6111,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         ? '<div class="doctor-prompt-box">' +
             '<div style="font-weight:600; font-size:0.82rem;">Prompt sugerido para reparar la fábrica:</div>' +
             '<pre class="doctor-prompt-pre">' + escapeHtml(String(rec.suggested_prompt)) + '</pre>' +
-            '<button type="button" class="btn btn-sm" data-copy-doctor-prompt="1">Copiar prompt sugerido</button>' +
+            '<div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:6px;">' +
+              '<button type="button" class="btn btn-sm" data-copy-doctor-prompt="1">Copiar prompt sugerido</button>' +
+              '<button type="button" class="btn btn-primary btn-sm" data-open-factory-improve="1">🏭 Enviar a Mejorar Fábrica</button>' +
+            '</div>' +
           '</div>'
         : '';
       return '<div class="doctor-recovery-card">' +
@@ -5920,6 +6138,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const txt = pre ? pre.textContent : '';
           if (txt) {
             copyToClipboard(txt, '✓ Prompt sugerido copiado al portapapeles.');
+          }
+        });
+      });
+      container.querySelectorAll('button[data-open-factory-improve]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const box = btn.closest('.doctor-prompt-box');
+          const pre = box ? box.querySelector('.doctor-prompt-pre') : null;
+          const txt = pre ? pre.textContent : '';
+          if (typeof window.openFactoryImproveModal === 'function') {
+            window.openFactoryImproveModal(txt ? ('Diagnostica y prepara esta mejora interna de la fábrica:\\n\\n' + txt) : '');
           }
         });
       });
@@ -9536,6 +9764,264 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     })();
 
+    (function initFactoryImproverModal() {
+      const openBtn = document.getElementById('improve-factory-btn');
+      const modal = document.getElementById('factory-improve-modal');
+      const closeBtn = document.getElementById('close-factory-improve-btn');
+      const memToggle = document.getElementById('factory-memory-toggle');
+      const memPanel = document.getElementById('factory-memory-panel');
+      const streamEl = document.getElementById('factory-chat-stream');
+      const previewsEl = document.getElementById('factory-paste-previews');
+      const formEl = document.getElementById('factory-chat-form');
+      const inputEl = document.getElementById('factory-chat-input');
+      const attachBtn = document.getElementById('factory-attach-btn');
+      const fileInputEl = document.getElementById('factory-image-input');
+      const sendBtn = document.getElementById('factory-chat-send-btn');
+      const statusEl = document.getElementById('factory-inline-status');
+      const restartBanner = document.getElementById('factory-restart-banner');
+      if (!openBtn || !modal || !streamEl) return;
+
+      let pendingImages = [];
+      let reconnectTimer = null;
+
+      function startReconnectPolling() {
+        if (restartBanner) restartBanner.style.display = 'block';
+        if (reconnectTimer) clearInterval(reconnectTimer);
+        let sawDrop = false;
+        const startedAt = Date.now();
+        reconnectTimer = setInterval(async () => {
+          try {
+            const resp = await fetch('/api/projects', { cache: 'no-store' });
+            if (resp.ok && (sawDrop || (Date.now() - startedAt) > 2000)) {
+              clearInterval(reconnectTimer);
+              reconnectTimer = null;
+              window.location.reload();
+            }
+          } catch (_) {
+            sawDrop = true;
+          }
+        }, 900);
+      }
+
+      function renderPreviews() {
+        previewsEl.innerHTML = pendingImages.map((img, idx) =>
+          '<span class="factory-paste-chip">' +
+            '<img src="' + escapeHtml(img.previewUrl) + '" alt="' + escapeHtml(img.filename) + '" />' +
+            '<span>' + escapeHtml(img.filename) + '</span>' +
+            '<button type="button" class="btn-icon" data-rm-paste="' + idx + '" aria-label="Quitar captura">✕</button>' +
+          '</span>'
+        ).join('');
+        previewsEl.querySelectorAll('button[data-rm-paste]').forEach((b) => {
+          b.addEventListener('click', () => {
+            const i = Number(b.getAttribute('data-rm-paste'));
+            pendingImages.splice(i, 1);
+            renderPreviews();
+          });
+        });
+      }
+
+      function appendImageFile(file) {
+        if (!file || !String(file.type || '').startsWith('image/')) return;
+        if (pendingImages.length >= 4) {
+          if (statusEl) statusEl.textContent = 'Máximo 4 capturas por mensaje.';
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = String(reader.result || '');
+          const b64Idx = dataUrl.indexOf('base64,');
+          const b64 = b64Idx >= 0 ? dataUrl.slice(b64Idx + 7) : dataUrl;
+          pendingImages.push({
+            filename: file.name || ('captura_' + (pendingImages.length + 1) + '.png'),
+            data_base64: b64,
+            previewUrl: dataUrl,
+          });
+          renderPreviews();
+        };
+        reader.readAsDataURL(file);
+      }
+
+      function renderMemory(rules) {
+        const list = Array.isArray(rules) ? rules : [];
+        memToggle.textContent = '🧠 Memoria de Liwi (' + list.length + ')';
+        if (!list.length) {
+          memPanel.innerHTML = '<div class="muted">Sin reglas guardadas todavía. Las preferencias detectadas en el chat aparecerán aquí.</div>';
+          return;
+        }
+        memPanel.innerHTML = list.map((r) =>
+          '<div class="factory-memory-item">' +
+            '<span>• ' + escapeHtml(String(r.rule_text || '')) + '</span>' +
+            '<button type="button" class="btn btn-sm" data-del-frule="' + escapeHtml(String(r.id || '')) + '">Eliminar</button>' +
+          '</div>'
+        ).join('');
+        memPanel.querySelectorAll('button[data-del-frule]').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            const rid = btn.getAttribute('data-del-frule');
+            if (!rid) return;
+            btn.disabled = true;
+            try {
+              const res = await apiFetch('/api/factory/assistant/memory/' + encodeURIComponent(rid), { method: 'DELETE' });
+              renderMemory(res.memory_rules || []);
+            } catch (err) {
+              if (statusEl) statusEl.textContent = 'Error eliminando regla: ' + err.message;
+              btn.disabled = false;
+            }
+          });
+        });
+      }
+
+      function renderMessages(msgs) {
+        const list = Array.isArray(msgs) ? msgs : [];
+        if (!list.length) {
+          streamEl.innerHTML = '<div class="muted">Pregúntale a Liwi cómo funciona la fábrica o describe una mejora que quieras proponer y verificar.</div>';
+          return;
+        }
+        streamEl.innerHTML = list.map((m) => {
+          const isUser = m.role === 'user';
+          const cls = isUser ? 'chat-msg user' : 'chat-msg auditor';
+          const who = isUser ? 'Tú' : 'Liwi';
+          const imgs = Array.isArray(m.image_urls) ? m.image_urls : [];
+          const thumbs = imgs.length
+            ? '<div class="factory-chat-thumbs">' + imgs.map((u) => '<img src="' + escapeHtml(String(u)) + '" alt="Captura adjunta" />').join('') + '</div>'
+            : '';
+          let propHtml = '';
+          if (!isUser && m.proposal_prompt) {
+            const isApplied = m.status === 'applied';
+            const applyLabel = isApplied ? '✓ Mejora aplicada' : '✨ Aplicar mejora a Liwi';
+            propHtml = '<div class="factory-proposal-card">' +
+              '<div style="font-weight:600; margin-bottom:4px;">Propuesta: ' + escapeHtml(String(m.proposal_title || 'Auto-mejora')) + '</div>' +
+              '<pre class="doctor-prompt-pre">' + escapeHtml(String(m.proposal_prompt)) + '</pre>' +
+              '<button type="button" class="btn btn-primary btn-sm" data-apply-factory-proposal="1" data-msg-id="' + escapeHtml(String(m.id || '')) + '" data-prop-title="' + escapeHtml(String(m.proposal_title || '')) + '"' + (isApplied ? ' disabled' : '') + '>' + applyLabel + '</button>' +
+            '</div>';
+          }
+          return '<div class="' + cls + '">' +
+            '<div class="chat-msg-head"><strong>' + who + '</strong></div>' +
+            '<div class="chat-msg-body">' + renderSafeMarkdown(String(m.content || ''), 'simple').html + '</div>' +
+            thumbs +
+            propHtml +
+          '</div>';
+        }).join('');
+        streamEl.scrollTop = streamEl.scrollHeight;
+        streamEl.querySelectorAll('button[data-apply-factory-proposal]').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            const card = btn.closest('.factory-proposal-card');
+            const pre = card ? card.querySelector('.doctor-prompt-pre') : null;
+            const promptText = pre ? pre.textContent : '';
+            if (!promptText) return;
+            const origText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'Aplicando y ejecutando pruebas...';
+            if (statusEl) statusEl.textContent = 'Guardando tag Git, ejecutando agy y validando ruff + pytest...';
+            try {
+              const res = await apiFetch('/api/factory/assistant/apply', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  message_id: btn.getAttribute('data-msg-id') || null,
+                  proposal_title: btn.getAttribute('data-prop-title') || 'Auto-mejora Liwi',
+                  proposal_prompt: promptText,
+                }),
+              });
+              renderMessages(res.messages || []);
+              if (res && res.restart_scheduled) {
+                if (statusEl) statusEl.textContent = '✓ Mejora aplicada. Reiniciando Liwi...';
+                modal.style.display = 'none';
+                startReconnectPolling();
+              } else {
+                if (statusEl) statusEl.textContent = 'Mejora revertida automáticamente tras fallo en verificación.';
+              }
+            } catch (err) {
+              btn.disabled = false;
+              btn.textContent = origText;
+              if (statusEl) statusEl.textContent = 'Error aplicando mejora: ' + err.message;
+            }
+          });
+        });
+      }
+
+      async function refreshHistory() {
+        try {
+          const hist = await apiFetch('/api/factory/assistant/history');
+          renderMemory(hist.memory_rules || []);
+          renderMessages(hist.messages || []);
+        } catch (err) {
+          streamEl.innerHTML = '<div class="muted">No se pudo cargar el historial: ' + escapeHtml(err.message) + '</div>';
+        }
+      }
+
+      window.openFactoryImproveModal = (prefillText) => {
+        modal.style.display = 'flex';
+        if (prefillText && inputEl) {
+          inputEl.value = prefillText;
+        }
+        refreshHistory();
+        if (inputEl) inputEl.focus();
+      };
+
+      openBtn.addEventListener('click', () => window.openFactoryImproveModal(''));
+      if (closeBtn) closeBtn.addEventListener('click', () => { modal.style.display = 'none'; });
+      modal.addEventListener('click', (ev) => {
+        if (ev.target === modal) modal.style.display = 'none';
+      });
+      if (memToggle) {
+        memToggle.addEventListener('click', () => {
+          const open = memPanel.style.display !== 'none';
+          memPanel.style.display = open ? 'none' : 'block';
+          memToggle.setAttribute('aria-expanded', open ? 'false' : 'true');
+        });
+      }
+      if (attachBtn && fileInputEl) {
+        attachBtn.addEventListener('click', () => fileInputEl.click());
+        fileInputEl.addEventListener('change', () => {
+          Array.from(fileInputEl.files || []).forEach(appendImageFile);
+          fileInputEl.value = '';
+        });
+      }
+      modal.addEventListener('paste', (ev) => {
+        const items = ev.clipboardData && ev.clipboardData.items ? Array.from(ev.clipboardData.items) : [];
+        items.forEach((it) => {
+          if (it.type && it.type.indexOf('image/') === 0) {
+            const f = it.getAsFile();
+            if (f) appendImageFile(f);
+          }
+        });
+      });
+      if (formEl) {
+        formEl.addEventListener('submit', async (ev) => {
+          ev.preventDefault();
+          const msgTxt = inputEl ? inputEl.value.trim() : '';
+          if (!msgTxt && !pendingImages.length) {
+            if (statusEl) statusEl.textContent = 'Escribe un mensaje o pega una captura.';
+            return;
+          }
+          sendBtn.disabled = true;
+          sendBtn.textContent = 'Consultando...';
+          if (statusEl) statusEl.textContent = 'Analizando src/agent_factory/ en modo lectura...';
+          try {
+            const payloadImages = pendingImages.map((im) => ({
+              filename: im.filename,
+              data_base64: im.data_base64,
+            }));
+            await apiFetch('/api/factory/assistant/message', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ message: msgTxt, images: payloadImages }),
+            });
+            if (inputEl) inputEl.value = '';
+            pendingImages = [];
+            renderPreviews();
+            if (statusEl) statusEl.textContent = '';
+            await refreshHistory();
+          } catch (err) {
+            if (statusEl) statusEl.textContent = 'Error consultando: ' + err.message;
+          } finally {
+            sendBtn.disabled = false;
+            sendBtn.textContent = 'Consultar a Liwi';
+          }
+        });
+      }
+    })();
+
     setInterval(updateLiveTimers, 1000);
     setInterval(() => {
       loadProjects();
@@ -9667,7 +10153,7 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             except ValueError:
                 pass
 
-    def _read_json_body(self) -> dict[str, Any]:
+    def _read_json_body(self, *, max_bytes: int = 1024 * 1024) -> dict[str, Any]:
         raw_len = self.headers.get("Content-Length")
         if not raw_len:
             return {}
@@ -9677,7 +10163,7 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             raise ValueError("Invalid Content-Length header") from exc
         if length <= 0:
             return {}
-        if length > 1024 * 1024:
+        if length > max_bytes:
             raise ValueError("Request body too large")
         raw_bytes = self.rfile.read(length)
         if not raw_bytes.strip():
@@ -9799,6 +10285,23 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, ctrl.get_lan_mode())
             return
 
+        if path == "/api/factory/assistant/history":
+            self._send_json(200, ctrl.get_factory_assistant_history())
+            return
+
+        if path.startswith("/api/factory/assistant/uploads/"):
+            raw_fname = urllib.parse.unquote(path[len("/api/factory/assistant/uploads/") :])
+            try:
+                mime, data = ctrl.get_factory_assistant_upload(raw_fname)
+            except (ValueError, SandboxViolationError) as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            except ProjectNotFoundError as exc:
+                self._send_json(404, {"error": str(exc)})
+                return
+            self._send_bytes(200, mime, data)
+            return
+
         pid, action = self._parse_project_route()
         if pid is not None and action == "logo":
             try:
@@ -9881,6 +10384,39 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(400, {"error": str(exc)})
                 return
             self._send_json(200, result)
+            return
+
+        if path == "/api/factory/assistant/message":
+            def _post_factory_msg() -> dict[str, Any]:
+                body = self._read_json_body(max_bytes=8 * 1024 * 1024)
+                raw_msg = body.get("message", "")
+                if raw_msg is not None and not isinstance(raw_msg, str):
+                    raise TypeError("El campo 'message' debe ser texto.")
+                raw_imgs = body.get("images") or ()
+                if not isinstance(raw_imgs, list) and raw_imgs != ():
+                    raise TypeError("El campo 'images' debe ser una lista.")
+                return ctrl.post_factory_assistant_message(str(raw_msg or ""), images=raw_imgs)
+
+            self._send_controller_json(_post_factory_msg)
+            return
+
+        if path == "/api/factory/assistant/apply":
+            def _post_factory_apply() -> dict[str, Any]:
+                body = self._read_json_body()
+                raw_prompt = body.get("proposal_prompt")
+                if raw_prompt is None:
+                    raw_prompt = body.get("prompt")
+                if not isinstance(raw_prompt, str) or not raw_prompt.strip():
+                    raise ValueError("El campo 'proposal_prompt' es obligatorio.")
+                raw_title = body.get("proposal_title", "")
+                raw_mid = body.get("message_id")
+                return ctrl.apply_factory_assistant_proposal(
+                    raw_prompt,
+                    proposal_title=str(raw_title or ""),
+                    message_id=str(raw_mid) if raw_mid is not None else None,
+                )
+
+            self._send_controller_json(_post_factory_apply)
             return
 
         chat_pid, chat_entry_id, chat_subact = self._parse_project_chat_entry_route()
@@ -10028,6 +10564,13 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             )
             return
 
+        raw_del_path = urllib.parse.urlsplit(self.path).path
+        mem_prefix = "/api/factory/assistant/memory/"
+        if raw_del_path.startswith(mem_prefix):
+            raw_rid = urllib.parse.unquote(raw_del_path[len(mem_prefix) :])
+            self._send_controller_json(lambda: ctrl.delete_factory_assistant_rule(raw_rid))
+            return
+
         pid, action = self._parse_project_route()
 
         if pid is None or action is not None:
@@ -10063,6 +10606,7 @@ def start_dashboard_server(
     chats_dir: Path | None = None,
     vcs: Any | None = None,
     runner: Runner | None = None,
+    self_improver: FactorySelfImprover | None = None,
     secrets_to_redact: Sequence[str] = (),
 ) -> tuple[DashboardHTTPServer, threading.Thread, str]:
     """Create and start DashboardHTTPServer on 127.0.0.1:<port> in a daemon thread."""
@@ -10078,6 +10622,7 @@ def start_dashboard_server(
         chats_dir=chats_dir,
         vcs=vcs,
         runner=runner,
+        self_improver=self_improver,
         secrets_to_redact=secrets_to_redact,
     )
     server = DashboardHTTPServer((LOOPBACK_HOST, port), controller)

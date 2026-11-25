@@ -960,6 +960,7 @@ def main(
                 model_resolver=runtime.model_resolver,
                 local_runner=runtime.local_runner,
                 vcs=runtime.vcs,
+                runner=runtime.build_worker.runner if runtime.build_worker else None,
                 secrets_to_redact=active_secrets,
             )
             print(f"Dashboard local disponible en {dashboard_url}", flush=True)
