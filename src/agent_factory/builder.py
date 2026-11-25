@@ -1,6 +1,7 @@
 """Local build worker, job queue, and write-test-fix loop (Section 7 Phase 2, INV-09, INV-13, INV-15, INV-17)."""
 
 import difflib
+import importlib.util
 import json
 import re
 import sys
@@ -1197,13 +1198,13 @@ class BuildWorker:
         max_code_rounds: int,
         tests_passed_count: int,
         tests_total_count: int,
-    ) -> tuple[bool, str | None, tuple[str, ...]]:
-        """Run HTTP smoke check when applicable, returning (passed, redacted_error, failed_resources)."""
+    ) -> tuple[bool, str | None, tuple[str, ...], tuple[str, ...]]:
+        """Run HTTP + optional Playwright browser smoke checks, returning (passed, redacted_error, failed_resources, browser_findings)."""
         if not (
             (self.local_app_runner is not None or isinstance(self.runner, SubprocessRunner))
             and detect_workspace_app(ws_dir).app_type in ("static", "python_local")
         ):
-            return True, None, ()
+            return True, None, (), ()
 
         self._report_activity(
             "Verificando arranque local (HTTP Smoke Test)...",
@@ -1224,9 +1225,14 @@ class BuildWorker:
             )
         )
         smoke_res = run_http_smoke_test(smoke_runner, project_id, ws_dir)
+        browser_findings = tuple(
+            self._redact(item)
+            for item in (getattr(smoke_res, "browser_findings", ()) or ())
+            if str(item or "").strip()
+        )
         if smoke_res.passed:
-            return True, None, ()
-        return False, self._redact(smoke_res.summary), tuple(smoke_res.failed_resources)
+            return True, None, (), browser_findings
+        return False, self._redact(smoke_res.summary), tuple(smoke_res.failed_resources), browser_findings
 
     def _compute_round_diff_text(
         self,
@@ -1308,6 +1314,7 @@ class BuildWorker:
         max_ref_rounds_override: int | None = None,
         skip_pytest_if_no_tests: bool = False,
         force_polish: bool = False,
+        browser_smoke_findings: Sequence[str] = (),
     ) -> tuple[QualityAuditReport | None, int, int, bool, float]:
         """Run 2-agent Adversarial Debate (Critic vs. Builder) + bounded 2-round refinement with anti-regression checkpointing."""
         auditor = auditor_override if auditor_override is not None else self._resolve_quality_auditor()
@@ -1366,6 +1373,7 @@ class BuildWorker:
                 round_number=1,
                 project_name=cur_status.name or project_id,
                 challenge_for_polish=force_polish,
+                browser_smoke_findings=browser_smoke_findings,
                 extra_secrets=self.secrets_to_redact,
             )
             _record_critic_call(rep, round(max(0.0, time.monotonic() - call_t0), 3))
@@ -1531,6 +1539,7 @@ class BuildWorker:
                     cur_total = best_tests_total
 
             smoke_ok = False
+            round_browser_findings: tuple[str, ...] = ()
             if tests_ok:
                 cur_meta = self.orchestrator.get_status(project_id)
                 ensure_workspace_favicon(
@@ -1538,7 +1547,7 @@ class BuildWorker:
                     cur_meta.name or project_id,
                     cur_meta.objective or job.plan.summary,
                 )
-                smoke_ok, _, _ = self._run_local_smoke_test(
+                smoke_ok, _, _, round_browser_findings = self._run_local_smoke_test(
                     project_id,
                     ws_dir,
                     build_round=build_round + ref_round,
@@ -1614,6 +1623,7 @@ class BuildWorker:
                 round_number=ref_round + 1,
                 project_name=cur_status.name or project_id,
                 challenge_for_polish=force_polish,
+                browser_smoke_findings=round_browser_findings,
                 extra_secrets=self.secrets_to_redact,
             )
             _record_critic_call(new_report, round(max(0.0, time.monotonic() - diff_t0), 3))
@@ -1857,6 +1867,21 @@ class BuildWorker:
         initial_test_results: dict[str, bool] = (
             {"suite": status.tests.failed == 0} if status.tests.total > 0 else {}
         )
+        initial_browser_findings: tuple[str, ...] = ()
+        has_playwright = (
+            "playwright" in sys.modules or importlib.util.find_spec("playwright") is not None
+        )
+        if has_playwright and (
+            self.local_app_runner is not None or isinstance(self.runner, SubprocessRunner)
+        ):
+            _, _, _, initial_browser_findings = self._run_local_smoke_test(
+                project_id,
+                ws_dir,
+                build_round=1,
+                max_code_rounds=1,
+                tests_passed_count=status.tests.passed,
+                tests_total_count=status.tests.total,
+            )
         t0 = time.monotonic()
         initial_report = eff_auditor.audit_workspace(
             project_id,
@@ -1868,6 +1893,7 @@ class BuildWorker:
             project_name=status.name or project_id,
             version_label=cur_version,
             challenge_for_polish=force_polish,
+            browser_smoke_findings=initial_browser_findings,
             extra_secrets=self.secrets_to_redact,
         )
 
@@ -2467,13 +2493,15 @@ class BuildWorker:
             )
 
             # Local HTTP Smoke Test before promoting to VERIFYING
-            smoke_passed, smoke_err, smoke_failed_resources = self._run_local_smoke_test(
-                project_id,
-                ws_dir,
-                build_round=build_round,
-                max_code_rounds=max_code_rounds,
-                tests_passed_count=tests_passed_count,
-                tests_total_count=tests_total_count,
+            smoke_passed, smoke_err, smoke_failed_resources, smoke_browser_findings = (
+                self._run_local_smoke_test(
+                    project_id,
+                    ws_dir,
+                    build_round=build_round,
+                    max_code_rounds=max_code_rounds,
+                    tests_passed_count=tests_passed_count,
+                    tests_total_count=tests_total_count,
+                )
             )
             if not smoke_passed:
                 assert smoke_err is not None
@@ -2513,6 +2541,7 @@ class BuildWorker:
                 effective_plan=effective_plan,
                 tests_passed_count=tests_passed_count,
                 tests_total_count=tests_total_count,
+                browser_smoke_findings=smoke_browser_findings,
             )
 
             # Local tests, HTTP Smoke Test, and Quality Audit passed! Transition to VERIFYING

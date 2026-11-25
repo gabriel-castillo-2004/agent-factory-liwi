@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -33,19 +33,42 @@ QUALITY_DIMENSION_ORDER: tuple[str, ...] = (
     "testing_runtime",
 )
 
+STRICT_UX_UI_CAP: float = 72.0
+STRICT_FUNCTIONAL_CAP: float = 70.0
+STRICT_TESTING_CAP: float = 72.0
+
+STRICT_RUBRIC_PROMPT_BLOCK: str = (
+    "Reglas estrictas de penalización (topes obligatorios que NO pueden superarse si se incumplen):\n"
+    "a) UX/UI <= 72: si la interfaz web dispara llamadas asíncronas (fetch/acciones) sin deshabilitar "
+    "el botón, sin indicador visual de carga (spinner/estado activo) o sin comunicar claramente qué "
+    "motor/fallback ejecutó la acción, O si el smoke test de navegador reporta console.error, "
+    "pageerror, scrollWidth > innerWidth o imágenes rotas (naturalWidth === 0).\n"
+    "b) Funcionalidad <= 70: si el código o los generadores producen nombres o salidas con cadenas "
+    "plantilla/técnicas ('__', 'placeholder', 'fallback_', 'sample') o si un botón/acción de "
+    "'regenerar' puede reutilizar caché sin invalidarla.\n"
+    "c) Pruebas <= 72: si las pruebas solo verifican códigos HTTP 200 o cadenas no vacías sin validar "
+    "casos borde reales (metadatos ausentes, rotación EXIF, fallos de CLI externo, invalidación de caché)."
+)
+
 QUALITY_DIMENSION_META: dict[str, dict[str, str]] = {
     "ux_ui": {
         "label": "UX/UI",
         "focus": (
             "Jerarquía visual, contraste (claro/oscuro), responsividad (360px y 1280px+), "
-            "estados de carga/vacío/error y accesibilidad básica (ARIA/foco)."
+            "estados de carga/vacío/error y accesibilidad básica (ARIA/foco). "
+            "Regla estricta: tope máximo 72 si una UI dispara llamadas asíncronas (fetch/acciones) sin "
+            "deshabilitar el botón, sin indicador visual de carga (spinner/estado activo) o sin comunicar "
+            "claramente qué motor/fallback ejecutó la acción."
         ),
     },
     "functional_completeness": {
         "label": "Funcionalidad",
         "focus": (
             "Cruce entre cada requisito del Spec y el código real "
-            "(sin botones de adorno ni funciones incompletas)."
+            "(sin botones de adorno ni funciones incompletas). "
+            "Regla estricta: tope máximo 70 si código/generadores producen nombres o salidas con cadenas "
+            "plantilla/técnicas ('__', 'placeholder', 'fallback_', 'sample') o si una acción 'regenerar' "
+            "puede reutilizar caché sin invalidarla."
         ),
     },
     "robustness": {
@@ -73,7 +96,9 @@ QUALITY_DIMENSION_META: dict[str, dict[str, str]] = {
         "label": "Pruebas",
         "focus": (
             "Cobertura real de comportamiento en pytest (evitando pruebas vacías), "
-            "requirements.txt completo y arranque limpio."
+            "requirements.txt completo y arranque limpio. "
+            "Regla estricta: tope máximo 72 si las pruebas solo verifican HTTP 200 o cadenas no vacías "
+            "sin validar casos borde reales (metadatos ausentes, rotación EXIF, fallos de CLI externo, invalidación de caché)."
         ),
     },
 }
@@ -788,12 +813,332 @@ def _evaluate_functional_robustness_arch(
     }
 
 
+_STANDARD_PY_DUNDERS: frozenset[str] = frozenset(
+    {
+        "__main__",
+        "__init__",
+        "__name__",
+        "__file__",
+        "__doc__",
+        "__all__",
+        "__future__",
+        "__version__",
+        "__pycache__",
+        "__slots__",
+        "__dict__",
+        "__class__",
+        "__spec__",
+    }
+)
+_STRING_LITERAL_RE = re.compile(r"""(['"`])((?:\\.|(?!\1).)*?)\1""")
+_INLINE_SCRIPT_RE = re.compile(r"<script\b[^>]*>(.*?)</script>", re.IGNORECASE | re.DOTALL)
+
+
+def _merge_unique_notes(existing: Iterable[str], additions: Iterable[str]) -> list[str]:
+    """Append non-empty note entries preserving order and avoiding case-insensitive duplicates."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in (*existing, *additions):
+        txt = str(item or "").strip()
+        if not txt:
+            continue
+        key = txt.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(txt)
+    return out
+
+
+def _normalize_browser_findings(
+    browser_smoke_findings: Any,
+    *,
+    extra_secrets: Sequence[str] = (),
+) -> list[str]:
+    """Extract secret-redacted findings list from BrowserSmokeTestResult, mapping, or sequence."""
+    if browser_smoke_findings is None:
+        return []
+    raw_items: Any = browser_smoke_findings
+    if hasattr(browser_smoke_findings, "findings"):
+        raw_items = getattr(browser_smoke_findings, "findings", None)
+    elif isinstance(browser_smoke_findings, Mapping):
+        raw_items = browser_smoke_findings.get("findings")
+    if isinstance(raw_items, str):
+        items = [raw_items]
+    elif isinstance(raw_items, Sequence) and not isinstance(raw_items, (bytes, bytearray)):
+        items = list(raw_items)
+    else:
+        return []
+    cleaned = [
+        redact_secrets(str(it).strip(), extra_secrets=extra_secrets)
+        for it in items
+        if str(it or "").strip()
+    ]
+    return _merge_unique_notes((), cleaned)
+
+
+def _extract_ui_scripts(src_texts: Sequence[tuple[str, str]]) -> str:
+    """Collect frontend JS/TS code and inline HTML <script> contents for async UX inspection."""
+    chunks: list[str] = []
+    for rel, txt in src_texts:
+        low_rel = rel.lower()
+        if low_rel.endswith((".js", ".mjs", ".ts", ".jsx", ".tsx")):
+            chunks.append(txt)
+        elif low_rel.endswith((".html", ".htm")):
+            chunks.extend(_INLINE_SCRIPT_RE.findall(txt))
+    return "\n".join(chunks)
+
+
+def _detect_ux_ui_strict_violations(
+    has_ui: bool,
+    src_texts: Sequence[tuple[str, str]],
+    browser_findings: Sequence[str],
+) -> tuple[float | None, list[str], list[str]]:
+    """Enforce rule (a): cap UX/UI <= 72 on missing async UX safeguards or live browser smoke findings."""
+    findings: list[str] = []
+    improvements: list[str] = []
+    cap: float | None = None
+
+    if browser_findings:
+        cap = STRICT_UX_UI_CAP
+        findings.extend(browser_findings[:6])
+        improvements.append(
+            "Corregir errores de consola JS, desbordamiento horizontal e imágenes rotas detectadas en Chromium headless."
+        )
+
+    if not has_ui:
+        return cap, findings, improvements
+
+    ui_blob = "\n".join(
+        txt
+        for rel, txt in src_texts
+        if Path(rel).suffix.lower() in _UI_EXTENSIONS or rel.lower().endswith((".js", ".mjs", ".ts"))
+    )
+    ui_low = ui_blob.lower()
+    ui_script_blob = _extract_ui_scripts(src_texts)
+    if re.search(r"\bfetch\s*\(|XMLHttpRequest|\baxios\.", ui_script_blob):
+        has_disable = bool(
+            re.search(
+                r"\.disabled\s*=|setAttribute\s*\(\s*['\"]disabled['\"]|removeAttribute\s*\(\s*['\"]disabled['\"]",
+                ui_script_blob,
+            )
+        )
+        has_loading = bool(
+            re.search(
+                r"\b(?:spinner|is-loading|loading|cargando|loader|busy)\b|aria-busy|animate-spin|@keyframes\s+spin",
+                ui_low,
+            )
+        )
+        combined_all_low = "\n".join(txt.lower() for _, txt in src_texts)
+        backend_uses_engine_or_fallback = bool(
+            re.search(
+                r"\b(?:fallback|heuristic|heurístic|exiftool|pillow|piexif|agy|ffmpeg|ffprobe)\b",
+                combined_all_low,
+            )
+        )
+        ui_communicates_engine = bool(
+            re.search(
+                r"\b(?:fallback|motor|engine|extractor|heurístic|heuristic|usando)\b",
+                ui_low,
+            )
+        )
+        missing_parts: list[str] = []
+        if not has_disable:
+            missing_parts.append("deshabilitar el botón durante la llamada")
+        if not has_loading:
+            missing_parts.append("mostrar indicador visual de carga (spinner/estado activo)")
+        if backend_uses_engine_or_fallback and not ui_communicates_engine:
+            missing_parts.append("comunicar qué motor o fallback ejecutó la acción")
+        if missing_parts:
+            cap = STRICT_UX_UI_CAP
+            findings.append(
+                f"Acciones asíncronas (fetch) sin resguardo UX completo: falta {', '.join(missing_parts)} (tope <= {STRICT_UX_UI_CAP:.0f})."
+            )
+            improvements.append(
+                "Deshabilitar botones mientras corre fetch, mostrar spinner/estado activo visible e indicar el motor o fallback ejecutado."
+            )
+    return cap, findings, improvements
+
+
+def _detect_functional_strict_violations(
+    src_texts: Sequence[tuple[str, str]],
+) -> tuple[float | None, list[str], list[str]]:
+    """Enforce rule (b): cap Funcionalidad <= 70 for technical template literals or uninvalidated regenerate cache."""
+    findings: list[str] = []
+    improvements: list[str] = []
+    cap: float | None = None
+
+    matched_tokens: list[str] = []
+    for rel, txt in src_texts:
+        ext = Path(rel).suffix.lower()
+        if ext not in {".py", ".js", ".mjs", ".ts", ".jsx", ".tsx"}:
+            continue
+        cleaned_txt = re.sub(r"\bplaceholder\s*=\s*(['\"]).*?\1", "", txt)
+        cleaned_txt = re.sub(r"::placeholder\b", "", cleaned_txt)
+        for match in _STRING_LITERAL_RE.finditer(cleaned_txt):
+            lit = match.group(2).strip()
+            if not lit:
+                continue
+            low_lit = lit.lower()
+            if low_lit in _STANDARD_PY_DUNDERS or low_lit.startswith("http"):
+                continue
+            token_hit: str | None = None
+            if "__" in lit:
+                token_hit = "__"
+            elif "fallback_" in low_lit:
+                token_hit = "fallback_"
+            elif re.search(r"\bplaceholder\b", low_lit) or "placeholder_" in low_lit:
+                token_hit = "placeholder"
+            elif re.search(r"\bsample\b", low_lit) or "sample_" in low_lit:
+                token_hit = "sample"
+            if token_hit and token_hit not in matched_tokens:
+                matched_tokens.append(token_hit)
+
+    if matched_tokens:
+        cap = STRICT_FUNCTIONAL_CAP
+        findings.append(
+            f"Se detectaron cadenas plantilla o técnicas en salidas/nombres generados ({', '.join(matched_tokens[:4])}; tope <= {STRICT_FUNCTIONAL_CAP:.0f})."
+        )
+        improvements.append(
+            "Reemplazar etiquetas o nombres con '__', 'placeholder', 'fallback_' o 'sample' por valores semánticos reales para el usuario."
+        )
+
+    combined_low = "\n".join(txt.lower() for _, txt in src_texts)
+    has_regenerate = bool(re.search(r"regenerar|regenerate", combined_low))
+    has_cache = bool(re.search(r"\b[a-z0-9_]*cache[a-z0-9_]*\b", combined_low))
+    if has_regenerate and has_cache:
+        has_invalidation = bool(
+            re.search(
+                r"invalidat|bypass|no_cache|skip_cache|use_cache\s*=\s*false|force_refresh|"
+                r"force\s*=\s*true|delete\s+from\s+[a-z0-9_]*cache|\.clear\s*\(|\.pop\s*\(",
+                combined_low,
+            )
+        )
+        if not has_invalidation:
+            cap = STRICT_FUNCTIONAL_CAP
+            findings.append(
+                f"Acción de regeneración detectada junto a caché sin mecanismo visible de invalidación o bypass (tope <= {STRICT_FUNCTIONAL_CAP:.0f})."
+            )
+            improvements.append(
+                "Invalidar o omitir la caché explícitamente cuando el usuario ejecute 'regenerar' para no devolver resultados obsoletos."
+            )
+
+    return cap, findings, improvements
+
+
+def _detect_testing_strict_violations(
+    src_texts: Sequence[tuple[str, str]],
+    test_texts: Sequence[tuple[str, str]],
+) -> tuple[float | None, list[str], list[str]]:
+    """Enforce rule (c): cap Pruebas <= 72 when tests only assert HTTP 200 / non-empty outputs without real edge cases."""
+    if not test_texts:
+        return None, [], []
+
+    combined_src_low = "\n".join(txt.lower() for _, txt in src_texts)
+    combined_tests_low = "\n".join(txt.lower() for _, txt in test_texts)
+
+    has_shallow_checks = bool(
+        re.search(
+            r"status_code\s*==\s*200|\.status\s*==\s*200|\blen\s*\([^)]+\)\s*>\s*0|"
+            r"assert\s+isinstance\s*\([^,]+,\s*str\)|assert\s+[a-z0-9_.]+\.strip\s*\(\s*\)",
+            combined_tests_low,
+        )
+    )
+    has_error_status_or_raises = bool(
+        re.search(
+            r"pytest\.raises|\bstatus(?:_code)?\s*==\s*(?:400|403|404|409|422|500)\b",
+            combined_tests_low,
+        )
+    )
+    has_missing_meta_edge = bool(
+        re.search(
+            r"missing_meta|sin_metadatos|no_meta|undated|captured_at['\"]?\s*[:=]\s*none|"
+            r"metadata['\"]?\s*[:=]\s*\{\}|invalid|corrupt|is\s+none",
+            combined_tests_low,
+        )
+    )
+    uses_exif_or_image = bool(
+        re.search(r"\b(?:pil|pillow|piexif|exif|exiftool|imageops)\b", combined_src_low)
+    )
+    has_exif_rotation_edge = bool(
+        re.search(
+            r"exif_transpose|orientation|orientaci|rotate|rotación|rotacion|270|180|90",
+            combined_tests_low,
+        )
+    )
+    uses_external_cli = bool(
+        re.search(r"subprocess\.(?:run|popen)|shutil\.which", combined_src_low)
+    )
+    has_cli_failure_edge = bool(
+        re.search(
+            r"filenotfounderror|timeoutexpired|oserror|subprocesperror|returncode\s*[!=]=\s*[12]|"
+            r"missing.*(?:bin|cli)|cli.*fallback",
+            combined_tests_low,
+        )
+    )
+    uses_cache_and_regen = bool(
+        re.search(r"regenerar|regenerate", combined_src_low)
+        and re.search(r"\b[a-z0-9_]*cache[a-z0-9_]*\b", combined_src_low)
+    )
+    has_cache_invalidation_edge = bool(
+        re.search(r"invalidat|no_cache|bypass|clear\(|cache.*regenera|regenera.*cache", combined_tests_low)
+    )
+
+    missing_edges: list[str] = []
+    if has_shallow_checks and not has_error_status_or_raises and not has_missing_meta_edge:
+        missing_edges.append("errores/metadatos ausentes")
+    if uses_exif_or_image and not has_exif_rotation_edge:
+        missing_edges.append("rotación/orientación EXIF")
+    if uses_external_cli and not has_cli_failure_edge:
+        missing_edges.append("fallos de CLI externo")
+    if uses_cache_and_regen and not has_cache_invalidation_edge:
+        missing_edges.append("invalidación de caché")
+
+    if (has_shallow_checks and missing_edges) or (
+        (uses_exif_or_image or uses_external_cli or uses_cache_and_regen) and missing_edges
+    ):
+        return (
+            STRICT_TESTING_CAP,
+            [
+                f"Pruebas superficiales (solo HTTP 200 o salidas no vacías) sin casos borde clave en {', '.join(missing_edges)} (tope <= {STRICT_TESTING_CAP:.0f})."
+            ],
+            [
+                f"Añadir pruebas negativas y de casos borde cubriendo: {', '.join(missing_edges)}."
+            ],
+        )
+    return None, [], []
+
+
+def _detect_strict_rubric_violations(
+    has_ui: bool,
+    src_texts: Sequence[tuple[str, str]],
+    test_texts: Sequence[tuple[str, str]],
+    browser_smoke_findings: Sequence[str] = (),
+) -> dict[str, tuple[float, list[str], list[str]]]:
+    """Compute hard score caps and concrete findings for UX/UI (<=72), Funcionalidad (<=70), and Pruebas (<=72)."""
+    caps: dict[str, tuple[float, list[str], list[str]]] = {}
+    ux_cap, ux_f, ux_i = _detect_ux_ui_strict_violations(
+        has_ui, src_texts, browser_smoke_findings
+    )
+    if ux_cap is not None:
+        caps["ux_ui"] = (ux_cap, ux_f, ux_i)
+
+    fn_cap, fn_f, fn_i = _detect_functional_strict_violations(src_texts)
+    if fn_cap is not None:
+        caps["functional_completeness"] = (fn_cap, fn_f, fn_i)
+
+    ts_cap, ts_f, ts_i = _detect_testing_strict_violations(src_texts, test_texts)
+    if ts_cap is not None:
+        caps["testing_runtime"] = (ts_cap, ts_f, ts_i)
+    return caps
+
+
 def _run_deterministic_audit(
     workspace_dir: Path,
     *,
     has_ui: bool,
     plan: Plan | None = None,
     test_results: Mapping[str, bool] | None = None,
+    browser_smoke_findings: Sequence[str] = (),
     extra_secrets: Sequence[str] = (),
 ) -> dict[str, dict[str, Any]]:
     ws = Path(workspace_dir)
@@ -802,7 +1147,7 @@ def _run_deterministic_audit(
     sec_s, sec_f, sec_i = _evaluate_security(src_texts)
     tst_s, tst_f, tst_i = _evaluate_testing_runtime(ws, src_texts, test_texts, test_results)
     core = _evaluate_functional_robustness_arch(src_texts, plan)
-    return {
+    dims: dict[str, dict[str, Any]] = {
         "ux_ui": {"score": ux_s, "findings": ux_f, "improvements": ux_i},
         "functional_completeness": {
             "score": core["functional_completeness"][0],
@@ -822,6 +1167,18 @@ def _run_deterministic_audit(
         "security_hygiene": {"score": sec_s, "findings": sec_f, "improvements": sec_i},
         "testing_runtime": {"score": tst_s, "findings": tst_f, "improvements": tst_i},
     }
+    strict_caps = _detect_strict_rubric_violations(
+        has_ui,
+        src_texts,
+        test_texts,
+        browser_smoke_findings=browser_smoke_findings,
+    )
+    for dim, (cap_val, cap_f, cap_i) in strict_caps.items():
+        if dim in dims:
+            dims[dim]["score"] = min(float(dims[dim]["score"]), cap_val)
+            dims[dim]["findings"] = _merge_unique_notes(dims[dim]["findings"], cap_f)
+            dims[dim]["improvements"] = _merge_unique_notes(dims[dim]["improvements"], cap_i)
+    return dims
 
 
 def build_quality_markdown_report(
@@ -1216,6 +1573,18 @@ class AdversarialCritic:
         )
         return parsed_dims, explicit_global, summary, parsed_objs, resolved_cnt, diff_summary
 
+    @staticmethod
+    def _format_browser_findings_block(browser_findings: Sequence[str]) -> str:
+        if not browser_findings:
+            return ""
+        items = "\n".join(f"- {line}" for line in browser_findings[:8])
+        return (
+            "\n\nVerificación real en navegador headless (Chromium):\n"
+            f"{items}\n"
+            "Evalúa estas evidencias bajo UX/UI (tope <= 72 si hay errores de consola, "
+            "desbordamiento horizontal scrollWidth > innerWidth o imágenes rotas naturalWidth === 0)."
+        )
+
     def _build_audit_messages(
         self,
         project_id: str,
@@ -1227,6 +1596,7 @@ class AdversarialCritic:
         plan: Plan | None,
         test_results: Mapping[str, bool] | None,
         challenge_for_polish: bool = False,
+        browser_smoke_findings: Sequence[str] = (),
         extra_secrets: Sequence[str],
     ) -> list[dict[str, str]]:
         code_ctx = collect_workspace_code_context(
@@ -1258,18 +1628,21 @@ class AdversarialCritic:
             "en modo ESTRICTAMENTE DE SOLO LECTURA.\n"
             "Evalúa cada dimensión activa de 0 a 100 puntos basándote SOLO en evidencia verificable del código "
             "(nunca infles calificaciones sin respaldo).\n"
+            f"{STRICT_RUBRIC_PROMPT_BLOCK}\n"
             "Emite objeciones accionables en `objections` con: `dimension`, `file_path`, `severity`, `issue`, `concrete_fix`."
             + polish_hint
             + "\nResponde únicamente en formato JSON válido siguiendo el esquema solicitado."
         )
+        browser_block = self._format_browser_findings_block(browser_smoke_findings)
         user_prompt = redact_secrets(
             f"Proyecto: {project_id}\n"
             f"UI detectada: {'Sí' if has_ui else 'No (API/CLI puro)'}\n"
             f"Pesos adaptativos: {weights_desc}\n"
             f"Resultados de pruebas actuales: {dict(test_results or {})}\n\n"
-            f"Criterios por Sub-Auditor:\n" + "\n".join(rubric_lines) + "\n\n"
-            f"Especificación (Spec):\n{spec_summary[:4000]}\n\n"
-            f"Código del workspace:\n{code_ctx or '(Sin archivos detectados)'}",
+            f"Criterios por Sub-Auditor:\n" + "\n".join(rubric_lines)
+            + browser_block
+            + f"\n\nEspecificación (Spec):\n{spec_summary[:4000]}\n\n"
+            + f"Código del workspace:\n{code_ctx or '(Sin archivos detectados)'}",
             extra_secrets=extra_secrets,
         )
         return [
@@ -1290,6 +1663,7 @@ class AdversarialCritic:
         spec: Spec | None,
         plan: Plan | None,
         test_results: Mapping[str, bool] | None,
+        browser_smoke_findings: Sequence[str] = (),
         extra_secrets: Sequence[str],
     ) -> list[dict[str, str]]:
         code_ctx = collect_workspace_code_context(
@@ -1317,8 +1691,10 @@ class AdversarialCritic:
             "Inspecciona el diff aplicado tras las correcciones del Constructor, comprueba cuántas objeciones "
             "fueron resueltas (`resolved_count`), resume lo verificado (`diff_summary`) y recalcula las 6 dimensiones "
             "con rigor de evidencia.\n"
+            f"{STRICT_RUBRIC_PROMPT_BLOCK}\n"
             "Responde únicamente en JSON válido."
         )
+        browser_block = self._format_browser_findings_block(browser_smoke_findings)
         user_prompt = redact_secrets(
             f"Proyecto: {project_id}\n"
             f"Puntaje previo: {previous_report.global_score:.1f}%\n"
@@ -1326,6 +1702,7 @@ class AdversarialCritic:
             f"Resultados de pruebas actuales: {dict(test_results or {})}\n\n"
             f"Objeciones planteadas anteriormente ({len(prior_objections)}):\n"
             + "\n".join(obj_lines)
+            + browser_block
             + "\n\nGit diff resultante tras la respuesta del Constructor:\n"
             + (diff_text.strip() or "(Sin diff registrado)")
             + f"\n\nSpec (resumen):\n{spec_summary[:2500]}\n\n"
@@ -1463,10 +1840,18 @@ class AdversarialCritic:
         project_name: str,
         version_label: str,
         challenge_for_polish: bool,
+        browser_smoke_findings: Sequence[str] = (),
         extra_secrets: Sequence[str],
     ) -> QualityAuditReport:
         active_dims = [dim for dim in QUALITY_DIMENSION_ORDER if weights[dim] > 0.0]
         all_active_supplied = bool(active_dims) and all(dim in llm_dims for dim in active_dims)
+        src_texts, test_texts = _safe_read_workspace_sources(ws, extra_secrets=extra_secrets)
+        strict_caps = _detect_strict_rubric_violations(
+            has_ui,
+            src_texts,
+            test_texts,
+            browser_smoke_findings=browser_smoke_findings,
+        )
 
         dimensions: dict[str, SubAuditResult] = {}
         all_findings: list[str] = []
@@ -1480,6 +1865,11 @@ class AdversarialCritic:
             score_val = _clamp_score(chosen.get("score"), default=80.0) if active else 100.0
             f_list = list(chosen.get("findings") or []) if active else []
             i_list = list(chosen.get("improvements") or []) if active else []
+            if active and dim in strict_caps:
+                cap_score, cap_findings, cap_improvements = strict_caps[dim]
+                score_val = min(score_val, cap_score)
+                f_list = _merge_unique_notes(f_list, cap_findings)
+                i_list = _merge_unique_notes(i_list, cap_improvements)
             dimensions[dim] = SubAuditResult(
                 dimension=dim,
                 label=meta["label"],
@@ -1498,7 +1888,7 @@ class AdversarialCritic:
             sum(dimensions[dim].score * dimensions[dim].weight for dim in active_dims),
             2,
         )
-        if all_active_supplied or explicit_global is None:
+        if strict_caps or all_active_supplied or explicit_global is None:
             global_score = weighted_global
         else:
             global_score = explicit_global
@@ -1608,17 +1998,22 @@ class AdversarialCritic:
         project_name: str = "",
         version_label: str = "",
         challenge_for_polish: bool = False,
+        browser_smoke_findings: Any = None,
         extra_secrets: Sequence[str] = (),
     ) -> QualityAuditReport:
         """Execute strict read-only Critic + 6 Sub-Auditors evaluation with fallback."""
         ws = Path(workspace_dir)
         has_ui = detect_workspace_has_ui(ws, plan=plan)
         weights = compute_area_weights(has_ui)
+        norm_browser = _normalize_browser_findings(
+            browser_smoke_findings, extra_secrets=extra_secrets
+        )
         deterministic_dims = _run_deterministic_audit(
             ws,
             has_ui=has_ui,
             plan=plan,
             test_results=test_results,
+            browser_smoke_findings=norm_browser,
             extra_secrets=extra_secrets,
         )
         messages = self._build_audit_messages(
@@ -1630,6 +2025,7 @@ class AdversarialCritic:
             plan=plan,
             test_results=test_results,
             challenge_for_polish=challenge_for_polish,
+            browser_smoke_findings=norm_browser,
             extra_secrets=extra_secrets,
         )
         llm_dims, explicit_global, summary, raw_objs, _, _, source = (
@@ -1650,6 +2046,7 @@ class AdversarialCritic:
             project_name=project_name,
             version_label=version_label,
             challenge_for_polish=challenge_for_polish,
+            browser_smoke_findings=norm_browser,
             extra_secrets=extra_secrets,
         )
 
@@ -1668,17 +2065,22 @@ class AdversarialCritic:
         project_name: str = "",
         version_label: str = "",
         challenge_for_polish: bool = False,
+        browser_smoke_findings: Any = None,
         extra_secrets: Sequence[str] = (),
     ) -> tuple[QualityAuditReport, int, str]:
         """Inspect resulting git diff against prior objections to count fixes and re-score."""
         ws = Path(workspace_dir)
         has_ui = detect_workspace_has_ui(ws, plan=plan)
         weights = compute_area_weights(has_ui)
+        norm_browser = _normalize_browser_findings(
+            browser_smoke_findings, extra_secrets=extra_secrets
+        )
         deterministic_dims = _run_deterministic_audit(
             ws,
             has_ui=has_ui,
             plan=plan,
             test_results=test_results,
+            browser_smoke_findings=norm_browser,
             extra_secrets=extra_secrets,
         )
         messages = self._build_diff_review_messages(
@@ -1692,6 +2094,7 @@ class AdversarialCritic:
             spec=spec,
             plan=plan,
             test_results=test_results,
+            browser_smoke_findings=norm_browser,
             extra_secrets=extra_secrets,
         )
         llm_dims, explicit_global, summary, raw_objs, explicit_resolved, diff_summary, source = (
@@ -1712,6 +2115,7 @@ class AdversarialCritic:
             project_name=project_name,
             version_label=version_label,
             challenge_for_polish=challenge_for_polish,
+            browser_smoke_findings=norm_browser,
             extra_secrets=extra_secrets,
         )
 
@@ -1975,6 +2379,7 @@ class ParentAuditor:
         spec: Spec | None,
         plan: Plan | None,
         test_results: Mapping[str, bool] | None,
+        browser_smoke_findings: Sequence[str] = (),
         extra_secrets: Sequence[str],
     ) -> list[dict[str, str]]:
         return self.critic._build_audit_messages(
@@ -1985,6 +2390,7 @@ class ParentAuditor:
             spec=spec,
             plan=plan,
             test_results=test_results,
+            browser_smoke_findings=browser_smoke_findings,
             extra_secrets=extra_secrets,
         )
 
@@ -2000,6 +2406,7 @@ class ParentAuditor:
         project_name: str = "",
         version_label: str = "",
         challenge_for_polish: bool = False,
+        browser_smoke_findings: Any = None,
         extra_secrets: Sequence[str] = (),
     ) -> QualityAuditReport:
         """Execute AdversarialCritic + 6 Sub-Auditors evaluation with adaptive weights and fallback."""
@@ -2013,6 +2420,7 @@ class ParentAuditor:
             project_name=project_name,
             version_label=version_label,
             challenge_for_polish=challenge_for_polish,
+            browser_smoke_findings=browser_smoke_findings,
             extra_secrets=extra_secrets,
         )
 
@@ -2031,6 +2439,7 @@ class ParentAuditor:
         project_name: str = "",
         version_label: str = "",
         challenge_for_polish: bool = False,
+        browser_smoke_findings: Any = None,
         extra_secrets: Sequence[str] = (),
     ) -> tuple[QualityAuditReport, int, str]:
         """Delegate git-diff re-evaluation cleanly to AdversarialCritic."""
@@ -2047,6 +2456,7 @@ class ParentAuditor:
             project_name=project_name,
             version_label=version_label,
             challenge_for_polish=challenge_for_polish,
+            browser_smoke_findings=browser_smoke_findings,
             extra_secrets=extra_secrets,
         )
 

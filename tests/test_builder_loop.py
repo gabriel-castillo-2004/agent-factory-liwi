@@ -4618,4 +4618,150 @@ def test_local_app_runner_and_build_worker_resolve_bare_cli_commands_and_pytest_
     _ = sys.executable
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_build_worker_passes_browser_smoke_findings_to_adversarial_critic_and_triggers_refinement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run_http_smoke_test invokes run_browser_smoke_test and BuildWorker forwards console/overflow/broken-image findings into AdversarialCritic, forcing refinement when UX/UI is capped <= 72."""
+    import sys
+    import types
+    from typing import Any
+
+    from agent_factory.agents.quality_auditor import AdversarialCritic, ParentAuditor
+    from agent_factory.runtime_runner import LocalAppRunner, run_http_smoke_test
+
+    pid = "proj-browser-smoke-critic"
+    orch, store = _create_approved_project(pid, num_tests=1, approve=True)
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_browser_smoke")
+    local_runner = LocalAppRunner(workspace_manager=ws_mgr)
+
+    # First browser visit fails (console.error + overflow + broken img); second visit passes after refinement
+    visits = {"count": 0}
+
+    class _FakeMsg:
+        def __init__(self, t: str, txt: str) -> None:
+            self.type = t
+            self.text = txt
+
+    class _StepPage:
+        def __init__(self, idx: int) -> None:
+            self.idx = idx
+            self.handlers: dict[str, list[Any]] = {}
+
+        def on(self, event: str, fn: Any) -> None:
+            self.handlers.setdefault(event, []).append(fn)
+
+        def goto(self, _url: str, **_kw: Any) -> None:
+            if self.idx == 1:
+                for fn in self.handlers.get("console", []):
+                    fn(_FakeMsg("error", "console boom on initial load"))
+
+        def wait_for_timeout(self, _ms: int) -> None:
+            return None
+
+        def evaluate(self, script: str) -> Any:
+            if "scrollWidth" in script:
+                return {"scrollWidth": 1440, "innerWidth": 1280} if self.idx == 1 else {"scrollWidth": 1280, "innerWidth": 1280}
+            return ["/missing.png"] if self.idx == 1 else []
+
+    class _StepPW:
+        def __enter__(self) -> Any:
+            visits["count"] += 1
+            cur_idx = visits["count"]
+            return types.SimpleNamespace(
+                chromium=types.SimpleNamespace(
+                    launch=lambda **_kw: types.SimpleNamespace(
+                        new_page=lambda **_pw_kw: _StepPage(cur_idx),
+                        close=lambda: None,
+                    )
+                )
+            )
+
+        def __exit__(self, *_a: object) -> None:
+            return None
+
+    fake_pkg = types.ModuleType("playwright")
+    fake_sync = types.ModuleType("playwright.sync_api")
+    fake_sync.sync_playwright = lambda: _StepPW()  # type: ignore[attr-defined]
+    fake_pkg.sync_api = fake_sync  # type: ignore[attr-defined]
+
+    clean_html = (
+        "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<style>@media(max-width:600px){body{margin:0}}</style></head>"
+        "<body><button id='go' aria-label='Ir'>Ir</button></body></html>\n"
+    )
+    inflated_r1 = {
+        "summary": "Todo ok visualmente",
+        "dimensions": {
+            "ux_ui": {"score": 94.0, "findings": [], "improvements": []},
+            "functional_completeness": {"score": 88.0, "findings": [], "improvements": []},
+            "robustness": {"score": 88.0, "findings": [], "improvements": []},
+            "architecture_quality": {"score": 88.0, "findings": [], "improvements": []},
+            "security_hygiene": {"score": 88.0, "findings": [], "improvements": []},
+            "testing_runtime": {"score": 88.0, "findings": [], "improvements": []},
+        },
+        "objections": [],
+    }
+    clean_r2 = {
+        "summary": "Errores de navegador resueltos en diff",
+        "resolved_count": 1,
+        "dimensions": {
+            "ux_ui": {"score": 91.0, "findings": [], "improvements": []},
+            "functional_completeness": {"score": 90.0, "findings": [], "improvements": []},
+            "robustness": {"score": 90.0, "findings": [], "improvements": []},
+            "architecture_quality": {"score": 90.0, "findings": [], "improvements": []},
+            "security_hygiene": {"score": 90.0, "findings": [], "improvements": []},
+            "testing_runtime": {"score": 90.0, "findings": [], "improvements": []},
+        },
+        "objections": [],
+    }
+    critic_llm = FakeLLM(responses=[inflated_r1, clean_r2])
+    auditor = ParentAuditor(llm=critic_llm, critic=AdversarialCritic(llm=critic_llm))
+    agent = FakeCodeAgent(
+        test_gen_steps=[{"tests/test_app.py": "def test_at_01(): assert 1 + 1 == 2\n"}],
+        impl_steps=[
+            {"index.html": clean_html},
+            {"index.html": clean_html + "<!-- fixed -->\n"},
+        ],
+    )
+    worker = BuildWorker(
+        orchestrator=orch,
+        workspace_manager=ws_mgr,
+        code_agent=agent,
+        runner=FakeRunner(
+            results=[
+                CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True}),
+                CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True}),
+            ]
+        ),
+        vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="CI ok")]),
+        local_app_runner=local_runner,
+        quality_auditor=auditor,
+    )
+
+    try:
+        with monkeypatch.context() as mp:
+            mp.setitem(sys.modules, "playwright", fake_pkg)
+            mp.setitem(sys.modules, "playwright.sync_api", fake_sync)
+            report = worker.run_job(pid)
+
+        assert orch.get_status(pid).state == ProjectState.DELIVERED
+        assert report.invocations == 3  # test_gen + initial impl + 1 adversarial refinement round
+        assert visits["count"] == 2
+        critic_first_prompt = str(critic_llm.calls[0]["messages"])
+        assert "console boom on initial load" in critic_first_prompt
+        assert "1440" in critic_first_prompt and "1280" in critic_first_prompt
+        assert "/missing.png" in critic_first_prompt
+
+        delivered = next(e for e in store.get_events(pid) if e.type == EventType.PROJECT_DELIVERED)
+        sc = delivered.payload["quality_scorecard"]
+        assert sc["debate_summary"]["score_before"] < 85.0
+        assert sc["global_score"] >= 85.0
+        _ = run_http_smoke_test
+    finally:
+        local_runner.stop_all()
+
+
 

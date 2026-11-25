@@ -131,6 +131,22 @@ class LocalAppStatus(BaseModel):
         return data
 
 
+class BrowserSmokeTestResult(BaseModel):
+    """Result of optional Playwright headless Chromium DOM, console, overflow, and image checks."""
+
+    available: bool = False
+    passed: bool = True
+    url: str | None = None
+    console_errors: list[str] = Field(default_factory=list)
+    page_errors: list[str] = Field(default_factory=list)
+    horizontal_overflow: bool = False
+    scroll_width: int = 0
+    inner_width: int = 0
+    broken_images: list[str] = Field(default_factory=list)
+    findings: list[str] = Field(default_factory=list)
+    summary: str = ""
+
+
 class HttpSmokeTestResult(BaseModel):
     """Result of starting an app locally and probing GET / and relative HTML assets."""
 
@@ -138,6 +154,8 @@ class HttpSmokeTestResult(BaseModel):
     url: str | None = None
     summary: str = ""
     failed_resources: list[str] = Field(default_factory=list)
+    browser_smoke: BrowserSmokeTestResult | None = None
+    browser_findings: list[str] = Field(default_factory=list)
 
 
 @dataclass
@@ -1264,6 +1282,158 @@ def _fetch_local_http(url: str, timeout_seconds: float = 3.0) -> tuple[int, str,
         return status_code, content_type, body
 
 
+def run_browser_smoke_test(
+    base_url: str,
+    *,
+    timeout_ms: int = 10000,
+    viewport_width: int = 1280,
+    viewport_height: int = 720,
+    secrets_to_redact: Sequence[str] = (),
+) -> BrowserSmokeTestResult:
+    """Run optional headless Chromium smoke checks (console.error, pageerror, overflow, broken images)."""
+    clean_url = str(base_url or "").strip()
+    parsed = urllib.parse.urlsplit(clean_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return BrowserSmokeTestResult(
+            available=False,
+            passed=False,
+            url=clean_url or None,
+            findings=["URL inválida para smoke test de navegador."],
+            summary="URL inválida para smoke test de navegador.",
+        )
+
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore[import-not-found]
+    except ImportError:
+        return BrowserSmokeTestResult(
+            available=False,
+            passed=True,
+            url=clean_url,
+            summary="Playwright no instalado; smoke test de navegador omitido de forma segura.",
+        )
+
+    pw_err_types: tuple[type[BaseException], ...] = (
+        OSError,
+        RuntimeError,
+        TimeoutError,
+        ValueError,
+        TypeError,
+    )
+    try:
+        from playwright.sync_api import Error as PlaywrightError  # type: ignore[import-not-found]
+
+        pw_err_types = (*pw_err_types, PlaywrightError)
+    except ImportError:
+        pass
+
+    def _scrub(text: object) -> str:
+        return redact_secrets(str(text or "").strip(), extra_secrets=secrets_to_redact)
+
+    console_errors: list[str] = []
+    page_errors: list[str] = []
+    horizontal_overflow = False
+    scroll_width = 0
+    inner_width = int(viewport_width)
+    broken_images: list[str] = []
+    findings: list[str] = []
+    browser: Any = None
+
+    try:
+        with sync_playwright() as pw:
+            try:
+                browser = pw.chromium.launch(headless=True)
+            except pw_err_types as launch_exc:
+                err_low = str(launch_exc).lower()
+                if any(
+                    tok in err_low
+                    for tok in ("executable doesn't exist", "playwright install", "browsertype.launch")
+                ):
+                    return BrowserSmokeTestResult(
+                        available=False,
+                        passed=True,
+                        url=clean_url,
+                        summary=f"Chromium de Playwright no disponible; verificación omitida ({_scrub(launch_exc)}).",
+                    )
+                raise
+
+            try:
+                page = browser.new_page(viewport={"width": int(viewport_width), "height": int(viewport_height)})
+
+                def _on_console(msg: Any) -> None:
+                    msg_type = str(getattr(msg, "type", "") or "").lower()
+                    if msg_type == "error":
+                        raw_txt = msg.text() if callable(getattr(msg, "text", None)) else getattr(msg, "text", "")
+                        cleaned = _scrub(raw_txt)
+                        if cleaned:
+                            console_errors.append(cleaned)
+
+                def _on_pageerror(err: Any) -> None:
+                    cleaned = _scrub(err)
+                    if cleaned:
+                        page_errors.append(cleaned)
+
+                page.on("console", _on_console)
+                page.on("pageerror", _on_pageerror)
+                page.goto(clean_url, wait_until="load", timeout=max(1000, int(timeout_ms)))
+                if hasattr(page, "wait_for_timeout"):
+                    page.wait_for_timeout(200)
+
+                layout = page.evaluate(
+                    "() => ({scrollWidth: document.documentElement ? document.documentElement.scrollWidth : 0, innerWidth: window.innerWidth || 0})"
+                )
+                if isinstance(layout, Mapping):
+                    scroll_width = int(layout.get("scrollWidth") or 0)
+                    inner_width = int(layout.get("innerWidth") or viewport_width)
+                    horizontal_overflow = scroll_width > inner_width > 0
+
+                raw_broken = page.evaluate(
+                    "() => Array.from(document.images || []).filter(i => !i.complete || i.naturalWidth === 0).map(i => i.getAttribute('src') || i.alt || '(imagen sin src)')"
+                )
+                if isinstance(raw_broken, Sequence) and not isinstance(raw_broken, (str, bytes)):
+                    broken_images = [_scrub(img) for img in raw_broken if str(img or "").strip()]
+            finally:
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except pw_err_types as close_exc:
+                        logger.debug("Playwright browser close failed cleanly: %s", close_exc)
+    except pw_err_types as exc:
+        findings.append(f"Fallo al inspeccionar página en Chromium headless: {_scrub(exc)}")
+
+    for err_txt in console_errors[:5]:
+        findings.append(f"Error de consola en navegador (console.error): {err_txt}")
+    for perr_txt in page_errors[:5]:
+        findings.append(f"Excepción no capturada en navegador (pageerror): {perr_txt}")
+    if horizontal_overflow:
+        findings.append(
+            f"Desbordamiento horizontal detectado en navegador (scrollWidth={scroll_width} > innerWidth={inner_width})."
+        )
+    if broken_images:
+        findings.append(
+            f"Imágenes rotas detectadas en navegador (naturalWidth === 0): {', '.join(broken_images[:5])}."
+        )
+
+    passed = len(findings) == 0
+    summary = (
+        f"Browser smoke test aprobado en {clean_url} ({inner_width}px, sin errores ni imágenes rotas)."
+        if passed
+        else " | ".join(findings[:4])
+    )
+    return BrowserSmokeTestResult(
+        available=True,
+        passed=passed,
+        url=clean_url,
+        console_errors=console_errors,
+        page_errors=page_errors,
+        horizontal_overflow=horizontal_overflow,
+        scroll_width=scroll_width,
+        inner_width=inner_width,
+        broken_images=broken_images,
+        findings=findings,
+        summary=summary,
+    )
+
+
 def run_http_smoke_test(
     app_runner: LocalAppRunner,
     project_id: str,
@@ -1371,10 +1541,21 @@ def run_http_smoke_test(
                 failed_resources=failed_resources,
             )
 
+        browser_res = run_browser_smoke_test(
+            started_url,
+            secrets_to_redact=app_runner.secrets_to_redact,
+        )
+        summary = (
+            f"HTTP Smoke Test passed: GET / and {len(seen_urls)} local asset(s) returned HTTP 200."
+        )
+        if browser_res.available and not browser_res.passed and browser_res.findings:
+            summary = f"{summary} | Browser check: {' ; '.join(browser_res.findings[:3])}"
         return HttpSmokeTestResult(
             passed=True,
             url=started_url,
-            summary=f"HTTP Smoke Test passed: GET / and {len(seen_urls)} local asset(s) returned HTTP 200.",
+            summary=summary,
+            browser_smoke=browser_res,
+            browser_findings=list(browser_res.findings),
         )
     finally:
         app_runner.stop(project_id, workspace_dir=ws_dir)
