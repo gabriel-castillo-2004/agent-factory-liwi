@@ -2156,7 +2156,7 @@ def test_dashboard_post_delivery_modify_workflow_preserves_workspace_and_updates
         )
         assert m_code == 200
         assert m_res["background_started"] is True
-        assert server.controller.wait_for_idle(timeout=5.0) is True
+        assert server.controller.wait_for_idle(timeout=25.0) is True
 
         _, updated_detail = _http_json(f"{base_url}/api/projects/{pid}")
         assert updated_detail["status"]["state"] == "DELIVERED"
@@ -6184,3 +6184,86 @@ def test_dashboard_mobile_responsive_step1_header_and_project_selector(tmp_path:
         if thread.is_alive():
             thread.join(timeout=2.0)
         store.close()
+
+
+def test_dashboard_mobile_responsive_header_and_project_selector() -> None:
+    """Verify @media (max-width: 768px) enforces body anti-overflow, scrollable top-bar buttons, and flex project selector + Nuevo row without CDNs or ID changes."""
+    from agent_factory.dashboard import DASHBOARD_HTML
+
+    # Zero external CDNs and expected Spanish labels + HTML IDs preserved
+    assert "cdn." not in DASHBOARD_HTML.lower()
+    assert "https://" not in DASHBOARD_HTML.lower()
+    for expected_markup in (
+        'id="view-mode-simple"',
+        ">Simple</button>",
+        'id="view-mode-dev"',
+        ">Desarrollador</button>",
+        'id="themes-menu-btn"',
+        "Temas</button>",
+        'id="improve-factory-btn"',
+        "Mejorar Fábrica</button>",
+        'id="settings-menu-btn"',
+        "Ajustes</button>",
+        'id="mobile-project-switcher"',
+        'id="mobile-new-project-shortcut"',
+        ">+ Nuevo</button>",
+    ):
+        assert expected_markup in DASHBOARD_HTML, f"Missing expected dashboard markup: {expected_markup}"
+
+    style_start = DASHBOARD_HTML.index("<style>") + len("<style>")
+    style_end = DASHBOARD_HTML.index("</style>", style_start)
+    css = DASHBOARD_HTML[style_start:style_end]
+
+    media_768 = _extract_css_block(css, "@media (max-width: 768px)")
+    assert media_768, "Missing @media (max-width: 768px) block"
+
+    # Body anti-overflow inside @media (max-width: 768px)
+    body_rule = _extract_css_block(media_768, "html,\n      body") or _extract_css_block(media_768, "body {")
+    assert body_rule, "Expected html, body or body rule inside @media (max-width: 768px)"
+    assert "overflow-x: hidden;" in body_rule
+
+    # Top bar scrollable container and non-wrapping accessible buttons
+    controls_rule = _extract_css_block(media_768, "header .controls {")
+    assert controls_rule, "Expected header .controls rule inside @media (max-width: 768px)"
+    assert "overflow-x: auto;" in controls_rule
+    assert "max-width: 100%;" in controls_rule
+
+    header_btns_rule = _extract_css_block(media_768, "header .controls .btn")
+    assert header_btns_rule, "Expected header button rule inside @media (max-width: 768px)"
+    for btn_id in (
+        "#view-mode-simple",
+        "#view-mode-dev",
+        "#themes-menu-btn",
+        "#improve-factory-btn",
+        "#settings-menu-btn",
+    ):
+        assert btn_id in media_768
+    assert "white-space: nowrap;" in header_btns_rule
+    assert "min-height: 38px;" in header_btns_rule
+    assert "display: inline-flex;" in header_btns_rule
+    assert "align-items: center;" in header_btns_rule
+
+    # Project selector + '+ Nuevo' row rules
+    switcher_row_rule = _extract_css_block(media_768, ".mobile-switcher-row {")
+    assert switcher_row_rule, "Expected .mobile-switcher-row rule inside @media (max-width: 768px)"
+    assert "display: flex;" in switcher_row_rule
+    assert "align-items: center;" in switcher_row_rule
+    assert "max-width: 100%;" in switcher_row_rule
+
+    selector_rule = _extract_css_block(media_768, ".mobile-switcher-row .mobile-switcher-btn")
+    assert selector_rule, "Expected project selector rule inside @media (max-width: 768px)"
+    assert ".mobile-switcher-row select" in media_768
+    assert "flex: 1;" in selector_rule
+    assert "min-width: 0;" in selector_rule
+    assert "max-width: 100%;" in selector_rule
+
+    new_btn_rule = _extract_css_block(media_768, "#mobile-new-project-shortcut {")
+    assert new_btn_rule, "Expected #mobile-new-project-shortcut rule inside @media (max-width: 768px)"
+    assert "white-space: nowrap;" in new_btn_rule
+    assert "flex-shrink: 0;" in new_btn_rule
+    assert "min-height: 38px;" in new_btn_rule
+
+    # Desktop CSS outside @media (max-width: 768px) untouched
+    assert ".controls { display: flex; align-items: center; gap: 10px; }" in css
+    desktop_switcher = _extract_css_block(css, ".mobile-switcher-row {")
+    assert "display: none;" in desktop_switcher

@@ -3900,6 +3900,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       #themes-menu-btn,
       #improve-factory-btn,
       #settings-menu-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
         white-space: nowrap;
         flex-shrink: 0;
         min-height: 38px;
@@ -3927,6 +3930,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       .mobile-switcher-row select {
         flex: 1;
         min-width: 0;
+        max-width: 100%;
         min-height: 38px;
         overflow: hidden;
         text-overflow: ellipsis;
