@@ -2360,12 +2360,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .project-card {
       border: 1px solid var(--border);
       border-radius: 12px;
-      padding: 16px 18px;
-      margin-bottom: 14px;
+      padding: 14px 16px;
+      margin-bottom: 12px;
       cursor: pointer;
       background: var(--surface);
-      transition: all 0.2s ease;
-      box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+      transition: border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease, background 0.18s ease;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
     }
     .project-card:hover {
       border-color: var(--accent);
@@ -2472,13 +2472,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       font-size: 0.92rem;
     }
     .guidance-banner {
-      border-radius: 12px;
+      border-radius: 14px;
       padding: 16px 18px;
-      margin: 16px 0 20px;
+      margin: 14px 0 18px;
       border: 1px solid var(--border);
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08);
       display: flex;
       flex-direction: column;
-      gap: 14px;
+      gap: 12px;
     }
     .guidance-banner.banner-warn {
       background: var(--warn-bg);
@@ -3975,11 +3976,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .audit-card {
       border: 1px solid var(--border);
       background: var(--surface-alt);
-      border-radius: 10px;
+      border-radius: 12px;
       padding: 14px 16px;
       display: flex;
       flex-direction: column;
       gap: 8px;
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
+      transition: border-color 0.16s ease;
+    }
+    .audit-card:hover {
+      border-color: rgba(56, 189, 248, 0.32);
     }
     .audit-card-head {
       display: flex;
@@ -4318,12 +4324,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .version-node.current .version-dot { background: var(--ok); }
     .version-card {
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-radius: 10px;
       background: var(--surface-alt);
-      padding: 9px 12px;
+      padding: 10px 14px;
       display: flex;
       flex-direction: column;
       gap: 6px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
     }
     .version-head {
       display: flex;
@@ -4813,6 +4820,137 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         max-width: 88%;
       }
     }
+    .btn-spinner {
+      display: inline-block;
+      width: 13px;
+      height: 13px;
+      border: 2px solid currentColor;
+      border-top-color: transparent;
+      border-radius: 50%;
+      vertical-align: -2px;
+      margin-right: 6px;
+      animation: spin 0.75s linear infinite;
+    }
+    .live-op-clock,
+    .card-live-timer {
+      font-variant-numeric: tabular-nums;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.76rem;
+      color: var(--accent);
+      font-weight: 600;
+    }
+    #audit-toolbar-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.78rem;
+      color: var(--accent);
+    }
+    .factory-fs-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 950;
+      background: rgba(6, 10, 20, 0.76);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .factory-fs-card {
+      position: relative;
+      width: 100%;
+      max-width: 540px;
+      background: var(--surface);
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      border-radius: 18px;
+      padding: 30px 24px 24px;
+      box-shadow: 0 24px 64px rgba(0, 0, 0, 0.45);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      gap: 12px;
+    }
+    .factory-fs-minimize {
+      position: absolute;
+      top: 14px;
+      right: 14px;
+    }
+    @keyframes factory-fs-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.35); }
+      50% { box-shadow: 0 0 0 14px rgba(56, 189, 248, 0); }
+    }
+    .factory-fs-ring-wrap {
+      position: relative;
+      width: 68px;
+      height: 68px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      animation: factory-fs-pulse 2s ease-in-out infinite;
+    }
+    .factory-fs-ring {
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      border: 3px solid rgba(56, 189, 248, 0.2);
+      border-top-color: var(--accent);
+      animation: spin 1s linear infinite;
+    }
+    .factory-fs-ring-icon {
+      font-size: 1.5rem;
+      line-height: 1;
+    }
+    .factory-fs-kicker {
+      font-size: 0.78rem;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+    .factory-fs-title {
+      margin: 0;
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .factory-fs-timer {
+      font-size: 1.05rem;
+      padding: 3px 12px;
+      border-radius: 999px;
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+    }
+    .factory-fs-steps {
+      width: 100%;
+    }
+    .factory-fs-detail {
+      font-size: 0.86rem;
+      color: var(--muted);
+      line-height: 1.45;
+      max-width: 460px;
+    }
+    .factory-thinking-bubble {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      border-radius: 14px;
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .factory-fs-ring,
+      .factory-fs-ring-wrap,
+      .btn-spinner {
+        animation: none !important;
+      }
+    }
   </style>
 </head>
 <body>
@@ -5011,6 +5149,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div id="factory-inline-status" class="factory-inline-status" role="status" aria-live="polite"></div>
           </div>
         </div>
+      </div>
+    </div>
+
+    <div id="factory-fullscreen-build-overlay" class="factory-fs-overlay" role="dialog" aria-modal="true" aria-labelledby="factory-fs-title" style="display:none">
+      <div class="factory-fs-card">
+        <button id="factory-fs-minimize-btn" class="btn btn-sm factory-fs-minimize" type="button" title="Minimizar a la barra superior">Minimizar</button>
+        <div class="factory-fs-ring-wrap" aria-hidden="true">
+          <div class="factory-fs-ring"></div>
+          <div class="factory-fs-ring-icon">🔨</div>
+        </div>
+        <div class="factory-fs-kicker">Actualizando Liwi</div>
+        <h3 id="factory-fs-title" class="factory-fs-title">Aplicando mejora...</h3>
+        <div id="factory-fs-timer" class="factory-fs-timer live-op-clock">00:00</div>
+        <div class="factory-steps-bar factory-fs-steps">
+          <div class="factory-step-pill" data-fsstep="1">1/3 Editando código con IA</div>
+          <div class="factory-step-pill" data-fsstep="2">2/3 Verificando pruebas</div>
+          <div class="factory-step-pill" data-fsstep="3">3/3 Guardando y reiniciando</div>
+        </div>
+        <div id="factory-fs-detail" class="factory-fs-detail">Iniciando proceso...</div>
       </div>
     </div>
 
@@ -5910,7 +6067,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           p.state === 'BUILDING' || p.state === 'VERIFYING'
         );
         const statusTag = running
-          ? ' <span class="busy-pill">(en curso)</span>'
+          ? ' <span class="busy-pill"><span class="working-spinner" style="width:11px;height:11px;border-width:2px;vertical-align:-1px;margin-right:3px;" aria-hidden="true"></span>(en curso)</span>'
           : (pausedActive ? ' <span class="busy-pill" style="color:var(--warn)">(pausado)</span>' : '');
         const badgeCls = pausedActive ? 'badge-warn' : info.cls;
         const isDeliveredCard = p.state === 'DELIVERED' || p.state === 'COMPLETED';
@@ -5919,8 +6076,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           : ((p.state === 'FAILED' || p.state === 'ERROR') ? 'error' : (pausedActive ? 'paused' : 'active'));
         const stageBarHtml = isDeliveredCard ? '' : renderStageSegments(info.stage, segMode);
         const cardExtraCls = isDeliveredCard ? ' delivered-card' : '';
+        const cardLiveClock = (running && p.last_event_at)
+          ? '<span class="card-live-timer" data-started-at="' + escapeHtml(p.op_started_at || p.last_event_at) + '" data-pid="' + escapeHtml(p.project_id) + '"></span> · '
+          : '';
         const timeHtml = p.last_event_at
-          ? '<div class="muted" style="font-size:0.75rem; margin-top:4px; text-align:right;" title="' + escapeHtml(p.last_event_at) + '">' + escapeHtml(formatFriendlyTime(p.last_event_at)) + '</div>'
+          ? '<div class="muted" style="font-size:0.75rem; margin-top:4px; text-align:right;" title="' + escapeHtml(p.last_event_at) + '">' + cardLiveClock + escapeHtml(formatFriendlyTime(p.last_event_at)) + '</div>'
           : '';
         const logoUrl = escapeHtml(p.logo_url || ('/api/projects/' + encodeURIComponent(p.project_id) + '/logo'));
         return '<div class="project-card ' + selected + cardExtraCls + '" data-id="' + escapeHtml(p.project_id) + '">' +
@@ -6332,21 +6492,45 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       stallEl.style.display = stalled ? 'flex' : 'none';
     }
 
+    function setButtonLoading(btnEl, loading, loadingText) {
+      const btn = typeof btnEl === 'string' ? document.getElementById(btnEl) : btnEl;
+      if (!btn || !document.body.contains(btn)) return;
+      if (loading) {
+        if (btn.dataset.origHtml === undefined) {
+          btn.dataset.origHtml = btn.innerHTML;
+        }
+        btn.disabled = true;
+        btn.setAttribute('aria-busy', 'true');
+        if (loadingText) {
+          btn.innerHTML = '<span class="btn-spinner" aria-hidden="true"></span><span>' + escapeHtml(String(loadingText)) + '</span>';
+        }
+      } else {
+        if (btn.dataset.origHtml !== undefined) {
+          btn.innerHTML = btn.dataset.origHtml;
+          delete btn.dataset.origHtml;
+        }
+        btn.disabled = false;
+        btn.removeAttribute('aria-busy');
+      }
+    }
+
     async function runTrackedOperation(opts, asyncFn) {
       const cfg = opts || {};
       const btn = typeof cfg.buttonEl === 'string'
         ? document.getElementById(cfg.buttonEl)
         : cfg.buttonEl;
+      if (btn && btn.disabled) return undefined;
       const inlineEl = cfg.inlineTargetId ? document.getElementById(cfg.inlineTargetId) : null;
-      if (btn) btn.disabled = true;
+      const opStart = Date.now();
+      setButtonLoading(btn, true, cfg.buttonLoadingText || cfg.label || 'Procesando...');
       if (inlineEl) {
         inlineEl.innerHTML =
           '<span class="inline-op-feedback">' +
             '<span class="working-spinner" style="width:14px;height:14px;" aria-hidden="true"></span>' +
-            '<span>' + escapeHtml(cfg.label || 'Procesando...') + '</span>' +
+            '<span>' + escapeHtml(cfg.label || 'Procesando...') + '</span> ' +
+            '<span class="live-op-clock" data-op-clock-start="' + opStart + '">00:00</span>' +
           '</span>';
       }
-      const opStart = Date.now();
       state.activeOp = {
         pid: cfg.pid || state.selectedId || null,
         label: cfg.label || 'Procesando...',
@@ -6385,9 +6569,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const btnAfter = typeof cfg.buttonEl === 'string'
           ? document.getElementById(cfg.buttonEl)
           : cfg.buttonEl;
-        if (btnAfter && document.body.contains(btnAfter)) {
-          btnAfter.disabled = false;
-        }
+        setButtonLoading(btnAfter, false);
       }
     }
 
@@ -6460,6 +6642,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const elapsedSecs = resolveOperationElapsedSeconds(st, pid, startedAt);
         if (elapsedSecs !== null) {
           el.textContent = 'Tiempo en este paso: ' + formatClockMmSs(elapsedSecs);
+        }
+      });
+      document.querySelectorAll('.live-op-clock[data-op-clock-start]').forEach((el) => {
+        const startMs = Number(el.getAttribute('data-op-clock-start'));
+        if (Number.isFinite(startMs) && startMs > 0) {
+          const secs = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+          const mins = Math.floor(secs / 60);
+          el.textContent = String(mins).padStart(2, '0') + ':' + String(secs % 60).padStart(2, '0');
+        }
+      });
+      document.querySelectorAll('.card-live-timer[data-started-at]').forEach((el) => {
+        const startedAt = el.getAttribute('data-started-at');
+        const startedMs = startedAt ? Date.parse(startedAt) : NaN;
+        if (!Number.isNaN(startedMs)) {
+          const secs = Math.max(0, Math.floor((Date.now() - startedMs) / 1000));
+          const mins = Math.floor(secs / 60);
+          el.textContent = String(mins).padStart(2, '0') + ':' + String(secs % 60).padStart(2, '0');
         }
       });
       renderLiveActivityBanner();
@@ -7358,12 +7557,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
         if (replyBtn && replyInput) {
           replyBtn.addEventListener('click', async () => {
-            replyBtn.disabled = true;
-            try {
-              await sendProjectMessage(st.project_id, replyInput.value, 'reply');
-            } finally {
-              if (document.body.contains(replyBtn)) replyBtn.disabled = false;
-            }
+            await sendProjectMessage(st.project_id, replyInput.value, 'reply', replyBtn);
           });
         }
 
@@ -7382,12 +7576,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
         if (adjBtn && adjInput) {
           adjBtn.addEventListener('click', async () => {
-            adjBtn.disabled = true;
-            try {
-              await sendProjectMessage(st.project_id, adjInput.value, 'adjust');
-            } finally {
-              if (document.body.contains(adjBtn)) adjBtn.disabled = false;
-            }
+            await sendProjectMessage(st.project_id, adjInput.value, 'adjust', adjBtn);
           });
         }
       } else {
@@ -8328,7 +8517,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
 
     function renderSafeMarkdown(mdText) {
-      const normalized = String(mdText || '').replace(/\\r\\n?/g, '\\n');
+      const normalizedRaw = String(mdText || '').replace(/\\r\\n?/g, '\\n');
+      const segments = normalizedRaw.split(/(```[\\s\\S]*?```)/g);
+      const normalized = segments.map((seg, idx) => (
+        idx % 2 === 1 ? seg : seg.replace(/\\\\r\\\\n|\\\\r|\\\\n/g, '\\n')
+      )).join('');
       const codeBlocks = [];
       const withoutFences = normalized.replace(/```([^\\n`]*?)[ \\t]*\\n([\\s\\S]*?)```/g, (_m, lang, code) => {
         const idx = codeBlocks.length;
@@ -8906,6 +9099,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             let collapseBtnHtml = '';
             if (isUser) {
               bodyHtml = '<div class="audit-msg-body">' + escapeHtml(rawContent.trim()) + '</div>';
+            } else if (m.status === 'running' && !hasRealContent) {
+              const stLbl = m.stage_label ? String(m.stage_label) : 'Auditor pensando...';
+              bodyHtml = '<div class="factory-thinking-bubble"><span class="working-spinner" style="width:14px;height:14px;" aria-hidden="true"></span><span>' + escapeHtml(stLbl) + '</span> <span class="live-op-clock" data-op-clock-start="' + Date.now() + '">00:00</span></div>';
             } else {
               const parsed = renderSafeMarkdown(rawContent);
               const baseOffset = allCodeBlocks.length;
@@ -8968,6 +9164,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             '<button type="button" class="audit-subtab' + (activeSub === 'questions' ? ' active' : '') + '" data-audit-sub="questions">💬 Preguntas (' + chatEntries.length + ')</button>' +
           '</div>' +
           '<div class="audit-primary-split">' +
+            '<span id="audit-toolbar-status"></span>' +
             '<button id="audit-quick-audit-btn" class="btn btn-primary btn-sm" type="button" data-chat-mode="audit"' + disabledAttr + '>🔍 Auditar código</button>' +
             '<div class="more-menu-wrap">' +
               '<button id="audit-more-actions-btn" class="btn btn-sm" type="button" aria-expanded="false" aria-controls="audit-more-actions-menu" title="Más acciones de análisis"' + disabledAttr + '>▾</button>' +
@@ -9296,6 +9493,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         return;
       }
       const isReportMode = mode === 'audit' || mode === 'document';
+      const prevDraft = state.chatDrafts[pid] || '';
       if (isReportMode) {
         state.auditSubTabByPid[pid] = 'index';
         delete state.selectedAuditMsgIdByPid[pid];
@@ -9314,12 +9512,42 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         state.chatHistories[pid] = prevList;
         state.lastChatSig = null;
         renderAuditChatTab(pid, false);
+      } else {
+        state.chatDrafts[pid] = '';
+        state.auditSubTabByPid[pid] = 'questions';
+        const chatInput = document.getElementById('audit-chat-input');
+        if (chatInput) chatInput.value = '';
+        const prevList = Array.isArray(state.chatHistories[pid])
+          ? state.chatHistories[pid].filter((m) => m && !String(m.id || '').startsWith('optimistic-'))
+          : [];
+        prevList.push({
+          id: 'optimistic-u-' + Date.now(),
+          role: 'user',
+          mode: 'chat',
+          content: msg,
+          created_at: new Date().toISOString(),
+        });
+        prevList.push({
+          id: 'optimistic-a-' + Date.now(),
+          role: 'assistant',
+          mode: 'chat',
+          content: '',
+          status: 'running',
+          stage_label: 'Auditor está pensando…',
+          created_at: new Date().toISOString(),
+        });
+        state.chatHistories[pid] = prevList;
+        state.lastChatSig = null;
+        renderAuditChatTab(pid, false);
       }
       const modeLabel = mode === 'audit'
         ? 'Analizando archivos del repositorio (auditoría)...'
         : (mode === 'document'
           ? 'Analizando archivos del repositorio para documentar...'
           : 'Analizando archivos del repositorio...');
+      const btnLoadingTxt = mode === 'audit'
+        ? 'Auditando...'
+        : (mode === 'document' ? 'Generando .md...' : 'Enviando...');
       const pollTimer = isReportMode
         ? setInterval(() => { loadProjectChatHistory(pid, true); }, 1500)
         : null;
@@ -9328,35 +9556,48 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           {
             pid,
             label: modeLabel,
+            buttonLoadingText: btnLoadingTxt,
             subtext: 'Lectura segura del código sin alterar archivos.',
             buttonEl: triggerBtn || 'audit-chat-send-btn',
-            inlineTargetId: 'audit-inline-status',
+            inlineTargetId: isReportMode ? 'audit-toolbar-status' : 'audit-inline-status',
           },
           async () => {
-            const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/chat', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ message: msg, mode: mode || 'chat' }),
-            });
-            if (mode === 'chat') {
-              state.chatDrafts[pid] = '';
-              state.auditSubTabByPid[pid] = 'questions';
-            } else {
-              state.auditSubTabByPid[pid] = 'index';
-              const hist = Array.isArray(res.history) ? res.history : [];
-              const lastRep = hist.slice().reverse().find((x) => x && x.role === 'assistant');
-              if (lastRep && lastRep.id) {
-                state.selectedAuditMsgIdByPid[pid] = lastRep.id;
+            try {
+              const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message: msg, mode: mode || 'chat' }),
+              });
+              if (mode === 'chat') {
+                state.chatDrafts[pid] = '';
+                state.auditSubTabByPid[pid] = 'questions';
+              } else {
+                state.auditSubTabByPid[pid] = 'index';
+                const hist = Array.isArray(res.history) ? res.history : [];
+                const lastRep = hist.slice().reverse().find((x) => x && x.role === 'assistant');
+                if (lastRep && lastRep.id) {
+                  state.selectedAuditMsgIdByPid[pid] = lastRep.id;
+                }
               }
+              state.chatHistories[pid] = Array.isArray(res.history) ? res.history : [];
+              state.chatLoadedFor[pid] = true;
+              state.lastChatSig = null;
+              renderAuditChatTab(pid, false);
+              if (res && res.reply) {
+                speakSpanishText(res.reply);
+              }
+              setNote('✓ Respuesta generada.', 'ok');
+            } catch (innerErr) {
+              if (mode === 'chat') {
+                state.chatDrafts[pid] = prevDraft || msg;
+                state.chatHistories[pid] = (state.chatHistories[pid] || []).filter(
+                  (m) => m && !String(m.id || '').startsWith('optimistic-')
+                );
+                state.lastChatSig = null;
+                renderAuditChatTab(pid, false);
+              }
+              throw innerErr;
             }
-            state.chatHistories[pid] = Array.isArray(res.history) ? res.history : [];
-            state.chatLoadedFor[pid] = true;
-            state.lastChatSig = null;
-            renderAuditChatTab(pid, false);
-            if (res && res.reply) {
-              speakSpanishText(res.reply);
-            }
-            setNote('✓ Respuesta generada.', 'ok');
           }
         );
       } finally {
@@ -9404,37 +9645,61 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    async function sendProjectMessage(pid, rawMsg, kind) {
+    async function sendProjectMessage(pid, rawMsg, kind, triggerBtn) {
       const message = (rawMsg || '').trim();
       if (!message) {
         setNote('Por favor escribe un mensaje antes de enviar.');
         return;
       }
-      const inlineTarget = kind === 'reply' ? 'interview-inline-status' : '';
-      try {
-        await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/message', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message }),
-        });
-        if (kind === 'reply') {
-          delete state.replyDrafts[pid];
-          state.interviewPendingByPid[pid] = Date.now();
-          setNote('✓ Respuesta enviada · Analizando…', 'ok');
-        } else {
-          delete state.adjustDrafts[pid];
-          state.adjustOpen[pid] = false;
-          setNote('✓ Solicitud de ajuste enviada para ' + pid + '.', 'ok');
-        }
-        state.lastBannerSignature = null;
-        await loadProjects();
-      } catch (err) {
-        const errMsg = 'Error enviando mensaje: ' + err.message;
-        setNote(errMsg, 'err');
-        if (inlineTarget) {
-          showInlineError(inlineTarget, errMsg, () => sendProjectMessage(pid, rawMsg, kind));
-        }
+      const isReply = kind === 'reply';
+      const inputId = isReply ? 'interview-reply-input' : 'adjust-plan-input';
+      const inlineTarget = isReply ? 'interview-inline-status' : '';
+      const fallbackBtnId = isReply ? 'interview-reply-btn' : 'adjust-plan-btn';
+      const inputEl = document.getElementById(inputId);
+      const prevDraft = rawMsg || '';
+      if (inputEl) inputEl.value = '';
+      if (isReply) {
+        delete state.replyDrafts[pid];
+      } else {
+        delete state.adjustDrafts[pid];
       }
+      await runTrackedOperation(
+        {
+          pid,
+          label: isReply ? 'Enviando respuesta...' : 'Enviando solicitud de ajuste...',
+          buttonLoadingText: isReply ? 'Enviando...' : 'Enviando ajuste...',
+          subtext: 'Procesando mensaje y actualizando el estado del proyecto.',
+          buttonEl: triggerBtn || fallbackBtnId,
+          inlineTargetId: inlineTarget,
+        },
+        async () => {
+          try {
+            await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/message', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ message }),
+            });
+            if (isReply) {
+              state.interviewPendingByPid[pid] = Date.now();
+              setNote('✓ Respuesta enviada · Analizando…', 'ok');
+            } else {
+              state.adjustOpen[pid] = false;
+              setNote('✓ Solicitud de ajuste enviada para ' + pid + '.', 'ok');
+            }
+            state.lastBannerSignature = null;
+            await loadProjects();
+          } catch (innerErr) {
+            if (isReply) {
+              state.replyDrafts[pid] = prevDraft;
+            } else {
+              state.adjustDrafts[pid] = prevDraft;
+            }
+            const curInput = document.getElementById(inputId);
+            if (curInput) curInput.value = prevDraft;
+            throw innerErr;
+          }
+        }
+      );
     }
 
     async function loadProjectDevAndVersionData(pid, sig) {
@@ -9558,6 +9823,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         {
           pid,
           label: 'Aplicando cambios y ejecutando pruebas...',
+          buttonLoadingText: 'Aplicando...',
           subtext: 'El agente modificará el repositorio y correrá la verificación automática.',
           buttonEl: triggerBtn || 'modify-project-btn',
           inlineTargetId: 'modify-inline-status',
@@ -9709,20 +9975,49 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             confirmLabel: 'Eliminar proyecto',
           });
           if (!delOk) return;
-          await apiFetch('/api/projects/' + encodeURIComponent(pid), { method: 'DELETE' });
-          setNote('Proyecto ' + pid + ' eliminado.');
-          if (state.selectedId === pid) {
-            state.selectedId = null;
-            state.detail = null;
-          }
+          await runTrackedOperation(
+            {
+              pid,
+              label: 'Eliminando proyecto...',
+              buttonLoadingText: 'Eliminando...',
+              subtext: 'Limpiando registro y recursos locales.',
+              buttonEl: triggerBtn,
+            },
+            async () => {
+              await apiFetch('/api/projects/' + encodeURIComponent(pid), { method: 'DELETE' });
+              setNote('Proyecto ' + pid + ' eliminado.');
+              if (state.selectedId === pid) {
+                state.selectedId = null;
+                state.detail = null;
+              }
+              state.lastBannerSignature = null;
+              await loadProjects();
+            }
+          );
+          return;
         } else if (action === 'approve') {
-          await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/approve', { method: 'POST' });
-          setNote('✓ Construcción iniciada para ' + pid + '.', 'ok');
+          await runTrackedOperation(
+            {
+              pid,
+              label: 'Aprobando plan e iniciando construcción...',
+              buttonLoadingText: 'Iniciando...',
+              subtext: 'Preparando pruebas de aceptación y generador de código.',
+              buttonEl: triggerBtn,
+            },
+            async () => {
+              await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/approve', { method: 'POST' });
+              setNote('✓ Construcción iniciada para ' + pid + '.', 'ok');
+              state.lastBannerSignature = null;
+              await loadProjects();
+            }
+          );
+          return;
         } else if (action === 'retry') {
           await runTrackedOperation(
             {
               pid,
               label: 'Reintentando etapa del proyecto...',
+              buttonLoadingText: 'Reintentando...',
               subtext: 'Recuperando estado y preparando el siguiente paso...',
               buttonEl: triggerBtn,
             },
@@ -9743,6 +10038,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             {
               pid,
               label: 'Generando preguntas de aclaración...',
+              buttonLoadingText: 'Generando...',
               subtext: 'Consultando al entrevistador para definir los detalles del proyecto...',
               buttonEl: triggerBtn || 'generate-questions-btn',
               inlineTargetId: 'interview-retry-inline-status',
@@ -9766,17 +10062,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             confirmLabel: 'Sí, reconstruir',
           });
           if (!cleanOk) return;
-          await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/retry', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ clean_workspace: true }),
-          });
-          setNote('Reconstrucción desde cero iniciada para ' + pid + '.');
+          await runTrackedOperation(
+            {
+              pid,
+              label: 'Reconstruyendo desde cero...',
+              buttonLoadingText: 'Reconstruyendo...',
+              subtext: 'Limpiando espacio de trabajo e iniciando desde cero.',
+              buttonEl: triggerBtn,
+            },
+            async () => {
+              await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/retry', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ clean_workspace: true }),
+              });
+              setNote('Reconstrucción desde cero iniciada para ' + pid + '.');
+              state.lastBannerSignature = null;
+              await loadProjects();
+            }
+          );
+          return;
         } else if (action === 'local-start') {
           await runTrackedOperation(
             {
               pid,
               label: 'Preparando entorno virtual e instalando dependencias...',
+              buttonLoadingText: 'Encendiendo...',
               subtext: 'Iniciando servidor local y verificando respuesta HTTP...',
               buttonEl: triggerBtn,
               inlineTargetId: 'local-inline-status',
@@ -9791,10 +10102,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           );
           return;
         } else if (action === 'local-stop') {
-          state.previewOpen[pid] = false;
-          delete state.previewRenderedUrl[pid];
-          await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/stop', { method: 'POST' });
-          setNote('App local apagada para ' + pid + '.');
+          await runTrackedOperation(
+            {
+              pid,
+              label: 'Apagando servidor local...',
+              buttonLoadingText: 'Apagando...',
+              subtext: 'Deteniendo proceso local de forma segura.',
+              buttonEl: triggerBtn,
+              inlineTargetId: 'local-inline-status',
+            },
+            async () => {
+              state.previewOpen[pid] = false;
+              delete state.previewRenderedUrl[pid];
+              await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/stop', { method: 'POST' });
+              setNote('App local apagada para ' + pid + '.');
+              state.lastBannerSignature = null;
+              await loadProjects();
+            }
+          );
+          return;
         }
         state.lastBannerSignature = null;
         await loadProjects();
@@ -10000,27 +10326,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           setNote('Describe qué quieres construir.');
           return;
         }
-        submitBtn.disabled = true;
-        try {
-          const res = await apiFetch('/api/projects', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ prompt }),
-          });
-          input.value = '';
-          form.style.display = 'none';
-          if (res.project_id) {
-            state.selectedId = res.project_id;
-            state.lastBannerSignature = null;
-            state.lastListSignature = null;
+        await runTrackedOperation(
+          {
+            label: 'Creando proyecto y preparando entrevista...',
+            buttonLoadingText: 'Creando...',
+            subtext: 'Analizando tu idea inicial para generar las primeras preguntas.',
+            buttonEl: submitBtn,
+          },
+          async () => {
+            const res = await apiFetch('/api/projects', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ prompt }),
+            });
+            input.value = '';
+            form.style.display = 'none';
+            if (res.project_id) {
+              state.selectedId = res.project_id;
+              state.lastBannerSignature = null;
+              state.lastListSignature = null;
+            }
+            setNote('✓ Proyecto iniciado: ' + (res.project_id || '') + '.', 'ok');
+            await loadProjects();
           }
-          setNote('✓ Proyecto iniciado: ' + (res.project_id || '') + '.', 'ok');
-          await loadProjects();
-        } catch (err) {
-          setNote('Error creando proyecto: ' + err.message, 'err');
-        } finally {
-          submitBtn.disabled = false;
-        }
+        );
       });
     })();
 
@@ -10164,6 +10493,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const buildBannerTitle = document.getElementById('factory-build-banner-title');
       const buildBannerDetail = document.getElementById('factory-build-banner-detail');
       const buildBannerTimer = document.getElementById('factory-build-banner-timer');
+      const fsOverlay = document.getElementById('factory-fullscreen-build-overlay');
+      const fsMinBtn = document.getElementById('factory-fs-minimize-btn');
+      const fsTitle = document.getElementById('factory-fs-title');
+      const fsTimer = document.getElementById('factory-fs-timer');
+      const fsDetail = document.getElementById('factory-fs-detail');
       const streamEl = document.getElementById('factory-chat-stream');
       const previewsEl = document.getElementById('factory-paste-previews');
       const formEl = document.getElementById('factory-chat-form');
@@ -10181,7 +10515,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       let statusPollTimer = null;
       let clockTickTimer = null;
       let applyInFlight = false;
+      let consultInFlight = false;
+      let buildOverlayMinimized = false;
       let lastServerRunning = false;
+      let lastActiveStep = 0;
+      let allFactoryCodeBlocks = [];
       let activeStatus = {
         running: false,
         step: 0,
@@ -10209,7 +10547,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
 
       function setFactoryControlsLocked(locked) {
-        if (sendBtn) sendBtn.disabled = !!locked;
+        if (sendBtn) sendBtn.disabled = !!(locked || consultInFlight);
         if (inputEl) inputEl.disabled = !!locked;
         if (attachBtn) attachBtn.disabled = !!locked;
         streamEl.querySelectorAll('button[data-apply-factory-proposal]').forEach((b) => {
@@ -10231,6 +10569,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           openBtn.textContent = '🔨 Construyendo mejora (Paso ' + stepNum + '/' + totalSteps + ' · ' + mmss + ')';
           if (buildBannerTimer) buildBannerTimer.textContent = mmss;
           if (progressTimer) progressTimer.textContent = mmss;
+          if (fsTimer) fsTimer.textContent = mmss;
         } else {
           openBtn.classList.remove('is-building');
           openBtn.textContent = DEFAULT_OPEN_BTN_LABEL;
@@ -10265,10 +10604,53 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
       }
 
+      function syncFullscreenOverlay(isRunning, stepNum, headline, detailTxt) {
+        if (!fsOverlay) return;
+        if (!isRunning || buildOverlayMinimized) {
+          fsOverlay.style.display = 'none';
+          return;
+        }
+        fsOverlay.style.display = 'flex';
+        if (fsTitle) fsTitle.textContent = headline || 'Aplicando mejora...';
+        if (fsDetail) fsDetail.textContent = detailTxt || 'Procesando mejora en Liwi...';
+        fsOverlay.querySelectorAll('.factory-step-pill[data-fsstep]').forEach((pill) => {
+          const pStep = Number(pill.getAttribute('data-fsstep') || 0);
+          pill.classList.toggle('is-done', pStep < stepNum);
+          pill.classList.toggle('is-active', pStep === stepNum);
+        });
+      }
+
+      function finishWithUpdatedReload(messageText) {
+        stopStatusPolling();
+        stopClockTicker();
+        if (reconnectTimer) {
+          clearInterval(reconnectTimer);
+          reconnectTimer = null;
+        }
+        applyInFlight = false;
+        lastServerRunning = false;
+        activeStatus.running = false;
+        if (restartBanner) restartBanner.style.display = 'none';
+        if (buildBanner) buildBanner.style.display = 'none';
+        if (fsOverlay) {
+          fsOverlay.style.display = 'flex';
+          if (fsTitle) fsTitle.textContent = messageText || '✓ ¡Liwi actualizado! Recargando...';
+          if (fsDetail) fsDetail.textContent = 'La verificación completa pasó en verde y Liwi ya reinició.';
+          fsOverlay.querySelectorAll('.factory-step-pill[data-fsstep]').forEach((pill) => {
+            pill.classList.remove('is-active');
+            pill.classList.add('is-done');
+          });
+        }
+        if (statusEl) statusEl.textContent = '✅ Mejora aplicada y Liwi actualizado';
+        setFactoryControlsLocked(false);
+        setTimeout(() => { window.location.reload(); }, 650);
+      }
+
       function applyStatusSnapshot(st) {
         const s = st && typeof st === 'object' ? st : {};
         const wasRunning = lastServerRunning;
         const isRunning = !!s.running;
+        const prevStep = lastActiveStep;
         activeStatus = {
           running: isRunning,
           step: Number(s.step) || 0,
@@ -10287,21 +10669,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           ensureClockTicker();
           setFactoryControlsLocked(true);
           const stepNum = Math.max(1, activeStatus.step || 1);
+          lastActiveStep = stepNum;
           const totalSteps = Math.max(3, activeStatus.total_steps || 3);
-          const headline = (activeStatus.title ? activeStatus.title + ' — ' : '') + (activeStatus.stage || ('Paso ' + stepNum + '/' + totalSteps));
+          const headline = activeStatus.title || activeStatus.stage || ('Paso ' + stepNum + '/' + totalSteps);
+          const detailLine = (activeStatus.stage ? (activeStatus.stage + ': ') : '') + (activeStatus.detail || 'Procesando mejora en Liwi...');
           if (buildBanner) buildBanner.style.display = 'block';
           if (buildBannerTitle) buildBannerTitle.textContent = '🔨 ' + headline;
-          if (buildBannerDetail) buildBannerDetail.textContent = activeStatus.detail || 'Procesando mejora en Liwi...';
+          if (buildBannerDetail) buildBannerDetail.textContent = detailLine;
           if (progressCard) {
             progressCard.style.display = 'flex';
             if (progressTitle) progressTitle.textContent = '🔨 ' + headline;
-            if (progressDetail) progressDetail.textContent = activeStatus.detail || '';
+            if (progressDetail) progressDetail.textContent = detailLine;
             progressCard.querySelectorAll('.factory-step-pill').forEach((pill) => {
               const pStep = Number(pill.getAttribute('data-fstep') || 0);
               pill.classList.toggle('is-done', pStep < stepNum);
               pill.classList.toggle('is-active', pStep === stepNum);
             });
           }
+          syncFullscreenOverlay(true, stepNum, headline, detailLine);
           updateLiveClockAndHeader();
           return;
         }
@@ -10316,14 +10701,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         if (wasRunning && !applyInFlight && !reconnectTimer) {
           setFactoryControlsLocked(false);
-          if (statusEl) {
-            if (activeStatus.last_outcome === 'applied') {
-              statusEl.textContent = '✅ Mejora aplicada y Liwi actualizado';
-            } else if (activeStatus.last_outcome === 'rolled_back') {
-              statusEl.textContent = 'Mejora revertida automáticamente tras fallo en verificación.';
-            }
+          if (activeStatus.last_outcome === 'applied' || prevStep >= 3) {
+            finishWithUpdatedReload('✓ ¡Liwi actualizado! Recargando...');
+            return;
+          }
+          if (fsOverlay) fsOverlay.style.display = 'none';
+          if (statusEl && activeStatus.last_outcome === 'rolled_back') {
+            statusEl.textContent = 'Mejora revertida automáticamente tras fallo en verificación.';
           }
           refreshHistory();
+        } else if (!isRunning && fsOverlay && !applyInFlight && !reconnectTimer) {
+          fsOverlay.style.display = 'none';
         }
       }
 
@@ -10340,6 +10728,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       function startReconnectPolling() {
         if (restartBanner) restartBanner.style.display = 'block';
         if (buildBanner) buildBanner.style.display = 'none';
+        if (fsOverlay && !buildOverlayMinimized) {
+          fsOverlay.style.display = 'flex';
+          if (fsTitle) fsTitle.textContent = 'Guardando y reiniciando Liwi...';
+          if (fsDetail) fsDetail.textContent = 'Esperando reconexión automática tras verificar todas las pruebas.';
+        }
         stopStatusPolling();
         if (reconnectTimer) clearInterval(reconnectTimer);
         let sawDrop = false;
@@ -10350,18 +10743,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             if (resp.ok) {
               const st = await resp.json().catch(() => ({}));
               if (!st.running && (sawDrop || (Date.now() - startedAt) > 1200)) {
-                clearInterval(reconnectTimer);
-                reconnectTimer = null;
-                applyInFlight = false;
-                lastServerRunning = false;
-                activeStatus.running = false;
-                stopClockTicker();
-                if (restartBanner) restartBanner.style.display = 'none';
-                if (progressCard) progressCard.style.display = 'none';
-                updateLiveClockAndHeader();
-                setFactoryControlsLocked(false);
-                if (statusEl) statusEl.textContent = '✅ Mejora aplicada y Liwi actualizado';
-                await refreshHistory();
+                finishWithUpdatedReload('✓ ¡Liwi actualizado! Recargando...');
               }
             } else {
               sawDrop = true;
@@ -10457,9 +10839,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       function renderMessages(msgs) {
         const list = Array.isArray(msgs) ? msgs : [];
         if (!list.length) {
+          allFactoryCodeBlocks = [];
           streamEl.innerHTML = '<div class="factory-chat-empty">¿Qué quieres consultar o mejorar en Liwi?</div>';
           return;
         }
+        allFactoryCodeBlocks = [];
         const isLocked = !!(applyInFlight || activeStatus.running);
         streamEl.innerHTML = list.map((m) => {
           const isUser = m.role === 'user';
@@ -10481,14 +10865,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             '</div>';
           }
           const roleHtml = isUser ? '' : '<div class="factory-msg-role">Liwi</div>';
+          const parsed = renderSafeMarkdown(String(m.content || ''));
+          const baseOffset = allFactoryCodeBlocks.length;
+          parsed.codeBlocks.forEach((cb) => allFactoryCodeBlocks.push(cb));
+          const bodyHtml = parsed.html.replace(/data-md-code-idx="(\\d+)"/g, (_mt, n) =>
+            'data-md-code-idx="' + (Number(n) + baseOffset) + '"'
+          );
           return '<div class="' + cls + '">' +
             roleHtml +
-            '<div class="factory-msg-body">' + renderSafeMarkdown(String(m.content || ''), 'simple').html + '</div>' +
+            '<div class="factory-msg-body">' + bodyHtml + '</div>' +
             thumbs +
             propHtml +
           '</div>';
         }).join('');
         streamEl.scrollTop = streamEl.scrollHeight;
+        streamEl.querySelectorAll('button.md-copy-btn[data-md-code-idx]').forEach((copyBtn) => {
+          copyBtn.addEventListener('click', () => {
+            const idx = Number(copyBtn.getAttribute('data-md-code-idx'));
+            const entry = allFactoryCodeBlocks[idx];
+            if (entry) copyToClipboard(entry.raw, '✓ Bloque de código copiado.');
+          });
+        });
         streamEl.querySelectorAll('button[data-apply-factory-proposal]').forEach((btn) => {
           btn.addEventListener('click', async () => {
             if (applyInFlight || activeStatus.running) return;
@@ -10499,6 +10896,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const propTitle = btn.getAttribute('data-prop-title') || 'Auto-mejora Liwi';
             const origText = btn.textContent;
             applyInFlight = true;
+            buildOverlayMinimized = false;
             setFactoryControlsLocked(true);
             btn.textContent = 'Construyendo mejora...';
             applyStatusSnapshot({
@@ -10529,6 +10927,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 startReconnectPolling();
               } else {
                 applyInFlight = false;
+                if (fsOverlay) fsOverlay.style.display = 'none';
                 applyStatusSnapshot({ running: false, step: 0, total_steps: 3, last_outcome: 'rolled_back' });
                 setFactoryControlsLocked(false);
                 if (statusEl) statusEl.textContent = 'Mejora revertida automáticamente tras fallo en verificación.';
@@ -10544,6 +10943,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               stopClockTicker();
               setFactoryControlsLocked(false);
               btn.textContent = origText;
+              if (fsOverlay) fsOverlay.style.display = 'none';
               if (progressCard) progressCard.style.display = 'none';
               if (buildBanner) buildBanner.style.display = 'none';
               updateLiveClockAndHeader();
@@ -10579,12 +10979,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       };
 
       openBtn.addEventListener('click', () => window.openFactoryImproveModal(''));
+      if (fsMinBtn) {
+        fsMinBtn.addEventListener('click', () => {
+          buildOverlayMinimized = true;
+          if (fsOverlay) fsOverlay.style.display = 'none';
+        });
+      }
       if (buildBanner) {
-        buildBanner.addEventListener('click', () => window.openFactoryImproveModal(''));
+        const reopenBuildOverlayOrModal = () => {
+          if (activeStatus.running || applyInFlight) {
+            buildOverlayMinimized = false;
+            if (fsOverlay) fsOverlay.style.display = 'flex';
+          } else {
+            window.openFactoryImproveModal('');
+          }
+        };
+        buildBanner.addEventListener('click', reopenBuildOverlayOrModal);
         buildBanner.addEventListener('keydown', (ev) => {
           if (ev.key === 'Enter' || ev.key === ' ') {
             ev.preventDefault();
-            window.openFactoryImproveModal('');
+            reopenBuildOverlayOrModal();
           }
         });
       }
@@ -10631,38 +11045,73 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (formEl) {
         formEl.addEventListener('submit', async (ev) => {
           ev.preventDefault();
-          if (applyInFlight || activeStatus.running) return;
-          const msgTxt = inputEl ? inputEl.value.trim() : '';
+          if (consultInFlight || applyInFlight || activeStatus.running) return;
+          const rawInputVal = inputEl ? inputEl.value : '';
+          const msgTxt = rawInputVal.trim();
           if (!msgTxt && !pendingImages.length) {
             if (statusEl) statusEl.textContent = 'Escribe un mensaje o pega una captura.';
             return;
           }
+          const payloadImages = pendingImages.map((im) => ({
+            filename: im.filename,
+            data_base64: im.data_base64,
+          }));
+          const previewThumbs = pendingImages.map((im) => im.previewUrl);
+          if (inputEl) {
+            inputEl.value = '';
+            autoResizeFactoryInput();
+          }
+          pendingImages = [];
+          renderPreviews();
+
+          const emptyEl = streamEl.querySelector('.factory-chat-empty');
+          if (emptyEl) emptyEl.remove();
+          const optUserEl = document.createElement('div');
+          optUserEl.className = 'factory-msg factory-msg-user';
+          optUserEl.innerHTML =
+            '<div class="factory-msg-body">' + renderSafeMarkdown(msgTxt || 'Analiza esta captura.').html + '</div>' +
+            (previewThumbs.length
+              ? '<div class="factory-chat-thumbs">' + previewThumbs.map((u) => '<img src="' + escapeHtml(u) + '" alt="Captura" />').join('') + '</div>'
+              : '');
+          streamEl.appendChild(optUserEl);
+
+          const thinkingStartMs = Date.now();
+          const thinkingEl = document.createElement('div');
+          thinkingEl.id = 'factory-thinking-bubble';
+          thinkingEl.className = 'factory-msg factory-msg-assistant';
+          thinkingEl.innerHTML =
+            '<div class="factory-msg-role">Liwi</div>' +
+            '<div class="factory-thinking-bubble">' +
+              '<span class="working-spinner" style="width:14px;height:14px;" aria-hidden="true"></span>' +
+              '<span>Liwi está pensando…</span>' +
+              '<span id="factory-thinking-clock" class="live-op-clock" data-op-clock-start="' + thinkingStartMs + '">00:00</span>' +
+            '</div>';
+          streamEl.appendChild(thinkingEl);
+          streamEl.scrollTop = streamEl.scrollHeight;
+
+          consultInFlight = true;
           sendBtn.disabled = true;
           sendBtn.textContent = '…';
           sendBtn.setAttribute('aria-busy', 'true');
           if (statusEl) statusEl.textContent = 'Analizando src/agent_factory/ en modo lectura...';
           try {
-            const payloadImages = pendingImages.map((im) => ({
-              filename: im.filename,
-              data_base64: im.data_base64,
-            }));
             await apiFetch('/api/factory/assistant/message', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               timeoutMs: 185000,
               body: JSON.stringify({ message: msgTxt, images: payloadImages }),
             });
-            if (inputEl) {
-              inputEl.value = '';
-              autoResizeFactoryInput();
-            }
-            pendingImages = [];
-            renderPreviews();
             if (statusEl) statusEl.textContent = '';
             await refreshHistory();
           } catch (err) {
+            if (thinkingEl && thinkingEl.parentNode) thinkingEl.parentNode.removeChild(thinkingEl);
+            if (inputEl && rawInputVal) {
+              inputEl.value = rawInputVal;
+              autoResizeFactoryInput();
+            }
             if (statusEl) statusEl.textContent = 'Error consultando: ' + err.message;
           } finally {
+            consultInFlight = false;
             if (!applyInFlight && !activeStatus.running) {
               sendBtn.disabled = false;
             }

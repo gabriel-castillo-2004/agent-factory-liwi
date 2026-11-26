@@ -180,6 +180,7 @@ class SubprocessRunner(Runner):
                 try:
                     subprocess.run(
                         taskkill_cmd,
+                        stdin=subprocess.DEVNULL,
                         capture_output=True,
                         check=False,
                     )

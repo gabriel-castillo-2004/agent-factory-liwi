@@ -759,3 +759,103 @@ def test_factory_assistant_apply_selects_targeted_tests_for_modified_dashboard_f
         store.close()
 
 
+def test_factory_assistant_apply_targets_self_improver_tests_only_and_auto_repairs_once_on_failure(
+    tmp_path: Path,
+) -> None:
+    """Editing src/agent_factory/self_improver.py targets only tests/test_self_improver.py (no full-suite fallback), consult prompts enforce atomic Paso 1, and failed verification triggers 1 auto-repair round (<=180s) updating live status."""
+    repo_root = tmp_path / "repo_repair"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "TestFactory"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.email", "factory@local"], cwd=repo_root, check=True)
+    (repo_root / "src" / "agent_factory").mkdir(parents=True, exist_ok=True)
+    (repo_root / "tests").mkdir(parents=True, exist_ok=True)
+    (repo_root / "src" / "agent_factory" / "self_improver.py").write_text("X = 1\n", encoding="utf-8")
+    (repo_root / "tests" / "test_self_improver.py").write_text("def test_si(): assert True\n", encoding="utf-8")
+    (repo_root / "tests" / "test_unrelated.py").write_text("def test_other(): assert True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "chore: seed repair repo"], cwd=repo_root, check=True, capture_output=True)
+
+    real_runner = SubprocessRunner(default_timeout_seconds=15.0)
+    agy_calls: list[dict[str, Any]] = []
+    pytest_cmds: list[list[str]] = []
+    repair_stages_seen: list[str] = []
+    consult_prompts: list[str] = []
+    pytest_attempt = [0]
+    improver_holder: list[FactorySelfImprover] = []
+
+    class _RepairSpyRunner(SubprocessRunner):
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            exe_stem = Path(command[0]).stem.lower()
+            if exe_stem == "agy":
+                prompt = command[command.index("-p") + 1]
+                if "--dangerously-skip-permissions" not in command:
+                    consult_prompts.append(prompt)
+                    return CommandResult(
+                        exit_code=0,
+                        stdout=json.dumps({"reply": "Dividido", "new_memory_rules": [], "actionable_proposal": None}),
+                    )
+                agy_calls.append({"prompt": prompt, "timeout": timeout_seconds})
+                if len(agy_calls) == 1:
+                    (repo_root / "src" / "agent_factory" / "self_improver.py").write_text("X = 'bug'\n", encoding="utf-8")
+                    return CommandResult(exit_code=0, stdout="initial edit")
+                repair_stages_seen.append(improver_holder[0].get_status()["stage"])
+                (repo_root / "src" / "agent_factory" / "self_improver.py").write_text("X = 'fixed'\n", encoding="utf-8")
+                return CommandResult(exit_code=0, stdout="repaired edit")
+            if exe_stem == "ruff":
+                return CommandResult(exit_code=0, stdout="All checks passed!")
+            if exe_stem == "pytest":
+                pytest_attempt[0] += 1
+                pytest_cmds.append(list(command))
+                if pytest_attempt[0] == 1:
+                    return CommandResult(exit_code=1, stdout="FAILED tests/test_self_improver.py - AssertionError: boom_repair")
+                return CommandResult(exit_code=0, stdout="1 passed")
+            return real_runner.run(command, cwd, timeout_seconds=timeout_seconds, env=env)
+
+    store = SqliteEventStore(db_path=tmp_path / "repair.db")
+    try:
+        improver = FactorySelfImprover(
+            sqlite_store=store,
+            repo_root=repo_root,
+            uploads_dir=tmp_path / "uploads_rep",
+            runner=_RepairSpyRunner(),
+            restart_fn=lambda _code: None,
+            restart_delay_seconds=0.01,
+        )
+        improver_holder.append(improver)
+
+        # Direct selector check: self_improver.py targets only tests/test_self_improver.py
+        assert improver._select_targeted_pytest_targets(["src/agent_factory/self_improver.py"]) == (
+            ["tests/test_self_improver.py"],
+            True,
+        )
+
+        # Consult prompt enforces atomic Paso 1 splitting
+        improver.consult_message("Haz muchos cambios en dashboard.py")
+        assert len(consult_prompts) == 1
+        assert "Paso 1" in consult_prompts[0]
+
+        # Apply fails first pytest -> 1 repair round (<=180s) -> passes without rollback
+        res = improver.apply_proposal("Actualiza self_improver.py", proposal_title="Auto-repair test")
+        assert res["ok"] is True
+        assert res["applied"] is True
+        assert res["rolled_back"] is False
+        assert len(agy_calls) == 2
+        assert agy_calls[1]["timeout"] <= 180.0
+        assert "AssertionError: boom_repair" in agy_calls[1]["prompt"]
+        assert repair_stages_seen == ["Auto-reparando fallo detectado..."]
+        assert len(pytest_cmds) == 2
+        for p_cmd in pytest_cmds:
+            assert "tests/test_self_improver.py" in p_cmd
+            assert "tests/test_unrelated.py" not in p_cmd
+        assert (repo_root / "src" / "agent_factory" / "self_improver.py").read_text(encoding="utf-8") == "X = 'fixed'\n"
+    finally:
+        store.close()
+
+

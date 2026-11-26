@@ -607,10 +607,13 @@ class FactorySelfImprover:
             f"Historial reciente:\n{hist_block}\n\n"
             f"Imágenes adjuntas (rutas locales):\n{img_block}\n\n"
             f"Solicitud del usuario:\n{self._redact(eff_msg)}\n\n"
-            "IMPORTANTE SOBRE PRUEBAS EN actionable_proposal: En el campo 'prompt' de actionable_proposal, "
-            "indica explícitamente que el agente ejecute ÚNICAMENTE las pruebas dirigidas de los archivos modificados "
-            "(por ejemplo: `pytest -q --no-cov tests/test_dashboard.py`) y NO ejecute toda la suite completa de pruebas, "
-            "ya que la verificación final completa la ejecuta el gate automático de la fábrica.\n\n"
+            "IMPORTANTE SOBRE PROPUESTAS ATÓMICAS Y PRUEBAS EN actionable_proposal:\n"
+            "- Si el usuario pide múltiples cambios o cambios sobre archivos grandes (como dashboard.py), divide el plan "
+            "en pasos pequeños (<3 min cada uno), explica los pasos siguientes en 'reply' y genera 'actionable_proposal' "
+            "ÚNICAMENTE para el Paso 1 atómico.\n"
+            "- En el campo 'prompt' de actionable_proposal, indica explícitamente que el agente ejecute ÚNICAMENTE las "
+            "pruebas dirigidas de los archivos modificados (por ejemplo: `pytest -q --no-cov tests/test_dashboard.py`) "
+            "y NO ejecute toda la suite completa de pruebas, ya que la verificación final la ejecuta el gate automático de la fábrica.\n\n"
             "Devuelve ÚNICAMENTE un JSON válido con esta estructura exacta:\n"
             '{"reply": "<respuesta en español claro>", '
             '"new_memory_rules": ["<regla o preferencia detectada, si aplica>"], '
@@ -766,16 +769,20 @@ class FactorySelfImprover:
         return changed
 
     def _select_targeted_pytest_targets(self, changed_paths: Sequence[str]) -> tuple[list[str], bool]:
-        """Select targeted test files for modified src/tests modules; fall back if none outside test_self_improver."""
+        """Select targeted test files for modified src/tests modules; fall back only if a modified src module has no matching tests."""
         tests_dir = self.repo_root / "tests"
         selected: list[str] = []
         seen: set[str] = set()
+        has_unmatched_src = False
 
-        def _add_if_file(rel_path: str) -> None:
+        def _add_if_file(rel_path: str) -> bool:
             norm = rel_path.replace("\\", "/")
-            if norm not in seen and (self.repo_root / norm).is_file():
-                seen.add(norm)
-                selected.append(norm)
+            if (self.repo_root / norm).is_file():
+                if norm not in seen:
+                    seen.add(norm)
+                    selected.append(norm)
+                return True
+            return False
 
         _add_if_file("tests/test_self_improver.py")
 
@@ -786,14 +793,75 @@ class FactorySelfImprover:
                 _add_if_file(norm)
             elif norm.startswith("src/") and norm.endswith(".py"):
                 stem = Path(norm).stem
-                if stem and stem != "__init__" and tests_dir.is_dir():
+                if not stem or stem == "__init__":
+                    continue
+                matched_this_src = False
+                if tests_dir.is_dir():
                     for match in sorted(tests_dir.glob(f"test_*{stem}*.py")):
-                        _add_if_file(f"tests/{match.name}")
-                if name == "cli.py":
-                    _add_if_file("tests/test_dashboard.py")
+                        if _add_if_file(f"tests/{match.name}"):
+                            matched_this_src = True
+                if name == "cli.py" and _add_if_file("tests/test_dashboard.py"):
+                    matched_this_src = True
+                if not matched_this_src:
+                    has_unmatched_src = True
 
-        has_other_targeted = any(t != "tests/test_self_improver.py" for t in selected)
-        return (selected if has_other_targeted else []), has_other_targeted
+        if has_unmatched_src or not selected:
+            return [], False
+        return selected, True
+
+    def _run_verification_gate(
+        self,
+        *,
+        clean_env: Mapping[str, str],
+        ws_env: Mapping[str, str],
+        clean_title: str,
+        started_at: datetime,
+    ) -> tuple[bool, str]:
+        """Run ruff check src tests followed by targeted (or full fallback) pytest."""
+        self._set_apply_status(
+            running=True,
+            step=2,
+            total_steps=3,
+            stage="Verificando calidad y pruebas",
+            detail="Ejecutando ruff y la suite completa de seguridad (puede tardar ~4 min)...",
+            title=clean_title,
+            started_at=started_at,
+        )
+        ruff_cmd = [*self._resolve_venv_tool("ruff"), "check", "src", "tests"]
+        ruff_res = self.runner.run(
+            ruff_cmd,
+            cwd=self.repo_root,
+            timeout_seconds=self.verify_timeout_seconds,
+            env=ws_env,
+        )
+        if ruff_res.exit_code != 0:
+            tail = (ruff_res.stdout or ruff_res.stderr or "ruff check failed").strip()[-1200:]
+            return False, f"Falló ruff check src tests:\n{self._redact(tail)}"
+
+        changed_paths = self._collect_changed_src_tests(clean_env)
+        targeted_tests, has_targeted = self._select_targeted_pytest_targets(changed_paths)
+        pytest_args = ["-q", "--no-cov", *targeted_tests] if has_targeted else ["-q", "--no-cov"]
+        if has_targeted:
+            self._set_apply_status(
+                running=True,
+                step=2,
+                total_steps=3,
+                stage="Verificando calidad y pruebas",
+                detail=f"Ejecutando pruebas dirigidas ({', '.join(targeted_tests)})...",
+                title=clean_title,
+                started_at=started_at,
+            )
+        pytest_cmd = [*self._resolve_venv_tool("pytest"), *pytest_args]
+        pytest_res = self.runner.run(
+            pytest_cmd,
+            cwd=self.repo_root,
+            timeout_seconds=self.verify_timeout_seconds,
+            env=ws_env,
+        )
+        if pytest_res.exit_code != 0:
+            tail = (pytest_res.stdout or pytest_res.stderr or "pytest failed").strip()[-1200:]
+            return False, f"Falló pytest {' '.join(pytest_args)}:\n{self._redact(tail)}"
+        return True, ""
 
     def _rollback_savepoint(self, env: Mapping[str, str]) -> None:
         self.runner.run(
@@ -896,51 +964,57 @@ class FactorySelfImprover:
             elif not agy_ok:
                 failure_reason = f"Falló la ejecución de agy: {agy_out}"
             else:
-                # 3. Quality gate: ruff check src tests + targeted/full pytest -q --no-cov
-                self._set_apply_status(
-                    running=True,
-                    step=2,
-                    total_steps=3,
-                    stage="Verificando calidad y pruebas",
-                    detail="Ejecutando ruff y la suite completa de seguridad (puede tardar ~4 min)...",
-                    title=clean_title,
+                # 3. Quality gate: ruff check src tests + targeted/full pytest (with 1 auto-repair round on failure)
+                ws_env = build_workspace_pytest_env()
+                verify_ok, verify_err = self._run_verification_gate(
+                    clean_env=clean_env,
+                    ws_env=ws_env,
+                    clean_title=clean_title,
                     started_at=started_at,
                 )
-                ws_env = build_workspace_pytest_env()
-                ruff_cmd = [*self._resolve_venv_tool("ruff"), "check", "src", "tests"]
-                ruff_res = self.runner.run(
-                    ruff_cmd,
-                    cwd=self.repo_root,
-                    timeout_seconds=self.verify_timeout_seconds,
-                    env=ws_env,
-                )
-                if ruff_res.exit_code != 0:
-                    tail = (ruff_res.stdout or ruff_res.stderr or "ruff check failed").strip()[-1200:]
-                    failure_reason = f"Falló ruff check src tests:\n{self._redact(tail)}"
-                else:
-                    changed_paths = self._collect_changed_src_tests(clean_env)
-                    targeted_tests, has_targeted = self._select_targeted_pytest_targets(changed_paths)
-                    pytest_args = ["-q", "--no-cov", *targeted_tests] if has_targeted else ["-q", "--no-cov"]
-                    if has_targeted:
-                        self._set_apply_status(
-                            running=True,
-                            step=2,
-                            total_steps=3,
-                            stage="Verificando calidad y pruebas",
-                            detail=f"Ejecutando pruebas dirigidas ({', '.join(targeted_tests)})...",
-                            title=clean_title,
+                if not verify_ok:
+                    self._set_apply_status(
+                        running=True,
+                        step=2,
+                        total_steps=3,
+                        stage="Auto-reparando fallo detectado...",
+                        detail="Ejecutando 1 ronda de auto-reparación con agy sobre el error exacto...",
+                        title=clean_title,
+                        started_at=started_at,
+                    )
+                    repair_prompt = (
+                        "AUTO-REPARACIÓN OBLIGATORIA (1 ronda): La verificación falló tras tu edición.\n"
+                        "REGLA ESTRICTA DE SEGURIDAD: PROHIBIDO leer o modificar .env, MASTER_PROMPT.md, "
+                        "AGENTS.md, config/models.toml, data/ o workspaces/.\n"
+                        "REGLA DE VELOCIDAD: Corrige únicamente los archivos afectados y verifica solo pruebas dirigidas.\n\n"
+                        f"Propuesta original ({clean_title}):\n{clean_prompt}\n\n"
+                        f"Error exacto reportado:\n{verify_err}"
+                    )
+                    repair_ok, repair_out = self._run_agy(
+                        prompt=repair_prompt,
+                        cwd=self.repo_root,
+                        allow_writes=True,
+                        timeout_seconds=min(float(self.apply_timeout_seconds), 180.0),
+                        extra_add_dirs=(self.repo_root,),
+                    )
+                    forbidden_after_repair = self._find_forbidden_modifications(baseline)
+                    if forbidden_after_repair:
+                        failure_reason = (
+                            f"Intento bloqueado: se tocaron rutas protegidas ({', '.join(forbidden_after_repair)})."
+                        )
+                    elif not repair_ok:
+                        failure_reason = (
+                            f"Falló la auto-reparación de agy: {repair_out}\n\nError previo:\n{verify_err}"
+                        )
+                    else:
+                        verify_ok2, verify_err2 = self._run_verification_gate(
+                            clean_env=clean_env,
+                            ws_env=ws_env,
+                            clean_title=clean_title,
                             started_at=started_at,
                         )
-                    pytest_cmd = [*self._resolve_venv_tool("pytest"), *pytest_args]
-                    pytest_res = self.runner.run(
-                        pytest_cmd,
-                        cwd=self.repo_root,
-                        timeout_seconds=self.verify_timeout_seconds,
-                        env=ws_env,
-                    )
-                    if pytest_res.exit_code != 0:
-                        tail = (pytest_res.stdout or pytest_res.stderr or "pytest failed").strip()[-1200:]
-                        failure_reason = f"Falló pytest {' '.join(pytest_args)}:\n{self._redact(tail)}"
+                        if not verify_ok2:
+                            failure_reason = verify_err2
 
             if failure_reason:
                 outcome = "rolled_back"

@@ -34,6 +34,9 @@ def _isolate_host_agy_from_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """Filter pre-existing system PATH directories containing real agy binaries and disable interactive Git prompts (INV-03)."""
     monkeypatch.setenv("GIT_TERMINAL_PROMPT", "0")
     monkeypatch.setenv("GCM_INTERACTIVE", "never")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_ASKPASS", "echo")
+    monkeypatch.setenv("SSH_ASKPASS", "echo")
     raw_path = os.environ.get("PATH", "")
     if not raw_path:
         return

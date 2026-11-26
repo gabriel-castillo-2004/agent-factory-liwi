@@ -5995,3 +5995,33 @@ def test_dashboard_liwi_chat_minimalist_redesign_and_contract_compatibility(
         if thread.is_alive():
             thread.join(timeout=2.0)
         store.close()
+
+
+def test_dashboard_liwi_fullscreen_overlay_optimistic_chat_markdown_newlines_and_button_spinners() -> None:
+    """DASHBOARD_HTML includes fullscreen update overlay (#factory-fullscreen-build-overlay), optimistic Liwi chat bubble, literal newline normalization in renderSafeMarkdown, and live spinners/clocks on slow actions."""
+    from agent_factory.dashboard import DASHBOARD_HTML
+
+    assert 'id="factory-fullscreen-build-overlay"' in DASHBOARD_HTML
+    assert 'id="factory-fs-minimize-btn"' in DASHBOARD_HTML
+    assert "backdrop-filter: blur(12px);" in DASHBOARD_HTML
+    assert "¡Liwi actualizado! Recargando..." in DASHBOARD_HTML
+    assert "window.location.reload()" in DASHBOARD_HTML
+    assert "1/3 Editando código con IA" in DASHBOARD_HTML
+    assert "2/3 Verificando pruebas" in DASHBOARD_HTML
+    assert "3/3 Guardando y reiniciando" in DASHBOARD_HTML
+
+    assert 'id="factory-thinking-bubble"' in DASHBOARD_HTML or "factory-thinking-bubble" in DASHBOARD_HTML
+    assert "Liwi está pensando…" in DASHBOARD_HTML
+    assert "consultInFlight = true" in DASHBOARD_HTML
+    assert "allFactoryCodeBlocks" in DASHBOARD_HTML
+    assert "setButtonLoading(" in DASHBOARD_HTML
+    assert ".btn-spinner {" in DASHBOARD_HTML
+    assert ".live-op-clock" in DASHBOARD_HTML
+    assert ".card-live-timer" in DASHBOARD_HTML
+    assert 'id="audit-toolbar-status"' in DASHBOARD_HTML
+
+    md_start = DASHBOARD_HTML.index("function renderSafeMarkdown(mdText)")
+    md_end = DASHBOARD_HTML.index("const codeBlocks = [];", md_start)
+    md_head = DASHBOARD_HTML[md_start:md_end]
+    assert "replace(" in md_head
+    assert "split(" in md_head
