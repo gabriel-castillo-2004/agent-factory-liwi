@@ -11,10 +11,22 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agent_factory.secrets import redact_secrets
+
+if TYPE_CHECKING:
+    from agent_factory.parallel_improver import (
+        ChangedFilesInspector,
+        ParallelImprover,
+        ParallelPlan,
+        ParallelRunResult,
+        PytestRunner,
+        RuffRunner,
+        WorkerRunner,
+    )
 
 _SAFE_WORKTREE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _SAFE_BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
@@ -211,10 +223,188 @@ class StagingManager:
         self._run_git(["reset", "--hard", "HEAD"], cwd=self.worktree_path)
         self._run_git(["clean", "-fd"], cwd=self.worktree_path)
 
+    def _commit_parallel_changes(
+        self,
+        worktree_path: Path,
+        plan: ParallelPlan,
+        *,
+        commit_message: str | None = None,
+    ) -> tuple[bool, str | None, str]:
+        branch_res = self._run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=worktree_path)
+        current_branch = branch_res.stdout.strip() if branch_res.returncode == 0 else ""
+        if current_branch != self.staging_branch:
+            return (
+                False,
+                None,
+                f"El worktree está en '{current_branch or 'desconocido'}' en lugar de '{self.staging_branch}'.",
+            )
+
+        assigned_files = [f for st in plan.subtasks for f in st.assigned_files]
+        add_args = ["add", "-A", "--", *assigned_files] if assigned_files else ["add", "-A"]
+        add_res = self._run_git(add_args, cwd=worktree_path)
+        if add_res.returncode != 0:
+            detail = redact_secrets((add_res.stderr or add_res.stdout or "git add failed").strip())
+            return False, None, f"Error preparando commit paralelo en staging: {detail}"
+
+        diff_res = self._run_git(["diff", "--cached", "--quiet"], cwd=worktree_path)
+        if diff_res.returncode != 0:
+            name_chk = self._run_git(["config", "--get", "user.name"], cwd=worktree_path)
+            email_chk = self._run_git(["config", "--get", "user.email"], cwd=worktree_path)
+            commit_prefix = (
+                []
+                if (
+                    name_chk.returncode == 0
+                    and name_chk.stdout.strip()
+                    and email_chk.returncode == 0
+                    and email_chk.stdout.strip()
+                )
+                else ["-c", "user.name=AgentFactory", "-c", "user.email=agent@factory.local"]
+            )
+            slug = re.sub(r"[\r\n\"`]+", " ", plan.title).strip() or "apply parallel improvement"
+            msg = commit_message.strip() if isinstance(commit_message, str) and commit_message.strip() else f"chore(self-improve): {slug}"
+            commit_res = self._run_git(
+                [*commit_prefix, "commit", "-m", msg],
+                cwd=worktree_path,
+            )
+            if commit_res.returncode != 0:
+                detail = redact_secrets(
+                    (commit_res.stderr or commit_res.stdout or "git commit failed").strip()
+                )
+                return False, None, f"Error creando commit paralelo en '{self.staging_branch}': {detail}"
+
+        head_res = self._run_git(["rev-parse", "HEAD"], cwd=worktree_path)
+        commit_sha = head_res.stdout.strip() if head_res.returncode == 0 else None
+        return True, commit_sha, ""
+
+    def _run_parallel_plan_in_worktree(
+        self,
+        worktree_path: Path,
+        plan: ParallelPlan,
+        *,
+        commit_message: str | None = None,
+        improver: ParallelImprover | None = None,
+        worker_runner: WorkerRunner | None = None,
+        ruff_runner: RuffRunner | None = None,
+        pytest_runner: PytestRunner | None = None,
+        changed_files_inspector: ChangedFilesInspector | None = None,
+        max_workers: int = 3,
+        cleanup_on_failure: bool = True,
+    ) -> ParallelRunResult:
+        from agent_factory.parallel_improver import ParallelImprover as _ParallelImprover
+
+        active_improver = (
+            improver
+            if improver is not None
+            else _ParallelImprover(
+                worktree_path=worktree_path,
+                max_workers=max_workers,
+                worker_runner=worker_runner,
+                ruff_runner=ruff_runner,
+                pytest_runner=pytest_runner,
+                changed_files_inspector=changed_files_inspector,
+            )
+        )
+        run_result = active_improver.run(plan)
+        if not run_result.success or not run_result.commit_allowed:
+            if cleanup_on_failure:
+                self._cleanup_worktree()
+            err_msg = redact_secrets(run_result.error or "La ejecución paralela en staging falló.")
+            with self._lock:
+                self._last_error = err_msg
+            return replace(run_result, success=False, commit_allowed=False, commit_sha=None, error=err_msg)
+
+        ok_commit, commit_sha, commit_err = self._commit_parallel_changes(
+            worktree_path,
+            run_result.plan,
+            commit_message=commit_message,
+        )
+        if not ok_commit:
+            if cleanup_on_failure:
+                self._cleanup_worktree()
+            err_msg = redact_secrets(commit_err)
+            with self._lock:
+                self._last_error = err_msg
+            return replace(
+                run_result,
+                success=False,
+                commit_allowed=False,
+                commit_sha=None,
+                error=err_msg,
+            )
+
+        with self._lock:
+            self._last_error = None
+        return replace(run_result, commit_sha=commit_sha)
+
+    def apply_parallel_plan(
+        self,
+        plan: ParallelPlan,
+        *,
+        commit_message: str | None = None,
+        improver: ParallelImprover | None = None,
+        worker_runner: WorkerRunner | None = None,
+        ruff_runner: RuffRunner | None = None,
+        pytest_runner: PytestRunner | None = None,
+        changed_files_inspector: ChangedFilesInspector | None = None,
+        max_workers: int = 3,
+        cleanup_on_failure: bool = True,
+    ) -> ParallelRunResult:
+        """Execute a disjoint-file ParallelPlan inside .liwi-staging and commit on liwi-staging only if all checks pass."""
+        with self._cond:
+            if self._is_promoting:
+                raise RuntimeError("No se puede ejecutar un plan paralelo mientras staging se está promoviendo.")
+            if self._is_building:
+                raise RuntimeError("Ya hay una mejora en construcción en staging.")
+            self._is_building = True
+            self._current_task = plan.title
+            self._cond.notify_all()
+
+        try:
+            worktree_path = self.ensure_worktree()
+            return self._run_parallel_plan_in_worktree(
+                worktree_path,
+                plan,
+                commit_message=commit_message,
+                improver=improver,
+                worker_runner=worker_runner,
+                ruff_runner=ruff_runner,
+                pytest_runner=pytest_runner,
+                changed_files_inspector=changed_files_inspector,
+                max_workers=max_workers,
+                cleanup_on_failure=cleanup_on_failure,
+            )
+        finally:
+            with self._cond:
+                self._is_building = False
+                self._current_task = None
+                self._cond.notify_all()
+
     def _default_execute(self, worktree_path: Path, task: dict[str, Any]) -> dict[str, Any]:
+        meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+        if meta.get("parallel_plan") is not None:
+            parallel_result = self._run_parallel_plan_in_worktree(
+                worktree_path,
+                meta["parallel_plan"],
+                commit_message=meta.get("commit_message"),
+                improver=meta.get("parallel_improver"),
+                worker_runner=meta.get("worker_runner"),
+                ruff_runner=meta.get("ruff_runner"),
+                pytest_runner=meta.get("pytest_runner"),
+                changed_files_inspector=meta.get("changed_files_inspector"),
+                max_workers=int(meta.get("max_workers", 3)),
+            )
+            if not parallel_result.success:
+                raise RuntimeError(
+                    parallel_result.error or "La auto-mejora paralela falló en el worktree de staging."
+                )
+            return {
+                "ok": True,
+                "commit_sha": parallel_result.commit_sha,
+                "parallel_result": parallel_result,
+            }
+
         from agent_factory.self_improver import FactorySelfImprover
 
-        meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
         improver_kwargs: dict[str, Any] = {
             "repo_root": worktree_path,
             "restart_fn": lambda _code: None,
