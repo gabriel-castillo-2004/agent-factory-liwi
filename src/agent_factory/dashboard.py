@@ -2043,6 +2043,13 @@ class DashboardController:
         """Return live real-time status of Liwi self-improvement apply execution."""
         return _scrub_value(self._effective_self_improver().get_status(), self.secrets_to_redact)
 
+    def get_factory_assistant_versions(self, *, limit: int = 30) -> dict[str, Any]:
+        """Return Git evolutionary version history of Liwi with secrets scrubbed."""
+        return _scrub_value(
+            self._effective_self_improver().get_evolution_history(limit=limit),
+            self.secrets_to_redact,
+        )
+
     def get_factory_assistant_upload(self, filename: str) -> tuple[str, bytes]:
         """Serve a validated screenshot uploaded to factory_chat_uploads."""
         try:
@@ -11372,7 +11379,8 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         return None, None
 
     def do_GET(self) -> None:
-        path = urllib.parse.urlsplit(self.path).path
+        parsed_url = urllib.parse.urlsplit(self.path)
+        path = parsed_url.path
         ctrl = self.server.controller
 
         if path == "/" or path == "/index.html":
@@ -11393,6 +11401,20 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/factory/assistant/status":
             self._send_json(200, ctrl.get_factory_assistant_status())
+            return
+
+        if path == "/api/factory/assistant/versions":
+            qs = urllib.parse.parse_qs(parsed_url.query, keep_blank_values=True)
+            if "limit" in qs:
+                raw_limit = str(qs["limit"][-1]).strip()
+                try:
+                    limit_val = int(raw_limit)
+                except ValueError:
+                    self._send_json(400, {"error": "Parámetro 'limit' inválido; debe ser un entero."})
+                    return
+                self._send_json(200, ctrl.get_factory_assistant_versions(limit=limit_val))
+                return
+            self._send_json(200, ctrl.get_factory_assistant_versions())
             return
 
         if path.startswith("/api/factory/assistant/uploads/"):

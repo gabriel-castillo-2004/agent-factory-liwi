@@ -42,6 +42,8 @@ MAX_UPLOAD_IMAGES_PER_MESSAGE: int = 4
 _MAX_INLINE_PROMPT_CHARS: int = 6000
 _SAFE_RULE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _SAFE_UPLOAD_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
+_SELF_IMPROVE_PREFIX_RE = re.compile(r"^chore\(self-improve\)\s*:\s*", flags=re.IGNORECASE)
+_SHORTSTAT_FILES_RE = re.compile(r"(\d+)\s+files?\s+changed", flags=re.IGNORECASE)
 _FORBIDDEN_SELF_IMPROVE_PREFIXES: tuple[str, ...] = (
     ".env",
     "MASTER_PROMPT.md",
@@ -475,6 +477,111 @@ class FactorySelfImprover:
                 "elapsed_seconds": elapsed,
                 "last_outcome": str(self._status.get("last_outcome") or ""),
             }
+
+    def get_evolution_history(self, limit: int = 30) -> dict[str, Any]:
+        """Return Git evolutionary version history (v1.N) from main (or HEAD fallback) with secrets redacted."""
+        empty: dict[str, Any] = {
+            "current_version": "v1.0",
+            "total_versions": 0,
+            "versions": [],
+        }
+        try:
+            cap = max(1, min(100, int(limit)))
+        except (TypeError, ValueError):
+            cap = 30
+
+        clean_env = build_sanitized_cli_env()
+        try:
+            main_res = self.runner.run(
+                ["git", "rev-parse", "--verify", "main"],
+                cwd=self.repo_root,
+                timeout_seconds=15.0,
+                env=clean_env,
+            )
+            ref = "main" if main_res.exit_code == 0 else "HEAD"
+            count_res = self.runner.run(
+                ["git", "rev-list", "--count", ref],
+                cwd=self.repo_root,
+                timeout_seconds=15.0,
+                env=clean_env,
+            )
+        except (CommandTimeoutError, OSError, RuntimeError, ValueError):
+            return empty
+
+        if count_res.exit_code != 0:
+            return empty
+        try:
+            total_versions = int((count_res.stdout or "").strip())
+        except ValueError:
+            return empty
+        if total_versions <= 0:
+            return empty
+
+        try:
+            log_res = self.runner.run(
+                [
+                    "git",
+                    "log",
+                    ref,
+                    "-n",
+                    str(cap),
+                    "--shortstat",
+                    "--format=%x1e%h%x1f%H%x1f%aI%x1f%s%x1f%b%x1f",
+                ],
+                cwd=self.repo_root,
+                timeout_seconds=15.0,
+                env=clean_env,
+            )
+        except (CommandTimeoutError, OSError, RuntimeError, ValueError):
+            return empty
+
+        if log_res.exit_code != 0:
+            return empty
+
+        versions: list[dict[str, Any]] = []
+        raw_records = [rec for rec in (log_res.stdout or "").split("\x1e") if rec.strip()]
+        for idx, rec in enumerate(raw_records):
+            parts = rec.split("\x1f", 5)
+            if len(parts) < 5:
+                continue
+            short_hash = self._redact(parts[0].strip())
+            commit_hash = self._redact(parts[1].strip())
+            committed_at = self._redact(parts[2].strip())
+            raw_subject_plain = parts[3].strip()
+            raw_subject = self._redact(raw_subject_plain)
+            is_self_improve = "self-improve" in raw_subject_plain.lower()
+            stripped_title = _SELF_IMPROVE_PREFIX_RE.sub("", raw_subject).strip()
+            title = stripped_title or raw_subject
+            raw_body = parts[4].replace("\r\n", "\n").replace("\r", "\n").strip()
+            summary = self._redact(raw_body)[:1000].strip() if raw_body else ""
+            raw_tail = parts[5] if len(parts) > 5 else ""
+            stat_lines = [ln.strip() for ln in raw_tail.splitlines() if ln.strip()]
+            stats = self._redact(" ".join(stat_lines)) if stat_lines else ""
+            files_match = _SHORTSTAT_FILES_RE.search(stats)
+            files_changed = int(files_match.group(1)) if files_match else 0
+            version_num = max(1, total_versions - idx)
+            versions.append(
+                {
+                    "version": f"v1.{version_num}",
+                    "short_hash": short_hash,
+                    "commit_hash": commit_hash,
+                    "committed_at": committed_at,
+                    "title": title,
+                    "raw_subject": raw_subject,
+                    "summary": summary,
+                    "stats": stats,
+                    "files_changed": files_changed,
+                    "is_self_improve": is_self_improve,
+                    "source": "self_improve" if is_self_improve else "manual",
+                    "source_label": "Auto-mejora" if is_self_improve else "Cambio manual",
+                }
+            )
+
+        return {
+            "current_version": f"v1.{total_versions}",
+            "total_versions": total_versions,
+            "versions": versions,
+        }
 
     def delete_memory_rule(self, rule_id: str) -> dict[str, Any]:
         """Delete a rule from factory_memory_rules or raise KeyError if missing."""

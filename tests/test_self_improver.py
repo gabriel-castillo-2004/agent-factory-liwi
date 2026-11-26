@@ -859,3 +859,246 @@ def test_factory_assistant_apply_targets_self_improver_tests_only_and_auto_repai
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_factory_evolution_history_git_versions_redaction_limit_and_http_endpoint(
+    tmp_path: Path,
+) -> None:
+    """FactorySelfImprover.get_evolution_history and GET /api/factory/assistant/versions return real global v1.N versions on main, shortstat, secret redaction, ?limit=N, and 400 on invalid limit."""
+    secret_tok = "EVO_SECRET_TOKEN_999"
+    repo_root = tmp_path / "repo_evo"
+    _init_temp_factory_git_repo(repo_root)
+
+    # Commit 2: manual commit with body containing secret
+    (repo_root / "src" / "agent_factory" / "sample.py").write_text("VALUE = 10\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo_root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "commit",
+            "-m",
+            "feat(ui): agregar panel base",
+            "-m",
+            f"Detalle manual con secreto {secret_tok}",
+        ],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    # Commit 3: self-improve commit modifying 2 files with secret in subject and body
+    (repo_root / "src" / "agent_factory" / "sample.py").write_text("VALUE = 20\n", encoding="utf-8")
+    (repo_root / "tests" / "test_sample.py").write_text(
+        "def test_ok():\n    assert 20 == 20\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "-A"], cwd=repo_root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "commit",
+            "-m",
+            f"chore(self-improve): Mejorar velocidad del panel {secret_tok}",
+            "-m",
+            "Optimiza consultas SQLite y evita re-render innecesario.",
+        ],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    # Commit 4: latest self-improve commit without body
+    (repo_root / "src" / "agent_factory" / "sample.py").write_text("VALUE = 30\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo_root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "commit",
+            "-m",
+            "chore(self-improve): Agregar historial de versiones",
+        ],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    head_full = subprocess.run(
+        ["git", "rev-parse", "main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    head_short = subprocess.run(
+        ["git", "rev-parse", "--short", "main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    store = SqliteEventStore(db_path=tmp_path / "evo.db")
+    try:
+        improver = FactorySelfImprover(
+            sqlite_store=store,
+            repo_root=repo_root,
+            uploads_dir=tmp_path / "uploads_evo",
+            runner=SubprocessRunner(default_timeout_seconds=15.0),
+            secrets_to_redact=(secret_tok,),
+        )
+
+        # Direct method check
+        evo = improver.get_evolution_history()
+        assert evo["current_version"] == "v1.4"
+        assert evo["total_versions"] == 4
+        versions = evo["versions"]
+        assert len(versions) == 4
+        assert [v["version"] for v in versions] == ["v1.4", "v1.3", "v1.2", "v1.1"]
+
+        # Newest commit (v1.4 - self_improve, no body)
+        v4 = versions[0]
+        assert v4["version"] == "v1.4"
+        assert v4["commit_hash"] == head_full
+        assert v4["short_hash"] == head_short
+        assert v4["committed_at"]
+        assert v4["title"] == "Agregar historial de versiones"
+        assert v4["raw_subject"] == "chore(self-improve): Agregar historial de versiones"
+        assert v4["summary"] == ""
+        assert v4["files_changed"] == 1
+        assert "1 file changed" in v4["stats"]
+        assert v4["is_self_improve"] is True
+        assert v4["source"] == "self_improve"
+        assert v4["source_label"] == "Auto-mejora"
+
+        # Commit 3 (v1.3 - self_improve, 2 files changed, secret redacted)
+        v3 = versions[1]
+        assert v3["version"] == "v1.3"
+        assert secret_tok not in v3["title"]
+        assert secret_tok not in v3["raw_subject"]
+        assert "[REDACTED]" in v3["title"]
+        assert not v3["title"].lower().startswith("chore(self-improve):")
+        assert v3["summary"] == "Optimiza consultas SQLite y evita re-render innecesario."
+        assert v3["files_changed"] == 2
+        assert "2 files changed" in v3["stats"]
+        assert v3["is_self_improve"] is True
+        assert v3["source"] == "self_improve"
+        assert v3["source_label"] == "Auto-mejora"
+
+        # Commit 2 (v1.2 - manual, secret redacted in summary)
+        v2 = versions[2]
+        assert v2["version"] == "v1.2"
+        assert v2["title"] == "feat(ui): agregar panel base"
+        assert v2["raw_subject"] == "feat(ui): agregar panel base"
+        assert secret_tok not in v2["summary"]
+        assert "[REDACTED]" in v2["summary"]
+        assert v2["files_changed"] == 1
+        assert v2["is_self_improve"] is False
+        assert v2["source"] == "manual"
+        assert v2["source_label"] == "Cambio manual"
+
+        # Commit 1 (v1.1 - manual initial snapshot, 3 files changed)
+        v1 = versions[3]
+        assert v1["version"] == "v1.1"
+        assert v1["title"] == "chore: initial snapshot"
+        assert v1["files_changed"] == 3
+        assert v1["is_self_improve"] is False
+        assert v1["source"] == "manual"
+        assert v1["source_label"] == "Cambio manual"
+
+        # HTTP endpoint integration
+        orch = Orchestrator(store=store, llm=FakeLLM())
+        server, thread, base_url = start_dashboard_server(
+            orchestrator=orch,
+            port=0,
+            self_improver=improver,
+            secrets_to_redact=(secret_tok,),
+        )
+        try:
+            c_all, r_all = _http_call(f"{base_url}/api/factory/assistant/versions")
+            assert c_all == 200
+            assert r_all["current_version"] == "v1.4"
+            assert r_all["total_versions"] == 4
+            assert [v["version"] for v in r_all["versions"]] == ["v1.4", "v1.3", "v1.2", "v1.1"]
+            assert secret_tok not in json.dumps(r_all)
+
+            c_lim, r_lim = _http_call(f"{base_url}/api/factory/assistant/versions?limit=2")
+            assert c_lim == 200
+            assert r_lim["current_version"] == "v1.4"
+            assert r_lim["total_versions"] == 4
+            assert len(r_lim["versions"]) == 2
+            assert [v["version"] for v in r_lim["versions"]] == ["v1.4", "v1.3"]
+
+            c_bad, r_bad = _http_call(f"{base_url}/api/factory/assistant/versions?limit=abc")
+            assert c_bad == 400
+            assert "error" in r_bad
+        finally:
+            server.shutdown()
+            server.server_close()
+            server.controller.wait_for_idle(timeout=5.0)
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+    finally:
+        store.close()
+
+
+def test_factory_evolution_history_degrades_safely_without_git_and_falls_back_to_head(
+    tmp_path: Path,
+) -> None:
+    """get_evolution_history returns v1.0/empty on non-git dirs or empty repos, clamps limit, and falls back to HEAD when main does not exist."""
+    no_git_dir = tmp_path / "not_a_git_repo"
+    no_git_dir.mkdir(parents=True, exist_ok=True)
+    improver_no_git = FactorySelfImprover(
+        db_path=tmp_path / "nogit.db",
+        repo_root=no_git_dir,
+        uploads_dir=tmp_path / "uploads_nogit",
+        runner=SubprocessRunner(default_timeout_seconds=15.0),
+    )
+    assert improver_no_git.get_evolution_history() == {
+        "current_version": "v1.0",
+        "total_versions": 0,
+        "versions": [],
+    }
+
+    # Repo without 'main' branch (uses 'develop' -> fallback to HEAD)
+    dev_repo = tmp_path / "dev_repo"
+    dev_repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "develop"], cwd=dev_repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "TestFactory"], cwd=dev_repo, check=True)
+    subprocess.run(["git", "config", "user.email", "factory@local"], cwd=dev_repo, check=True)
+
+    # Empty repo (0 commits) degrades safely
+    improver_dev = FactorySelfImprover(
+        db_path=tmp_path / "dev.db",
+        repo_root=dev_repo,
+        uploads_dir=tmp_path / "uploads_dev",
+        runner=SubprocessRunner(default_timeout_seconds=15.0),
+    )
+    assert improver_dev.get_evolution_history() == {
+        "current_version": "v1.0",
+        "total_versions": 0,
+        "versions": [],
+    }
+
+    # Add 2 commits on develop
+    (dev_repo / "a.txt").write_text("one\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=dev_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "chore: first"], cwd=dev_repo, check=True, capture_output=True)
+    (dev_repo / "a.txt").write_text("two\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=dev_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "chore(self-improve):"],
+        cwd=dev_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    res = improver_dev.get_evolution_history(limit=0)
+    assert res["current_version"] == "v1.2"
+    assert res["total_versions"] == 2
+    assert len(res["versions"]) == 1
+    assert res["versions"][0]["version"] == "v1.2"
+    # Empty suffix after chore(self-improve): falls back to raw subject
+    assert res["versions"][0]["title"] == "chore(self-improve):"
+    assert res["versions"][0]["is_self_improve"] is True
+
+
+
