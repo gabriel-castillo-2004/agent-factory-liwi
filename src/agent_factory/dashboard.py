@@ -3909,7 +3909,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         display: flex;
         flex-wrap: nowrap;
         align-items: center;
-        gap: 8px;
+        gap: 6px;
         width: 100%;
         max-width: 100%;
         min-width: 0;
@@ -3938,6 +3938,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         white-space: nowrap;
         flex-shrink: 0;
         min-height: 38px;
+        padding: 5px 9px;
+        font-size: 0.78rem;
+        line-height: 1.2;
       }
       header .themes-popover,
       header .settings-popover {
@@ -3987,6 +3990,216 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         max-width: 100%;
         min-width: 0;
         flex-wrap: wrap;
+      }
+      #detail-panel,
+      #detail-main-col {
+        max-width: 100%;
+        min-width: 0;
+        box-sizing: border-box;
+      }
+      .detail-header-group {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0 8px;
+        max-width: 100%;
+        min-width: 0;
+        margin-bottom: 10px;
+      }
+      .detail-header-group::before {
+        content: "";
+        flex: 0 0 100%;
+        height: 0;
+        order: 5;
+      }
+      .detail-header-group .detail-header,
+      .detail-header-group .detail-titles,
+      .detail-header-group .title-row {
+        display: contents;
+      }
+      #change-logo-btn {
+        order: 1;
+        flex: 0 0 auto;
+      }
+      #detail-title,
+      .detail-title {
+        order: 2;
+        flex: 1 1 150px;
+        min-width: 0;
+        font-size: 1.25rem;
+        line-height: 1.25;
+        word-break: break-word;
+      }
+      .detail-header-status {
+        order: 3;
+        flex: 0 0 auto;
+        max-width: 100%;
+        margin-top: 2px;
+      }
+      #edit-title-form {
+        order: 4;
+        flex: 1 0 100%;
+        max-width: 100%;
+        min-width: 0;
+        margin-top: 8px;
+      }
+      #edit-title-form .input-inline {
+        min-width: 0;
+      }
+      #edit-title-btn {
+        order: 6;
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        margin-top: 6px;
+        padding: 4px 8px;
+      }
+      #detail-time {
+        order: 7;
+        flex: 0 1 auto;
+        min-width: 0;
+        margin: 6px 0 0 auto !important;
+        text-align: right;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #detail-segments {
+        order: 8;
+        flex: 1 0 100%;
+        width: 100%;
+        margin: 8px 0 2px 0;
+      }
+      .guidance-banner,
+      .guidance-banner.delivered-compact,
+      .delivered-compact-info,
+      .delivered-compact-actions,
+      .local-controls-row,
+      .banner-actions {
+        max-width: 100%;
+        min-width: 0;
+        box-sizing: border-box;
+      }
+      .guidance-banner.delivered-compact {
+        padding: 12px 14px;
+        gap: 10px;
+      }
+      .delivered-compact-info {
+        flex: 1 1 100%;
+        min-width: 0;
+      }
+      .delivered-compact-actions {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        width: 100%;
+      }
+      .local-controls-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        flex: 1 1 auto;
+      }
+      .delivered-compact-actions .btn,
+      .local-controls-row .btn,
+      #project-more-btn,
+      #header-more-btn,
+      .banner-actions .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        white-space: nowrap;
+        min-height: 38px;
+        padding: 7px 12px;
+        font-size: 0.84rem;
+        line-height: 1.2;
+        max-width: 100%;
+      }
+      .more-popover {
+        max-width: calc(100vw - 32px);
+      }
+      .tabs {
+        display: flex;
+        flex-wrap: nowrap;
+        align-items: center;
+        gap: 6px;
+        max-width: 100%;
+        min-width: 0;
+        overflow-x: auto;
+        white-space: nowrap;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: thin;
+      }
+      .tab-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex: 0 0 auto;
+        white-space: nowrap;
+        min-height: 38px;
+        padding: 6px 11px;
+        font-size: 0.84rem;
+        line-height: 1.2;
+      }
+      .audit-unified-bar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        max-width: 100%;
+        min-width: 0;
+      }
+      .audit-subtabs {
+        display: flex;
+        flex-wrap: nowrap;
+        align-items: center;
+        gap: 6px;
+        max-width: 100%;
+        min-width: 0;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: thin;
+      }
+      .audit-subtab {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex: 0 0 auto;
+        white-space: nowrap;
+        min-height: 36px;
+        padding: 5px 10px;
+        font-size: 0.8rem;
+        line-height: 1.2;
+      }
+      .audit-primary-split {
+        display: inline-flex;
+        flex-wrap: nowrap;
+        align-items: center;
+        gap: 4px;
+        max-width: 100%;
+        min-width: 0;
+      }
+      .audit-primary-split .btn,
+      #audit-quick-audit-btn,
+      #audit-more-actions-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        white-space: nowrap;
+        flex-shrink: 0;
+        min-height: 38px;
+        padding: 6px 11px;
+        font-size: 0.82rem;
+        line-height: 1.2;
+        max-width: 100%;
+      }
+      #audit-more-actions-btn {
+        padding: 6px 10px;
       }
     }
     @media (max-width: 600px) {
@@ -5377,34 +5590,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div id="detail-content" style="display:none">
         <div id="detail-work-split" class="detail-work-split">
           <div id="detail-main-col">
-            <div class="detail-header">
-              <div class="detail-titles">
-                <div class="title-row">
-                  <button id="change-logo-btn" class="logo-icon-btn" type="button" title="Cambiar logo" aria-label="Cambiar logo">
-                    <img id="detail-logo-img" class="detail-logo" src="" alt="Logo del proyecto" style="display:none" />
-                  </button>
-                  <h2 id="detail-title" class="detail-title"></h2>
-                  <button id="edit-title-btn" class="btn-icon" type="button" title="Editar título" aria-label="Editar título">✏️</button>
-                  <input id="logo-file-input" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" style="display:none" />
+            <div class="detail-header-group">
+              <div class="detail-header">
+                <div class="detail-titles">
+                  <div class="title-row">
+                    <button id="change-logo-btn" class="logo-icon-btn" type="button" title="Cambiar logo" aria-label="Cambiar logo">
+                      <img id="detail-logo-img" class="detail-logo" src="" alt="Logo del proyecto" style="display:none" />
+                    </button>
+                    <h2 id="detail-title" class="detail-title"></h2>
+                    <button id="edit-title-btn" class="btn-icon" type="button" title="Editar título" aria-label="Editar título">✏️</button>
+                    <input id="logo-file-input" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" style="display:none" />
+                  </div>
+                  <form id="edit-title-form" class="edit-title-form" style="display:none">
+                    <input id="edit-title-input" class="input-field input-inline" type="text" maxlength="80" placeholder="Nombre del proyecto" required />
+                    <button id="suggest-title-btn" class="btn btn-sm" type="button" title="Analizar archivos del repositorio y sugerir título">✨ Sugerir analizando repo</button>
+                    <label id="rename-github-wrap" class="rename-github-check" style="display:none">
+                      <input id="rename-github-checkbox" type="checkbox" checked />
+                      <span>Renombrar también en GitHub</span>
+                    </label>
+                    <button id="save-title-btn" class="btn btn-primary btn-sm" type="submit">Guardar</button>
+                    <button id="cancel-title-btn" class="btn btn-sm" type="button">Cancelar</button>
+                  </form>
                 </div>
-                <form id="edit-title-form" class="edit-title-form" style="display:none">
-                  <input id="edit-title-input" class="input-field input-inline" type="text" maxlength="80" placeholder="Nombre del proyecto" required />
-                  <button id="suggest-title-btn" class="btn btn-sm" type="button" title="Analizar archivos del repositorio y sugerir título">✨ Sugerir analizando repo</button>
-                  <label id="rename-github-wrap" class="rename-github-check" style="display:none">
-                    <input id="rename-github-checkbox" type="checkbox" checked />
-                    <span>Renombrar también en GitHub</span>
-                  </label>
-                  <button id="save-title-btn" class="btn btn-primary btn-sm" type="submit">Guardar</button>
-                  <button id="cancel-title-btn" class="btn btn-sm" type="button">Cancelar</button>
-                </form>
+                <div class="detail-header-status" style="display:flex; align-items:center; gap:8px;">
+                  <span id="detail-badge" class="badge"></span>
+                  <span id="detail-header-more"></span>
+                </div>
               </div>
-              <div style="display:flex; align-items:center; gap:8px;">
-                <span id="detail-badge" class="badge"></span>
-                <span id="detail-header-more"></span>
-              </div>
+              <div id="detail-segments" class="stage-segments"></div>
+              <div id="detail-time" class="muted" style="font-size:0.78rem; margin:-2px 0 10px 0; text-align:right;"></div>
             </div>
-            <div id="detail-segments" class="stage-segments"></div>
-            <div id="detail-time" class="muted" style="font-size:0.78rem; margin:-2px 0 10px 0; text-align:right;"></div>
 
             <div id="detail-guidance"></div>
 

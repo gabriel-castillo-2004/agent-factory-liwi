@@ -6326,3 +6326,139 @@ def test_dashboard_factory_chat_includes_copy_button_and_clipboard_fallback(
             thread.join(timeout=2.0)
         store.close()
 
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_mobile_responsive_topbar_and_project_card_refinements(
+    tmp_path: Path,
+) -> None:
+    """Step 1 mobile CSS inside @media (max-width: 768px) compacts top-bar buttons, shrinks project title, aligns edit-title with updated date, and prevents overflow on card actions/tabs/audit split without altering desktop."""
+    store = SqliteEventStore(str(tmp_path / "mobile_step1_cards.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as resp:
+            assert resp.status == 200
+            html = resp.read().decode("utf-8")
+
+        # 1. Zero external CDNs and all relevant existing HTML IDs preserved
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+        for dom_id in (
+            "view-mode-simple",
+            "view-mode-dev",
+            "themes-menu-btn",
+            "improve-factory-btn",
+            "settings-menu-btn",
+            "detail-title",
+            "edit-title-btn",
+            "detail-time",
+            "tab-audit-btn",
+            "tab-modify-btn",
+            "tab-spec-btn",
+            "tab-events-btn",
+            "project-more-btn",
+            "audit-quick-audit-btn",
+            "audit-more-actions-btn",
+        ):
+            assert f'id="{dom_id}"' in html, f"Missing existing HTML id: {dom_id}"
+
+        style_start = html.index("<style>") + len("<style>")
+        style_end = html.index("</style>", style_start)
+        css = html[style_start:style_end]
+
+        media_768_marker = "@media (max-width: 768px)"
+        media_768 = _extract_css_block(css, media_768_marker)
+        assert media_768, "Expected @media (max-width: 768px) block in dashboard CSS"
+
+        # 2. Compact padding and font-size for top-bar buttons in narrow viewports (360px-412px)
+        header_btns_rule = _extract_css_block(media_768, "header .controls .btn")
+        assert header_btns_rule, "Expected header button rules inside @media (max-width: 768px)"
+        assert "padding: 5px 9px;" in header_btns_rule
+        assert "font-size: 0.78rem;" in header_btns_rule
+        assert "white-space: nowrap;" in header_btns_rule
+        assert "flex-shrink: 0;" in header_btns_rule
+
+        # 3. Project card main title reduced to 1.25rem with line-height: 1.25
+        title_rule = _extract_css_block(media_768, "#detail-title")
+        assert title_rule, "Expected #detail-title / .detail-title rule inside @media (max-width: 768px)"
+        assert ".detail-title" in media_768
+        assert "font-size: 1.25rem;" in title_rule
+        assert "line-height: 1.25;" in title_rule
+
+        # 4. Single-row flex alignment eliminating empty line between edit-title button and updated date
+        header_group_rule = _extract_css_block(media_768, ".detail-header-group {")
+        assert header_group_rule, "Expected .detail-header-group rule inside @media (max-width: 768px)"
+        assert "display: flex;" in header_group_rule
+        assert "align-items: center;" in header_group_rule
+        assert "justify-content: space-between;" in header_group_rule
+
+        edit_btn_rule = _extract_css_block(media_768, "#edit-title-btn {")
+        assert edit_btn_rule, "Expected #edit-title-btn rule inside @media (max-width: 768px)"
+        assert "order:" in edit_btn_rule
+
+        detail_time_rule = _extract_css_block(media_768, "#detail-time {")
+        assert detail_time_rule, "Expected #detail-time rule inside @media (max-width: 768px)"
+        assert "order:" in detail_time_rule
+        assert "margin:" in detail_time_rule
+
+        # 5. Card action buttons (Encender en local, Más), tabs, and Auditar código + ▾ split group:
+        #    white-space: nowrap, uniform height, and zero overflow containment
+        card_actions_wrap_rule = _extract_css_block(media_768, ".delivered-compact-actions {")
+        assert card_actions_wrap_rule, "Expected .delivered-compact-actions rule inside @media (max-width: 768px)"
+        assert "flex-wrap: wrap;" in card_actions_wrap_rule
+
+        card_action_btns_rule = _extract_css_block(media_768, ".delivered-compact-actions .btn")
+        assert card_action_btns_rule, "Expected card action button rules inside @media (max-width: 768px)"
+        assert ".local-controls-row .btn" in media_768
+        assert "#project-more-btn" in media_768
+        assert "white-space: nowrap;" in card_action_btns_rule
+        assert "min-height: 38px;" in card_action_btns_rule
+        assert "max-width: 100%;" in card_action_btns_rule
+
+        tabs_rule = _extract_css_block(media_768, ".tabs {")
+        assert tabs_rule, "Expected .tabs rule inside @media (max-width: 768px)"
+        assert "max-width: 100%;" in tabs_rule
+        assert "min-width: 0;" in tabs_rule
+        assert "overflow-x: auto;" in tabs_rule
+        assert "white-space: nowrap;" in tabs_rule
+
+        tab_btn_rule = _extract_css_block(media_768, ".tab-btn {")
+        assert tab_btn_rule, "Expected .tab-btn rule inside @media (max-width: 768px)"
+        assert "white-space: nowrap;" in tab_btn_rule
+        assert "min-height: 38px;" in tab_btn_rule
+
+        audit_bar_rule = _extract_css_block(media_768, ".audit-unified-bar {")
+        assert audit_bar_rule, "Expected .audit-unified-bar rule inside @media (max-width: 768px)"
+        assert "max-width: 100%;" in audit_bar_rule
+        assert "min-width: 0;" in audit_bar_rule
+
+        audit_split_rule = _extract_css_block(media_768, ".audit-primary-split {")
+        assert audit_split_rule, "Expected .audit-primary-split rule inside @media (max-width: 768px)"
+        assert "max-width: 100%;" in audit_split_rule
+        assert "min-width: 0;" in audit_split_rule
+
+        audit_btns_rule = _extract_css_block(media_768, ".audit-primary-split .btn")
+        assert audit_btns_rule, "Expected .audit-primary-split button rules inside @media (max-width: 768px)"
+        assert "#audit-quick-audit-btn" in media_768
+        assert "#audit-more-actions-btn" in media_768
+        assert "white-space: nowrap;" in audit_btns_rule
+        assert "min-height: 38px;" in audit_btns_rule
+        assert "max-width: 100%;" in audit_btns_rule
+
+        # 6. Desktop styles outside @media (max-width: 768px) remain untouched
+        desktop_css = css.replace(media_768, "")
+        assert ".detail-header-group" not in desktop_css
+        desktop_title_rule = _extract_css_block(desktop_css, ".detail-title {")
+        assert "font-size: 1.35rem;" in desktop_title_rule
+        assert "line-height: 1.3;" in desktop_title_rule
+        assert ".controls { display: flex; align-items: center; gap: 10px; }" in desktop_css
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
