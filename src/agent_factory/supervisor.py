@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -88,6 +89,39 @@ def _notify_supervisor_event(
         pass
 
 
+def _detached_popen_kwargs() -> dict[str, Any]:
+    """Return cross-platform Popen kwargs so child servers stay detached from parent terminal on Windows."""
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        detached = int(getattr(subprocess, "DETACHED_PROCESS", 0x00000008))
+        new_group = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+        kwargs["creationflags"] = detached | new_group
+    else:
+        kwargs["start_new_session"] = True
+    return kwargs
+
+
+def launch_detached_supervisor(
+    args: Sequence[str] | None = None,
+    *,
+    executable: str | None = None,
+    repo_root: Path | str | None = None,
+) -> subprocess.Popen[Any]:
+    """Spawn `python -m agent_factory.supervisor` completely detached from the caller terminal."""
+    cmd = [executable or sys.executable, "-m", "agent_factory.supervisor", *list(args or ())]
+    eff_repo = Path(repo_root).resolve() if repo_root is not None else Path.cwd()
+    return subprocess.Popen(
+        cmd,
+        cwd=eff_repo,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        **_detached_popen_kwargs(),
+    )
+
+
 def _run_child_with_watchdog(
     cmd: Sequence[str],
     *,
@@ -107,6 +141,7 @@ def _run_child_with_watchdog(
         text=True,
         encoding="utf-8",
         errors="replace",
+        **_detached_popen_kwargs(),
     )
     stderr_lines: list[str] = []
 
@@ -146,7 +181,8 @@ def _run_child_with_watchdog(
                 proc.wait(timeout=2.0)
         drain_t.join(timeout=1.0)
         tb_text = "".join(stderr_lines)[-3500:]
-        if allow_rollback:
+        port_busy = "address already in use" in tb_text.lower() or "10048" in tb_text
+        if allow_rollback and not port_busy:
             _rollback_failed_boot_commit(
                 repo_root=repo_root,
                 traceback_text=tb_text,

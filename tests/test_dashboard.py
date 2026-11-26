@@ -8370,6 +8370,9 @@ def test_dashboard_triage_client_error_tickets_and_banner_ui(
             'id="triage-copy-prompt-btn"',
             'id="triage-dismiss-btn"',
             "ANTI_SPAM_MS = 15000",
+            "return 8000;",
+            'id="retry-load-projects-btn"',
+            "🔄 Reintentar",
             "/api/telemetry/client-error",
             "/api/triage/tickets",
         ):

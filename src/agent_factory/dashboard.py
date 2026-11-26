@@ -8269,7 +8269,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (u.indexOf('/api/factory/assistant/message') >= 0) return 185000;
       if (/\\/(?:runtime\\/)?start\\b/.test(u)) return 180000;
       if (/\\/(modify|rollback|import|retry)\\b/.test(u)) return 120000;
-      return 30000;
+      return 8000;
     }
 
     async function apiFetch(url, options = {}) {
@@ -11951,11 +11951,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const listEl = document.getElementById('project-list');
         if (listEl && !state.projects.length) {
           listEl.innerHTML =
-            '<div class="empty-box" role="alert">No se pudieron cargar los proyectos: ' +
-            escapeHtml(err && err.message ? err.message : 'Error de conexión') +
+            '<div class="empty-box" role="alert">' +
+              '<div style="margin-bottom:8px;">No se pudieron cargar los proyectos: ' +
+              escapeHtml(err && err.message ? err.message : 'Error de conexión') +
+              '</div>' +
+              '<button id="retry-load-projects-btn" class="btn btn-primary btn-sm" type="button">🔄 Reintentar</button>' +
             '</div>';
+          const retryBtn = document.getElementById('retry-load-projects-btn');
+          if (retryBtn) retryBtn.addEventListener('click', () => { loadProjects(); });
         }
-        setNote('Error de conexión: ' + err.message, 'err');
+        setNote('Error de conexión: ' + (err && err.message ? err.message : 'Error de conexión'), 'err');
       }
     }
 
@@ -14366,7 +14371,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
 
       window.refreshLiwiRadarIdeas = loadIdeas;
+      try {
       loadIdeas();
+      } catch (_) {}
     })();
 
     (function initAutonomousAndProjectIdeas() {
@@ -14801,8 +14808,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       window.loadProjectIdeasFor = loadProjectIdeasFor;
       window.renderProjectIdeasTab = renderProjectIdeasTab;
       window.pollAutonomousStatus = pollAutonomousStatus;
-      pollAutonomousStatus();
-      setInterval(pollAutonomousStatus, 12000);
+      try { pollAutonomousStatus(); } catch (_) {}
+      setInterval(() => { try { pollAutonomousStatus(); } catch (_) {} }, 12000);
     })();
 
     (function initClientTriageSensorAndBanner() {
@@ -14942,15 +14949,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         });
       }
 
-      refreshTriageTickets();
-      setInterval(refreshTriageTickets, 15000);
+      window.loadTriageTickets = refreshTriageTickets;
+      try { refreshTriageTickets(); } catch (_) {}
+      setInterval(() => { try { refreshTriageTickets(); } catch (_) {} }, 15000);
     })();
 
     setInterval(updateLiveTimers, 1000);
     setInterval(() => {
-      loadProjects();
+      try { loadProjects(); } catch (_) {}
     }, 5000);
-    loadProjects();
+    try { loadProjects(); } catch (err) {
+      const listEl = document.getElementById('project-list');
+      if (listEl && !state.projects.length) {
+        listEl.innerHTML = '<div class="empty-box" role="alert"><div style="margin-bottom:8px;">Error iniciando vista de proyectos.</div><button id="retry-load-projects-btn" class="btn btn-primary btn-sm" type="button">🔄 Reintentar</button></div>';
+        const rBtn = document.getElementById('retry-load-projects-btn');
+        if (rBtn) rBtn.addEventListener('click', () => { loadProjects(); });
+      }
+    }
   </script>
 </body>
 </html>
