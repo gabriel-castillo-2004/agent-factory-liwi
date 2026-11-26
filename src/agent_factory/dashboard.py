@@ -2577,97 +2577,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       word-break: break-word;
       color: var(--text);
     }
-    .factory-chat-modal {
-      max-width: 780px;
-      width: 94vw;
-      max-height: 86vh;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
-    .factory-chat-head {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-      border-bottom: 1px solid var(--border);
-      padding-bottom: 10px;
-    }
-    .factory-memory-panel {
-      background: var(--surface-alt);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 10px 12px;
-      max-height: 180px;
-      overflow-y: auto;
-      font-size: 0.84rem;
-    }
-    .factory-memory-item {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 8px;
-      padding: 4px 0;
-      border-bottom: 1px dashed var(--border);
-    }
-    .factory-memory-item:last-child {
-      border-bottom: none;
-    }
-    .factory-chat-stream {
-      flex: 1 1 auto;
-      min-height: 240px;
-      max-height: 46vh;
-      overflow-y: auto;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-      padding: 10px;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-    }
-    .factory-proposal-card {
-      margin-top: 8px;
-      padding: 10px;
-      border-radius: 8px;
-      background: var(--surface-alt);
-      border: 1px solid var(--border);
-    }
-    .factory-paste-previews {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-      align-items: center;
-    }
-    .factory-paste-chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 8px;
-      border-radius: 6px;
-      background: var(--surface-alt);
-      border: 1px solid var(--border);
-      font-size: 0.78rem;
-    }
-    .factory-paste-chip img {
-      width: 28px;
-      height: 28px;
-      object-fit: cover;
-      border-radius: 4px;
-    }
-    .factory-chat-thumbs {
-      display: flex;
-      gap: 6px;
-      flex-wrap: wrap;
-      margin-top: 6px;
-    }
-    .factory-chat-thumbs img {
-      max-width: 140px;
-      max-height: 90px;
-      border-radius: 6px;
-      border: 1px solid var(--border);
-    }
     @keyframes factory-pulse {
       0%, 100% { box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.35); }
       50% { box-shadow: 0 0 0 6px rgba(56, 189, 248, 0); }
@@ -4505,6 +4414,405 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       padding: 6px 10px;
       line-height: 1.4;
     }
+    /* Minimalist Liwi Chat ("Mejorar Fábrica") */
+    #factory-improve-modal {
+      padding: 12px;
+      background: rgba(2, 6, 23, 0.8);
+      backdrop-filter: blur(6px);
+    }
+    #factory-improve-modal .factory-chat-modal {
+      width: 96vw;
+      max-width: 1320px;
+      height: 94vh;
+      max-height: 94dvh;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      overflow: hidden;
+      overflow-x: hidden;
+      box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
+    }
+    .factory-chat-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 24px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+      background: var(--bg);
+      flex-shrink: 0;
+      min-width: 0;
+    }
+    .factory-chat-head-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+      flex-wrap: wrap;
+    }
+    .factory-chat-title {
+      margin: 0;
+      font-size: 1.05rem;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      color: var(--text);
+    }
+    .factory-close-btn {
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--muted);
+      border-radius: 9999px;
+      padding: 6px 12px;
+      font-size: 0.84rem;
+      font-weight: 500;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+      transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+    }
+    .factory-close-btn:hover {
+      background: var(--surface-alt);
+      color: var(--text);
+      border-color: var(--border);
+    }
+    .factory-chat-meta-col {
+      max-width: 800px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 0 20px;
+      box-sizing: border-box;
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .factory-memory-panel {
+      margin-top: 10px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 14px;
+      max-height: 190px;
+      overflow-y: auto;
+      font-size: 0.85rem;
+    }
+    .factory-memory-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 0;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+    }
+    .factory-memory-item:last-child {
+      border-bottom: none;
+    }
+    .factory-chat-meta-col .factory-progress-card {
+      margin-top: 10px;
+      border-radius: 12px;
+    }
+    .factory-chat-stream {
+      flex: 1 1 auto;
+      min-height: 0;
+      max-width: 800px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 24px 20px 32px;
+      box-sizing: border-box;
+      overflow-y: auto;
+      overflow-x: hidden;
+      display: flex;
+      flex-direction: column;
+      gap: 22px;
+      background: transparent;
+      border: none;
+      border-radius: 0;
+      scrollbar-width: thin;
+    }
+    .factory-chat-empty {
+      margin: auto;
+      text-align: center;
+      color: var(--muted);
+      font-size: 1rem;
+      line-height: 1.6;
+      max-width: 480px;
+      padding: 24px 12px;
+    }
+    .factory-msg {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      max-width: 100%;
+    }
+    .factory-msg-user {
+      align-self: flex-end;
+      max-width: min(78%, 600px);
+      background: var(--surface-alt);
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      border-radius: 20px 20px 6px 20px;
+      padding: 12px 18px;
+      font-size: 15px;
+      line-height: 1.6;
+      color: var(--text);
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .factory-msg-assistant {
+      align-self: stretch;
+      width: 100%;
+      background: transparent;
+      border: none;
+      border-radius: 0;
+      padding: 4px 0;
+      font-size: 15.5px;
+      line-height: 1.65;
+      color: var(--text);
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .factory-msg-role {
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--muted);
+      margin-bottom: 6px;
+      letter-spacing: 0.01em;
+    }
+    .factory-msg-body p {
+      margin: 0 0 10px;
+    }
+    .factory-msg-body p:last-child {
+      margin-bottom: 0;
+    }
+    .factory-msg-body ul,
+    .factory-msg-body ol {
+      margin: 6px 0 10px;
+      padding-left: 20px;
+    }
+    .factory-msg-body pre {
+      overflow-x: auto;
+      max-width: 100%;
+    }
+    .factory-proposal-card {
+      margin-top: 14px;
+      padding: 14px 16px;
+      border-radius: 12px;
+      background: var(--surface);
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .factory-proposal-title {
+      font-size: 0.92rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .factory-proposal-card .doctor-prompt-pre {
+      margin: 0;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: var(--surface-alt);
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      font-size: 0.83rem;
+      line-height: 1.5;
+      max-height: 220px;
+      overflow-y: auto;
+    }
+    .factory-proposal-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+    }
+    .factory-chat-thumbs {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+    .factory-chat-thumbs img {
+      max-width: 150px;
+      max-height: 96px;
+      border-radius: 8px;
+      border: 1px solid rgba(148, 163, 184, 0.2);
+    }
+    .factory-composer-wrap {
+      flex-shrink: 0;
+      width: 100%;
+      padding: 8px 20px 18px;
+      box-sizing: border-box;
+      background: var(--bg);
+    }
+    .factory-composer-inner {
+      max-width: 800px;
+      width: 100%;
+      margin: 0 auto;
+      box-sizing: border-box;
+    }
+    .factory-composer-capsule {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 26px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.16);
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .factory-composer-capsule:focus-within {
+      border-color: var(--accent);
+      box-shadow: 0 4px 22px rgba(56, 189, 248, 0.12);
+    }
+    .factory-paste-previews {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+      padding: 2px 6px 8px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+    }
+    .factory-paste-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 8px 3px 4px;
+      border-radius: 10px;
+      background: var(--surface-alt);
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      font-size: 0.76rem;
+      max-width: 200px;
+    }
+    .factory-paste-chip img {
+      width: 34px;
+      height: 34px;
+      object-fit: cover;
+      border-radius: 7px;
+      flex-shrink: 0;
+    }
+    .factory-paste-chip-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+    .factory-composer-row {
+      display: flex;
+      align-items: flex-end;
+      gap: 8px;
+      min-width: 0;
+    }
+    .factory-attach-icon-btn {
+      width: 36px;
+      height: 36px;
+      border-radius: 9999px;
+      flex-shrink: 0;
+      border: none;
+      background: transparent;
+      color: var(--muted);
+      font-size: 1.05rem;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: background 0.15s ease, color 0.15s ease;
+    }
+    .factory-attach-icon-btn:hover:not(:disabled) {
+      background: var(--surface-alt);
+      color: var(--text);
+    }
+    .factory-attach-icon-btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .factory-composer-textarea {
+      flex: 1 1 auto;
+      min-width: 0;
+      width: 100%;
+      border: none;
+      background: transparent;
+      color: var(--text);
+      font-family: inherit;
+      font-size: 15px;
+      line-height: 1.5;
+      padding: 6px 4px;
+      margin: 0;
+      resize: none;
+      outline: none;
+      box-shadow: none;
+      max-height: 180px;
+      overflow-y: hidden;
+      box-sizing: border-box;
+    }
+    .factory-composer-textarea::placeholder {
+      color: var(--muted);
+    }
+    .factory-send-circle-btn {
+      width: 36px;
+      height: 36px;
+      border-radius: 9999px;
+      flex-shrink: 0;
+      border: none;
+      background: var(--accent);
+      color: var(--btn-primary-fg);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.05rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background 0.15s ease, opacity 0.15s ease, transform 0.1s ease;
+    }
+    .factory-send-circle-btn:hover:not(:disabled) {
+      background: var(--accent-hover);
+      transform: translateY(-1px);
+    }
+    .factory-send-circle-btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      transform: none;
+    }
+    .factory-inline-status {
+      min-height: 16px;
+      font-size: 0.78rem;
+      padding: 5px 14px 0;
+      color: var(--muted);
+    }
+    @media (max-width: 720px) {
+      #factory-improve-modal {
+        padding: 0;
+        align-items: stretch;
+      }
+      #factory-improve-modal .factory-chat-modal {
+        width: 100vw;
+        max-width: 100vw;
+        height: 100dvh;
+        max-height: 100dvh;
+        border-radius: 0;
+        border: none;
+      }
+      .factory-chat-head {
+        padding: 12px 14px;
+      }
+      .factory-chat-meta-col {
+        padding: 0 12px;
+      }
+      .factory-chat-stream {
+        padding: 16px 14px 20px;
+        gap: 18px;
+      }
+      .factory-composer-wrap {
+        padding: 8px 12px 12px;
+      }
+      .factory-msg-user {
+        max-width: 88%;
+      }
+    }
   </style>
 </head>
 <body>
@@ -4665,40 +4973,44 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div id="factory-improve-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="factory-improve-title" style="display:none">
       <div class="modal-card factory-chat-modal">
         <div class="factory-chat-head">
-          <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-            <h3 id="factory-improve-title" style="margin:0;">🏭 Mejorar Fábrica (Liwi)</h3>
+          <div class="factory-chat-head-left">
+            <h3 id="factory-improve-title" class="factory-chat-title">Liwi</h3>
             <button id="factory-memory-toggle" type="button" class="model-pill" aria-expanded="false" aria-controls="factory-memory-panel">🧠 Memoria de Liwi (0)</button>
           </div>
-          <button id="close-factory-improve-btn" class="btn btn-sm" type="button" aria-label="Cerrar chat de auto-mejora">✕</button>
+          <button id="close-factory-improve-btn" class="factory-close-btn" type="button" aria-label="Cerrar / Volver">✕ Cerrar</button>
         </div>
-        <div id="factory-memory-panel" class="factory-memory-panel" style="display:none"></div>
-        <div id="factory-progress-card" class="factory-progress-card" style="display:none" role="status" aria-live="polite">
-          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
-            <strong id="factory-progress-title" style="font-size:0.88rem;">🔨 Construyendo mejora...</strong>
-            <span id="factory-progress-timer" class="live-activity-timer">00:00</span>
+        <div class="factory-chat-meta-col">
+          <div id="factory-memory-panel" class="factory-memory-panel" style="display:none"></div>
+          <div id="factory-progress-card" class="factory-progress-card" style="display:none" role="status" aria-live="polite">
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+              <strong id="factory-progress-title" style="font-size:0.88rem;">🔨 Construyendo mejora...</strong>
+              <span id="factory-progress-timer" class="live-activity-timer">00:00</span>
+            </div>
+            <div class="factory-steps-bar">
+              <div class="factory-step-pill" data-fstep="1">1/3 · Editar IA</div>
+              <div class="factory-step-pill" data-fstep="2">2/3 · Ruff + Pytest</div>
+              <div class="factory-step-pill" data-fstep="3">3/3 · Commit + Reinicio</div>
+            </div>
+            <div id="factory-progress-detail" class="muted" style="font-size:0.8rem;"></div>
           </div>
-          <div class="factory-steps-bar">
-            <div class="factory-step-pill" data-fstep="1">1/3 · Editar IA</div>
-            <div class="factory-step-pill" data-fstep="2">2/3 · Ruff + Pytest</div>
-            <div class="factory-step-pill" data-fstep="3">3/3 · Commit + Reinicio</div>
-          </div>
-          <div id="factory-progress-detail" class="muted" style="font-size:0.8rem;"></div>
         </div>
         <div id="factory-chat-stream" class="factory-chat-stream">
-          <div class="muted">Cargando historial del asistente...</div>
+          <div class="factory-chat-empty">Cargando historial del asistente...</div>
         </div>
-        <div id="factory-paste-previews" class="factory-paste-previews"></div>
-        <form id="factory-chat-form" style="display:flex; flex-direction:column; gap:8px;">
-          <textarea id="factory-chat-input" class="input-field" rows="3" placeholder="Consulta o describe una mejora para Liwi (puedes pegar capturas con Ctrl+V)..."></textarea>
-          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
-            <div style="display:flex; align-items:center; gap:8px;">
-              <input id="factory-image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple style="display:none" />
-              <button id="factory-attach-btn" class="btn btn-sm" type="button">📎 Adjuntar / Ctrl+V captura</button>
-              <span id="factory-inline-status" class="muted" style="font-size:0.8rem;"></span>
-            </div>
-            <button id="factory-chat-send-btn" class="btn btn-primary btn-sm" type="submit">Consultar a Liwi</button>
+        <div class="factory-composer-wrap">
+          <div class="factory-composer-inner">
+            <form id="factory-chat-form" class="factory-composer-capsule">
+              <div id="factory-paste-previews" class="factory-paste-previews" style="display:none"></div>
+              <div class="factory-composer-row">
+                <input id="factory-image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple style="display:none" />
+                <button id="factory-attach-btn" class="factory-attach-icon-btn" type="button" title="Adjuntar captura (o Ctrl+V)" aria-label="Adjuntar captura">📎</button>
+                <textarea id="factory-chat-input" class="factory-composer-textarea" rows="1" placeholder="Escribe a Liwi... (puedes pegar capturas con Ctrl+V)"></textarea>
+                <button id="factory-chat-send-btn" class="factory-send-circle-btn" type="submit" title="Enviar mensaje" aria-label="Enviar mensaje">↑</button>
+              </div>
+            </form>
+            <div id="factory-inline-status" class="factory-inline-status" role="status" aria-live="polite"></div>
           </div>
-        </form>
+        </div>
       </div>
     </div>
 
@@ -10060,11 +10372,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }, 1200);
       }
 
+      function autoResizeFactoryInput() {
+        if (!inputEl) return;
+        inputEl.style.height = 'auto';
+        const maxH = 180;
+        const sh = inputEl.scrollHeight || 0;
+        if (sh > 0) {
+          inputEl.style.height = Math.min(sh, maxH) + 'px';
+          inputEl.style.overflowY = sh > maxH ? 'auto' : 'hidden';
+        } else {
+          inputEl.style.overflowY = 'hidden';
+        }
+      }
+
       function renderPreviews() {
+        if (!previewsEl) return;
+        previewsEl.style.display = pendingImages.length ? 'flex' : 'none';
         previewsEl.innerHTML = pendingImages.map((img, idx) =>
           '<span class="factory-paste-chip">' +
             '<img src="' + escapeHtml(img.previewUrl) + '" alt="' + escapeHtml(img.filename) + '" />' +
-            '<span>' + escapeHtml(img.filename) + '</span>' +
+            '<span class="factory-paste-chip-name">' + escapeHtml(img.filename) + '</span>' +
             '<button type="button" class="btn-icon" data-rm-paste="' + idx + '" aria-label="Quitar captura">✕</button>' +
           '</span>'
         ).join('');
@@ -10130,14 +10457,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       function renderMessages(msgs) {
         const list = Array.isArray(msgs) ? msgs : [];
         if (!list.length) {
-          streamEl.innerHTML = '<div class="muted">Pregúntale a Liwi cómo funciona la fábrica o describe una mejora que quieras proponer y verificar.</div>';
+          streamEl.innerHTML = '<div class="factory-chat-empty">¿Qué quieres consultar o mejorar en Liwi?</div>';
           return;
         }
         const isLocked = !!(applyInFlight || activeStatus.running);
         streamEl.innerHTML = list.map((m) => {
           const isUser = m.role === 'user';
-          const cls = isUser ? 'chat-msg user' : 'chat-msg auditor';
-          const who = isUser ? 'Tú' : 'Liwi';
+          const cls = isUser ? 'factory-msg factory-msg-user' : 'factory-msg factory-msg-assistant';
           const imgs = Array.isArray(m.image_urls) ? m.image_urls : [];
           const thumbs = imgs.length
             ? '<div class="factory-chat-thumbs">' + imgs.map((u) => '<img src="' + escapeHtml(String(u)) + '" alt="Captura adjunta" />').join('') + '</div>'
@@ -10147,14 +10473,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const isApplied = m.status === 'applied';
             const applyLabel = isApplied ? '✓ Mejora aplicada' : '✨ Aplicar mejora a Liwi';
             propHtml = '<div class="factory-proposal-card">' +
-              '<div style="font-weight:600; margin-bottom:4px;">Propuesta: ' + escapeHtml(String(m.proposal_title || 'Auto-mejora')) + '</div>' +
+              '<div class="factory-proposal-title">Propuesta: ' + escapeHtml(String(m.proposal_title || 'Auto-mejora')) + '</div>' +
               '<pre class="doctor-prompt-pre">' + escapeHtml(String(m.proposal_prompt)) + '</pre>' +
-              '<button type="button" class="btn btn-primary btn-sm" data-apply-factory-proposal="1" data-applied="' + (isApplied ? '1' : '0') + '" data-msg-id="' + escapeHtml(String(m.id || '')) + '" data-prop-title="' + escapeHtml(String(m.proposal_title || '')) + '"' + ((isApplied || isLocked) ? ' disabled' : '') + '>' + applyLabel + '</button>' +
+              '<div class="factory-proposal-actions">' +
+                '<button type="button" class="btn btn-primary btn-sm" data-apply-factory-proposal="1" data-applied="' + (isApplied ? '1' : '0') + '" data-msg-id="' + escapeHtml(String(m.id || '')) + '" data-prop-title="' + escapeHtml(String(m.proposal_title || '')) + '"' + ((isApplied || isLocked) ? ' disabled' : '') + '>' + applyLabel + '</button>' +
+              '</div>' +
             '</div>';
           }
+          const roleHtml = isUser ? '' : '<div class="factory-msg-role">Liwi</div>';
           return '<div class="' + cls + '">' +
-            '<div class="chat-msg-head"><strong>' + who + '</strong></div>' +
-            '<div class="chat-msg-body">' + renderSafeMarkdown(String(m.content || ''), 'simple').html + '</div>' +
+            roleHtml +
+            '<div class="factory-msg-body">' + renderSafeMarkdown(String(m.content || ''), 'simple').html + '</div>' +
             thumbs +
             propHtml +
           '</div>';
@@ -10243,6 +10572,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         if (prefillText && inputEl) {
           inputEl.value = prefillText;
         }
+        autoResizeFactoryInput();
         refreshHistory();
         pollFactoryStatus();
         if (inputEl && !applyInFlight && !activeStatus.running) inputEl.focus();
@@ -10262,6 +10592,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       modal.addEventListener('click', (ev) => {
         if (ev.target === modal) modal.style.display = 'none';
       });
+      if (inputEl) {
+        inputEl.addEventListener('input', autoResizeFactoryInput);
+        inputEl.addEventListener('keydown', (ev) => {
+          if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing && ev.keyCode !== 229) {
+            ev.preventDefault();
+            if (formEl && typeof formEl.requestSubmit === 'function') {
+              formEl.requestSubmit();
+            } else if (formEl) {
+              formEl.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+            }
+          }
+        });
+      }
       if (memToggle) {
         memToggle.addEventListener('click', () => {
           const open = memPanel.style.display !== 'none';
@@ -10295,7 +10638,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             return;
           }
           sendBtn.disabled = true;
-          sendBtn.textContent = 'Consultando...';
+          sendBtn.textContent = '…';
+          sendBtn.setAttribute('aria-busy', 'true');
           if (statusEl) statusEl.textContent = 'Analizando src/agent_factory/ en modo lectura...';
           try {
             const payloadImages = pendingImages.map((im) => ({
@@ -10308,7 +10652,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               timeoutMs: 185000,
               body: JSON.stringify({ message: msgTxt, images: payloadImages }),
             });
-            if (inputEl) inputEl.value = '';
+            if (inputEl) {
+              inputEl.value = '';
+              autoResizeFactoryInput();
+            }
             pendingImages = [];
             renderPreviews();
             if (statusEl) statusEl.textContent = '';
@@ -10319,7 +10666,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             if (!applyInFlight && !activeStatus.running) {
               sendBtn.disabled = false;
             }
-            sendBtn.textContent = 'Consultar a Liwi';
+            sendBtn.textContent = '↑';
+            sendBtn.removeAttribute('aria-busy');
           }
         });
       }

@@ -5809,3 +5809,189 @@ def test_dashboard_questions_chat_clean_layout_collapse_relative_paths_and_noise
         if thread.is_alive():
             thread.join(timeout=2.0)
         store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_liwi_chat_minimalist_redesign_and_contract_compatibility(
+    tmp_path: Path,
+) -> None:
+    """Liwi chat modal uses minimalist full-height 800px centered layout, clean header, borderless stream, and capsule composer while preserving all IDs/endpoints."""
+    import re
+
+    store = SqliteEventStore(str(tmp_path / "liwi_minimal_ui.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as resp:
+            assert resp.status == 200
+            html = resp.read().decode("utf-8")
+
+        # 1. All existing HTML IDs, data-* hooks, and API endpoints remain intact
+        required_ids = [
+            "improve-factory-btn",
+            "factory-build-banner",
+            "factory-build-banner-title",
+            "factory-build-banner-detail",
+            "factory-build-banner-timer",
+            "factory-restart-banner",
+            "factory-improve-modal",
+            "factory-improve-title",
+            "factory-memory-toggle",
+            "factory-memory-panel",
+            "close-factory-improve-btn",
+            "factory-progress-card",
+            "factory-progress-title",
+            "factory-progress-timer",
+            "factory-progress-detail",
+            "factory-chat-stream",
+            "factory-paste-previews",
+            "factory-chat-form",
+            "factory-chat-input",
+            "factory-image-input",
+            "factory-attach-btn",
+            "factory-inline-status",
+            "factory-chat-send-btn",
+        ]
+        for dom_id in required_ids:
+            assert f'id="{dom_id}"' in html, f"Missing required DOM id: {dom_id}"
+
+        required_endpoints = [
+            "/api/factory/assistant/history",
+            "/api/factory/assistant/status",
+            "/api/factory/assistant/message",
+            "/api/factory/assistant/apply",
+            "/api/factory/assistant/memory/",
+        ]
+        for ep in required_endpoints:
+            assert ep in html, f"Missing required endpoint: {ep}"
+
+        assert "data-apply-factory-proposal" in html
+        assert "data-open-factory-improve" in html
+        assert "addEventListener('paste'" in html
+
+        # 2. Expanded near-fullscreen container + centered 800px column + clean top-right close button
+        assert "#factory-improve-modal .factory-chat-modal" in html
+        modal_css_start = html.index("#factory-improve-modal .factory-chat-modal")
+        modal_css_end = html.index("</style>", modal_css_start)
+        liwi_css = html[modal_css_start:modal_css_end]
+
+        assert "max-width: 800px;" in liwi_css
+        assert "width: 100%;" in liwi_css
+        assert "margin: 0 auto;" in liwi_css
+        assert "94dvh" in liwi_css or "94vh" in liwi_css or "96vh" in liwi_css
+        assert "overflow-x: hidden;" in liwi_css
+
+        # 3. Clean header: ONLY title "Liwi", collapsible "🧠 Memoria de Liwi" pill, and top-right Close/Back button (no filler/subtitles)
+        modal_html_start = html.index('<div id="factory-improve-modal"')
+        modal_html_end = html.index('<section class="panel" id="detail-panel">', modal_html_start)
+        modal_html = html[modal_html_start:modal_html_end]
+
+        head_match = re.search(
+            r'<div class="factory-chat-head">(.*?)</div>\s*<div class="factory-chat-meta-col"',
+            modal_html,
+            re.DOTALL,
+        )
+        assert head_match is not None, "Expected clean .factory-chat-head block"
+        head_html = head_match.group(1)
+
+        title_match = re.search(
+            r'<h3 id="factory-improve-title"[^>]*>(.*?)</h3>',
+            head_html,
+            re.DOTALL,
+        )
+        assert title_match is not None
+        assert title_match.group(1).strip() == "Liwi"
+        assert 'id="factory-memory-toggle"' in head_html
+        assert "🧠 Memoria de Liwi" in head_html
+        assert 'id="close-factory-improve-btn"' in head_html
+        assert "Cerrar" in head_html or "Volver" in head_html
+        assert "<p" not in head_html
+        assert "<small" not in head_html
+        assert "Mejorar Fábrica (Liwi)" not in head_html
+
+        # 4. Borderless history stream, right-aligned subtle user bubble, clean Liwi replies with comfortable typography & light proposal cards
+        stream_css_match = re.search(r"\.factory-chat-stream\s*\{([^}]*)\}", liwi_css)
+        assert stream_css_match is not None
+        stream_css = stream_css_match.group(1)
+        assert "border: none;" in stream_css
+        assert "background: transparent;" in stream_css
+        assert "max-width: 800px;" in stream_css
+
+        user_msg_match = re.search(r"\.factory-msg-user\s*\{([^}]*)\}", liwi_css)
+        assert user_msg_match is not None
+        user_msg_css = user_msg_match.group(1)
+        assert "align-self: flex-end;" in user_msg_css
+        assert "border-radius:" in user_msg_css
+
+        assistant_msg_match = re.search(r"\.factory-msg-assistant\s*\{([^}]*)\}", liwi_css)
+        assert assistant_msg_match is not None
+        assistant_msg_css = assistant_msg_match.group(1)
+        assert "background: transparent;" in assistant_msg_css
+        assert "border: none;" in assistant_msg_css
+        assert "line-height: 1.65;" in assistant_msg_css
+        assert "font-size: 15.5px;" in assistant_msg_css or "font-size: 15px;" in assistant_msg_css or "font-size: 16px;" in assistant_msg_css
+
+        assert ".factory-proposal-card" in liwi_css
+        assert "✨ Aplicar mejora a Liwi" in html
+
+        # 5. Single rounded capsule input bar: previews on top (hidden when empty), 📎 left, borderless auto-resizing textarea center, circular ↑ right, Enter/Shift+Enter handling
+        form_match = re.search(
+            r'<form id="factory-chat-form"[^>]*>(.*?)</form>',
+            modal_html,
+            re.DOTALL,
+        )
+        assert form_match is not None
+        form_html = form_match.group(1)
+
+        previews_pos = form_html.find('id="factory-paste-previews"')
+        attach_pos = form_html.find('id="factory-attach-btn"')
+        input_pos = form_html.find('id="factory-chat-input"')
+        send_pos = form_html.find('id="factory-chat-send-btn"')
+        assert previews_pos >= 0, "Expected #factory-paste-previews integrated at top of capsule form"
+        assert attach_pos > previews_pos
+        assert input_pos > attach_pos
+        assert send_pos > input_pos
+
+        assert 'id="factory-paste-previews" class="factory-paste-previews" style="display:none"' in form_html
+        attach_btn_match = re.search(
+            r'<button id="factory-attach-btn"[^>]*>(.*?)</button>',
+            form_html,
+            re.DOTALL,
+        )
+        assert attach_btn_match is not None
+        assert attach_btn_match.group(1).strip() == "📎"
+
+        send_btn_match = re.search(
+            r'<button id="factory-chat-send-btn"[^>]*>(.*?)</button>',
+            form_html,
+            re.DOTALL,
+        )
+        assert send_btn_match is not None
+        assert send_btn_match.group(1).strip() == "↑"
+
+        assert 'rows="1"' in form_html
+        assert ".factory-composer-capsule" in liwi_css
+        assert "border-radius: 26px;" in liwi_css or "border-radius: 24px;" in liwi_css
+        assert ".factory-composer-textarea" in liwi_css
+        assert ".factory-send-circle-btn" in liwi_css
+        assert "border-radius: 9999px;" in liwi_css or "border-radius: 50%;" in liwi_css
+
+        init_js_start = html.index("(function initFactoryImproverModal()")
+        init_js_end = html.index("setInterval(updateLiveTimers", init_js_start)
+        init_js = html[init_js_start:init_js_end]
+
+        assert "autoResizeFactoryInput" in init_js
+        assert "inputEl.scrollHeight" in init_js
+        assert "ev.key === 'Enter'" in init_js
+        assert "!ev.shiftKey" in init_js
+        assert "!ev.isComposing" in init_js
+        assert "previewsEl.style.display = pendingImages.length ? 'flex' : 'none'" in init_js
+        assert "sendBtn.textContent = '↑'" in init_js
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
