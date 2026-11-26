@@ -6612,4 +6612,180 @@ def test_dashboard_mobile_responsive_overflow_containment_and_header(
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_mobile_responsive_step2a_cards_doctor_tabs_overflow_and_antizoom(
+    tmp_path: Path,
+) -> None:
+    """Step 2A mobile audit: project cards, Doctor alert/pills containment, action buttons/tabs/audit split, and 16px anti-zoom inputs strictly inside @media (max-width: 768px)."""
+    store = SqliteEventStore(str(tmp_path / "mobile_step2a.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as resp:
+            assert resp.status == 200
+            html = resp.read().decode("utf-8")
+
+        # e) Zero external CDNs and existing HTML IDs/labels preserved
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+        for dom_id in (
+            "detail-title",
+            "edit-title-btn",
+            "detail-time",
+            "detail-badge",
+            "tab-audit-btn",
+            "tab-modify-btn",
+            "tab-spec-btn",
+            "tab-events-btn",
+            "audit-quick-audit-btn",
+            "audit-more-actions-btn",
+            "new-project-input",
+            "edit-title-input",
+        ):
+            assert f'id="{dom_id}"' in html, f"Missing existing HTML id: {dom_id}"
+
+        style_start = html.index("<style>") + len("<style>")
+        style_end = html.index("</style>", style_start)
+        css = html[style_start:style_end]
+
+        media_768 = _extract_css_block(css, "@media (max-width: 768px)")
+        assert media_768, "Expected @media (max-width: 768px) block in dashboard CSS"
+
+        # a) Project cards: 1.2rem title with line-height 1.25 + overflow-wrap: anywhere,
+        #    flex row for edit button & Actualizado date with gap 8px and no empty break,
+        #    and badge/status rows wrapping with gap 6px.
+        step2a_title_rule = _extract_css_block(media_768, "#detail-panel #detail-title")
+        assert step2a_title_rule, "Expected Step 2A project title rule inside @media (max-width: 768px)"
+        assert ".detail-header-group .detail-title" in media_768
+        assert ".project-card .card-title" in media_768
+        assert "font-size: 1.2rem;" in step2a_title_rule
+        assert "line-height: 1.25;" in step2a_title_rule
+        assert "overflow-wrap: anywhere;" in step2a_title_rule
+
+        header_group_rule = _extract_css_block(media_768, ".detail-header-group {")
+        assert header_group_rule, "Expected .detail-header-group rule inside @media (max-width: 768px)"
+        assert "display: flex;" in header_group_rule
+        assert "align-items: center;" in header_group_rule
+        assert "justify-content: space-between;" in header_group_rule
+        assert "gap: 8px;" in header_group_rule
+
+        edit_btn_rule = _extract_css_block(media_768, "#edit-title-btn {")
+        assert edit_btn_rule
+        assert "margin: 0;" in edit_btn_rule
+
+        detail_time_rule = _extract_css_block(media_768, "#detail-time {")
+        assert detail_time_rule
+        assert "margin: 0 0 0 auto !important;" in detail_time_rule
+
+        badge_rows_rule = _extract_css_block(media_768, ".project-card .card-header")
+        assert badge_rows_rule, "Expected badge/status rows rule inside @media (max-width: 768px)"
+        for badge_row_sel in (
+            ".detail-header-status",
+            ".model-usage-row",
+            ".plan-meta",
+            ".round-meta",
+            ".timeline-title-group",
+        ):
+            assert badge_row_sel in media_768
+        assert "flex-wrap: wrap;" in badge_rows_rule
+        assert "gap: 6px;" in badge_rows_rule
+
+        # b) 'Se requiere atención' alert and 'Agente Doctor / Diagnóstico' pills + text containment
+        doctor_badges_rule = _extract_css_block(media_768, ".doctor-recovery-badges {")
+        assert doctor_badges_rule, "Expected .doctor-recovery-badges rule inside @media (max-width: 768px)"
+        assert "flex-wrap: wrap;" in doctor_badges_rule
+        assert "gap: 6px;" in doctor_badges_rule
+        assert "max-width: 100%;" in doctor_badges_rule
+        assert "min-width: 0;" in doctor_badges_rule
+
+        doctor_pills_rule = _extract_css_block(media_768, ".doctor-recovery-badges .model-pill")
+        assert doctor_pills_rule, "Expected Doctor pills wrap rule inside @media (max-width: 768px)"
+        assert ".doctor-recovery-badges .test-badge" in media_768
+        assert "max-width: 100%;" in doctor_pills_rule
+        assert "overflow-wrap: anywhere;" in doctor_pills_rule
+
+        doctor_diag_rule = _extract_css_block(media_768, ".guidance-banner.banner-err,")
+        assert doctor_diag_rule, "Expected alert & Doctor diagnostic containment rule inside @media (max-width: 768px)"
+        for diag_sel in (
+            ".guidance-banner.banner-err .banner-desc",
+            ".doctor-recovery-card",
+            ".doctor-recovery-card .round-summary",
+            ".doctor-prompt-box",
+        ):
+            assert diag_sel in media_768
+        assert "max-width: 100%;" in doctor_diag_rule
+        assert "min-width: 0;" in doctor_diag_rule
+        assert "overflow-wrap: anywhere;" in doctor_diag_rule
+        assert "word-break: break-word;" in doctor_diag_rule
+
+        # c) Action buttons, tabs, audit subtabs, and 'Auditar código' + '▾' split group
+        banner_actions_rule = _extract_css_block(media_768, ".banner-actions {")
+        assert banner_actions_rule, "Expected .banner-actions wrap rule inside @media (max-width: 768px)"
+        assert "flex-wrap: wrap;" in banner_actions_rule
+
+        card_action_btns_rule = _extract_css_block(media_768, ".delivered-compact-actions .btn")
+        assert card_action_btns_rule
+        assert ".banner-actions .btn" in media_768
+        assert ".doctor-prompt-box .btn" in media_768
+        assert "min-height: 38px;" in card_action_btns_rule
+        assert "white-space: nowrap;" in card_action_btns_rule
+
+        tabs_rule = _extract_css_block(media_768, ".tabs {")
+        assert "overflow-x: auto;" in tabs_rule
+        assert "max-width: 100%;" in tabs_rule
+
+        tab_btn_rule = _extract_css_block(media_768, ".tab-btn {")
+        assert "min-height: 38px;" in tab_btn_rule
+        assert "white-space: nowrap;" in tab_btn_rule
+
+        audit_subtabs_rule = _extract_css_block(media_768, ".audit-subtabs {")
+        assert "overflow-x: auto;" in audit_subtabs_rule
+        assert "max-width: 100%;" in audit_subtabs_rule
+
+        audit_subtab_rule = _extract_css_block(media_768, ".audit-subtab {")
+        assert "min-height: 38px;" in audit_subtab_rule
+        assert "white-space: nowrap;" in audit_subtab_rule
+
+        audit_split_rule = _extract_css_block(media_768, ".audit-primary-split {")
+        assert "flex-wrap: wrap;" in audit_split_rule
+        assert "max-width: 100%;" in audit_split_rule
+        assert "min-width: 0;" in audit_split_rule
+
+        audit_btns_rule = _extract_css_block(media_768, ".audit-primary-split .btn")
+        assert "min-height: 38px;" in audit_btns_rule
+        assert "white-space: nowrap;" in audit_btns_rule
+
+        # d) Anti-zoom 16px for <input>, <textarea>, <select> strictly inside @media (max-width: 768px)
+        antizoom_rule = _extract_css_block(media_768, "input,\n      textarea,\n      select {")
+        assert antizoom_rule, "Expected input, textarea, select anti-zoom rule inside @media (max-width: 768px)"
+        assert "font-size: 16px;" in antizoom_rule
+
+        antizoom_fields_rule = _extract_css_block(media_768, "input.input-field,")
+        assert antizoom_fields_rule, "Expected .input-field/.input-inline anti-zoom override inside @media (max-width: 768px)"
+        assert "textarea.input-field" in media_768
+        assert "select.input-field" in media_768
+        assert "input.input-inline" in media_768
+        assert "font-size: 16px;" in antizoom_fields_rule
+
+        # e) Desktop (> 768px) CSS remains completely untouched
+        desktop_css = css.replace(media_768, "")
+        assert "font-size: 16px;" not in desktop_css
+        desktop_title = _extract_css_block(desktop_css, ".detail-title {")
+        assert "font-size: 1.35rem;" in desktop_title
+        assert "line-height: 1.3;" in desktop_title
+        desktop_input = _extract_css_block(desktop_css, ".input-field {")
+        assert "font-size: 0.92rem;" in desktop_input
+        desktop_doctor_badges = _extract_css_block(desktop_css, ".doctor-recovery-badges {")
+        assert "gap: 8px;" in desktop_doctor_badges
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+
 

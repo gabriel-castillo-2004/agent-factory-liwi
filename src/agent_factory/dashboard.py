@@ -4177,7 +4177,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         flex-wrap: wrap;
         align-items: center;
         justify-content: space-between;
-        gap: 0 8px;
+        gap: 8px;
         max-width: 100%;
         min-width: 0;
         margin-bottom: 10px;
@@ -4204,6 +4204,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         min-width: 0;
         font-size: 1.25rem;
         line-height: 1.25;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
+      #detail-panel #detail-title,
+      .detail-header-group .detail-title,
+      .project-card .card-title {
+        font-size: 1.2rem;
+        line-height: 1.25;
+        overflow-wrap: anywhere;
         word-break: break-word;
       }
       .detail-header-status {
@@ -4211,6 +4220,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         flex: 0 0 auto;
         max-width: 100%;
         margin-top: 2px;
+      }
+      .project-card .card-header,
+      .detail-header-status,
+      .model-usage-row,
+      .plan-meta,
+      .round-meta,
+      .timeline-title-group {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
       }
       #edit-title-form {
         order: 4;
@@ -4228,14 +4248,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        margin-top: 6px;
+        margin: 0;
         padding: 4px 8px;
       }
       #detail-time {
         order: 7;
         flex: 0 1 auto;
         min-width: 0;
-        margin: 6px 0 0 auto !important;
+        margin: 0 0 0 auto !important;
         text-align: right;
         white-space: nowrap;
         overflow: hidden;
@@ -4245,14 +4265,50 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         order: 8;
         flex: 1 0 100%;
         width: 100%;
-        margin: 8px 0 2px 0;
+        margin: 4px 0 2px 0;
       }
       .guidance-banner,
       .guidance-banner.delivered-compact,
       .delivered-compact-info,
       .delivered-compact-actions,
-      .local-controls-row,
+      .local-controls-row {
+        max-width: 100%;
+        min-width: 0;
+        box-sizing: border-box;
+      }
+      .guidance-banner.banner-err,
+      .guidance-banner.banner-err .banner-content,
+      .guidance-banner.banner-err .banner-body,
+      .guidance-banner.banner-err .banner-desc,
+      .doctor-recovery-card,
+      .doctor-recovery-card .round-summary,
+      .doctor-prompt-box {
+        max-width: 100%;
+        min-width: 0;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+        box-sizing: border-box;
+      }
+      .doctor-recovery-badges {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
+        max-width: 100%;
+        min-width: 0;
+      }
+      .doctor-recovery-badges .model-pill,
+      .doctor-recovery-badges .test-badge {
+        max-width: 100%;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
       .banner-actions {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
         max-width: 100%;
         min-width: 0;
         box-sizing: border-box;
@@ -4283,7 +4339,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       .local-controls-row .btn,
       #project-more-btn,
       #header-more-btn,
-      .banner-actions .btn {
+      .banner-actions .btn,
+      .doctor-prompt-box .btn {
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -4346,14 +4403,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         justify-content: center;
         flex: 0 0 auto;
         white-space: nowrap;
-        min-height: 36px;
+        min-height: 38px;
         padding: 5px 10px;
         font-size: 0.8rem;
         line-height: 1.2;
       }
       .audit-primary-split {
         display: inline-flex;
-        flex-wrap: nowrap;
+        flex-wrap: wrap;
         align-items: center;
         gap: 4px;
         max-width: 100%;
@@ -4375,6 +4432,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
       #audit-more-actions-btn {
         padding: 6px 10px;
+      }
+      input,
+      textarea,
+      select {
+        font-size: 16px;
+      }
+      input.input-field,
+      textarea.input-field,
+      select.input-field,
+      input.input-inline {
+        font-size: 16px;
       }
     }
     @media (max-width: 600px) {
