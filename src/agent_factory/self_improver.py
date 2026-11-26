@@ -33,7 +33,8 @@ if TYPE_CHECKING:
     from agent_factory.adapters.sqlite_store import SqliteEventStore
 
 DEFAULT_SELF_IMPROVE_CONSULT_TIMEOUT_SECONDS: float = 180.0
-DEFAULT_SELF_IMPROVE_TIMEOUT_SECONDS: float = 600.0
+DEFAULT_SELF_IMPROVE_APPLY_TIMEOUT_SECONDS: float = 900.0
+DEFAULT_SELF_IMPROVE_TIMEOUT_SECONDS: float = DEFAULT_SELF_IMPROVE_APPLY_TIMEOUT_SECONDS
 DEFAULT_RESTART_DELAY_SECONDS: float = 1.0
 MAX_UPLOAD_IMAGE_BYTES: int = 5 * 1024 * 1024
 MAX_UPLOAD_IMAGES_PER_MESSAGE: int = 4
@@ -305,7 +306,7 @@ class FactorySelfImprover:
         model: str | None = None,
         secrets_to_redact: Sequence[str] = (),
         consult_timeout_seconds: float = DEFAULT_SELF_IMPROVE_CONSULT_TIMEOUT_SECONDS,
-        apply_timeout_seconds: float = DEFAULT_SELF_IMPROVE_TIMEOUT_SECONDS,
+        apply_timeout_seconds: float = DEFAULT_SELF_IMPROVE_APPLY_TIMEOUT_SECONDS,
         restart_fn: Callable[[int], Any] | None = None,
         restart_delay_seconds: float = DEFAULT_RESTART_DELAY_SECONDS,
         pre_exit_hook: Callable[[], Any] | None = None,
@@ -349,6 +350,17 @@ class FactorySelfImprover:
         self.restart_delay_seconds = float(restart_delay_seconds)
         self.pre_exit_hook = pre_exit_hook
         self._apply_lock = threading.Lock()
+        self._status_lock = threading.Lock()
+        self._status: dict[str, Any] = {
+            "running": False,
+            "step": 0,
+            "total_steps": 3,
+            "stage": "",
+            "detail": "",
+            "title": "",
+            "started_at": None,
+            "last_outcome": "",
+        }
 
     def _redact(self, text: str, extra_secrets: Sequence[str] = ()) -> str:
         return redact_secrets(text, extra_secrets=(*self.secrets_to_redact, *extra_secrets))
@@ -418,6 +430,48 @@ class FactorySelfImprover:
             "memory_rules": rules,
             "memory_count": len(rules),
         }
+
+    def _set_apply_status(
+        self,
+        *,
+        running: bool,
+        step: int = 0,
+        total_steps: int = 3,
+        stage: str = "",
+        detail: str = "",
+        title: str = "",
+        started_at: datetime | None = None,
+        last_outcome: str | None = None,
+    ) -> None:
+        with self._status_lock:
+            self._status["running"] = bool(running)
+            self._status["step"] = int(step)
+            self._status["total_steps"] = int(total_steps)
+            self._status["stage"] = str(stage)
+            self._status["detail"] = str(detail)
+            self._status["title"] = str(title)
+            self._status["started_at"] = started_at
+            if last_outcome is not None:
+                self._status["last_outcome"] = str(last_outcome)
+
+    def get_status(self) -> dict[str, Any]:
+        """Return thread-safe real-time status of self-improvement apply execution."""
+        with self._status_lock:
+            running = bool(self._status["running"])
+            started_at = self._status.get("started_at")
+            elapsed = 0.0
+            if running and isinstance(started_at, datetime):
+                elapsed = round(max(0.0, (self.clock.now() - started_at).total_seconds()), 2)
+            return {
+                "running": running,
+                "step": int(self._status["step"]),
+                "total_steps": int(self._status["total_steps"]),
+                "stage": str(self._status["stage"]),
+                "detail": str(self._status["detail"]),
+                "title": str(self._status["title"]),
+                "elapsed_seconds": elapsed,
+                "last_outcome": str(self._status.get("last_outcome") or ""),
+            }
 
     def delete_memory_rule(self, rule_id: str) -> dict[str, Any]:
         """Delete a rule from factory_memory_rules or raise KeyError if missing."""
@@ -550,10 +604,14 @@ class FactorySelfImprover:
             f"Historial reciente:\n{hist_block}\n\n"
             f"Imágenes adjuntas (rutas locales):\n{img_block}\n\n"
             f"Solicitud del usuario:\n{self._redact(eff_msg)}\n\n"
+            "IMPORTANTE SOBRE PRUEBAS EN actionable_proposal: En el campo 'prompt' de actionable_proposal, "
+            "indica explícitamente que el agente ejecute ÚNICAMENTE las pruebas dirigidas de los archivos modificados "
+            "(por ejemplo: `pytest -q --no-cov tests/test_dashboard.py`) y NO ejecute toda la suite completa de pruebas, "
+            "ya que la verificación final completa la ejecuta el gate automático de la fábrica.\n\n"
             "Devuelve ÚNICAMENTE un JSON válido con esta estructura exacta:\n"
             '{"reply": "<respuesta en español claro>", '
             '"new_memory_rules": ["<regla o preferencia detectada, si aplica>"], '
-            '"actionable_proposal": {"title": "<título corto>", "prompt": "<instrucciones técnicas detalladas TDD>"} | null}'
+            '"actionable_proposal": {"title": "<título corto>", "prompt": "<instrucciones técnicas detalladas TDD con pruebas dirigidas únicamente>"} | null}'
         )
 
         with tempfile.TemporaryDirectory(prefix="af_liwi_consult_") as ro_cwd:
@@ -717,7 +775,7 @@ class FactorySelfImprover:
         message_id: str | None = None,
         github_token: str = "",
     ) -> dict[str, Any]:
-        """Tag HEAD, run agy (600s), gate with ruff + pytest (600s), rollback on failure, commit+push+exit 42 on pass."""
+        """Tag HEAD, run agy (900s), gate with ruff + pytest (900s), rollback on failure, commit+push+exit 42 on pass."""
         clean_prompt = str(proposal_prompt or "").strip()
         if not clean_prompt:
             raise ValueError("El campo 'proposal_prompt' es obligatorio.")
@@ -727,6 +785,18 @@ class FactorySelfImprover:
             raise RuntimeError("Ya hay una auto-mejora en ejecución.")
 
         clean_env = build_sanitized_cli_env()
+        started_at = self.clock.now()
+        outcome = "error"
+        self._set_apply_status(
+            running=True,
+            step=1,
+            total_steps=3,
+            stage="Editando código de Liwi con IA",
+            detail="Analizando archivos y aplicando cambios solicitados...",
+            title=clean_title,
+            started_at=started_at,
+            last_outcome="",
+        )
         try:
             # 1. Create Git savepoint tag
             tag_res = self.runner.run(
@@ -741,11 +811,14 @@ class FactorySelfImprover:
 
             baseline = self._snapshot_forbidden_state()
 
-            # 2. Execute agy inside factory repo with explicit forbidden-file guardrails
+            # 2. Execute agy inside factory repo with explicit forbidden-file guardrails & targeted tests only
             apply_prompt = (
                 "Implementa la siguiente mejora en Agent Factory usando TDD.\n"
                 "REGLA ESTRICTA DE SEGURIDAD: PROHIBIDO leer o modificar .env, MASTER_PROMPT.md, "
-                "AGENTS.md, config/models.toml, data/ o workspaces/.\n\n"
+                "AGENTS.md, config/models.toml, data/ o workspaces/.\n"
+                "REGLA DE VELOCIDAD Y PRUEBAS: Ejecuta ÚNICAMENTE pruebas dirigidas de los archivos que modifiques "
+                "(por ejemplo `pytest -q --no-cov tests/test_dashboard.py` o `tests/test_self_improver.py`) y `ruff check`. "
+                "NO ejecutes la suite completa de pytest; FactorySelfImprover ejecutará la suite completa en su puerta final.\n\n"
                 f"Propuesta ({clean_title}):\n{clean_prompt}"
             )
             agy_ok, agy_out = self._run_agy(
@@ -765,7 +838,16 @@ class FactorySelfImprover:
             elif not agy_ok:
                 failure_reason = f"Falló la ejecución de agy: {agy_out}"
             else:
-                # 3. Quality gate: ruff check src tests + pytest -q --no-cov
+                # 3. Quality gate: ruff check src tests + full pytest -q --no-cov
+                self._set_apply_status(
+                    running=True,
+                    step=2,
+                    total_steps=3,
+                    stage="Verificando calidad y pruebas",
+                    detail="Ejecutando ruff y la suite completa de seguridad (puede tardar ~4 min)...",
+                    title=clean_title,
+                    started_at=started_at,
+                )
                 ws_env = build_workspace_pytest_env()
                 ruff_cmd = [*self._resolve_venv_tool("ruff"), "check", "src", "tests"]
                 ruff_res = self.runner.run(
@@ -790,6 +872,7 @@ class FactorySelfImprover:
                         failure_reason = f"Falló pytest -q --no-cov:\n{self._redact(tail)}"
 
             if failure_reason:
+                outcome = "rolled_back"
                 self._rollback_savepoint(clean_env)
                 if message_id:
                     self.memory_store.update_message_status(message_id, "rolled_back")
@@ -811,6 +894,15 @@ class FactorySelfImprover:
                 }
 
             # 4. Verification passed: stage src & tests, commit on main, best-effort push, schedule exit 42
+            self._set_apply_status(
+                running=True,
+                step=3,
+                total_steps=3,
+                stage="Guardando commit y reiniciando",
+                detail="Creando commit en main y recargando Liwi automáticamente...",
+                title=clean_title,
+                started_at=started_at,
+            )
             add_res = self.runner.run(
                 ["git", "add", "-A", "--", "src", "tests"],
                 cwd=self.repo_root,
@@ -877,6 +969,7 @@ class FactorySelfImprover:
                 ),
                 status="applied",
             )
+            outcome = "applied"
             self._schedule_process_restart()
             return {
                 "ok": True,
@@ -889,4 +982,14 @@ class FactorySelfImprover:
                 "messages": self.memory_store.list_messages(),
             }
         finally:
+            self._set_apply_status(
+                running=False,
+                step=0,
+                total_steps=3,
+                stage="",
+                detail="",
+                title="",
+                started_at=None,
+                last_outcome=outcome,
+            )
             self._apply_lock.release()

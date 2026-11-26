@@ -435,13 +435,17 @@ def test_factory_assistant_apply_commits_pushes_and_triggers_exit_42_when_checks
             assert new_head != orig_head
             assert new_head == remote_head
 
-            # Verify 600s timeouts on agy and verification commands
+            # Verify 900s timeouts on agy and verification commands + targeted-tests instruction
+            agy_cmds = [cmd for cmd, _t in recorded if Path(cmd[0]).stem.lower() == "agy"]
             agy_timeouts = [t for cmd, t in recorded if Path(cmd[0]).stem.lower() == "agy"]
             ruff_timeouts = [t for cmd, t in recorded if Path(cmd[0]).stem.lower() == "ruff"]
             pytest_timeouts = [t for cmd, t in recorded if Path(cmd[0]).stem.lower() == "pytest"]
-            assert agy_timeouts == [600.0]
-            assert ruff_timeouts == [600.0]
-            assert pytest_timeouts == [600.0]
+            assert agy_timeouts == [900.0]
+            assert ruff_timeouts == [900.0]
+            assert pytest_timeouts == [900.0]
+            agy_prompt_sent = agy_cmds[0][agy_cmds[0].index("-p") + 1]
+            assert "pruebas dirigidas" in agy_prompt_sent.lower()
+            assert "suite completa" in agy_prompt_sent.lower()
 
             # Verify header UI elements and Doctor Agent shortcut present in Dashboard HTML
             with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
@@ -501,4 +505,181 @@ def test_consult_message_invokes_agy_with_at_least_180s_timeout_and_dashboard_cl
     assert recorded_timeouts[0] >= 180.0
     assert "185000" in DASHBOARD_HTML
     assert "/api/factory/assistant/message" in DASHBOARD_HTML
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_factory_assistant_status_endpoint_live_progress_apply_900s_and_targeted_tests(
+    tmp_path: Path,
+) -> None:
+    """GET /api/factory/assistant/status tracks steps 1/3 -> 2/3 -> 3/3 in real time, resets running=False on finish/rollback, consult+apply instruct targeted tests, and UI contains live progress markers."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    repo_root = tmp_path / "repo_status"
+    _init_temp_factory_git_repo(repo_root)
+    store = SqliteEventStore(db_path=tmp_path / "status_factory.db")
+    real_runner = SubprocessRunner(default_timeout_seconds=15.0)
+
+    step1_entered = threading.Event()
+    step1_release = threading.Event()
+    step2_entered = threading.Event()
+    step2_release = threading.Event()
+    step3_entered = threading.Event()
+    step3_release = threading.Event()
+    recorded_consult_prompts: list[str] = []
+    recorded_apply_timeouts: list[float] = []
+
+    class _StepSynchronizedRunner(SubprocessRunner):
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            exe_stem = Path(command[0]).stem.lower()
+            if exe_stem == "agy":
+                prompt = command[command.index("-p") + 1]
+                if "--dangerously-skip-permissions" not in command:
+                    recorded_consult_prompts.append(prompt)
+                    return CommandResult(
+                        exit_code=0,
+                        stdout=json.dumps(
+                            {
+                                "reply": "Propuesta lista",
+                                "new_memory_rules": [],
+                                "actionable_proposal": {
+                                    "title": "Optimizar timeout",
+                                    "prompt": "Ejecuta solo pytest -q --no-cov tests/test_dashboard.py",
+                                },
+                            }
+                        ),
+                    )
+                recorded_apply_timeouts.append(timeout_seconds)
+                step1_entered.set()
+                assert step1_release.wait(timeout=8.0)
+                (repo_root / "src" / "agent_factory" / "sample.py").write_text("VALUE = 3\n", encoding="utf-8")
+                return CommandResult(exit_code=0, stdout="Edited cleanly")
+            if exe_stem == "ruff":
+                step2_entered.set()
+                assert step2_release.wait(timeout=8.0)
+                return CommandResult(exit_code=0, stdout="All checks passed!")
+            if exe_stem == "pytest":
+                return CommandResult(exit_code=0, stdout="1 passed")
+            if exe_stem == "git" and len(command) >= 2 and command[1] == "commit":
+                step3_entered.set()
+                assert step3_release.wait(timeout=8.0)
+            return real_runner.run(command, cwd, timeout_seconds=timeout_seconds, env=env)
+
+    try:
+        improver = FactorySelfImprover(
+            sqlite_store=store,
+            repo_root=repo_root,
+            uploads_dir=tmp_path / "uploads_st",
+            runner=_StepSynchronizedRunner(),
+            restart_fn=lambda _code: None,
+            restart_delay_seconds=0.01,
+        )
+        orch = Orchestrator(store=store, llm=FakeLLM())
+        server, thread, base_url = start_dashboard_server(
+            orchestrator=orch,
+            port=0,
+            self_improver=improver,
+        )
+        try:
+            # 1. Idle status at rest
+            c_idle, r_idle = _http_call(f"{base_url}/api/factory/assistant/status")
+            assert c_idle == 200
+            assert r_idle["running"] is False
+            assert r_idle["step"] == 0
+            assert r_idle["total_steps"] == 3
+            assert r_idle["stage"] == ""
+            assert r_idle["detail"] == ""
+            assert r_idle["elapsed_seconds"] == 0.0
+
+            # 2. Consult mode instructs targeted tests only
+            c_cons, _r_cons = _http_call(
+                f"{base_url}/api/factory/assistant/message",
+                method="POST",
+                body={"message": "Optimiza dashboard.py"},
+            )
+            assert c_cons == 200
+            assert len(recorded_consult_prompts) == 1
+            assert "únicamente" in recorded_consult_prompts[0].lower()
+            assert "tests/test_dashboard.py" in recorded_consult_prompts[0]
+
+            # 3. Live apply updates GET /api/factory/assistant/status across all 3 steps
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                fut = pool.submit(
+                    _http_call,
+                    f"{base_url}/api/factory/assistant/apply",
+                    method="POST",
+                    body={
+                        "proposal_title": "Optimizar timeout",
+                        "proposal_prompt": "Edita sample.py y corre pruebas dirigidas.",
+                    },
+                    timeout=15.0,
+                )
+
+                assert step1_entered.wait(timeout=8.0)
+                c_s1, r_s1 = _http_call(f"{base_url}/api/factory/assistant/status")
+                assert c_s1 == 200
+                assert r_s1["running"] is True
+                assert r_s1["step"] == 1
+                assert r_s1["total_steps"] == 3
+                assert r_s1["stage"] == "Editando código de Liwi con IA"
+                assert "Analizando archivos" in r_s1["detail"]
+                assert r_s1["title"] == "Optimizar timeout"
+                assert r_s1["elapsed_seconds"] >= 0.0
+                step1_release.set()
+
+                assert step2_entered.wait(timeout=8.0)
+                c_s2, r_s2 = _http_call(f"{base_url}/api/factory/assistant/status")
+                assert c_s2 == 200
+                assert r_s2["running"] is True
+                assert r_s2["step"] == 2
+                assert r_s2["stage"] == "Verificando calidad y pruebas"
+                assert "suite completa" in r_s2["detail"]
+                step2_release.set()
+
+                assert step3_entered.wait(timeout=8.0)
+                c_s3, r_s3 = _http_call(f"{base_url}/api/factory/assistant/status")
+                assert c_s3 == 200
+                assert r_s3["running"] is True
+                assert r_s3["step"] == 3
+                assert r_s3["stage"] == "Guardando commit y reiniciando"
+                assert "commit en main" in r_s3["detail"]
+                step3_release.set()
+
+                c_done, r_done = fut.result(timeout=10.0)
+                assert c_done == 200
+                assert r_done["applied"] is True
+
+            assert recorded_apply_timeouts == [900.0]
+
+            # 4. Back to idle after completion
+            c_end, r_end = _http_call(f"{base_url}/api/factory/assistant/status")
+            assert c_end == 200
+            assert r_end["running"] is False
+
+            # 5. UI contains global live banner, modal progress card, double-click lock & status polling markers
+            with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+                html = html_resp.read().decode("utf-8")
+            assert "/api/factory/assistant/status" in html
+            assert "factory-build-banner" in html
+            assert "factory-progress-card" in html
+            assert "Construyendo mejora" in html
+            assert "Mejora aplicada y Liwi actualizado" in html
+        finally:
+            step1_release.set()
+            step2_release.set()
+            step3_release.set()
+            server.shutdown()
+            server.server_close()
+            server.controller.wait_for_idle(timeout=5.0)
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+    finally:
+        store.close()
+
 

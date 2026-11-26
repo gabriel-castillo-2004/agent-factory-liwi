@@ -2039,6 +2039,10 @@ class DashboardController:
         """Return Liwi self-improvement chat history and persistent memory rules."""
         return _scrub_value(self._effective_self_improver().get_history(), self.secrets_to_redact)
 
+    def get_factory_assistant_status(self) -> dict[str, Any]:
+        """Return live real-time status of Liwi self-improvement apply execution."""
+        return _scrub_value(self._effective_self_improver().get_status(), self.secrets_to_redact)
+
     def get_factory_assistant_upload(self, filename: str) -> tuple[str, bytes]:
         """Serve a validated screenshot uploaded to factory_chat_uploads."""
         try:
@@ -2663,6 +2667,49 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       max-height: 90px;
       border-radius: 6px;
       border: 1px solid var(--border);
+    }
+    @keyframes factory-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.35); }
+      50% { box-shadow: 0 0 0 6px rgba(56, 189, 248, 0); }
+    }
+    #improve-factory-btn.is-building {
+      border-color: var(--accent, #38bdf8);
+      color: var(--accent, #38bdf8);
+      animation: factory-pulse 1.8s ease-in-out infinite;
+      font-weight: 600;
+    }
+    .factory-progress-card {
+      background: var(--surface-alt);
+      border: 1px solid var(--accent, #38bdf8);
+      border-radius: 8px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .factory-steps-bar {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px;
+    }
+    .factory-step-pill {
+      padding: 4px 8px;
+      border-radius: 6px;
+      font-size: 0.74rem;
+      font-weight: 600;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--muted);
+      text-align: center;
+    }
+    .factory-step-pill.is-active {
+      border-color: var(--accent, #38bdf8);
+      color: var(--text);
+      background: rgba(56, 189, 248, 0.12);
+    }
+    .factory-step-pill.is-done {
+      border-color: rgba(34, 197, 94, 0.5);
+      color: #4ade80;
     }
     .secondary-actions {
       display: flex;
@@ -4539,6 +4586,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <button id="live-activity-reload-btn" class="btn btn-sm btn-warn" type="button">Reintentar / Recargar estado</button>
       </div>
     </div>
+    <div id="factory-build-banner" class="live-activity-banner" role="button" tabindex="0" style="display:none; margin-top:8px; cursor:pointer;" title="Abrir chat de Liwi para ver el progreso completo">
+      <div class="live-activity-main">
+        <svg class="live-spinner-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true">
+          <circle cx="12" cy="12" r="9" opacity="0.25"></circle>
+          <path d="M21 12a9 9 0 0 0-9-9" stroke-linecap="round"></path>
+        </svg>
+        <div style="flex:1 1 auto;">
+          <div id="factory-build-banner-title" style="font-size:0.9rem; font-weight:600;">🔨 Construyendo mejora de Liwi...</div>
+          <div id="factory-build-banner-detail" class="muted" style="font-size:0.78rem;"></div>
+        </div>
+        <span id="factory-build-banner-timer" class="live-activity-timer">00:00</span>
+      </div>
+    </div>
     <div id="factory-restart-banner" class="live-activity-banner" style="display:none; margin-top:8px;" role="status" aria-live="polite">
       <div class="live-activity-main">
         <svg class="live-spinner-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true">
@@ -4612,6 +4672,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <button id="close-factory-improve-btn" class="btn btn-sm" type="button" aria-label="Cerrar chat de auto-mejora">✕</button>
         </div>
         <div id="factory-memory-panel" class="factory-memory-panel" style="display:none"></div>
+        <div id="factory-progress-card" class="factory-progress-card" style="display:none" role="status" aria-live="polite">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+            <strong id="factory-progress-title" style="font-size:0.88rem;">🔨 Construyendo mejora...</strong>
+            <span id="factory-progress-timer" class="live-activity-timer">00:00</span>
+          </div>
+          <div class="factory-steps-bar">
+            <div class="factory-step-pill" data-fstep="1">1/3 · Editar IA</div>
+            <div class="factory-step-pill" data-fstep="2">2/3 · Ruff + Pytest</div>
+            <div class="factory-step-pill" data-fstep="3">3/3 · Commit + Reinicio</div>
+          </div>
+          <div id="factory-progress-detail" class="muted" style="font-size:0.8rem;"></div>
+        </div>
         <div id="factory-chat-stream" class="factory-chat-stream">
           <div class="muted">Cargando historial del asistente...</div>
         </div>
@@ -5429,6 +5501,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (typeof explicitMs === 'number' && explicitMs > 0) return explicitMs;
       const u = String(url || '');
       if (u.indexOf('/chat') >= 0) return 250000;
+      if (u.indexOf('/api/factory/assistant/apply') >= 0) return 920000;
       if (u.indexOf('/api/factory/assistant/message') >= 0) return 185000;
       if (/\\/(?:runtime\\/)?start\\b/.test(u)) return 180000;
       if (/\\/(modify|rollback|import|retry)\\b/.test(u)) return 120000;
@@ -9771,6 +9844,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const closeBtn = document.getElementById('close-factory-improve-btn');
       const memToggle = document.getElementById('factory-memory-toggle');
       const memPanel = document.getElementById('factory-memory-panel');
+      const progressCard = document.getElementById('factory-progress-card');
+      const progressTitle = document.getElementById('factory-progress-title');
+      const progressTimer = document.getElementById('factory-progress-timer');
+      const progressDetail = document.getElementById('factory-progress-detail');
+      const buildBanner = document.getElementById('factory-build-banner');
+      const buildBannerTitle = document.getElementById('factory-build-banner-title');
+      const buildBannerDetail = document.getElementById('factory-build-banner-detail');
+      const buildBannerTimer = document.getElementById('factory-build-banner-timer');
       const streamEl = document.getElementById('factory-chat-stream');
       const previewsEl = document.getElementById('factory-paste-previews');
       const formEl = document.getElementById('factory-chat-form');
@@ -9782,26 +9863,201 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const restartBanner = document.getElementById('factory-restart-banner');
       if (!openBtn || !modal || !streamEl) return;
 
+      const DEFAULT_OPEN_BTN_LABEL = '🏭 Mejorar Fábrica';
       let pendingImages = [];
       let reconnectTimer = null;
+      let statusPollTimer = null;
+      let clockTickTimer = null;
+      let applyInFlight = false;
+      let lastServerRunning = false;
+      let activeStatus = {
+        running: false,
+        step: 0,
+        total_steps: 3,
+        stage: '',
+        detail: '',
+        title: '',
+        elapsed_seconds: 0,
+        last_outcome: '',
+        syncedAtMs: Date.now(),
+      };
+
+      function formatMmSs(totalSecs) {
+        const secs = Math.max(0, Math.floor(Number(totalSecs) || 0));
+        const mins = Math.floor(secs / 60);
+        const rem = secs % 60;
+        return String(mins).padStart(2, '0') + ':' + String(rem).padStart(2, '0');
+      }
+
+      function currentElapsedSeconds() {
+        const base = Number(activeStatus.elapsed_seconds) || 0;
+        if (!activeStatus.running) return base;
+        const delta = Math.max(0, (Date.now() - (activeStatus.syncedAtMs || Date.now())) / 1000);
+        return base + delta;
+      }
+
+      function setFactoryControlsLocked(locked) {
+        if (sendBtn) sendBtn.disabled = !!locked;
+        if (inputEl) inputEl.disabled = !!locked;
+        if (attachBtn) attachBtn.disabled = !!locked;
+        streamEl.querySelectorAll('button[data-apply-factory-proposal]').forEach((b) => {
+          if (locked) {
+            b.disabled = true;
+          } else {
+            b.disabled = b.getAttribute('data-applied') === '1';
+          }
+        });
+      }
+
+      function updateLiveClockAndHeader() {
+        const isRunning = !!(activeStatus.running || applyInFlight);
+        const mmss = formatMmSs(currentElapsedSeconds());
+        if (isRunning) {
+          const stepNum = Math.max(1, Number(activeStatus.step) || 1);
+          const totalSteps = Math.max(3, Number(activeStatus.total_steps) || 3);
+          openBtn.classList.add('is-building');
+          openBtn.textContent = '🔨 Construyendo mejora (Paso ' + stepNum + '/' + totalSteps + ' · ' + mmss + ')';
+          if (buildBannerTimer) buildBannerTimer.textContent = mmss;
+          if (progressTimer) progressTimer.textContent = mmss;
+        } else {
+          openBtn.classList.remove('is-building');
+          openBtn.textContent = DEFAULT_OPEN_BTN_LABEL;
+        }
+      }
+
+      function stopClockTicker() {
+        if (clockTickTimer) {
+          clearInterval(clockTickTimer);
+          clockTickTimer = null;
+        }
+      }
+
+      function ensureClockTicker() {
+        if (!clockTickTimer) {
+          clockTickTimer = setInterval(updateLiveClockAndHeader, 1000);
+        }
+      }
+
+      function stopStatusPolling() {
+        if (statusPollTimer) {
+          clearInterval(statusPollTimer);
+          statusPollTimer = null;
+        }
+      }
+
+      function ensureStatusPolling() {
+        if (!statusPollTimer) {
+          statusPollTimer = setInterval(() => {
+            pollFactoryStatus();
+          }, 2500);
+        }
+      }
+
+      function applyStatusSnapshot(st) {
+        const s = st && typeof st === 'object' ? st : {};
+        const wasRunning = lastServerRunning;
+        const isRunning = !!s.running;
+        activeStatus = {
+          running: isRunning,
+          step: Number(s.step) || 0,
+          total_steps: Number(s.total_steps) || 3,
+          stage: String(s.stage || ''),
+          detail: String(s.detail || ''),
+          title: String(s.title || ''),
+          elapsed_seconds: Number(s.elapsed_seconds) || 0,
+          last_outcome: String(s.last_outcome || ''),
+          syncedAtMs: Date.now(),
+        };
+        lastServerRunning = isRunning;
+
+        if (isRunning) {
+          ensureStatusPolling();
+          ensureClockTicker();
+          setFactoryControlsLocked(true);
+          const stepNum = Math.max(1, activeStatus.step || 1);
+          const totalSteps = Math.max(3, activeStatus.total_steps || 3);
+          const headline = (activeStatus.title ? activeStatus.title + ' — ' : '') + (activeStatus.stage || ('Paso ' + stepNum + '/' + totalSteps));
+          if (buildBanner) buildBanner.style.display = 'block';
+          if (buildBannerTitle) buildBannerTitle.textContent = '🔨 ' + headline;
+          if (buildBannerDetail) buildBannerDetail.textContent = activeStatus.detail || 'Procesando mejora en Liwi...';
+          if (progressCard) {
+            progressCard.style.display = 'flex';
+            if (progressTitle) progressTitle.textContent = '🔨 ' + headline;
+            if (progressDetail) progressDetail.textContent = activeStatus.detail || '';
+            progressCard.querySelectorAll('.factory-step-pill').forEach((pill) => {
+              const pStep = Number(pill.getAttribute('data-fstep') || 0);
+              pill.classList.toggle('is-done', pStep < stepNum);
+              pill.classList.toggle('is-active', pStep === stepNum);
+            });
+          }
+          updateLiveClockAndHeader();
+          return;
+        }
+
+        if (!applyInFlight && !reconnectTimer) {
+          stopStatusPolling();
+          stopClockTicker();
+        }
+        if (buildBanner) buildBanner.style.display = 'none';
+        if (progressCard) progressCard.style.display = 'none';
+        updateLiveClockAndHeader();
+
+        if (wasRunning && !applyInFlight && !reconnectTimer) {
+          setFactoryControlsLocked(false);
+          if (statusEl) {
+            if (activeStatus.last_outcome === 'applied') {
+              statusEl.textContent = '✅ Mejora aplicada y Liwi actualizado';
+            } else if (activeStatus.last_outcome === 'rolled_back') {
+              statusEl.textContent = 'Mejora revertida automáticamente tras fallo en verificación.';
+            }
+          }
+          refreshHistory();
+        }
+      }
+
+      async function pollFactoryStatus() {
+        try {
+          const st = await apiFetch('/api/factory/assistant/status', { cache: 'no-store' });
+          applyStatusSnapshot(st);
+          return st;
+        } catch (_) {
+          return null;
+        }
+      }
 
       function startReconnectPolling() {
         if (restartBanner) restartBanner.style.display = 'block';
+        if (buildBanner) buildBanner.style.display = 'none';
+        stopStatusPolling();
         if (reconnectTimer) clearInterval(reconnectTimer);
         let sawDrop = false;
         const startedAt = Date.now();
         reconnectTimer = setInterval(async () => {
           try {
-            const resp = await fetch('/api/projects', { cache: 'no-store' });
-            if (resp.ok && (sawDrop || (Date.now() - startedAt) > 2000)) {
-              clearInterval(reconnectTimer);
-              reconnectTimer = null;
-              window.location.reload();
+            const resp = await fetch('/api/factory/assistant/status', { cache: 'no-store' });
+            if (resp.ok) {
+              const st = await resp.json().catch(() => ({}));
+              if (!st.running && (sawDrop || (Date.now() - startedAt) > 1200)) {
+                clearInterval(reconnectTimer);
+                reconnectTimer = null;
+                applyInFlight = false;
+                lastServerRunning = false;
+                activeStatus.running = false;
+                stopClockTicker();
+                if (restartBanner) restartBanner.style.display = 'none';
+                if (progressCard) progressCard.style.display = 'none';
+                updateLiveClockAndHeader();
+                setFactoryControlsLocked(false);
+                if (statusEl) statusEl.textContent = '✅ Mejora aplicada y Liwi actualizado';
+                await refreshHistory();
+              }
+            } else {
+              sawDrop = true;
             }
           } catch (_) {
             sawDrop = true;
           }
-        }, 900);
+        }, 1200);
       }
 
       function renderPreviews() {
@@ -9877,6 +10133,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           streamEl.innerHTML = '<div class="muted">Pregúntale a Liwi cómo funciona la fábrica o describe una mejora que quieras proponer y verificar.</div>';
           return;
         }
+        const isLocked = !!(applyInFlight || activeStatus.running);
         streamEl.innerHTML = list.map((m) => {
           const isUser = m.role === 'user';
           const cls = isUser ? 'chat-msg user' : 'chat-msg auditor';
@@ -9892,7 +10149,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             propHtml = '<div class="factory-proposal-card">' +
               '<div style="font-weight:600; margin-bottom:4px;">Propuesta: ' + escapeHtml(String(m.proposal_title || 'Auto-mejora')) + '</div>' +
               '<pre class="doctor-prompt-pre">' + escapeHtml(String(m.proposal_prompt)) + '</pre>' +
-              '<button type="button" class="btn btn-primary btn-sm" data-apply-factory-proposal="1" data-msg-id="' + escapeHtml(String(m.id || '')) + '" data-prop-title="' + escapeHtml(String(m.proposal_title || '')) + '"' + (isApplied ? ' disabled' : '') + '>' + applyLabel + '</button>' +
+              '<button type="button" class="btn btn-primary btn-sm" data-apply-factory-proposal="1" data-applied="' + (isApplied ? '1' : '0') + '" data-msg-id="' + escapeHtml(String(m.id || '')) + '" data-prop-title="' + escapeHtml(String(m.proposal_title || '')) + '"' + ((isApplied || isLocked) ? ' disabled' : '') + '>' + applyLabel + '</button>' +
             '</div>';
           }
           return '<div class="' + cls + '">' +
@@ -9905,35 +10162,66 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         streamEl.scrollTop = streamEl.scrollHeight;
         streamEl.querySelectorAll('button[data-apply-factory-proposal]').forEach((btn) => {
           btn.addEventListener('click', async () => {
+            if (applyInFlight || activeStatus.running) return;
             const card = btn.closest('.factory-proposal-card');
             const pre = card ? card.querySelector('.doctor-prompt-pre') : null;
             const promptText = pre ? pre.textContent : '';
             if (!promptText) return;
+            const propTitle = btn.getAttribute('data-prop-title') || 'Auto-mejora Liwi';
             const origText = btn.textContent;
-            btn.disabled = true;
-            btn.textContent = 'Aplicando y ejecutando pruebas...';
-            if (statusEl) statusEl.textContent = 'Guardando tag Git, ejecutando agy y validando ruff + pytest...';
+            applyInFlight = true;
+            setFactoryControlsLocked(true);
+            btn.textContent = 'Construyendo mejora...';
+            applyStatusSnapshot({
+              running: true,
+              step: 1,
+              total_steps: 3,
+              stage: 'Editando código de Liwi con IA',
+              detail: 'Analizando archivos y aplicando cambios solicitados...',
+              title: propTitle,
+              elapsed_seconds: 0,
+            });
+            ensureStatusPolling();
+            if (statusEl) statusEl.textContent = 'En construcción: Paso 1/3 iniciado...';
             try {
               const res = await apiFetch('/api/factory/assistant/apply', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
+                timeoutMs: 920000,
                 body: JSON.stringify({
                   message_id: btn.getAttribute('data-msg-id') || null,
-                  proposal_title: btn.getAttribute('data-prop-title') || 'Auto-mejora Liwi',
+                  proposal_title: propTitle,
                   proposal_prompt: promptText,
                 }),
               });
               renderMessages(res.messages || []);
               if (res && res.restart_scheduled) {
                 if (statusEl) statusEl.textContent = '✓ Mejora aplicada. Reiniciando Liwi...';
-                modal.style.display = 'none';
                 startReconnectPolling();
               } else {
+                applyInFlight = false;
+                applyStatusSnapshot({ running: false, step: 0, total_steps: 3, last_outcome: 'rolled_back' });
+                setFactoryControlsLocked(false);
                 if (statusEl) statusEl.textContent = 'Mejora revertida automáticamente tras fallo en verificación.';
               }
             } catch (err) {
-              btn.disabled = false;
+              const stNow = await pollFactoryStatus();
+              if (stNow && stNow.running) {
+                if (statusEl) statusEl.textContent = 'La mejora sigue construyéndose en segundo plano...';
+                return;
+              }
+              applyInFlight = false;
+              stopStatusPolling();
+              stopClockTicker();
+              setFactoryControlsLocked(false);
               btn.textContent = origText;
+              if (progressCard) progressCard.style.display = 'none';
+              if (buildBanner) buildBanner.style.display = 'none';
+              updateLiveClockAndHeader();
+              if (err && err.name !== 'AbortError' && String(err.message || '').indexOf('HTTP ') < 0) {
+                startReconnectPolling();
+                return;
+              }
               if (statusEl) statusEl.textContent = 'Error aplicando mejora: ' + err.message;
             }
           });
@@ -9956,10 +10244,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           inputEl.value = prefillText;
         }
         refreshHistory();
-        if (inputEl) inputEl.focus();
+        pollFactoryStatus();
+        if (inputEl && !applyInFlight && !activeStatus.running) inputEl.focus();
       };
 
       openBtn.addEventListener('click', () => window.openFactoryImproveModal(''));
+      if (buildBanner) {
+        buildBanner.addEventListener('click', () => window.openFactoryImproveModal(''));
+        buildBanner.addEventListener('keydown', (ev) => {
+          if (ev.key === 'Enter' || ev.key === ' ') {
+            ev.preventDefault();
+            window.openFactoryImproveModal('');
+          }
+        });
+      }
       if (closeBtn) closeBtn.addEventListener('click', () => { modal.style.display = 'none'; });
       modal.addEventListener('click', (ev) => {
         if (ev.target === modal) modal.style.display = 'none';
@@ -9990,6 +10288,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (formEl) {
         formEl.addEventListener('submit', async (ev) => {
           ev.preventDefault();
+          if (applyInFlight || activeStatus.running) return;
           const msgTxt = inputEl ? inputEl.value.trim() : '';
           if (!msgTxt && !pendingImages.length) {
             if (statusEl) statusEl.textContent = 'Escribe un mensaje o pega una captura.';
@@ -10017,11 +10316,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           } catch (err) {
             if (statusEl) statusEl.textContent = 'Error consultando: ' + err.message;
           } finally {
-            sendBtn.disabled = false;
+            if (!applyInFlight && !activeStatus.running) {
+              sendBtn.disabled = false;
+            }
             sendBtn.textContent = 'Consultar a Liwi';
           }
         });
       }
+
+      pollFactoryStatus();
     })();
 
     setInterval(updateLiveTimers, 1000);
@@ -10289,6 +10592,10 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/factory/assistant/history":
             self._send_json(200, ctrl.get_factory_assistant_history())
+            return
+
+        if path == "/api/factory/assistant/status":
+            self._send_json(200, ctrl.get_factory_assistant_status())
             return
 
         if path.startswith("/api/factory/assistant/uploads/"):
