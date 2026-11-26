@@ -95,6 +95,7 @@ class DashboardController:
         self_improver: FactorySelfImprover | None = None,
         staging_manager: StagingManager | None = None,
         autonomous_engine: idea_engine.AutonomousEngine | None = None,
+        visual_qa_runner: Callable[..., Mapping[str, Any]] | None = None,
         secrets_to_redact: Sequence[str] = (),
     ) -> None:
         self.orchestrator = orchestrator
@@ -166,6 +167,7 @@ class DashboardController:
         self._self_improver: FactorySelfImprover | None = self_improver
         self._staging_manager: StagingManager | None = staging_manager
         self._autonomous_engine: idea_engine.AutonomousEngine | None = autonomous_engine
+        self._visual_qa_runner: Callable[..., Mapping[str, Any]] | None = visual_qa_runner
         self._legacy_direct_self_improver: bool = (
             isinstance(self_improver, FactorySelfImprover) and staging_manager is None
         )
@@ -2257,6 +2259,106 @@ class DashboardController:
             },
             self.secrets_to_redact,
         )
+
+    def run_staging_visual_qa(
+        self,
+        *,
+        base_url: str | None = None,
+        timeout_seconds: float | None = None,
+        default_base_url: str | None = None,
+    ) -> dict[str, Any]:
+        """Run bounded-timeout pre-promote visual QA against the local staging view with safe degradation."""
+        if timeout_seconds is None:
+            eff_timeout = visual_qa_agent.DEFAULT_STAGING_QA_TIMEOUT_SECONDS
+        elif isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
+            raise TypeError("El campo 'timeout_seconds' debe ser numérico.")
+        elif float(timeout_seconds) <= 0:
+            raise ValueError("El campo 'timeout_seconds' debe ser mayor que 0.")
+        else:
+            eff_timeout = min(
+                float(timeout_seconds),
+                visual_qa_agent.MAX_STAGING_QA_TIMEOUT_SECONDS,
+            )
+
+        explicit_url = str(base_url).strip() if isinstance(base_url, str) and base_url.strip() else None
+        if explicit_url is not None:
+            visual_qa_agent._validate_local_staging_url(explicit_url)
+
+        with self._lock:
+            mgr = self._staging_manager
+
+        if mgr is None and explicit_url is None:
+            return _scrub_value(
+                {
+                    "status": "skipped",
+                    "score": None,
+                    "issues": [],
+                    "screenshot_path": None,
+                    "reason": "staging_unavailable",
+                    "detail": "Staging no está inicializado o disponible para auditoría visual.",
+                    "base_url": str(default_base_url or ""),
+                    "timeout_seconds": eff_timeout,
+                    "viewports_audited": [],
+                },
+                self.secrets_to_redact,
+            )
+
+        staging_url: str | None = None
+        if mgr is not None:
+            staging_status = self.get_self_improve_staging_status()
+            for key in ("staging_url", "preview_url", "url"):
+                cand = staging_status.get(key)
+                if isinstance(cand, str) and cand.strip():
+                    staging_url = cand.strip()
+                    break
+            raw_wt = getattr(mgr, "worktree_path", None)
+            pending_count = int(staging_status.get("pending_count") or 0)
+            if (
+                explicit_url is None
+                and staging_url is None
+                and isinstance(raw_wt, Path)
+                and not raw_wt.is_dir()
+                and pending_count <= 0
+            ):
+                return _scrub_value(
+                    {
+                        "status": "skipped",
+                        "score": None,
+                        "issues": [],
+                        "screenshot_path": None,
+                        "reason": "staging_unavailable",
+                        "detail": "El worktree local de staging no está disponible para auditoría visual.",
+                        "base_url": str(default_base_url or ""),
+                        "timeout_seconds": eff_timeout,
+                        "viewports_audited": [],
+                    },
+                    self.secrets_to_redact,
+                )
+
+        target_url = explicit_url or staging_url or (str(default_base_url).strip() if default_base_url else "")
+        if not target_url:
+            return _scrub_value(
+                {
+                    "status": "skipped",
+                    "score": None,
+                    "issues": [],
+                    "screenshot_path": None,
+                    "reason": "staging_unavailable",
+                    "detail": "No hay una URL local de staging disponible para auditoría visual.",
+                    "base_url": "",
+                    "timeout_seconds": eff_timeout,
+                    "viewports_audited": [],
+                },
+                self.secrets_to_redact,
+            )
+
+        result = visual_qa_agent.run_staging_visual_qa(
+            base_url=target_url,
+            timeout_seconds=eff_timeout,
+            db_path=self._resolve_idea_db_path(),
+            audit_fn=self._visual_qa_runner,
+        )
+        return _scrub_value(result, self.secrets_to_redact)
 
     def get_factory_assistant_history(self) -> dict[str, Any]:
         """Return Liwi self-improvement chat history and persistent memory rules."""
@@ -15736,6 +15838,27 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_controller_json(_post_self_improve_promote)
             return
 
+        if path == "/api/staging/visual-qa":
+            def _post_staging_visual_qa() -> dict[str, Any]:
+                body = self._read_json_body()
+                raw_url = body.get("base_url")
+                if raw_url is not None and not isinstance(raw_url, str):
+                    raise TypeError("El campo 'base_url' debe ser texto.")
+                raw_timeout = body.get("timeout_seconds")
+                if raw_timeout is not None and (
+                    isinstance(raw_timeout, bool) or not isinstance(raw_timeout, (int, float))
+                ):
+                    raise TypeError("El campo 'timeout_seconds' debe ser numérico.")
+                eff_default_url = f"http://{LOOPBACK_HOST}:{self.server.server_address[1]}"
+                return ctrl.run_staging_visual_qa(
+                    base_url=raw_url.strip() if isinstance(raw_url, str) and raw_url.strip() else None,
+                    timeout_seconds=float(raw_timeout) if raw_timeout is not None else None,
+                    default_base_url=eff_default_url,
+                )
+
+            self._send_controller_json(_post_staging_visual_qa)
+            return
+
         if path == "/api/ideas/generate":
             def _post_ideas_generate() -> dict[str, Any]:
                 body = self._read_json_body()
@@ -16122,6 +16245,7 @@ def start_dashboard_server(
     self_improver: FactorySelfImprover | None = None,
     staging_manager: StagingManager | None = None,
     autonomous_engine: idea_engine.AutonomousEngine | None = None,
+    visual_qa_runner: Callable[..., Mapping[str, Any]] | None = None,
     secrets_to_redact: Sequence[str] = (),
 ) -> tuple[DashboardHTTPServer, threading.Thread, str]:
     """Create and start DashboardHTTPServer on 127.0.0.1:<port> in a daemon thread."""
@@ -16140,6 +16264,7 @@ def start_dashboard_server(
         self_improver=self_improver,
         staging_manager=staging_manager,
         autonomous_engine=autonomous_engine,
+        visual_qa_runner=visual_qa_runner,
         secrets_to_redact=secrets_to_redact,
     )
     if "PYTEST_CURRENT_TEST" not in os.environ:

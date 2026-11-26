@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import re
 import tempfile
+import threading
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -38,6 +39,9 @@ DEFAULT_AGY_TIMEOUT_SECONDS: float = 180.0
 DEFAULT_NAV_TIMEOUT_MS: int = 15000
 DEFAULT_STEP_TIMEOUT_MS: int = 3000
 DEFAULT_SETTLE_WAIT_MS: int = 250
+DEFAULT_STAGING_QA_TIMEOUT_SECONDS: float = 20.0
+MAX_STAGING_QA_TIMEOUT_SECONDS: float = 60.0
+_LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1"})
 DEFAULT_SOURCE_FILE: str = "src/agent_factory/dashboard.py"
 _MAX_INLINE_PROMPT_CHARS: int = 6000
 
@@ -131,6 +135,18 @@ def _validate_base_url(base_url: str) -> str:
     return clean
 
 
+def _validate_local_staging_url(base_url: str) -> str:
+    """Validate that a staging preview URL uses http(s) on a local loopback host (INV-22)."""
+    clean = _validate_base_url(base_url)
+    parsed = urllib.parse.urlparse(clean)
+    hostname = (parsed.hostname or "").strip().lower()
+    if hostname not in _LOOPBACK_HOSTS:
+        raise ValueError(
+            f"base_url de staging debe apuntar a loopback local (127.0.0.1/localhost), recibido: {base_url!r}."
+        )
+    return clean
+
+
 def _read_attr_or_call(obj: Any, attr: str, default: Any = "") -> Any:
     val = getattr(obj, attr, default)
     if callable(val):
@@ -158,6 +174,7 @@ def _empty_result(
         "viewports_audited": [],
         "states_visited": [],
         "screenshots_captured": 0,
+        "screenshot_path": None,
         "console_errors": [],
         "page_errors": [],
         "http_errors": [],
@@ -715,6 +732,7 @@ def run_synthetic_user_audit(
     step_timeout_ms: int = DEFAULT_STEP_TIMEOUT_MS,
     settle_wait_ms: int = DEFAULT_SETTLE_WAIT_MS,
     source_file: str = DEFAULT_SOURCE_FILE,
+    screenshot_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     """Run a non-destructive synthetic user visual QA audit across desktop and mobile viewports."""
     safe_base_url = _validate_base_url(base_url)
@@ -744,9 +762,15 @@ def run_synthetic_user_audit(
     states_visited: list[str] = []
     viewports_audited: list[str] = []
 
-    with tempfile.TemporaryDirectory(prefix="af_visual_qa_shots_") as tmp_dir_str:
-        screenshots_dir = Path(tmp_dir_str).resolve()
+    temp_ctx: tempfile.TemporaryDirectory[str] | None = None
+    if screenshot_dir is not None:
+        screenshots_dir = Path(screenshot_dir).resolve()
+        screenshots_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        temp_ctx = tempfile.TemporaryDirectory(prefix="af_visual_qa_shots_")
+        screenshots_dir = Path(temp_ctx.name).resolve()
 
+    try:
         try:
             with sync_playwright_fn() as playwright:
                 try:
@@ -835,7 +859,15 @@ def run_synthetic_user_audit(
                     db_path=db_path,
                     max_items=bounded_max_ideas,
                 )
+    finally:
+        if temp_ctx is not None:
+            temp_ctx.cleanup()
 
+    persisted_screenshot: str | None = (
+        str(screenshot_records[0]["path"])
+        if screenshot_dir is not None and screenshot_records
+        else None
+    )
     audit_ok = bool(viewports_audited)
     return {
         "ok": audit_ok,
@@ -850,6 +882,7 @@ def run_synthetic_user_audit(
         "viewports_audited": viewports_audited,
         "states_visited": states_visited,
         "screenshots_captured": len(screenshot_records),
+        "screenshot_path": persisted_screenshot,
         "console_errors": console_errors,
         "page_errors": page_errors,
         "http_errors": http_errors,
@@ -859,3 +892,322 @@ def run_synthetic_user_audit(
         "agy_invoked": agy_invoked,
         "agy_error": agy_error,
     }
+
+
+def _build_skipped_staging_qa_payload(
+    *,
+    reason: str,
+    detail: str,
+    base_url: str = "",
+    timeout_seconds: float = DEFAULT_STAGING_QA_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    return {
+        "status": "skipped",
+        "score": None,
+        "issues": [],
+        "screenshot_path": None,
+        "reason": str(reason or "qa_skipped"),
+        "detail": redact_secrets(str(detail or "Auditoría visual de staging omitida.")),
+        "base_url": redact_secrets(str(base_url or "")),
+        "timeout_seconds": float(timeout_seconds),
+        "viewports_audited": [],
+    }
+
+
+def _normalize_screenshot_path(raw_value: Any) -> str | None:
+    if isinstance(raw_value, Path):
+        text = str(raw_value).strip()
+        return redact_secrets(text) if text else None
+    if isinstance(raw_value, str):
+        text = raw_value.strip()
+        return redact_secrets(text) if text else None
+    return None
+
+
+def summarize_staging_visual_qa(
+    raw_result: Mapping[str, Any] | None,
+    *,
+    base_url: str = "",
+    timeout_seconds: float = DEFAULT_STAGING_QA_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Normalize a raw visual QA audit result into a consistent staging pre-promote payload.
+
+    Scoring deductions (clamped to [0, 100]):
+    - page_error: -25
+    - http_error: -20
+    - console_error: -15
+    - horizontal_overflow: -15
+    - overlap: -10
+    """
+    if not isinstance(raw_result, Mapping):
+        return _build_skipped_staging_qa_payload(
+            reason="invalid_result",
+            detail="El motor de QA visual devolvió una respuesta vacía o inválida.",
+            base_url=base_url,
+            timeout_seconds=timeout_seconds,
+        )
+
+    eff_base_url = redact_secrets(str(raw_result.get("base_url") or base_url or ""))
+    raw_status = str(raw_result.get("status") or "").strip().lower()
+    raw_reason = str(raw_result.get("reason") or "").strip()
+    raw_detail = str(raw_result.get("detail") or "").strip()
+    viewports = [
+        str(vp)
+        for vp in (raw_result.get("viewports_audited") or [])
+        if isinstance(vp, str) and vp.strip()
+    ]
+
+    skip_reasons = {
+        "playwright_unavailable",
+        "browser_launch_failed",
+        "playwright_session_failed",
+        "navigation_failed",
+        "staging_unavailable",
+        "timeout",
+    }
+    if (
+        raw_status == "skipped"
+        or bool(raw_result.get("skipped"))
+        or (raw_result.get("ok") is False and raw_reason in skip_reasons)
+    ):
+        return _build_skipped_staging_qa_payload(
+            reason=raw_reason or "qa_skipped",
+            detail=raw_detail or "Auditoría visual de staging omitida por degradación segura.",
+            base_url=eff_base_url,
+            timeout_seconds=timeout_seconds,
+        )
+
+    issues: list[dict[str, Any]] = []
+    penalty = 0
+
+    for item in raw_result.get("page_errors") or ():
+        if isinstance(item, Mapping):
+            issues.append(
+                {
+                    "kind": "page_error",
+                    "severity": "high",
+                    "viewport": str(item.get("viewport") or "unknown"),
+                    "state": str(item.get("state") or "home"),
+                    "message": redact_secrets(str(item.get("message") or "JS pageerror")),
+                }
+            )
+            penalty += 25
+
+    for item in raw_result.get("http_errors") or ():
+        if isinstance(item, Mapping):
+            try:
+                http_status = int(item.get("status") or 0)
+            except (TypeError, ValueError):
+                http_status = 0
+            method = str(item.get("method") or "GET").upper()
+            url = redact_secrets(str(item.get("url") or ""))
+            issues.append(
+                {
+                    "kind": "http_error",
+                    "severity": "high" if http_status >= 500 else "medium",
+                    "viewport": str(item.get("viewport") or "unknown"),
+                    "state": str(item.get("state") or "home"),
+                    "message": f"HTTP {http_status} {method} {url}".strip(),
+                }
+            )
+            penalty += 20
+
+    for item in raw_result.get("console_errors") or ():
+        if isinstance(item, Mapping):
+            issues.append(
+                {
+                    "kind": "console_error",
+                    "severity": "medium",
+                    "viewport": str(item.get("viewport") or "unknown"),
+                    "state": str(item.get("state") or "home"),
+                    "message": redact_secrets(str(item.get("message") or "JS console.error")),
+                }
+            )
+            penalty += 15
+
+    for check in raw_result.get("geometry_checks") or ():
+        if not isinstance(check, Mapping):
+            continue
+        vp = str(check.get("viewport") or "unknown")
+        st = str(check.get("state") or "home")
+        if bool(check.get("has_horizontal_overflow")):
+            overflow_px = int(check.get("overflow_px", 0) or 0)
+            scroll_w = int(check.get("scroll_width", 0) or 0)
+            client_w = int(check.get("client_width", 0) or 0)
+            issues.append(
+                {
+                    "kind": "horizontal_overflow",
+                    "severity": "medium",
+                    "viewport": vp,
+                    "state": st,
+                    "message": (
+                        f"Desbordamiento horizontal de +{overflow_px}px "
+                        f"(scrollWidth={scroll_w} > clientWidth={client_w})"
+                    ),
+                }
+            )
+            penalty += 15
+        raw_overlaps = check.get("overlaps")
+        if isinstance(raw_overlaps, Sequence) and not isinstance(raw_overlaps, (str, bytes)):
+            for ov in raw_overlaps:
+                if not isinstance(ov, Mapping):
+                    continue
+                el_a = str(ov.get("a") or "elemento A")
+                el_b = str(ov.get("b") or "elemento B")
+                ow = int(ov.get("overlap_width", 0) or 0)
+                oh = int(ov.get("overlap_height", 0) or 0)
+                issues.append(
+                    {
+                        "kind": "overlap",
+                        "severity": "medium",
+                        "viewport": vp,
+                        "state": st,
+                        "message": f"Solapamiento visual entre {el_a} y {el_b} ({ow}x{oh}px)",
+                    }
+                )
+                penalty += 10
+
+    raw_explicit_issues = raw_result.get("issues")
+    if isinstance(raw_explicit_issues, Sequence) and not isinstance(
+        raw_explicit_issues, (str, bytes)
+    ):
+        for item in raw_explicit_issues:
+            if isinstance(item, Mapping):
+                sev = str(item.get("severity") or "medium").strip().lower()
+                if sev not in {"high", "medium", "low"}:
+                    sev = "medium"
+                issues.append(
+                    {
+                        "kind": str(item.get("kind") or "visual_issue"),
+                        "severity": sev,
+                        "viewport": str(item.get("viewport") or "unknown"),
+                        "state": str(item.get("state") or "home"),
+                        "message": redact_secrets(str(item.get("message") or "")),
+                    }
+                )
+                penalty += 15 if sev == "high" else (10 if sev == "medium" else 5)
+
+    raw_score = raw_result.get("score")
+    if not isinstance(raw_score, bool) and isinstance(raw_score, (int, float)):
+        score = max(0, min(100, int(raw_score)))
+    else:
+        score = max(0, min(100, 100 - penalty))
+
+    screenshot_path = _normalize_screenshot_path(raw_result.get("screenshot_path"))
+    if issues or raw_status == "issues_found" or raw_result.get("ok") is False:
+        status = "issues_found"
+    else:
+        status = "passed"
+
+    default_detail = (
+        "Auditoría visual de staging aprobada sin hallazgos."
+        if status == "passed"
+        else f"Auditoría visual de staging detectó {len(issues)} hallazgo(s)."
+    )
+    return {
+        "status": status,
+        "score": score,
+        "issues": issues,
+        "screenshot_path": screenshot_path,
+        "reason": raw_reason or ("completed" if status == "passed" else "issues_found"),
+        "detail": redact_secrets(raw_detail or default_detail),
+        "base_url": eff_base_url,
+        "timeout_seconds": float(timeout_seconds),
+        "viewports_audited": viewports,
+    }
+
+
+def run_staging_visual_qa(
+    base_url: str,
+    *,
+    timeout_seconds: float = DEFAULT_STAGING_QA_TIMEOUT_SECONDS,
+    db_path: Path | str | None = None,
+    screenshot_dir: Path | str | None = None,
+    audit_fn: Callable[..., Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Run bounded-timeout visual QA against a local staging preview with safe degradation."""
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
+        raise TypeError("El parámetro 'timeout_seconds' debe ser numérico.")
+    if float(timeout_seconds) <= 0:
+        raise ValueError("El parámetro 'timeout_seconds' debe ser mayor que 0.")
+    bounded_timeout = min(float(timeout_seconds), MAX_STAGING_QA_TIMEOUT_SECONDS)
+
+    safe_url = _validate_local_staging_url(base_url)
+    nav_timeout_ms = max(250, min(DEFAULT_NAV_TIMEOUT_MS, int(bounded_timeout * 500)))
+    step_timeout_ms = max(150, min(DEFAULT_STEP_TIMEOUT_MS, int(bounded_timeout * 150)))
+    settle_wait_ms = max(0, min(DEFAULT_SETTLE_WAIT_MS, int(bounded_timeout * 25)))
+
+    executor = audit_fn if audit_fn is not None else run_synthetic_user_audit
+    outcome: dict[str, Any] = {}
+    error_box: list[BaseException] = []
+
+    def _worker() -> None:
+        try:
+            res = executor(
+                base_url=safe_url,
+                db_path=db_path,
+                max_ideas=0,
+                nav_timeout_ms=nav_timeout_ms,
+                step_timeout_ms=step_timeout_ms,
+                settle_wait_ms=settle_wait_ms,
+                screenshot_dir=screenshot_dir,
+            )
+            outcome["result"] = res
+        except BaseException as exc:  # noqa: BLE001
+            error_box.append(exc)
+
+    thread = threading.Thread(target=_worker, name="staging-visual-qa", daemon=True)
+    thread.start()
+    thread.join(timeout=bounded_timeout)
+
+    if thread.is_alive():
+        logger.warning(
+            "Staging visual QA timed out after %.2fs for %s",
+            bounded_timeout,
+            redact_secrets(safe_url),
+        )
+        return _build_skipped_staging_qa_payload(
+            reason="timeout",
+            detail=(
+                f"La auditoría visual de staging excedió el timeout acotado ({bounded_timeout:g}s)."
+            ),
+            base_url=safe_url,
+            timeout_seconds=bounded_timeout,
+        )
+
+    if error_box:
+        exc = error_box[0]
+        if isinstance(exc, ImportError):
+            return _build_skipped_staging_qa_payload(
+                reason="playwright_unavailable",
+                detail=f"Playwright no está disponible: {exc}",
+                base_url=safe_url,
+                timeout_seconds=bounded_timeout,
+            )
+        if isinstance(exc, (TimeoutError, CommandTimeoutError)):
+            return _build_skipped_staging_qa_payload(
+                reason="timeout",
+                detail=f"La auditoría visual de staging excedió el tiempo límite: {exc}",
+                base_url=safe_url,
+                timeout_seconds=bounded_timeout,
+            )
+        if isinstance(exc, OSError):
+            return _build_skipped_staging_qa_payload(
+                reason="staging_unavailable",
+                detail=f"Vista local de staging no disponible: {exc}",
+                base_url=safe_url,
+                timeout_seconds=bounded_timeout,
+            )
+        logger.warning("Staging visual QA failed safely: %s", redact_secrets(str(exc)))
+        return _build_skipped_staging_qa_payload(
+            reason="qa_execution_failed",
+            detail=f"Error ejecutando QA visual de staging: {exc}",
+            base_url=safe_url,
+            timeout_seconds=bounded_timeout,
+        )
+
+    return summarize_staging_visual_qa(
+        outcome.get("result"),
+        base_url=safe_url,
+        timeout_seconds=bounded_timeout,
+    )

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+import urllib.error
+import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import TracebackType
@@ -12,6 +15,10 @@ from typing import Any, Self
 import pytest
 
 from agent_factory import idea_engine
+from agent_factory.adapters.fake_llm import FakeLLM
+from agent_factory.adapters.sqlite_store import SqliteEventStore
+from agent_factory.dashboard import start_dashboard_server
+from agent_factory.orchestrator import Orchestrator
 from agent_factory.ports.runner import CommandResult, CommandTimeoutError
 
 
@@ -700,3 +707,402 @@ def test_rejects_non_http_base_url(tmp_path: Path) -> None:
             base_url="file:///etc/passwd",
             db_path=tmp_path / "telemetry.db",
         )
+
+
+_LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _post_json(
+    url: str,
+    body: dict[str, Any] | None = None,
+    *,
+    timeout: float = 5.0,
+) -> tuple[int, dict[str, Any]]:
+    data = json.dumps(body if body is not None else {}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with _LOOPBACK_OPENER.open(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        return err.code, json.loads(err.read().decode("utf-8"))
+
+
+class _FakeStagingManager:
+    """Minimal staging manager stub without touching Git or worktrees."""
+
+    def __init__(
+        self,
+        *,
+        pending_count: int = 1,
+        staging_url: str | None = None,
+        worktree_path: Path | None = None,
+    ) -> None:
+        self._pending_count = pending_count
+        self._staging_url = staging_url
+        if worktree_path is not None:
+            self.worktree_path = worktree_path
+
+    def get_staging_status(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "pending_count": self._pending_count,
+            "commits": (
+                [{"hash": "abc1234", "title": "feat: staging preview"}]
+                if self._pending_count > 0
+                else []
+            ),
+            "is_building": False,
+            "queue_size": 0,
+            "last_error": None,
+            "current_task": None,
+        }
+        if self._staging_url is not None:
+            payload["staging_url"] = self._staging_url
+        return payload
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        _ = timeout
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_staging_visual_qa_endpoint_success_with_mocked_executor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from agent_factory import visual_qa_agent
+
+    captured_calls: list[dict[str, Any]] = []
+
+    def _fake_audit(**kwargs: Any) -> dict[str, Any]:
+        captured_calls.append(dict(kwargs))
+        return {
+            "ok": True,
+            "skipped": False,
+            "reason": "completed",
+            "detail": "Auditoría visual completada en 2 viewport(s).",
+            "base_url": kwargs["base_url"],
+            "viewports_audited": ["desktop", "mobile"],
+            "states_visited": ["desktop:home", "mobile:home"],
+            "screenshots_captured": 2,
+            "screenshot_path": "/tmp/staging_desktop_home.png",
+            "console_errors": [],
+            "page_errors": [],
+            "http_errors": [],
+            "triage_reports": [],
+            "geometry_checks": [
+                {
+                    "viewport": "desktop",
+                    "state": "home",
+                    "scroll_width": 1440,
+                    "client_width": 1440,
+                    "overflow_px": 0,
+                    "has_horizontal_overflow": False,
+                    "overlaps": [],
+                    "overlap_count": 0,
+                }
+            ],
+            "ideas_created": [],
+            "agy_invoked": False,
+            "agy_error": None,
+        }
+
+    monkeypatch.setattr(visual_qa_agent, "run_synthetic_user_audit", _fake_audit)
+
+    store = SqliteEventStore(db_path=tmp_path / "staging_qa_ok.db")
+    staging_mgr = _FakeStagingManager(pending_count=1, staging_url="http://127.0.0.1:8123")
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=Orchestrator(store=store, llm=FakeLLM()),
+        port=0,
+        staging_manager=staging_mgr,  # type: ignore[arg-type]
+    )
+    try:
+        code, payload = _post_json(f"{base_url}/api/staging/visual-qa", {"timeout_seconds": 12})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+        store.close()
+
+    assert code == 200
+    assert payload["status"] == "passed"
+    assert payload["score"] == 100
+    assert payload["issues"] == []
+    assert payload["screenshot_path"] == "/tmp/staging_desktop_home.png"
+    assert payload["base_url"] == "http://127.0.0.1:8123"
+    assert len(captured_calls) == 1
+    assert captured_calls[0]["base_url"] == "http://127.0.0.1:8123"
+    assert captured_calls[0]["max_ideas"] == 0
+    assert captured_calls[0]["nav_timeout_ms"] <= 6000
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_staging_visual_qa_endpoint_reports_visual_findings_and_score(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from agent_factory import visual_qa_agent
+
+    def _fake_audit_with_issues(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "skipped": False,
+            "reason": "completed",
+            "detail": "Auditoría visual completada en 2 viewport(s).",
+            "base_url": kwargs["base_url"],
+            "viewports_audited": ["desktop", "mobile"],
+            "states_visited": ["desktop:home", "mobile:home"],
+            "screenshots_captured": 2,
+            "screenshot_path": "/tmp/staging_mobile_overflow.png",
+            "console_errors": [
+                {
+                    "viewport": "desktop",
+                    "state": "home",
+                    "type": "console.error",
+                    "message": "TypeError: Cannot read properties of undefined",
+                }
+            ],
+            "page_errors": [],
+            "http_errors": [
+                {
+                    "viewport": "mobile",
+                    "state": "home",
+                    "status": 500,
+                    "method": "GET",
+                    "url": "http://127.0.0.1:8123/api/staging-widget",
+                }
+            ],
+            "triage_reports": [],
+            "geometry_checks": [
+                {
+                    "viewport": "mobile",
+                    "state": "home",
+                    "scroll_width": 438,
+                    "client_width": 390,
+                    "overflow_px": 48,
+                    "has_horizontal_overflow": True,
+                    "overlaps": [
+                        {
+                            "a": "button#promote-btn",
+                            "b": "button#qa-btn",
+                            "overlap_width": 16,
+                            "overlap_height": 20,
+                        }
+                    ],
+                    "overlap_count": 1,
+                }
+            ],
+            "ideas_created": [],
+            "agy_invoked": False,
+            "agy_error": None,
+        }
+
+    monkeypatch.setattr(visual_qa_agent, "run_synthetic_user_audit", _fake_audit_with_issues)
+
+    store = SqliteEventStore(db_path=tmp_path / "staging_qa_issues.db")
+    staging_mgr = _FakeStagingManager(pending_count=2)
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=Orchestrator(store=store, llm=FakeLLM()),
+        port=0,
+        staging_manager=staging_mgr,  # type: ignore[arg-type]
+    )
+    try:
+        code, payload = _post_json(f"{base_url}/api/staging/visual-qa", {})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+        store.close()
+
+    assert code == 200
+    assert payload["status"] == "issues_found"
+    # Hand-computed expected score (INV-23): 100 - 15 (console) - 20 (http) - 15 (overflow) - 10 (overlap) = 40
+    assert payload["score"] == 40
+    assert payload["screenshot_path"] == "/tmp/staging_mobile_overflow.png"
+    assert len(payload["issues"]) == 4
+    assert {item["kind"] for item in payload["issues"]} == {
+        "console_error",
+        "http_error",
+        "horizontal_overflow",
+        "overlap",
+    }
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_staging_visual_qa_endpoint_safe_fallback_when_playwright_or_staging_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from agent_factory import visual_qa_agent
+
+    # 1) Staging not initialized / unavailable -> status='skipped' without invoking Playwright
+    called_without_staging = False
+
+    def _should_not_run(**_kwargs: Any) -> dict[str, Any]:
+        nonlocal called_without_staging
+        called_without_staging = True
+        return {}
+
+    monkeypatch.setattr(visual_qa_agent, "run_synthetic_user_audit", _should_not_run)
+
+    store_no_staging = SqliteEventStore(db_path=tmp_path / "no_staging.db")
+    server1, thread1, base_url1 = start_dashboard_server(
+        orchestrator=Orchestrator(store=store_no_staging, llm=FakeLLM()),
+        port=0,
+    )
+    try:
+        code1, payload1 = _post_json(f"{base_url1}/api/staging/visual-qa", {})
+    finally:
+        server1.shutdown()
+        server1.server_close()
+        thread1.join(timeout=2.0)
+        store_no_staging.close()
+
+    assert code1 == 200
+    assert called_without_staging is False
+    assert payload1["status"] == "skipped"
+    assert payload1["score"] is None
+    assert payload1["issues"] == []
+    assert payload1["screenshot_path"] is None
+    assert payload1["reason"] == "staging_unavailable"
+
+    # 2) Playwright unavailable (returned skipped=True from visual_qa_agent) -> status='skipped'
+    def _fake_playwright_missing(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": "playwright_unavailable",
+            "detail": "Playwright no está instalado.",
+            "base_url": kwargs["base_url"],
+            "viewports_audited": [],
+            "states_visited": [],
+            "screenshots_captured": 0,
+            "console_errors": [],
+            "page_errors": [],
+            "http_errors": [],
+            "triage_reports": [],
+            "geometry_checks": [],
+            "ideas_created": [],
+            "agy_invoked": False,
+            "agy_error": None,
+        }
+
+    monkeypatch.setattr(visual_qa_agent, "run_synthetic_user_audit", _fake_playwright_missing)
+
+    store_pw = SqliteEventStore(db_path=tmp_path / "no_playwright.db")
+    staging_mgr = _FakeStagingManager(pending_count=1)
+    server2, thread2, base_url2 = start_dashboard_server(
+        orchestrator=Orchestrator(store=store_pw, llm=FakeLLM()),
+        port=0,
+        staging_manager=staging_mgr,  # type: ignore[arg-type]
+    )
+    try:
+        code2, payload2 = _post_json(f"{base_url2}/api/staging/visual-qa", {})
+
+        # 3) Staging URL unreachable (navigation_failed) -> status='skipped'
+        monkeypatch.setattr(
+            visual_qa_agent,
+            "run_synthetic_user_audit",
+            lambda **kwargs: {
+                "ok": False,
+                "skipped": False,
+                "reason": "navigation_failed",
+                "detail": "No se pudo cargar la vista de staging.",
+                "base_url": kwargs["base_url"],
+                "viewports_audited": [],
+                "states_visited": [],
+                "screenshots_captured": 0,
+                "console_errors": [],
+                "page_errors": [],
+                "http_errors": [],
+                "triage_reports": [],
+                "geometry_checks": [],
+                "ideas_created": [],
+                "agy_invoked": False,
+                "agy_error": None,
+            },
+        )
+        code3, payload3 = _post_json(f"{base_url2}/api/staging/visual-qa", {})
+
+        # 4) Executor raises ImportError directly -> status='skipped'
+        def _raise_import(**_kwargs: Any) -> dict[str, Any]:
+            raise ImportError("No module named 'playwright'")
+
+        monkeypatch.setattr(visual_qa_agent, "run_synthetic_user_audit", _raise_import)
+        code4, payload4 = _post_json(f"{base_url2}/api/staging/visual-qa", {})
+    finally:
+        server2.shutdown()
+        server2.server_close()
+        thread2.join(timeout=2.0)
+        store_pw.close()
+
+    for code, payload, expected_reason in (
+        (code2, payload2, "playwright_unavailable"),
+        (code3, payload3, "navigation_failed"),
+        (code4, payload4, "playwright_unavailable"),
+    ):
+        assert code == 200
+        assert payload["status"] == "skipped"
+        assert payload["score"] is None
+        assert payload["issues"] == []
+        assert payload["screenshot_path"] is None
+        assert payload["reason"] == expected_reason
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_staging_visual_qa_endpoint_bounded_timeout_and_validation(
+    tmp_path: Path,
+) -> None:
+    unblock = threading.Event()
+
+    def _hanging_executor(**_kwargs: Any) -> dict[str, Any]:
+        unblock.wait(timeout=3.0)
+        return {"ok": True, "skipped": False}
+
+    store = SqliteEventStore(db_path=tmp_path / "timeout_staging.db")
+    staging_mgr = _FakeStagingManager(pending_count=1)
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=Orchestrator(store=store, llm=FakeLLM()),
+        port=0,
+        staging_manager=staging_mgr,  # type: ignore[arg-type]
+        visual_qa_runner=_hanging_executor,
+    )
+    try:
+        code_timeout, payload_timeout = _post_json(
+            f"{base_url}/api/staging/visual-qa",
+            {"timeout_seconds": 0.1},
+        )
+        code_remote, payload_remote = _post_json(
+            f"{base_url}/api/staging/visual-qa",
+            {"base_url": "https://example.com"},
+        )
+        code_bad_timeout, payload_bad_timeout = _post_json(
+            f"{base_url}/api/staging/visual-qa",
+            {"timeout_seconds": -5},
+        )
+    finally:
+        unblock.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+        store.close()
+
+    assert code_timeout == 200
+    assert payload_timeout["status"] == "skipped"
+    assert payload_timeout["reason"] == "timeout"
+    assert payload_timeout["score"] is None
+    assert payload_timeout["issues"] == []
+    assert payload_timeout["screenshot_path"] is None
+
+    assert code_remote == 400
+    assert "error" in payload_remote
+
+    assert code_bad_timeout == 400
+    assert "error" in payload_bad_timeout
