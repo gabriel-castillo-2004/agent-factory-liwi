@@ -7212,3 +7212,147 @@ def test_dashboard_self_improve_promote_endpoint_handles_success_empty_busy_and_
             thread.join(timeout=2.0)
         store.close()
 
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_staging_banner_ui_and_promote_flow_html_contract(tmp_path: Path) -> None:
+    """GET / serves staging header banner controls, /api/self-improve/staging + promote JS, non-blocking staging apply confirmation, and preserves existing IDs and zero-CDN policy."""
+    store = SqliteEventStore(str(tmp_path / "staging_ui_contract.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as resp:
+            assert resp.status == 200
+            html = resp.read().decode("utf-8")
+
+        # Zero external CDNs
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+
+        # Existing header & Liwi chat IDs preserved
+        for existing_id in (
+            "server-health-dot",
+            "server-health-label",
+            "status-note",
+            "view-mode-segmented",
+            "view-mode-simple",
+            "view-mode-dev",
+            "tech-mode-toggle",
+            "themes-menu-btn",
+            "themes-popover",
+            "improve-factory-btn",
+            "settings-menu-btn",
+            "settings-popover",
+            "factory-improve-modal",
+            "factory-chat-stream",
+            "factory-chat-form",
+            "factory-chat-input",
+            "factory-chat-send-btn",
+            "factory-inline-status",
+        ):
+            assert f'id="{existing_id}"' in html, f"Missing existing ID: {existing_id}"
+
+        # (a) Header staging banner controls: pill, dropdown list of titles, and 'Actualizar ahora' button
+        header_start = html.index("<header>")
+        header_end = html.index("</header>", header_start)
+        header_html = html[header_start:header_end]
+
+        for staging_id in (
+            "staging-banner-wrap",
+            "staging-banner-btn",
+            "staging-banner-spinner",
+            "staging-banner-label",
+            "staging-popover",
+            "staging-commits-list",
+            "staging-popover-error",
+            "staging-promote-btn",
+            "staging-promote-status",
+            "staging-promote-clock",
+        ):
+            assert f'id="{staging_id}"' in header_html, f"Missing staging header ID: {staging_id}"
+        assert "Actualizar ahora" in header_html
+
+        # (b) JS integrates GET /api/self-improve/staging and POST /api/self-improve/promote with real backend fields
+        script_start = html.index("<script>")
+        script_js = html[script_start:]
+        assert "/api/self-improve/staging" in script_js
+        assert "/api/self-improve/promote" in script_js
+        for backend_field in (
+            "pending_count",
+            "commits",
+            "is_building",
+            "queue_size",
+            "last_error",
+            "current_task",
+            "promoted",
+            "restart_scheduled",
+        ):
+            assert backend_field in script_js, f"Missing backend JSON field usage: {backend_field}"
+
+        assert "⏳ Preparando mejora en segundo plano..." in script_js
+        assert "1 mejora lista" in script_js
+        assert "mejoras listas" in script_js
+        assert "Aplicando actualizaciones y reiniciando..." in script_js
+        assert "window.location.reload()" in script_js
+        assert "escapeHtml(" in script_js
+
+        # (c) Liwi chat apply flow handles queued staging response non-blockingly and triggers staging refresh
+        assert "✓ Mejora encolada en segundo plano (staging)" in script_js
+        assert "res.queued" in script_js
+        assert "refreshSelfImproveStaging" in script_js
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_staging_banner_mobile_responsive_css_inside_media_768(tmp_path: Path) -> None:
+    """Mobile CSS adjustments for the staging banner and popover live strictly inside @media (max-width: 768px) without altering desktop header layout."""
+    store = SqliteEventStore(str(tmp_path / "staging_mobile_css.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as resp:
+            assert resp.status == 200
+            html = resp.read().decode("utf-8")
+
+        style_start = html.index("<style>") + len("<style>")
+        style_end = html.index("</style>", style_start)
+        css = html[style_start:style_end]
+
+        media_768 = _extract_css_block(css, "@media (max-width: 768px)")
+        assert media_768, "Expected @media (max-width: 768px) block"
+
+        assert "header .controls .staging-banner-wrap" in media_768
+        assert "#staging-banner-btn" in media_768
+        assert "header .staging-popover" in media_768
+        assert "#staging-promote-btn" in media_768
+
+        staging_pop_mobile = _extract_css_block(media_768, "header .staging-popover")
+        assert staging_pop_mobile
+        assert "position: fixed;" in staging_pop_mobile
+        assert "max-width: calc(100vw - 24px);" in staging_pop_mobile
+
+        staging_btn_mobile = _extract_css_block(media_768, "#staging-banner-btn")
+        assert staging_btn_mobile
+        assert "min-height: 38px;" in staging_btn_mobile
+        assert "white-space: nowrap;" in staging_btn_mobile
+
+        # Desktop header rule remains intact outside @media (max-width: 768px)
+        desktop_header = _extract_css_block(css, "header {")
+        assert "display: flex;" in desktop_header
+        assert "justify-content: space-between;" in desktop_header
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+

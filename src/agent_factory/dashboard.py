@@ -3765,6 +3765,135 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       gap: 10px;
       z-index: 30;
     }
+    .staging-banner-wrap {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+    }
+    .staging-pill {
+      border-radius: 999px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      padding: 6px 12px;
+      gap: 6px;
+      white-space: nowrap;
+    }
+    .staging-pill.is-building {
+      background: var(--info-bg);
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .staging-pill.is-ready {
+      background: var(--ok-bg);
+      border-color: var(--ok);
+      color: var(--ok);
+    }
+    .staging-pill.is-error {
+      background: var(--err-bg);
+      border-color: var(--err);
+      color: var(--err);
+    }
+    .staging-popover {
+      position: absolute;
+      top: calc(100% + 8px);
+      right: 0;
+      min-width: 280px;
+      max-width: 360px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px;
+      box-shadow: 0 12px 28px rgba(0, 0, 0, 0.38);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      z-index: 40;
+    }
+    .staging-popover-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 0.85rem;
+    }
+    .staging-commits-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 220px;
+      overflow-y: auto;
+    }
+    .staging-commit-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+      padding: 6px 8px;
+      border-radius: 7px;
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      font-size: 0.82rem;
+      line-height: 1.35;
+      color: var(--text);
+    }
+    .staging-commit-hash {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.74rem;
+      color: var(--muted);
+      flex-shrink: 0;
+    }
+    .staging-commit-title {
+      word-break: break-word;
+      overflow-wrap: anywhere;
+    }
+    .staging-popover-error {
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: var(--err-bg);
+      border: 1px solid rgba(239, 68, 68, 0.35);
+      color: var(--err);
+      font-size: 0.8rem;
+      line-height: 1.4;
+      word-break: break-word;
+    }
+    .staging-popover-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding-top: 6px;
+      border-top: 1px solid var(--border);
+    }
+    .staging-promote-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.8rem;
+      color: var(--muted);
+      flex-wrap: wrap;
+    }
+    .staging-live-clock {
+      font-variant-numeric: tabular-nums;
+      font-weight: 600;
+      color: var(--accent);
+    }
+    .factory-staging-notice {
+      margin-top: 8px;
+      padding: 8px 12px;
+      border-radius: 10px;
+      background: var(--ok-bg);
+      border: 1px solid rgba(34, 197, 94, 0.35);
+      color: var(--ok);
+      font-size: 0.84rem;
+      font-weight: 500;
+      line-height: 1.4;
+    }
+    .factory-staging-notice.is-error {
+      background: var(--err-bg);
+      border-color: rgba(239, 68, 68, 0.35);
+      color: var(--err);
+    }
     .theme-option,
     .more-menu-item {
       width: 100%;
@@ -4375,6 +4504,38 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         left: auto;
         max-width: calc(100vw - 24px);
         z-index: 80;
+      }
+      header .controls .staging-banner-wrap {
+        flex-shrink: 0;
+        display: inline-flex;
+        align-items: center;
+      }
+      #staging-banner-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        white-space: nowrap;
+        flex-shrink: 0;
+        min-height: 38px;
+        padding: 5px 10px;
+        font-size: 0.78rem;
+        line-height: 1.2;
+      }
+      header .staging-popover {
+        position: fixed;
+        top: 108px;
+        right: 12px;
+        left: 12px;
+        min-width: 0;
+        max-width: calc(100vw - 24px);
+        z-index: 85;
+      }
+      .staging-popover .staging-commits-list {
+        max-height: 40vh;
+      }
+      #staging-promote-btn {
+        width: 100%;
+        min-height: 40px;
       }
       .mobile-switcher-row {
         display: flex;
@@ -5891,6 +6052,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </button>
         </div>
       </div>
+      <div id="staging-banner-wrap" class="staging-banner-wrap" style="display:none">
+        <button id="staging-banner-btn" class="btn btn-sm staging-pill" type="button" aria-expanded="false" aria-controls="staging-popover" title="Estado de auto-mejoras en staging">
+          <span id="staging-banner-spinner" class="btn-spinner" aria-hidden="true" style="display:none"></span>
+          <span id="staging-banner-label"></span>
+        </button>
+        <div id="staging-popover" class="staging-popover" role="region" aria-label="Mejoras en staging" style="display:none">
+          <div class="staging-popover-head">
+            <strong id="staging-popover-title">Mejoras listas para aplicar</strong>
+            <span id="staging-popover-meta" class="muted"></span>
+          </div>
+          <ul id="staging-commits-list" class="staging-commits-list"></ul>
+          <div id="staging-popover-error" class="staging-popover-error" role="alert" style="display:none"></div>
+          <div class="staging-popover-actions">
+            <button id="staging-promote-btn" class="btn btn-primary btn-sm" type="button">Actualizar ahora</button>
+            <div id="staging-promote-status" class="staging-promote-status" aria-live="polite" style="display:none">
+              <span class="btn-spinner" aria-hidden="true"></span>
+              <span id="staging-promote-status-text">Aplicando actualizaciones y reiniciando...</span>
+              <span id="staging-promote-clock" class="staging-live-clock">0s</span>
+            </div>
+          </div>
+        </div>
+      </div>
       <button id="improve-factory-btn" class="btn btn-sm" type="button" title="Abrir chat padre de auto-mejora de Liwi">🏭 Mejorar Fábrica</button>
       <div class="settings-menu-wrap">
         <button id="settings-menu-btn" class="btn btn-sm" type="button" aria-expanded="false" aria-controls="settings-popover">⚙️ Ajustes</button>
@@ -6552,6 +6735,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.querySelectorAll('.more-popover, .themes-popover, .settings-popover').forEach((pop) => {
         pop.style.display = 'none';
       });
+      if (!window.__stagingPromoteInFlight) {
+        const stPop = document.getElementById('staging-popover');
+        if (stPop) stPop.style.display = 'none';
+        const stBtn = document.getElementById('staging-banner-btn');
+        if (stBtn) stBtn.setAttribute('aria-expanded', 'false');
+      }
       document.querySelectorAll('[aria-controls="project-more-popover"], [aria-controls="header-more-popover"], [aria-controls="audit-more-actions-menu"], [aria-controls="quality-more-actions-menu"], #themes-menu-btn, #settings-menu-btn').forEach((b) => {
         b.setAttribute('aria-expanded', 'false');
       });
@@ -6559,7 +6748,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     document.addEventListener('click', (ev) => {
       const target = ev.target;
-      const insideWrap = target && target.closest ? target.closest('.themes-menu-wrap, .settings-menu-wrap, .more-menu-wrap, .audit-primary-split') : null;
+      const insideWrap = target && target.closest ? target.closest('.themes-menu-wrap, .settings-menu-wrap, .staging-banner-wrap, .more-menu-wrap, .audit-primary-split') : null;
       if (!insideWrap) {
         closeFloatingDropdowns();
       }
@@ -11565,6 +11754,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         };
         lastServerRunning = isRunning;
 
+        if (window.__liwiStagingActive && !applyInFlight) {
+          stopStatusPolling();
+          stopClockTicker();
+          if (fsOverlay) fsOverlay.style.display = 'none';
+          if (buildBanner) buildBanner.style.display = 'none';
+          if (progressCard) progressCard.style.display = 'none';
+          setFactoryControlsLocked(false);
+          updateLiveClockAndHeader();
+          if (typeof window.refreshSelfImproveStaging === 'function') {
+            window.refreshSelfImproveStaging();
+          }
+          if (wasRunning && !isRunning) {
+            refreshHistory();
+          }
+          return;
+        }
+
         if (isRunning) {
           ensureStatusPolling();
           ensureClockTicker();
@@ -11940,28 +12146,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         streamEl.scrollTop = streamEl.scrollHeight;
         streamEl.querySelectorAll('button[data-apply-factory-proposal]').forEach((btn) => {
           btn.addEventListener('click', async () => {
-            if (applyInFlight || activeStatus.running) return;
+            if (btn.disabled || btn.getAttribute('data-enqueuing') === '1' || applyInFlight) return;
             const card = btn.closest('.factory-proposal-card');
             const pre = card ? card.querySelector('.doctor-prompt-pre') : null;
             const promptText = pre ? pre.textContent : '';
             if (!promptText) return;
             const propTitle = btn.getAttribute('data-prop-title') || 'Auto-mejora Liwi';
-            const origText = btn.textContent;
-            applyInFlight = true;
-            buildOverlayMinimized = false;
-            setFactoryControlsLocked(true);
-            btn.textContent = 'Construyendo mejora...';
-            applyStatusSnapshot({
-              running: true,
-              step: 1,
-              total_steps: 3,
-              stage: 'Editando código de Liwi con IA',
-              detail: 'Analizando archivos y aplicando cambios solicitados...',
-              title: propTitle,
-              elapsed_seconds: 0,
-            });
-            ensureStatusPolling();
-            if (statusEl) statusEl.textContent = 'En construcción: Paso 1/3 iniciado...';
+            const origHtml = btn.innerHTML;
+            const startedAtMs = Date.now();
+            btn.disabled = true;
+            btn.setAttribute('data-enqueuing', '1');
+            btn.setAttribute('aria-busy', 'true');
+            btn.innerHTML =
+              '<span class="btn-spinner" aria-hidden="true"></span>' +
+              '<span>Encolando mejora...</span>' +
+              ' <span class="staging-live-clock" data-apply-clock="1">0s</span>';
+            const applyClockTimer = setInterval(() => {
+              const cEl = btn.querySelector('[data-apply-clock]');
+              if (cEl) {
+                cEl.textContent = Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000)) + 's';
+              }
+            }, 1000);
+            if (statusEl) statusEl.textContent = 'Enviando mejora a segundo plano (staging)...';
             try {
               const res = await apiFetch('/api/factory/assistant/apply', {
                 method: 'POST',
@@ -11973,37 +12179,68 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                   proposal_prompt: promptText,
                 }),
               });
-              renderMessages(res.messages || []);
+              clearInterval(applyClockTimer);
+              btn.removeAttribute('data-enqueuing');
+              btn.removeAttribute('aria-busy');
+              if (res && res.queued) {
+                window.__liwiStagingActive = true;
+                btn.setAttribute('data-applied', '1');
+                btn.disabled = true;
+                btn.textContent = '✓ Encolada en staging';
+                const confirmText = '✓ Mejora encolada en segundo plano (staging)';
+                if (statusEl) statusEl.textContent = confirmText;
+                if (card) {
+                  const prevNotice = card.querySelector('.factory-staging-notice');
+                  if (prevNotice) prevNotice.remove();
+                  const noticeEl = document.createElement('div');
+                  noticeEl.className = 'factory-staging-notice';
+                  noticeEl.setAttribute('role', 'status');
+                  noticeEl.textContent = confirmText;
+                  card.appendChild(noticeEl);
+                }
+                if (res.staging && typeof window.applySelfImproveStagingSnapshot === 'function') {
+                  window.applySelfImproveStagingSnapshot(res.staging);
+                }
+                if (typeof window.refreshSelfImproveStaging === 'function') {
+                  window.refreshSelfImproveStaging();
+                }
+                return;
+              }
+              if (res && Array.isArray(res.messages)) {
+                renderMessages(res.messages);
+              }
               if (res && res.restart_scheduled) {
                 if (statusEl) statusEl.textContent = '✓ Mejora aplicada. Reiniciando Liwi...';
                 startReconnectPolling();
-              } else {
+              } else if (res && res.rolled_back) {
                 applyInFlight = false;
                 if (fsOverlay) fsOverlay.style.display = 'none';
                 applyStatusSnapshot({ running: false, step: 0, total_steps: 3, last_outcome: 'rolled_back' });
                 setFactoryControlsLocked(false);
                 if (statusEl) statusEl.textContent = 'Mejora revertida automáticamente tras fallo en verificación.';
+              } else {
+                btn.setAttribute('data-applied', '1');
+                btn.disabled = true;
+                btn.textContent = '✓ Mejora aplicada';
+                if (statusEl) statusEl.textContent = (res && res.message) ? String(res.message) : '✓ Mejora aplicada.';
               }
             } catch (err) {
-              const stNow = await pollFactoryStatus();
-              if (stNow && stNow.running) {
-                if (statusEl) statusEl.textContent = 'La mejora sigue construyéndose en segundo plano...';
-                return;
+              clearInterval(applyClockTimer);
+              btn.removeAttribute('data-enqueuing');
+              btn.removeAttribute('aria-busy');
+              btn.disabled = false;
+              btn.innerHTML = origHtml;
+              const errMsg = 'Error aplicando mejora: ' + (err && err.message ? err.message : String(err || 'Error inesperado'));
+              if (statusEl) statusEl.textContent = errMsg;
+              if (card) {
+                const prevErr = card.querySelector('.factory-staging-notice');
+                if (prevErr) prevErr.remove();
+                const errNotice = document.createElement('div');
+                errNotice.className = 'factory-staging-notice is-error';
+                errNotice.setAttribute('role', 'alert');
+                errNotice.textContent = errMsg;
+                card.appendChild(errNotice);
               }
-              applyInFlight = false;
-              stopStatusPolling();
-              stopClockTicker();
-              setFactoryControlsLocked(false);
-              btn.textContent = origText;
-              if (fsOverlay) fsOverlay.style.display = 'none';
-              if (progressCard) progressCard.style.display = 'none';
-              if (buildBanner) buildBanner.style.display = 'none';
-              updateLiveClockAndHeader();
-              if (err && err.name !== 'AbortError' && String(err.message || '').indexOf('HTTP ') < 0) {
-                startReconnectPolling();
-                return;
-              }
-              if (statusEl) statusEl.textContent = 'Error aplicando mejora: ' + err.message;
             }
           });
         });
@@ -12174,6 +12411,298 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
 
       pollFactoryStatus();
+    })();
+
+    (function initStagingBanner() {
+      const wrap = document.getElementById('staging-banner-wrap');
+      const btn = document.getElementById('staging-banner-btn');
+      const spinnerEl = document.getElementById('staging-banner-spinner');
+      const labelEl = document.getElementById('staging-banner-label');
+      const popover = document.getElementById('staging-popover');
+      const popTitleEl = document.getElementById('staging-popover-title');
+      const popMetaEl = document.getElementById('staging-popover-meta');
+      const commitsListEl = document.getElementById('staging-commits-list');
+      const popErrorEl = document.getElementById('staging-popover-error');
+      const promoteBtn = document.getElementById('staging-promote-btn');
+      const promoteStatusEl = document.getElementById('staging-promote-status');
+      const promoteStatusTextEl = document.getElementById('staging-promote-status-text');
+      const promoteClockEl = document.getElementById('staging-promote-clock');
+      if (!wrap || !btn || !labelEl || !popover || !commitsListEl || !promoteBtn) return;
+
+      let stagingFetchInFlight = false;
+      let promoteInFlight = false;
+      let promoteClockTimer = null;
+      let promoteStartedAtMs = 0;
+      let promoteReloadTimer = null;
+      let promoteErrorMsg = '';
+      let lastStagingSnapshot = {
+        pending_count: 0,
+        commits: [],
+        is_building: false,
+        queue_size: 0,
+        last_error: null,
+        current_task: null,
+        initialized: false,
+      };
+
+      function stopPromoteClock() {
+        if (promoteClockTimer) {
+          clearInterval(promoteClockTimer);
+          promoteClockTimer = null;
+        }
+      }
+
+      function stopPromoteReloadTimer() {
+        if (promoteReloadTimer) {
+          clearInterval(promoteReloadTimer);
+          promoteReloadTimer = null;
+        }
+      }
+
+      function renderStagingBanner(rawSnapshot) {
+        const s = rawSnapshot && typeof rawSnapshot === 'object' ? rawSnapshot : {};
+        const pendingCount = Math.max(0, Number(s.pending_count) || 0);
+        const commits = Array.isArray(s.commits) ? s.commits : [];
+        const effectivePending = pendingCount > 0 ? pendingCount : commits.length;
+        const isBuilding = Boolean(s.is_building);
+        const queueSize = Math.max(0, Number(s.queue_size) || 0);
+        const hasWorkInProgress = isBuilding || queueSize > 0;
+        const lastError = s.last_error ? String(s.last_error).trim() : '';
+        const currentTask = s.current_task ? String(s.current_task).trim() : '';
+        const initialized = Boolean(s.initialized);
+
+        lastStagingSnapshot = {
+          pending_count: effectivePending,
+          commits: commits,
+          is_building: isBuilding,
+          queue_size: queueSize,
+          last_error: lastError || null,
+          current_task: currentTask || null,
+          initialized: initialized,
+        };
+        window.__liwiStagingActive = Boolean(initialized || hasWorkInProgress || effectivePending > 0);
+
+        if (!hasWorkInProgress && effectivePending === 0 && !promoteInFlight) {
+          wrap.style.display = 'none';
+          popover.style.display = 'none';
+          btn.setAttribute('aria-expanded', 'false');
+          return;
+        }
+
+        wrap.style.display = 'inline-flex';
+        btn.classList.remove('is-building', 'is-ready', 'is-error');
+
+        if (hasWorkInProgress) {
+          btn.classList.add('is-building');
+          if (spinnerEl) spinnerEl.style.display = 'inline-block';
+          labelEl.textContent = '⏳ Preparando mejora en segundo plano...';
+          if (popTitleEl) popTitleEl.textContent = 'Preparando mejora en segundo plano';
+          if (popMetaEl) {
+            popMetaEl.textContent = queueSize > 0
+              ? ('Cola: ' + queueSize)
+              : (effectivePending > 0 ? (effectivePending + ' lista(s)') : 'En curso');
+          }
+        } else if (effectivePending > 0) {
+          btn.classList.add('is-ready');
+          if (spinnerEl) spinnerEl.style.display = 'none';
+          labelEl.textContent = effectivePending === 1
+            ? '🚀 1 mejora lista'
+            : ('🚀 ' + effectivePending + ' mejoras listas');
+          if (popTitleEl) popTitleEl.textContent = 'Mejoras listas para aplicar';
+          if (popMetaEl) {
+            popMetaEl.textContent = effectivePending === 1
+              ? '1 pendiente'
+              : (effectivePending + ' pendientes');
+          }
+        }
+
+        const listItems = [];
+        if (hasWorkInProgress && currentTask) {
+          listItems.push(
+            '<li class="staging-commit-item">' +
+              '<span class="staging-commit-hash">⏳</span>' +
+              '<span class="staging-commit-title">En curso: ' + escapeHtml(currentTask) + '</span>' +
+            '</li>'
+          );
+        }
+        commits.forEach((c) => {
+          const isObj = c && typeof c === 'object';
+          const shortHash = isObj && c.hash ? String(c.hash).slice(0, 7) : '';
+          const titleText = isObj ? String(c.title || c.hash || 'Mejora verificada') : String(c || 'Mejora verificada');
+          listItems.push(
+            '<li class="staging-commit-item">' +
+              (shortHash ? '<span class="staging-commit-hash">' + escapeHtml(shortHash) + '</span>' : '') +
+              '<span class="staging-commit-title">' + escapeHtml(titleText) + '</span>' +
+            '</li>'
+          );
+        });
+        if (!listItems.length) {
+          listItems.push(
+            '<li class="staging-commit-item">' +
+              '<span class="staging-commit-title">' +
+                escapeHtml(hasWorkInProgress ? 'Verificando mejora en segundo plano...' : 'Mejoras verificadas listas para aplicar.') +
+              '</span>' +
+            '</li>'
+          );
+        }
+        commitsListEl.innerHTML = listItems.join('');
+
+        if (popErrorEl) {
+          const errToShow = promoteErrorMsg || lastError;
+          if (errToShow && !promoteInFlight) {
+            popErrorEl.textContent = errToShow;
+            popErrorEl.style.display = 'block';
+          } else {
+            popErrorEl.textContent = '';
+            popErrorEl.style.display = 'none';
+          }
+        }
+
+        if (!promoteInFlight) {
+          if (effectivePending > 0) {
+            promoteBtn.style.display = 'inline-flex';
+            promoteBtn.disabled = hasWorkInProgress;
+            promoteBtn.textContent = 'Actualizar ahora';
+            promoteBtn.title = hasWorkInProgress
+              ? 'Espera a que termine la mejora en segundo plano para actualizar'
+              : 'Promover mejoras verificadas a main y reiniciar Liwi';
+          } else {
+            promoteBtn.style.display = 'none';
+            promoteBtn.disabled = true;
+          }
+        }
+      }
+
+      async function pollStagingStatus() {
+        if (stagingFetchInFlight || promoteInFlight) return null;
+        stagingFetchInFlight = true;
+        try {
+          const data = await apiFetch('/api/self-improve/staging', { cache: 'no-store' });
+          renderStagingBanner(data);
+          return data;
+        } catch (_) {
+          return null;
+        } finally {
+          stagingFetchInFlight = false;
+        }
+      }
+
+      function startPromoteReloadPolling(restartScheduled) {
+        stopPromoteReloadTimer();
+        if (!restartScheduled) {
+          if (promoteStatusTextEl) promoteStatusTextEl.textContent = '✓ ¡Liwi actualizado! Recargando...';
+          setTimeout(() => {
+            stopPromoteClock();
+            window.location.reload();
+          }, 600);
+          return;
+        }
+        let sawDrop = false;
+        const pollStartedAt = Date.now();
+        promoteReloadTimer = setInterval(async () => {
+          try {
+            const resp = await fetch('/api/self-improve/staging', { cache: 'no-store' });
+            if (resp.ok) {
+              if (sawDrop || (Date.now() - pollStartedAt) >= 1500) {
+                stopPromoteReloadTimer();
+                stopPromoteClock();
+                if (promoteStatusTextEl) promoteStatusTextEl.textContent = '✓ ¡Liwi actualizado! Recargando...';
+                window.location.reload();
+              }
+            } else {
+              sawDrop = true;
+            }
+          } catch (_) {
+            sawDrop = true;
+          }
+        }, 1000);
+      }
+
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const isOpen = popover.style.display !== 'none';
+        closeFloatingDropdowns();
+        if (!isOpen) {
+          popover.style.display = 'flex';
+          btn.setAttribute('aria-expanded', 'true');
+          pollStagingStatus();
+        }
+      });
+
+      promoteBtn.addEventListener('click', async () => {
+        if (promoteInFlight || promoteBtn.disabled) return;
+        promoteInFlight = true;
+        window.__stagingPromoteInFlight = true;
+        promoteErrorMsg = '';
+        promoteBtn.disabled = true;
+        promoteBtn.setAttribute('aria-busy', 'true');
+        promoteBtn.innerHTML = '<span class="btn-spinner" aria-hidden="true"></span><span>Actualizando...</span>';
+        if (popErrorEl) {
+          popErrorEl.style.display = 'none';
+          popErrorEl.textContent = '';
+        }
+        promoteStartedAtMs = Date.now();
+        if (promoteStatusTextEl) promoteStatusTextEl.textContent = 'Aplicando actualizaciones y reiniciando...';
+        if (promoteClockEl) promoteClockEl.textContent = '0s';
+        if (promoteStatusEl) promoteStatusEl.style.display = 'inline-flex';
+        stopPromoteClock();
+        promoteClockTimer = setInterval(() => {
+          if (promoteClockEl) {
+            promoteClockEl.textContent = Math.max(0, Math.floor((Date.now() - promoteStartedAtMs) / 1000)) + 's';
+          }
+        }, 1000);
+
+        try {
+          const res = await apiFetch('/api/self-improve/promote', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            timeoutMs: 60000,
+            body: JSON.stringify({}),
+          });
+          if (res && res.promoted) {
+            if (promoteStatusTextEl) {
+              promoteStatusTextEl.textContent = 'Aplicando actualizaciones y reiniciando...';
+            }
+            startPromoteReloadPolling(Boolean(res.restart_scheduled));
+            return;
+          }
+          stopPromoteClock();
+          promoteInFlight = false;
+          window.__stagingPromoteInFlight = false;
+          if (promoteStatusEl) promoteStatusEl.style.display = 'none';
+          promoteBtn.removeAttribute('aria-busy');
+          promoteBtn.textContent = 'Actualizar ahora';
+          promoteBtn.disabled = false;
+          if (res && res.message && popErrorEl) {
+            promoteErrorMsg = String(res.message);
+            popErrorEl.textContent = promoteErrorMsg;
+            popErrorEl.style.display = 'block';
+          }
+          pollStagingStatus();
+        } catch (err) {
+          stopPromoteClock();
+          stopPromoteReloadTimer();
+          promoteInFlight = false;
+          window.__stagingPromoteInFlight = false;
+          if (promoteStatusEl) promoteStatusEl.style.display = 'none';
+          promoteBtn.removeAttribute('aria-busy');
+          promoteBtn.textContent = 'Actualizar ahora';
+          promoteBtn.disabled = false;
+          promoteErrorMsg = 'Error al actualizar: ' + (err && err.message ? err.message : String(err || 'Error inesperado'));
+          if (popErrorEl) {
+            popErrorEl.textContent = promoteErrorMsg;
+            popErrorEl.style.display = 'block';
+          }
+          renderStagingBanner(lastStagingSnapshot);
+        }
+      });
+
+      window.applySelfImproveStagingSnapshot = renderStagingBanner;
+      window.refreshSelfImproveStaging = pollStagingStatus;
+      setInterval(() => {
+        pollStagingStatus();
+      }, 5000);
+      pollStagingStatus();
     })();
 
     setInterval(updateLiveTimers, 1000);
