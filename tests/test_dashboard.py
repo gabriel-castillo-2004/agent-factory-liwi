@@ -3479,11 +3479,13 @@ def test_dashboard_ux_redesign_progress_timer_header_and_four_tabs(tmp_path: Pat
         ):
             assert tab_marker in html
 
-        # Exactly 4 tab buttons in .tabs bar
+        # Exactly 5 tab buttons in .tabs bar (including Auto-Mejoras)
         tabs_start = html.index('<div class="tabs">')
         tabs_end = html.index("</div>", tabs_start)
         tabs_block = html[tabs_start:tabs_end]
-        assert tabs_block.count('class="tab-btn') == 4
+        assert tabs_block.count('class="tab-btn') == 5
+        assert 'id="tab-ideas-btn"' in tabs_block
+        assert 'data-tab="ideas"' in tabs_block
         assert 'data-tab="audit"' in tabs_block
         assert 'data-tab="modify"' in tabs_block
         assert 'data-tab="spec"' in tabs_block
@@ -7956,12 +7958,18 @@ def test_dashboard_auto_ideas_header_button_scrolls_to_radar_and_auto_loads_idea
         assert "#auto-ideas-btn" in media_768
 
         meta_col_rule = _extract_css_block(css, ".factory-chat-meta-col {")
-        assert "overflow-y: auto;" in meta_col_rule
+        assert "overflow-y" not in meta_col_rule
+        assert "max-height" not in meta_col_rule
+        radar_modal_rule = _extract_css_block(
+            css,
+            '#factory-improve-modal[data-view="radar"] .factory-chat-modal {',
+        )
+        assert "overflow-y: auto;" in radar_modal_rule
 
         script_js = html[html.index("<script>") :]
         assert "auto-ideas-btn" in script_js
         assert "focusRadar" in script_js
-        assert "scrollIntoView(" in script_js
+        assert "setFactoryModalView" in script_js
         assert "auto-ideas-count" in script_js
         radar_init = script_js[script_js.index("(function initLiwiIdeaRadar()") :]
         assert "\n      loadIdeas();" in radar_init
@@ -8231,6 +8239,13 @@ def test_dashboard_autonomous_quota_visual_audit_and_project_ideas_endpoints_and
             'id="liwi-autonomous-history-panel"',
             'id="tab-ideas-btn"',
             'id="tab-ideas"',
+            'id="factory-modal-switch-view-btn"',
+            'id="liwi-pilot-settings-btn"',
+            'id="liwi-pilot-settings-panel"',
+            "setFactoryModalView",
+            'data-view="chat"',
+            "liwi-radar-card-preview",
+            "-webkit-line-clamp: 2",
             "No se pudieron cargar los proyectos:",
             "function clearFactoryBlockingForStaging()",
             "/api/autonomous/status",

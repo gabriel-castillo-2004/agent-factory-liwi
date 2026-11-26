@@ -743,6 +743,8 @@ def test_factory_assistant_apply_selects_targeted_tests_for_modified_dashboard_f
         assert timeout_dash >= 900.0
         assert "tests/test_self_improver.py" in cmd_dash
         assert "tests/test_dashboard.py" in cmd_dash
+        assert "-k" in cmd_dash
+        assert "autonomous or ideas or radar or four_tabs or staging" in cmd_dash
         assert "tests/test_recovery_agent.py" not in cmd_dash
 
         # Unmatched module with no test_*<module>*.py triggers full suite fallback
@@ -841,13 +843,13 @@ def test_factory_assistant_apply_targets_self_improver_tests_only_and_auto_repai
         assert len(consult_prompts) == 1
         assert "Paso 1" in consult_prompts[0]
 
-        # Apply fails first pytest -> 1 repair round (<=180s) -> passes without rollback
+        # Apply fails first pytest -> 1 repair round (300s) -> passes without rollback
         res = improver.apply_proposal("Actualiza self_improver.py", proposal_title="Auto-repair test")
         assert res["ok"] is True
         assert res["applied"] is True
         assert res["rolled_back"] is False
         assert len(agy_calls) == 2
-        assert agy_calls[1]["timeout"] <= 180.0
+        assert agy_calls[1]["timeout"] == 300.0
         assert "AssertionError: boom_repair" in agy_calls[1]["prompt"]
         assert repair_stages_seen == ["Auto-reparando fallo detectado..."]
         assert len(pytest_cmds) == 2

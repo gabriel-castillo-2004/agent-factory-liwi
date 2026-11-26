@@ -4432,21 +4432,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .liwi-radar-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
-      max-height: 240px;
-      overflow-y: auto;
-      scrollbar-width: thin;
+      gap: 14px;
       min-width: 0;
     }
     .liwi-radar-card {
       background: var(--surface-alt);
       border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 10px 12px;
+      border-radius: 12px;
+      padding: 16px;
       cursor: pointer;
       display: flex;
       flex-direction: column;
-      gap: 8px;
+      gap: 10px;
       min-width: 0;
       box-sizing: border-box;
       transition: border-color 0.15s ease, background 0.15s ease;
@@ -4518,6 +4515,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       color: var(--ok);
       background: var(--ok-bg);
       border: 1px solid rgba(34, 197, 94, 0.32);
+    }
+    .liwi-radar-card-preview {
+      margin: 0;
+      font-size: 0.79rem;
+      line-height: 1.45;
+      color: var(--muted);
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .liwi-radar-card.is-expanded .liwi-radar-card-preview {
+      display: none;
     }
     .liwi-radar-card-details {
       display: none;
@@ -5587,7 +5599,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
       .liwi-radar-grid {
         grid-template-columns: 1fr;
-        max-height: 220px;
+        gap: 12px;
       }
       .liwi-radar-card-actions {
         width: 100%;
@@ -6246,9 +6258,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .factory-chat-meta-col {
       max-width: 800px;
       width: 100%;
-      max-height: 48vh;
-      overflow-y: auto;
-      scrollbar-width: thin;
       margin: 0 auto;
       padding: 0 20px;
       box-sizing: border-box;
@@ -6256,6 +6265,39 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       display: flex;
       flex-direction: column;
       gap: 8px;
+    }
+    #factory-improve-modal[data-view="radar"] .factory-chat-modal {
+      overflow-y: auto;
+      scrollbar-width: thin;
+    }
+    #factory-improve-modal[data-view="radar"] #factory-chat-stream,
+    #factory-improve-modal[data-view="radar"] .factory-composer-wrap,
+    #factory-improve-modal[data-view="radar"] #factory-memory-toggle,
+    #factory-improve-modal[data-view="radar"] #factory-memory-panel {
+      display: none !important;
+    }
+    #factory-improve-modal[data-view="chat"] #liwi-radar-section {
+      display: none !important;
+    }
+    .liwi-pilot-settings-panel {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      padding: 10px 12px;
+      margin-bottom: 10px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
+      align-items: center;
+    }
+    .liwi-pilot-setting-field {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 0.76rem;
+      color: var(--muted);
+      min-width: 130px;
+      flex: 1 1 130px;
     }
     .factory-memory-panel {
       margin-top: 10px;
@@ -6612,8 +6654,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
       .factory-chat-meta-col {
         padding: 0 12px;
-        max-height: 44dvh;
-        overflow-y: auto;
       }
       .factory-chat-stream {
         padding: 16px 14px 20px;
@@ -7064,12 +7104,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </form>
     </div>
 
-    <div id="factory-improve-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="factory-improve-title" style="display:none">
+    <div id="factory-improve-modal" class="modal-backdrop" data-view="chat" role="dialog" aria-modal="true" aria-labelledby="factory-improve-title" style="display:none">
       <div class="modal-card factory-chat-modal">
         <div class="factory-chat-head">
           <div class="factory-chat-head-left">
             <h3 id="factory-improve-title" class="factory-chat-title">Liwi</h3>
             <button id="factory-memory-toggle" type="button" class="model-pill" aria-expanded="false" aria-controls="factory-memory-panel">🧠 Memoria de Liwi (0)</button>
+            <button id="factory-modal-switch-view-btn" type="button" class="model-pill">💡 Ver Radar</button>
           </div>
           <button id="close-factory-improve-btn" class="factory-close-btn" type="button" aria-label="Cerrar / Volver">✕ Cerrar</button>
         </div>
@@ -7091,23 +7132,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div class="liwi-radar-head">
               <h4 id="liwi-radar-title" class="liwi-radar-title">💡 Radar de Auto-Mejoras</h4>
               <div class="liwi-radar-controls">
-                <select id="liwi-radar-frequency" class="liwi-radar-select" aria-label="Frecuencia automática de ideas" title="Frecuencia automática de generación de ideas">
-                  <option value="0">Manual</option>
-                  <option value="24">Cada 24h</option>
-                  <option value="72">Cada 3 días</option>
-                </select>
-                <select id="liwi-reserve-threshold" class="liwi-radar-select" aria-label="Reserva de cuota" title="Umbral mínimo de reserva de cuota antes de pausar automejoras">
-                  <option value="20">Reserva 20%</option>
-                  <option value="30" selected>Reserva 30%</option>
-                  <option value="40">Reserva 40%</option>
-                  <option value="50">Reserva 50%</option>
-                </select>
-                <select id="liwi-autonomous-cooldown" class="liwi-radar-select" aria-label="Cooldown autónomo" title="Pausa mínima entre mejoras autónomas">
-                  <option value="15">Cada 15m</option>
-                  <option value="20">Cada 20m</option>
-                  <option value="25" selected>Cada 25m</option>
-                  <option value="30">Cada 30m</option>
-                </select>
                 <button id="liwi-visual-audit-btn" class="btn btn-sm" type="button" title="Auditar interfaz como usuario sintético con Playwright">🕵️ Simular usuario</button>
                 <button id="liwi-radar-generate-btn" class="btn btn-sm liwi-radar-gen-btn" type="button">💡 Generar ideas</button>
               </div>
@@ -7115,6 +7139,35 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div class="liwi-radar-subtabs" role="tablist" aria-label="Vistas de auto-mejoras">
               <button id="liwi-subtab-ideas-btn" class="liwi-subtab-btn active" type="button" role="tab" aria-selected="true">💡 Ideas pendientes</button>
               <button id="liwi-subtab-history-btn" class="liwi-subtab-btn" type="button" role="tab" aria-selected="false">📜 Bitácora Autónoma</button>
+              <button id="liwi-pilot-settings-btn" class="liwi-subtab-btn" type="button" aria-expanded="false" aria-controls="liwi-pilot-settings-panel">⚙️ Ajustes del piloto</button>
+            </div>
+            <div id="liwi-pilot-settings-panel" class="liwi-pilot-settings-panel" style="display:none">
+              <label class="liwi-pilot-setting-field">
+                <span>Frecuencia de ideas</span>
+                <select id="liwi-radar-frequency" class="liwi-radar-select" aria-label="Frecuencia automática de ideas" title="Frecuencia automática de generación de ideas">
+                  <option value="0">Manual</option>
+                  <option value="24">Cada 24h</option>
+                  <option value="72">Cada 3 días</option>
+                </select>
+              </label>
+              <label class="liwi-pilot-setting-field">
+                <span>Reserva de cuota</span>
+                <select id="liwi-reserve-threshold" class="liwi-radar-select" aria-label="Reserva de cuota" title="Umbral mínimo de reserva de cuota antes de pausar automejoras">
+                  <option value="20">Reserva 20%</option>
+                  <option value="30" selected>Reserva 30%</option>
+                  <option value="40">Reserva 40%</option>
+                  <option value="50">Reserva 50%</option>
+                </select>
+              </label>
+              <label class="liwi-pilot-setting-field">
+                <span>Enfriamiento</span>
+                <select id="liwi-autonomous-cooldown" class="liwi-radar-select" aria-label="Cooldown autónomo" title="Pausa mínima entre mejoras autónomas">
+                  <option value="15">Cada 15m</option>
+                  <option value="20">Cada 20m</option>
+                  <option value="25" selected>Cada 25m</option>
+                  <option value="30">Cada 30m</option>
+                </select>
+              </label>
             </div>
             <div id="liwi-radar-live-status" class="liwi-radar-live-status" role="status" aria-live="polite" style="display:none">
               <span id="liwi-radar-spinner" class="btn-spinner" aria-hidden="true" style="display:none"></span>
@@ -12742,56 +12795,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       function stopStatusPolling() {
         if (statusPollTimer) {
           clearInterval(statusPollTimer);
-          statusPollTimer = null;
-        }
-      }
-
-      function ensureStatusPolling() {
-        if (!statusPollTimer) {
-          statusPollTimer = setInterval(() => {
-            pollFactoryStatus();
-          }, 2500);
-        }
-      }
-
-      function syncFullscreenOverlay(isRunning, stepNum, headline, detailTxt) {
-        if (!fsOverlay) return;
-        if (!isRunning || buildOverlayMinimized) {
-          fsOverlay.style.display = 'none';
-          return;
-        }
-        fsOverlay.style.display = 'flex';
-        if (fsTitle) fsTitle.textContent = headline || 'Aplicando mejora...';
-        if (fsDetail) fsDetail.textContent = detailTxt || 'Procesando mejora en Liwi...';
-        fsOverlay.querySelectorAll('.factory-step-pill[data-fsstep]').forEach((pill) => {
-          const pStep = Number(pill.getAttribute('data-fsstep') || 0);
-          pill.classList.toggle('is-done', pStep < stepNum);
-          pill.classList.toggle('is-active', pStep === stepNum);
-        });
-      }
-
-      function finishWithUpdatedReload(messageText) {
-        stopStatusPolling();
-        stopClockTicker();
-        if (reconnectTimer) {
-          clearInterval(reconnectTimer);
-          reconnectTimer = null;
-        }
-        applyInFlight = false;
-        lastServerRunning = false;
-        activeStatus.running = false;
-        if (restartBanner) restartBanner.style.display = 'none';
-        if (buildBanner) buildBanner.style.display = 'none';
-        if (fsOverlay) {
-          fsOverlay.style.display = 'flex';
-          if (fsTitle) fsTitle.textContent = messageText || '✓ ¡Liwi actualizado! Recargando...';
-          if (fsDetail) fsDetail.textContent = 'La verificación completa pasó en verde y Liwi ya reinició.';
-          fsOverlay.querySelectorAll('.factory-step-pill[data-fsstep]').forEach((pill) => {
-            pill.classList.remove('is-active');
-            pill.classList.add('is-done');
-          });
-        }
-        if (statusEl) statusEl.textContent = '✅ Mejora aplicada y Liwi actualizado';
         setFactoryControlsLocked(false);
         setTimeout(() => { window.location.reload(); }, 650);
       }
@@ -13336,9 +13339,35 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
       }
 
+      const switchViewBtn = document.getElementById('factory-modal-switch-view-btn');
+      const modalTitleEl = document.getElementById('factory-improve-title');
+
+      function setFactoryModalView(mode) {
+        const nextMode = mode === 'radar' ? 'radar' : 'chat';
+        modal.setAttribute('data-view', nextMode);
+        if (modalTitleEl) {
+          modalTitleEl.textContent = nextMode === 'radar' ? '💡 Radar de Auto-Mejoras' : 'Liwi';
+        }
+        if (switchViewBtn) {
+          switchViewBtn.textContent = nextMode === 'radar' ? '💬 Chat con Liwi' : '💡 Ver Radar';
+        }
+        if (nextMode === 'chat' && inputEl && !isBlockingApplyActive()) {
+          setTimeout(() => { try { inputEl.focus(); } catch (_) {} }, 30);
+        }
+      }
+      window.setFactoryModalView = setFactoryModalView;
+
+      if (switchViewBtn) {
+        switchViewBtn.addEventListener('click', () => {
+          const cur = modal.getAttribute('data-view') === 'radar' ? 'radar' : 'chat';
+          setFactoryModalView(cur === 'radar' ? 'chat' : 'radar');
+        });
+      }
+
       window.openFactoryImproveModal = (prefillText, opts) => {
         const cfg = opts && typeof opts === 'object' ? opts : {};
         modal.style.display = 'flex';
+        setFactoryModalView(cfg.focusRadar ? 'radar' : 'chat');
         if (prefillText && inputEl) {
           inputEl.value = prefillText;
         }
@@ -13347,21 +13376,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         pollFactoryStatus();
         if (typeof window.refreshLiwiRadarIdeas === 'function') {
           window.refreshLiwiRadarIdeas();
-        }
-        const radarEl = document.getElementById('liwi-radar-section');
-        if (cfg.focusRadar && radarEl) {
-          radarEl.style.display = 'flex';
-          radarEl.classList.add('is-radar-focused');
-          setTimeout(() => radarEl.classList.remove('is-radar-focused'), 1800);
-          requestAnimationFrame(() => {
-            try {
-              radarEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
-            } catch (_) {
-              radarEl.scrollIntoView();
-            }
-          });
-        } else if (inputEl && !isBlockingApplyActive()) {
-          inputEl.focus();
         }
       };
 
@@ -13967,19 +13981,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const isQueued = status === 'encolada';
           const isBusy = actionInFlightIds.has(idStr);
           const impactCls = impact.toLowerCase() === 'alto' ? 'is-high' : 'is-medium';
-          const icon = categoryIconFor(category);
+          const trimmedTitle = title.trim();
+          const hasLeadingEmoji = /^[\\u2600-\\u27BF\\uD83C-\\uDBFF]/.test(trimmedTitle);
+          const icon = hasLeadingEmoji ? '' : categoryIconFor(category);
           const implLabel = isQueued ? '✓ Encolada en staging' : '✨ Implementar';
 
           return (
             '<article class="liwi-radar-card' + (isExpanded ? ' is-expanded' : '') + '" role="button" tabindex="0" aria-expanded="' + (isExpanded ? 'true' : 'false') + '" data-radar-card-id="' + escapeHtml(idStr) + '">' +
               '<div class="liwi-radar-card-head">' +
-                '<span class="liwi-radar-card-icon" aria-hidden="true">' + escapeHtml(icon) + '</span>' +
+                (icon ? ('<span class="liwi-radar-card-icon" aria-hidden="true">' + escapeHtml(icon) + '</span>') : '') +
                 '<div class="liwi-radar-card-main">' +
                   '<div class="liwi-radar-card-title">' + escapeHtml(title) + '</div>' +
                   '<div class="liwi-radar-card-meta">' +
                     '<span class="liwi-radar-impact ' + impactCls + '">Impacto ' + escapeHtml(impact) + '</span>' +
                     (isQueued ? '<span class="liwi-radar-status-pill">✓ Encolada</span>' : '') +
                   '</div>' +
+                  (desc ? ('<p class="liwi-radar-card-preview">' + escapeHtml(desc) + '</p>') : '') +
                 '</div>' +
               '</div>' +
               '<div class="liwi-radar-card-details">' +
@@ -14426,6 +14443,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       if (subtabIdeasBtn) subtabIdeasBtn.addEventListener('click', () => switchAutoSubtab('ideas'));
       if (subtabHistoryBtn) subtabHistoryBtn.addEventListener('click', () => switchAutoSubtab('history'));
+      const pilotSettingsBtn = document.getElementById('liwi-pilot-settings-btn');
+      const pilotSettingsPanel = document.getElementById('liwi-pilot-settings-panel');
+      if (pilotSettingsBtn && pilotSettingsPanel) {
+        pilotSettingsBtn.addEventListener('click', () => {
+          const isOpen = pilotSettingsPanel.style.display !== 'none';
+          pilotSettingsPanel.style.display = isOpen ? 'none' : 'flex';
+          pilotSettingsBtn.setAttribute('aria-expanded', isOpen ? 'false' : 'true');
+        });
+      }
 
       async function pollAutonomousStatus() {
         try {

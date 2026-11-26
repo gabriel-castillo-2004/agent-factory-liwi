@@ -39,7 +39,9 @@ if TYPE_CHECKING:
 
 DEFAULT_SELF_IMPROVE_CONSULT_TIMEOUT_SECONDS: float = 180.0
 DEFAULT_SELF_IMPROVE_APPLY_TIMEOUT_SECONDS: float = 900.0
+DEFAULT_SELF_IMPROVE_REPAIR_TIMEOUT_SECONDS: float = 300.0
 DEFAULT_SELF_IMPROVE_VERIFY_TIMEOUT_SECONDS: float = 900.0
+FAST_DASHBOARD_PYTEST_K: str = "autonomous or ideas or radar or four_tabs or staging"
 DEFAULT_SELF_IMPROVE_TIMEOUT_SECONDS: float = DEFAULT_SELF_IMPROVE_APPLY_TIMEOUT_SECONDS
 DEFAULT_RESTART_DELAY_SECONDS: float = 1.0
 MAX_UPLOAD_IMAGE_BYTES: int = 5 * 1024 * 1024
@@ -1058,7 +1060,47 @@ class FactorySelfImprover:
 
         changed_paths = self._collect_changed_src_tests(clean_env)
         targeted_tests, has_targeted = self._select_targeted_pytest_targets(changed_paths)
-        pytest_args = ["-q", "--no-cov", *targeted_tests] if has_targeted else ["-q", "--no-cov"]
+        norm_changed = [p.replace("\\", "/") for p in changed_paths]
+        touches_dashboard = "src/agent_factory/dashboard.py" in norm_changed
+        other_src_changed = any(
+            p.startswith("src/") and p.endswith(".py") and p != "src/agent_factory/dashboard.py"
+            for p in norm_changed
+        )
+
+        if has_targeted and touches_dashboard and "tests/test_dashboard.py" in targeted_tests:
+            if other_src_changed:
+                non_dash_tests = [t for t in targeted_tests if t != "tests/test_dashboard.py"]
+                if non_dash_tests:
+                    self._set_apply_status(
+                        running=True,
+                        step=2,
+                        total_steps=3,
+                        stage="Verificando calidad y pruebas",
+                        detail=f"Ejecutando pruebas dirigidas ({', '.join(non_dash_tests)})...",
+                        title=clean_title,
+                        started_at=started_at,
+                    )
+                    pre_res = self.runner.run(
+                        [*self._resolve_venv_tool("pytest"), "-q", "--no-cov", *non_dash_tests],
+                        cwd=self.repo_root,
+                        timeout_seconds=self.verify_timeout_seconds,
+                        env=ws_env,
+                    )
+                    if pre_res.exit_code != 0:
+                        tail = (pre_res.stdout or pre_res.stderr or "pytest failed").strip()[-1200:]
+                        return False, f"Falló pytest {' '.join(non_dash_tests)}:\n{self._redact(tail)}"
+                pytest_args = [
+                    "-q",
+                    "--no-cov",
+                    "tests/test_dashboard.py",
+                    "-k",
+                    FAST_DASHBOARD_PYTEST_K,
+                ]
+            else:
+                pytest_args = ["-q", "--no-cov", *targeted_tests, "-k", FAST_DASHBOARD_PYTEST_K]
+        else:
+            pytest_args = ["-q", "--no-cov", *targeted_tests] if has_targeted else ["-q", "--no-cov"]
+
         if has_targeted:
             self._set_apply_status(
                 running=True,
@@ -1221,7 +1263,10 @@ class FactorySelfImprover:
                         prompt=repair_prompt,
                         cwd=self.repo_root,
                         allow_writes=True,
-                        timeout_seconds=min(float(self.apply_timeout_seconds), 180.0),
+                        timeout_seconds=min(
+                            float(self.apply_timeout_seconds),
+                            DEFAULT_SELF_IMPROVE_REPAIR_TIMEOUT_SECONDS,
+                        ),
                         extra_add_dirs=(self.repo_root,),
                     )
                     forbidden_after_repair = self._find_forbidden_modifications(baseline)
