@@ -654,7 +654,7 @@ class FactorySelfImprover:
         extra_add_dirs: Sequence[Path] = (),
         extra_secrets: Sequence[str] = (),
     ) -> tuple[bool, str]:
-        base_cmd, is_real_agy, err_reason = self._resolve_agy_cmd()
+        base_cmd, _is_real_agy, err_reason = self._resolve_agy_cmd()
         if base_cmd is None:
             return False, err_reason
         is_batch = bool(base_cmd and base_cmd[0].lower().endswith((".cmd", ".bat")))
@@ -680,8 +680,6 @@ class FactorySelfImprover:
                 cmd.extend(["--add-dir", str(d)])
             if allow_writes:
                 cmd.append("--dangerously-skip-permissions")
-                if is_real_agy:
-                    cmd.extend(["--mode", "auto"])
             if self.model:
                 cmd.extend(["--model", self.model])
 
@@ -697,10 +695,34 @@ class FactorySelfImprover:
             if tmp_prompt is not None:
                 tmp_prompt.unlink(missing_ok=True)
 
+        self._record_quota_telemetry(
+            prompt_len=len(prompt),
+            output_text=(res.stdout or "") + "\n" + (res.stderr or ""),
+            exit_code=res.exit_code,
+        )
         if res.exit_code != 0:
             raw = (res.stderr or res.stdout or f"exit code {res.exit_code}").strip()
             return False, self._redact(raw, extra_secrets)
         return True, self._redact(res.stdout.strip(), extra_secrets)
+
+    def _record_quota_telemetry(
+        self,
+        *,
+        prompt_len: int,
+        output_text: str,
+        exit_code: int,
+    ) -> None:
+        try:
+            from agent_factory.error_triage import is_quota_429_error
+            from agent_factory.idea_engine import record_agy_429_pause, record_agy_usage
+
+            db_path = self._resolve_telemetry_db_path()
+            if exit_code != 0 and is_quota_429_error(output_text):
+                record_agy_429_pause(output_text, db_path=db_path)
+            else:
+                record_agy_usage(prompt_len, len(output_text or ""), db_path=db_path)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).debug("Quota telemetry skipped in self_improver: %s", exc)
 
     def consult_message(
         self,
@@ -798,11 +820,16 @@ class FactorySelfImprover:
                 if not reply:
                     reply = self._redact(out[:3000])
             else:
+                from agent_factory.error_triage import format_agent_error, is_quota_429_error
+
                 detail = self._redact(out or "No se pudo consultar a agy.")
-                reply = self._redact(
-                    f"No pude obtener respuesta del agente en modo lectura ({detail}). "
-                    "Puedes revisar la configuración de agy e intentarlo nuevamente."
-                )
+                if is_quota_429_error(detail):
+                    reply = self._redact(format_agent_error(detail)["message"])
+                else:
+                    reply = self._redact(
+                        f"No pude obtener respuesta del agente en modo lectura ({detail}). "
+                        "Puedes revisar la configuración de agy e intentarlo nuevamente."
+                    )
 
             assistant_rec = self.memory_store.add_message(
                 role="assistant",
@@ -1091,6 +1118,7 @@ class FactorySelfImprover:
         proposal_title: str = "",
         message_id: str | None = None,
         github_token: str = "",
+        preserve_on_quota_429: bool = False,
     ) -> dict[str, Any]:
         """Tag HEAD, run agy (900s), gate with ruff + pytest (900s), rollback on failure, commit+push+exit 42 on pass."""
         clean_prompt = str(proposal_prompt or "").strip()
@@ -1216,9 +1244,44 @@ class FactorySelfImprover:
                             failure_reason = verify_err2
 
             if failure_reason:
+                from agent_factory.error_triage import format_agent_error, is_quota_429_error
+
+                raw_failure = self._redact(failure_reason)
+                if preserve_on_quota_429 and is_quota_429_error(raw_failure):
+                    outcome = "paused_quota"
+                    err_info = format_agent_error(raw_failure)
+                    duration_ms = max(0.0, (self.clock.now() - started_at).total_seconds() * 1000.0)
+                    record_safe_event(
+                        component="self_improver",
+                        stage="apply_finish",
+                        command=clean_title,
+                        duration_ms=duration_ms,
+                        exit_code=429,
+                        timed_out=False,
+                        error_text=raw_failure,
+                        db_path=telemetry_db,
+                    )
+                    err_msg = self.memory_store.add_message(
+                        role="assistant",
+                        content=err_info["message"],
+                        status="error",
+                    )
+                    return {
+                        "ok": False,
+                        "applied": False,
+                        "rolled_back": False,
+                        "quota_429": True,
+                        "restart_scheduled": False,
+                        "error": err_info["message"],
+                        "technical_detail": raw_failure,
+                        "error_details": err_info,
+                        "assistant_message": err_msg,
+                        "messages": self.memory_store.list_messages(),
+                    }
+
                 outcome = "rolled_back"
                 self._rollback_savepoint(clean_env)
-                redacted_failure = self._redact(failure_reason)
+                redacted_failure = raw_failure
                 duration_ms = max(0.0, (self.clock.now() - started_at).total_seconds() * 1000.0)
                 record_safe_incident(
                     stage="apply_proposal",

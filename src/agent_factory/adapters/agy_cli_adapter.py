@@ -496,7 +496,8 @@ class AgyCliAdapter(CodeAgent):
         ]
         if active_model:
             cmd.extend(["--model", active_model])
-        cmd.extend(["--mode", "auto" if is_real_agy else mode_arg])
+        if not (type(self.runner) is SubprocessRunner and is_real_agy):
+            cmd.extend(["--mode", "auto" if is_real_agy else mode_arg])
         return cmd
 
     def _build_prompt(

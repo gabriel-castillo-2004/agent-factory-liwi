@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import concurrent.futures
 import hashlib
+import html
 import logging
 import os
 import re
@@ -12,6 +13,7 @@ import tempfile
 import threading
 from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -213,6 +215,17 @@ def _analyze_error_with_agy(
         if tmp_prompt is not None:
             tmp_prompt.unlink(missing_ok=True)
 
+    raw_combined = (res.stdout or "") + "\n" + (res.stderr or "")
+    try:
+        from agent_factory.idea_engine import record_agy_429_pause, record_agy_usage
+
+        if res.exit_code != 0 and is_quota_429_error(raw_combined):
+            record_agy_429_pause(raw_combined)
+        else:
+            record_agy_usage(len(ro_prompt), len(raw_combined))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Quota telemetry skipped in error_triage: %s", exc)
+
     if res.exit_code != 0:
         logger.warning(
             "Auto-triage agy.EXE returned non-zero exit code %s",
@@ -325,3 +338,101 @@ def report_factory_error(
     except Exception as exc:  # noqa: BLE001
         logger.debug("report_factory_error swallowed unexpected error: %s", redact_secrets(str(exc)))
         return None
+
+
+_QUOTA_429_RE = re.compile(
+    r"(?:RESOURCE_EXHAUSTED|\bHTTP\s*429\b|\bstatus(?:\s*code)?\s*[:=]?\s*429\b|\b429\s+Too\s+Many\s+Requests\b|rate[_\s-]?limit|quota\s+exceeded)",
+    re.IGNORECASE,
+)
+_RESET_IN_RE = re.compile(
+    r"Resets?\s+in\s+(?:(?P<hours>\d+)\s*h\s*)?(?:(?P<minutes>\d+)\s*m\s*)?(?:(?P<seconds>\d+)\s*s)?",
+    re.IGNORECASE,
+)
+
+
+def is_quota_429_error(raw_output: str) -> bool:
+    """Return True when raw CLI/API output represents a 429 / RESOURCE_EXHAUSTED quota error."""
+    text = str(raw_output or "")
+    if not text.strip():
+        return False
+    return bool(_QUOTA_429_RE.search(text))
+
+
+def parse_quota_reset_delay_seconds(
+    raw_output: str,
+    *,
+    default_seconds: int = 1800,
+) -> int:
+    """Extract reset delay in seconds from strings like 'Resets in 14m32s', else return default_seconds (30m)."""
+    text = str(raw_output or "")
+    match = _RESET_IN_RE.search(text)
+    if not match:
+        return max(60, int(default_seconds))
+    hours = int(match.group("hours") or 0)
+    minutes = int(match.group("minutes") or 0)
+    seconds = int(match.group("seconds") or 0)
+    total = (hours * 3600) + (minutes * 60) + seconds
+    if total <= 0:
+        return max(60, int(default_seconds))
+    return total
+
+
+def format_agent_error(
+    raw_output: str,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Translate raw agent/CLI output into a friendly Spanish status payload with collapsible technical details."""
+    clean_detail = redact_secrets(str(raw_output or "").strip())
+    escaped_detail = html.escape(clean_detail)
+    details_block = (
+        f"<details><summary>Ver detalle técnico</summary><pre>{escaped_detail}</pre></details>"
+        if clean_detail
+        else ""
+    )
+
+    if is_quota_429_error(clean_detail):
+        delay_seconds = parse_quota_reset_delay_seconds(clean_detail, default_seconds=1800)
+        ref_now = now if now is not None else datetime.now().astimezone()
+        resume_dt = ref_now + timedelta(seconds=delay_seconds)
+        resume_hhmm = resume_dt.strftime("%H:%M")
+        friendly = (
+            "⏳ Sin cuota disponible por ahora. "
+            f"Tu avance quedó guardado a salvo y continuará automáticamente a las {resume_hhmm}."
+        )
+        summary_html = (
+            f"{html.escape(friendly)}\n{details_block}"
+            if details_block
+            else html.escape(friendly)
+        )
+        return {
+            "is_quota_429": True,
+            "message": friendly,
+            "user_message": friendly,
+            "resume_hhmm": resume_hhmm,
+            "reset_seconds": delay_seconds,
+            "quota_paused_until": resume_dt.isoformat(),
+            "technical_detail": clean_detail,
+            "details_html": summary_html,
+        }
+
+    first_line = clean_detail.splitlines()[0].strip() if clean_detail else "Error inesperado del agente."
+    if len(first_line) > 220:
+        first_line = first_line[:217] + "..."
+    friendly = f"⚠️ Ocurrió un inconveniente con el agente: {first_line}"
+    summary_html = (
+        f"{html.escape(friendly)}\n{details_block}"
+        if details_block
+        else html.escape(friendly)
+    )
+    return {
+        "is_quota_429": False,
+        "message": friendly,
+        "user_message": friendly,
+        "resume_hhmm": None,
+        "reset_seconds": None,
+        "quota_paused_until": None,
+        "technical_detail": clean_detail,
+        "details_html": summary_html,
+    }
+

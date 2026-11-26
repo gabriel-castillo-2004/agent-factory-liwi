@@ -14,12 +14,17 @@ import threading
 import time
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from agent_factory.adapters.agy_cli_adapter import build_sanitized_cli_env
 from agent_factory.adapters.subprocess_runner import SubprocessRunner, resolve_executable
+from agent_factory.error_triage import (
+    format_agent_error,
+    is_quota_429_error,
+    parse_quota_reset_delay_seconds,
+)
 from agent_factory.ports.runner import CommandResult, CommandTimeoutError, Runner
 from agent_factory.secrets import redact_secrets
 from agent_factory.telemetry import (
@@ -52,6 +57,15 @@ AUTONOMOUS_MAX_CONSECUTIVE_FAILURES: int = 2
 AUTONOMOUS_HISTORY_VALID_STATUSES: frozenset[str] = frozenset({"activa", "revertida"})
 DEFAULT_AUTONOMOUS_WAIT_TIMEOUT_SECONDS: float = 1800.0
 DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS: float = 300.0
+DEFAULT_ESTIMATED_WINDOW_CAPACITY: int = 180000
+DEFAULT_QUOTA_WINDOW_SECONDS: int = 5 * 3600
+DEFAULT_RESERVE_THRESHOLD_PCT: int = 30
+DEFAULT_AVG_TURN_TOKENS: int = 12000
+PROJECT_IDEA_VALID_SOURCES: frozenset[str] = frozenset({"manual", "runtime_error", "audit"})
+PROJECT_IDEA_VALID_STATUSES: frozenset[str] = frozenset(
+    {"nueva", "implementando", "aplicada", "descartada"}
+)
+_PROJECT_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 _AUTO_INTERVAL_SETTING_KEY = "auto_interval_hours"
 _MAX_INLINE_PROMPT_CHARS = 6000
@@ -176,6 +190,64 @@ def _ensure_idea_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_autonomous_history_status "
         "ON autonomous_history(status);"
+    )
+    now_iso = datetime.now(UTC).isoformat()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS quota_state (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            window_started_at TEXT NOT NULL,
+            window_tokens_used INTEGER NOT NULL DEFAULT 0 CHECK(window_tokens_used >= 0),
+            estimated_window_capacity INTEGER NOT NULL DEFAULT 180000
+                CHECK(estimated_window_capacity >= 1000),
+            quota_paused_until TEXT,
+            reserve_threshold_pct INTEGER NOT NULL DEFAULT 30
+                CHECK(reserve_threshold_pct >= 0 AND reserve_threshold_pct <= 95),
+            turns_used INTEGER NOT NULL DEFAULT 0 CHECK(turns_used >= 0),
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO quota_state (
+            id,
+            window_started_at,
+            window_tokens_used,
+            estimated_window_capacity,
+            quota_paused_until,
+            reserve_threshold_pct,
+            turns_used,
+            updated_at
+        ) VALUES (1, ?, 0, ?, NULL, ?, 0, ?);
+        """,
+        (now_iso, DEFAULT_ESTIMATED_WINDOW_CAPACITY, DEFAULT_RESERVE_THRESHOLD_PCT, now_iso),
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS project_ideas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            project_slug TEXT NOT NULL,
+            title TEXT NOT NULL,
+            category TEXT NOT NULL,
+            impact TEXT NOT NULL,
+            simple_description TEXT NOT NULL,
+            change_prompt TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'manual'
+                CHECK(source IN ('manual', 'runtime_error', 'audit')),
+            status TEXT NOT NULL DEFAULT 'nueva'
+                CHECK(status IN ('nueva', 'implementando', 'aplicada', 'descartada'))
+        );
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_project_ideas_slug_status "
+        "ON project_ideas(project_slug, status);"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_project_ideas_created_at "
+        "ON project_ideas(created_at DESC, id DESC);"
     )
 
 
@@ -415,7 +487,9 @@ def _normalize_candidate_idea(raw: Any) -> dict[str, str] | None:
     title = redact_secrets(str(raw.get("title") or "").strip())
     category = redact_secrets(str(raw.get("category") or "").strip())
     simple_description = redact_secrets(str(raw.get("simple_description") or "").strip())
-    technical_prompt = redact_secrets(str(raw.get("technical_prompt") or "").strip())
+    technical_prompt = redact_secrets(
+        str(raw.get("technical_prompt") or raw.get("change_prompt") or "").strip()
+    )
     if not (title and category and simple_description and technical_prompt):
         return None
     try:
@@ -941,9 +1015,22 @@ def generate_new_ideas(
 
     if res.exit_code != 0 or not res.stdout.strip():
         detail = redact_secrets((res.stderr or res.stdout or f"exit code {res.exit_code}").strip())
+        if is_quota_429_error(detail):
+            record_agy_429_pause(detail, db_path=db_path)
+        else:
+            record_agy_usage(
+                len(prompt),
+                len(res.stdout or "") + len(res.stderr or ""),
+                db_path=db_path,
+            )
         logger.warning("Idea generation CLI returned non-zero/empty output: %s", detail)
         return []
 
+    record_agy_usage(
+        len(prompt),
+        len(res.stdout or "") + len(res.stderr or ""),
+        db_path=db_path,
+    )
     parsed = parse_ideas_payload(res.stdout)
     if not parsed:
         return []
@@ -1548,6 +1635,313 @@ def _extract_promoted_commit_hash(result: Any) -> tuple[bool, str | None, str]:
     return False, None, "El promotor a main no devolvió un commit_hash válido."
 
 
+def _should_skip_default_db_write(db_path: Path | str | None) -> bool:
+    return (
+        db_path is None
+        and "PYTEST_CURRENT_TEST" in os.environ
+        and not os.environ.get("AGENT_FACTORY_TELEMETRY_DB")
+    )
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt
+    except ValueError:
+        return None
+
+
+def _compute_quota_payload(
+    row: sqlite3.Row,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    ref_now = now if now is not None else datetime.now(UTC)
+    if ref_now.tzinfo is None:
+        ref_now = ref_now.replace(tzinfo=UTC)
+
+    capacity = max(1000, int(row["estimated_window_capacity"]))
+    used = max(0, int(row["window_tokens_used"]))
+    turns_used = max(0, int(row["turns_used"]))
+    reserve_pct = max(0, min(95, int(row["reserve_threshold_pct"])))
+    paused_until_raw = row["quota_paused_until"]
+    paused_dt = _parse_iso_datetime(paused_until_raw)
+    is_paused = bool(paused_dt is not None and ref_now < paused_dt)
+
+    if is_paused and paused_dt is not None:
+        remaining_pct = 0
+        estimated_turns_left = 0
+        resume_hhmm = paused_dt.astimezone().strftime("%H:%M")
+    else:
+        remaining_capacity = max(0, capacity - used)
+        remaining_pct = max(0, min(100, round((remaining_capacity / capacity) * 100)))
+        avg_turn = max(4000, used // turns_used) if turns_used > 0 else DEFAULT_AVG_TURN_TOKENS
+        estimated_turns_left = max(0, remaining_capacity // avg_turn)
+        resume_hhmm = None
+
+    reserve_reached = (not is_paused) and (remaining_pct <= reserve_pct)
+    return {
+        "window_started_at": str(row["window_started_at"]),
+        "window_tokens_used": used,
+        "estimated_window_capacity": capacity,
+        "quota_paused_until": str(paused_until_raw) if is_paused and paused_until_raw else None,
+        "reserve_threshold_pct": reserve_pct,
+        "turns_used": turns_used,
+        "quota_remaining_pct": remaining_pct,
+        "estimated_turns_left": estimated_turns_left,
+        "is_paused": is_paused,
+        "reserve_reached": reserve_reached,
+        "resume_hhmm": resume_hhmm,
+        "updated_at": str(row["updated_at"]),
+    }
+
+
+def get_quota_status(
+    db_path: Path | str | None = None,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Return persisted quota meter telemetry, expiring finished 429 pauses or 5h windows cleanly."""
+    ref_now = now if now is not None else datetime.now(UTC)
+    if ref_now.tzinfo is None:
+        ref_now = ref_now.replace(tzinfo=UTC)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        row = conn.execute(
+            "SELECT window_started_at, window_tokens_used, estimated_window_capacity, "
+            "quota_paused_until, reserve_threshold_pct, turns_used, updated_at "
+            "FROM quota_state WHERE id = 1;"
+        ).fetchone()
+        if row is None:
+            now_iso = ref_now.isoformat()
+            return {
+                "window_started_at": now_iso,
+                "window_tokens_used": 0,
+                "estimated_window_capacity": DEFAULT_ESTIMATED_WINDOW_CAPACITY,
+                "quota_paused_until": None,
+                "reserve_threshold_pct": DEFAULT_RESERVE_THRESHOLD_PCT,
+                "turns_used": 0,
+                "quota_remaining_pct": 100,
+                "estimated_turns_left": DEFAULT_ESTIMATED_WINDOW_CAPACITY // DEFAULT_AVG_TURN_TOKENS,
+                "is_paused": False,
+                "reserve_reached": False,
+                "resume_hhmm": None,
+                "updated_at": now_iso,
+            }
+
+        paused_dt = _parse_iso_datetime(row["quota_paused_until"])
+        window_dt = _parse_iso_datetime(row["window_started_at"])
+        reset_needed = (paused_dt is not None and ref_now >= paused_dt) or (
+            paused_dt is None
+            and window_dt is not None
+            and (ref_now - window_dt).total_seconds() >= DEFAULT_QUOTA_WINDOW_SECONDS
+        )
+
+        if reset_needed:
+            now_iso = ref_now.isoformat()
+            conn.execute(
+                """
+                UPDATE quota_state
+                SET window_started_at = ?,
+                    window_tokens_used = 0,
+                    quota_paused_until = NULL,
+                    turns_used = 0,
+                    updated_at = ?
+                WHERE id = 1;
+                """,
+                (now_iso, now_iso),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT window_started_at, window_tokens_used, estimated_window_capacity, "
+                "quota_paused_until, reserve_threshold_pct, turns_used, updated_at "
+                "FROM quota_state WHERE id = 1;"
+            ).fetchone()
+
+        assert row is not None
+        return _compute_quota_payload(row, now=ref_now)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def set_quota_config(
+    *,
+    reserve_threshold_pct: int | None = None,
+    estimated_window_capacity: int | None = None,
+    window_tokens_used: int | None = None,
+    quota_paused_until: str | None = None,
+    clear_pause: bool = False,
+    turns_used: int | None = None,
+    db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Validate and update quota_state configuration atomically."""
+    updates: list[str] = []
+    params: list[Any] = []
+
+    if reserve_threshold_pct is not None:
+        if isinstance(reserve_threshold_pct, bool) or not isinstance(reserve_threshold_pct, int):
+            raise TypeError("reserve_threshold_pct debe ser un entero entre 0 y 95.")
+        if reserve_threshold_pct < 0 or reserve_threshold_pct > 95:
+            raise ValueError("reserve_threshold_pct debe estar entre 0 y 95.")
+        updates.append("reserve_threshold_pct = ?")
+        params.append(reserve_threshold_pct)
+
+    if estimated_window_capacity is not None:
+        if isinstance(estimated_window_capacity, bool) or not isinstance(estimated_window_capacity, int):
+            raise TypeError("estimated_window_capacity debe ser un entero >= 1000.")
+        if estimated_window_capacity < 1000:
+            raise ValueError("estimated_window_capacity debe ser >= 1000.")
+        updates.append("estimated_window_capacity = ?")
+        params.append(estimated_window_capacity)
+
+    if window_tokens_used is not None:
+        if isinstance(window_tokens_used, bool) or not isinstance(window_tokens_used, int) or window_tokens_used < 0:
+            raise ValueError("window_tokens_used debe ser un entero >= 0.")
+        updates.append("window_tokens_used = ?")
+        params.append(window_tokens_used)
+
+    if turns_used is not None:
+        if isinstance(turns_used, bool) or not isinstance(turns_used, int) or turns_used < 0:
+            raise ValueError("turns_used debe ser un entero >= 0.")
+        updates.append("turns_used = ?")
+        params.append(turns_used)
+
+    if clear_pause:
+        updates.append("quota_paused_until = NULL")
+    elif quota_paused_until is not None:
+        parsed = _parse_iso_datetime(quota_paused_until)
+        if parsed is None:
+            raise ValueError(f"quota_paused_until inválido: {quota_paused_until!r}")
+        updates.append("quota_paused_until = ?")
+        params.append(parsed.isoformat())
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        if updates:
+            updates.append("updated_at = ?")
+            params.append(datetime.now(UTC).isoformat())
+            conn.execute(
+                f"UPDATE quota_state SET {', '.join(updates)} WHERE id = 1;",
+                tuple(params),
+            )
+            conn.commit()
+        row = conn.execute(
+            "SELECT window_started_at, window_tokens_used, estimated_window_capacity, "
+            "quota_paused_until, reserve_threshold_pct, turns_used, updated_at "
+            "FROM quota_state WHERE id = 1;"
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("No se encontró el registro singleton quota_state (id=1).")
+        return _compute_quota_payload(row)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def record_agy_usage(
+    input_chars: int = 0,
+    output_chars: int = 0,
+    *,
+    db_path: Path | str | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Estimate and accumulate quota consumption from an agy invocation."""
+    if _should_skip_default_db_write(db_path):
+        return None
+    ref_now = now if now is not None else datetime.now(UTC)
+    if ref_now.tzinfo is None:
+        ref_now = ref_now.replace(tzinfo=UTC)
+    delta = max(0, int(input_chars)) + max(0, int(output_chars))
+    if delta <= 0:
+        delta = 1
+    conn: sqlite3.Connection | None = None
+    try:
+        # Ensure expired pause/window is rolled over cleanly first
+        get_quota_status(db_path=db_path, now=ref_now)
+        conn = _open_connection(db_path)
+        conn.execute(
+            """
+            UPDATE quota_state
+            SET window_tokens_used = window_tokens_used + ?,
+                turns_used = turns_used + 1,
+                updated_at = ?
+            WHERE id = 1;
+            """,
+            (delta, ref_now.isoformat()),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT window_started_at, window_tokens_used, estimated_window_capacity, "
+            "quota_paused_until, reserve_threshold_pct, turns_used, updated_at "
+            "FROM quota_state WHERE id = 1;"
+        ).fetchone()
+        assert row is not None
+        return _compute_quota_payload(row, now=ref_now)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def record_agy_429_pause(
+    raw_output: str = "",
+    *,
+    reset_seconds: int | None = None,
+    db_path: Path | str | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Record a 429 pause timestamp and auto-calibrate estimated_window_capacity without tripping failures."""
+    if _should_skip_default_db_write(db_path):
+        return None
+    ref_now = now if now is not None else datetime.now(UTC)
+    if ref_now.tzinfo is None:
+        ref_now = ref_now.replace(tzinfo=UTC)
+    delay = (
+        max(60, int(reset_seconds))
+        if reset_seconds is not None
+        else parse_quota_reset_delay_seconds(raw_output, default_seconds=1800)
+    )
+    paused_until = ref_now + timedelta(seconds=delay)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        row = conn.execute(
+            "SELECT window_tokens_used, estimated_window_capacity FROM quota_state WHERE id = 1;"
+        ).fetchone()
+        used = int(row["window_tokens_used"]) if row is not None else 0
+        current_cap = int(row["estimated_window_capacity"]) if row is not None else DEFAULT_ESTIMATED_WINDOW_CAPACITY
+        calibrated_cap = used if used >= 5000 else current_cap
+        conn.execute(
+            """
+            UPDATE quota_state
+            SET estimated_window_capacity = ?,
+                window_tokens_used = ?,
+                quota_paused_until = ?,
+                updated_at = ?
+            WHERE id = 1;
+            """,
+            (calibrated_cap, calibrated_cap, paused_until.isoformat(), ref_now.isoformat()),
+        )
+        conn.commit()
+        updated_row = conn.execute(
+            "SELECT window_started_at, window_tokens_used, estimated_window_capacity, "
+            "quota_paused_until, reserve_threshold_pct, turns_used, updated_at "
+            "FROM quota_state WHERE id = 1;"
+        ).fetchone()
+        assert updated_row is not None
+        return _compute_quota_payload(updated_row, now=ref_now)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 class AutonomousEngine:
     """24/7 Autonomous self-improvement daemon engine with 3 safety brakes."""
 
@@ -1563,6 +1957,7 @@ class AutonomousEngine:
         has_running_local_apps: Callable[[], bool] | None = None,
         triage_provider: Callable[[], dict[str, Any] | None] | None = None,
         idea_selector: Callable[[], dict[str, Any] | None] | None = None,
+        idea_generator: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
         staging_executor: Callable[[dict[str, Any]], Any] | None = None,
         main_promoter: Callable[[dict[str, Any]], Any] | None = None,
         revert_runner: Callable[[str], Any] | None = None,
@@ -1585,6 +1980,7 @@ class AutonomousEngine:
         self._has_running_local_apps = has_running_local_apps
         self._triage_provider = triage_provider
         self._idea_selector = idea_selector
+        self._idea_generator = idea_generator
         self._staging_executor = staging_executor
         self._main_promoter = main_promoter
         self._revert_runner = revert_runner
@@ -1603,6 +1999,8 @@ class AutonomousEngine:
         self._config_generation: int = 0
         self._thread: threading.Thread | None = None
         self._last_cycle_result: dict[str, Any] | None = None
+        self._building_task_title: str | None = None
+        self._last_error_details: dict[str, Any] | None = None
 
     @property
     def is_running(self) -> bool:
@@ -1626,14 +2024,53 @@ class AutonomousEngine:
             self._wakeup_event.set()
 
     def get_state(self) -> dict[str, Any]:
-        """Return persisted autonomous state combined with live worker and busy status."""
+        """Return persisted autonomous state combined with live worker, quota, and busy status."""
         state = get_autonomous_state(db_path=self.db_path)
+        quota = get_quota_status(db_path=self.db_path)
+        busy_reason = self.get_busy_reason()
+        with self._lock:
+            building_title = self._building_task_title
+            last_error_details = dict(self._last_error_details) if self._last_error_details else None
+            last_result = dict(self._last_cycle_result) if self._last_cycle_result else None
+
+        pause_reason: str | None = None
+        if quota["is_paused"]:
+            hhmm = quota["resume_hhmm"] or "pronto"
+            pause_reason = f"Sin cuota hasta las {hhmm}"
+        elif quota["reserve_reached"]:
+            pause_reason = (
+                f"Cuota en reserva ({quota['quota_remaining_pct']}% <= "
+                f"{quota['reserve_threshold_pct']}%)"
+            )
+
+        if not state["autonomous_enabled"]:
+            live_state = "apagado"
+        elif building_title:
+            live_state = "construyendo"
+        elif pause_reason is not None:
+            live_state = "pausado_cuota"
+        elif busy_reason is not None:
+            live_state = "cediendo_paso"
+        else:
+            live_state = "activo"
+
         return {
             **state,
+            "state": live_state,
+            "current_task": building_title,
             "is_running": self.is_running,
-            "busy_reason": self.get_busy_reason(),
-            "last_cycle_result": self.last_cycle_result,
+            "busy_reason": busy_reason,
+            "pause_reason": pause_reason,
+            "last_error": last_error_details,
+            "last_cycle_result": last_result,
+            "quota": quota,
         }
+
+    def get_status_snapshot(self, *, history_limit: int = 20) -> dict[str, Any]:
+        """Return full status payload (engine state + quota telemetry + autonomous history)."""
+        base = self.get_state()
+        base["history"] = list_autonomous_history(limit=history_limit, db_path=self.db_path)
+        return base
 
     def update_config(
         self,
@@ -1641,8 +2078,9 @@ class AutonomousEngine:
         autonomous_enabled: bool | None = None,
         cooldown_minutes: int | None = None,
         consecutive_failures: int | None = None,
+        reserve_threshold_pct: int | None = None,
     ) -> dict[str, Any]:
-        """Update autonomous configuration in SQLite and wake the daemon loop immediately."""
+        """Update autonomous & quota configuration in SQLite and wake the daemon loop immediately."""
         eff_failures = consecutive_failures
         if autonomous_enabled is True and eff_failures is None:
             current = get_autonomous_state(db_path=self.db_path)
@@ -1655,6 +2093,12 @@ class AutonomousEngine:
             consecutive_failures=eff_failures,
             db_path=self.db_path,
         )
+        if reserve_threshold_pct is not None:
+            quota = set_quota_config(
+                reserve_threshold_pct=reserve_threshold_pct,
+                db_path=self.db_path,
+            )
+            updated["quota"] = quota
         self.notify_config_changed()
         return updated
 
@@ -1785,6 +2229,18 @@ class AutonomousEngine:
             return {"ok": False, "error": "Tiempo de espera agotado construyendo en .liwi-staging."}
         status = manager.get_staging_status()
         if isinstance(status, Mapping):
+            if int(status.get("paused_count", 0)) > 0 or (
+                status.get("last_error") and is_quota_429_error(str(status["last_error"]))
+            ):
+                return {
+                    "ok": False,
+                    "quota_429": True,
+                    "error": str(
+                        status.get("quota_paused_message")
+                        or status.get("last_error")
+                        or "RESOURCE_EXHAUSTED 429"
+                    ),
+                }
             if status.get("last_error"):
                 return {"ok": False, "error": str(status["last_error"])}
             if int(status.get("pending_count", 0)) <= 0:
@@ -1858,12 +2314,33 @@ class AutonomousEngine:
         )
 
     def run_cycle(self) -> dict[str, Any]:
-        """Execute a single autonomous cycle enforcing all 3 safety brakes."""
+        """Execute a single autonomous cycle enforcing quota reserve and all 3 safety brakes."""
         with self._cycle_lock:
             state = get_autonomous_state(db_path=self.db_path)
             if not state["autonomous_enabled"] or self._stop_event.is_set():
                 return self._set_last_cycle_result(
                     {"status": "disabled", "executed": False, "promoted": False}
+                )
+
+            # Quota Brake: yield when 429 pause is active or remaining quota <= reserve threshold
+            quota = get_quota_status(db_path=self.db_path)
+            if quota["is_paused"] or quota["reserve_reached"]:
+                pause_reason = (
+                    f"Sin cuota hasta las {quota['resume_hhmm']}"
+                    if quota["is_paused"] and quota["resume_hhmm"]
+                    else (
+                        f"Cuota en reserva ({quota['quota_remaining_pct']}% <= "
+                        f"{quota['reserve_threshold_pct']}%)"
+                    )
+                )
+                return self._set_last_cycle_result(
+                    {
+                        "status": "paused_quota",
+                        "executed": False,
+                        "promoted": False,
+                        "pause_reason": pause_reason,
+                        "quota": quota,
+                    }
                 )
 
             # Brake 1: absolute user priority
@@ -1880,6 +2357,38 @@ class AutonomousEngine:
 
             work_item = self._select_next_work_item()
             if work_item is None:
+                # Generate fresh backlog ideas automatically if permitted and quota is healthy
+                if self._idea_generator is not None:
+                    try:
+                        self._idea_generator()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Autonomous idea_generator failed: %s", redact_secrets(str(exc)))
+                    work_item = self._select_next_work_item()
+                elif self._idea_selector is None:
+                    try:
+                        generate_new_ideas(
+                            count=3,
+                            source="auto",
+                            db_path=self.db_path,
+                            repo_root=self.repo_root,
+                            runner=self._command_runner,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Autonomous generate_new_ideas failed: %s", redact_secrets(str(exc)))
+                    work_item = self._select_next_work_item()
+
+            if work_item is None:
+                post_quota = get_quota_status(db_path=self.db_path)
+                if post_quota["is_paused"]:
+                    return self._set_last_cycle_result(
+                        {
+                            "status": "paused_quota",
+                            "executed": False,
+                            "promoted": False,
+                            "pause_reason": f"Sin cuota hasta las {post_quota['resume_hhmm'] or 'pronto'}",
+                            "quota": post_quota,
+                        }
+                    )
                 return self._set_last_cycle_result(
                     {"status": "idle_no_work", "executed": False, "promoted": False}
                 )
@@ -1891,20 +2400,49 @@ class AutonomousEngine:
                 )
 
             # Build and verify inside isolated .liwi-staging worktree
+            with self._lock:
+                self._building_task_title = work_item["title"]
             try:
-                if self._staging_executor is not None:
-                    exec_raw = self._staging_executor(work_item)
-                else:
-                    exec_raw = self._default_staging_execute(work_item)
-                exec_ok, exec_err = _interpret_action_result(
-                    exec_raw,
-                    "La ejecución o verificación en .liwi-staging falló.",
-                )
-            except Exception as exc:  # noqa: BLE001
-                exec_ok = False
-                exec_err = redact_secrets(str(exc) or type(exc).__name__)
+                try:
+                    if self._staging_executor is not None:
+                        exec_raw = self._staging_executor(work_item)
+                    else:
+                        exec_raw = self._default_staging_execute(work_item)
+                    exec_ok, exec_err = _interpret_action_result(
+                        exec_raw,
+                        "La ejecución o verificación en .liwi-staging falló.",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    exec_ok = False
+                    exec_err = redact_secrets(str(exc) or type(exc).__name__)
+            finally:
+                with self._lock:
+                    self._building_task_title = None
 
             if not exec_ok:
+                if is_quota_429_error(exec_err):
+                    err_info = format_agent_error(exec_err)
+                    current_quota = get_quota_status(db_path=self.db_path)
+                    if not current_quota["is_paused"]:
+                        current_quota = (
+                            record_agy_429_pause(exec_err, db_path=self.db_path) or current_quota
+                        )
+                    with self._lock:
+                        self._last_error_details = err_info
+                    return self._set_last_cycle_result(
+                        {
+                            "status": "paused_quota",
+                            "executed": True,
+                            "promoted": False,
+                            "error": err_info["message"],
+                            "error_details": err_info,
+                            "quota": current_quota,
+                            "work_item": work_item,
+                        }
+                    )
+                err_info = format_agent_error(exec_err)
+                with self._lock:
+                    self._last_error_details = err_info
                 return self._record_cycle_failure(exec_err, work_item)
 
             # Brake 2: immediate shutoff during build parks result in .liwi-staging without promoting
@@ -1946,6 +2484,8 @@ class AutonomousEngine:
             )
             set_autonomous_config(consecutive_failures=0, db_path=self.db_path)
             self._mark_work_item_applied(work_item)
+            with self._lock:
+                self._last_error_details = None
 
             return self._set_last_cycle_result(
                 {
@@ -2223,3 +2763,429 @@ def start_autonomous_engine(
         idle_poll_seconds=idle_poll_seconds,
     )
     return engine.start()
+
+
+# ---------------------------------------------------------------------------
+# Per-Project Auto-Improvement Ideas (project_ideas)
+# ---------------------------------------------------------------------------
+
+
+def _validate_project_slug(project_slug: str) -> str:
+    clean = str(project_slug or "").strip()
+    if not clean or not _PROJECT_SLUG_RE.fullmatch(clean):
+        raise ValueError(f"project_slug inválido: {project_slug!r}")
+    return clean
+
+
+def _validate_project_idea_source(source: str) -> str:
+    clean = str(source or "manual").strip().lower() or "manual"
+    if clean not in PROJECT_IDEA_VALID_SOURCES:
+        raise ValueError(
+            f"source de project_idea inválido {source!r}; "
+            f"se esperaba uno de {sorted(PROJECT_IDEA_VALID_SOURCES)}."
+        )
+    return clean
+
+
+def _validate_project_idea_status(status: str) -> str:
+    clean = str(status or "").strip().lower()
+    if clean not in PROJECT_IDEA_VALID_STATUSES:
+        raise ValueError(
+            f"status de project_idea inválido {status!r}; "
+            f"se esperaba uno de {sorted(PROJECT_IDEA_VALID_STATUSES)}."
+        )
+    return clean
+
+
+def _row_to_project_idea(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "created_at": str(row["created_at"]),
+        "project_slug": str(row["project_slug"]),
+        "title": str(row["title"]),
+        "category": str(row["category"]),
+        "impact": str(row["impact"]),
+        "simple_description": str(row["simple_description"]),
+        "change_prompt": str(row["change_prompt"]),
+        "source": str(row["source"]),
+        "status": str(row["status"]),
+    }
+
+
+def list_project_ideas(
+    project_slug: str,
+    *,
+    status: str | None = None,
+    limit: int = DEFAULT_LIST_LIMIT,
+    db_path: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    """List improvement ideas for a specific generated project ordered newest first."""
+    clean_slug = _validate_project_slug(project_slug)
+    bounded_limit = max(1, min(int(limit), MAX_LIST_LIMIT))
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        if status is not None:
+            clean_status = _validate_project_idea_status(status)
+            rows = conn.execute(
+                "SELECT id, created_at, project_slug, title, category, impact, "
+                "simple_description, change_prompt, source, status "
+                "FROM project_ideas WHERE project_slug = ? AND status = ? "
+                "ORDER BY id DESC LIMIT ?;",
+                (clean_slug, clean_status, bounded_limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, created_at, project_slug, title, category, impact, "
+                "simple_description, change_prompt, source, status "
+                "FROM project_ideas WHERE project_slug = ? "
+                "ORDER BY id DESC LIMIT ?;",
+                (clean_slug, bounded_limit),
+            ).fetchall()
+        return [_row_to_project_idea(row) for row in rows]
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def get_project_idea(
+    idea_id: int,
+    *,
+    db_path: Path | str | None = None,
+) -> dict[str, Any] | None:
+    """Return a single project_idea row by id, or None."""
+    validated_id = _validate_idea_id(idea_id)
+    if validated_id is None:
+        raise ValueError(f"idea_id inválido: {idea_id!r}")
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        row = conn.execute(
+            "SELECT id, created_at, project_slug, title, category, impact, "
+            "simple_description, change_prompt, source, status "
+            "FROM project_ideas WHERE id = ?;",
+            (validated_id,),
+        ).fetchone()
+        return _row_to_project_idea(row) if row is not None else None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def update_project_idea_status(
+    idea_id: int,
+    status: str,
+    *,
+    project_slug: str | None = None,
+    db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Update status of a project idea, verifying ownership when project_slug is provided."""
+    validated_id = _validate_idea_id(idea_id)
+    if validated_id is None:
+        raise ValueError(f"idea_id inválido: {idea_id!r}")
+    clean_status = _validate_project_idea_status(status)
+    clean_slug = _validate_project_slug(project_slug) if project_slug is not None else None
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        if clean_slug is not None:
+            cur = conn.execute(
+                "UPDATE project_ideas SET status = ? WHERE id = ? AND project_slug = ?;",
+                (clean_status, validated_id, clean_slug),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE project_ideas SET status = ? WHERE id = ?;",
+                (clean_status, validated_id),
+            )
+        conn.commit()
+        if cur.rowcount <= 0:
+            raise KeyError(f"Idea de proyecto {validated_id} no encontrada.")
+        row = conn.execute(
+            "SELECT id, created_at, project_slug, title, category, impact, "
+            "simple_description, change_prompt, source, status "
+            "FROM project_ideas WHERE id = ?;",
+            (validated_id,),
+        ).fetchone()
+        assert row is not None
+        return _row_to_project_idea(row)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def create_project_error_idea(
+    project_slug: str,
+    error_text: str,
+    *,
+    title: str | None = None,
+    db_path: Path | str | None = None,
+) -> dict[str, Any] | None:
+    """Persist an actionable runtime_error idea for a generated project (deduplicating open identical issues)."""
+    clean_slug = _validate_project_slug(project_slug)
+    clean_error = redact_secrets(str(error_text or "").strip())
+    if not clean_error:
+        return None
+    if _should_skip_default_db_write(db_path):
+        return None
+
+    short_summary = clean_error.splitlines()[0].strip()[:140]
+    eff_title = redact_secrets(str(title or f"🩹 Corregir error al iniciar: {short_summary[:60]}").strip())[:140]
+    simple_desc = f"Se detectó un fallo en tiempo de ejecución: {short_summary}"
+    change_prompt = (
+        f"Diagnostica y corrige el siguiente error ocurrido al ejecutar el proyecto '{clean_slug}'.\n"
+        f"Error reportado:\n{clean_error[:1200]}\n\n"
+        "Asegura una prueba automatizada que cubra el fallo antes de terminar."
+    )
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        existing = conn.execute(
+            "SELECT id, created_at, project_slug, title, category, impact, "
+            "simple_description, change_prompt, source, status "
+            "FROM project_ideas "
+            "WHERE project_slug = ? AND source = 'runtime_error' AND status IN ('nueva', 'implementando') "
+            "ORDER BY id DESC LIMIT 10;",
+            (clean_slug,),
+        ).fetchall()
+        for row in existing:
+            if normalize_idea_title(str(row["title"])) == normalize_idea_title(eff_title) or (
+                short_summary[:60].lower() in str(row["simple_description"]).lower()
+            ):
+                return _row_to_project_idea(row)
+
+        now_iso = datetime.now(UTC).isoformat()
+        cur = conn.execute(
+            """
+            INSERT INTO project_ideas (
+                created_at, project_slug, title, category, impact,
+                simple_description, change_prompt, source, status
+            ) VALUES (?, ?, ?, 'Estabilidad', 'Alto', ?, ?, 'runtime_error', 'nueva');
+            """,
+            (now_iso, clean_slug, eff_title, simple_desc, change_prompt),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT id, created_at, project_slug, title, category, impact, "
+            "simple_description, change_prompt, source, status "
+            "FROM project_ideas WHERE id = ?;",
+            (int(cur.lastrowid),),
+        ).fetchone()
+        assert row is not None
+        return _row_to_project_idea(row)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def save_project_ideas(
+    project_slug: str,
+    ideas: Sequence[Mapping[str, Any]],
+    *,
+    source: str = "manual",
+    db_path: Path | str | None = None,
+    max_items: int = MAX_IDEATION_COUNT,
+) -> list[dict[str, Any]]:
+    """Persist validated, deduplicated per-project ideas to project_ideas."""
+    clean_slug = _validate_project_slug(project_slug)
+    eff_source = _validate_project_idea_source(source)
+    conn: sqlite3.Connection | None = None
+    inserted: list[dict[str, Any]] = []
+    try:
+        conn = _open_connection(db_path)
+        existing_rows = conn.execute(
+            "SELECT title FROM project_ideas WHERE project_slug = ?;",
+            (clean_slug,),
+        ).fetchall()
+        seen_keys = {normalize_idea_title(str(r["title"])) for r in existing_rows}
+
+        for item in ideas:
+            if len(inserted) >= max_items:
+                break
+            title = redact_secrets(str(item.get("title") or "").strip())
+            simple_desc = redact_secrets(str(item.get("simple_description") or "").strip())
+            change_prompt = redact_secrets(
+                str(item.get("change_prompt") or item.get("technical_prompt") or "").strip()
+            )
+            if not title or not simple_desc or not change_prompt:
+                continue
+            key = normalize_idea_title(title)
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            category = redact_secrets(str(item.get("category") or "UX").strip()) or "UX"
+            raw_impact = str(item.get("impact") or "Medio").strip().lower()
+            impact = "Alto" if raw_impact in _HIGH_IMPACT_ALIASES else "Medio"
+            now_iso = datetime.now(UTC).isoformat()
+
+            cur = conn.execute(
+                """
+                INSERT INTO project_ideas (
+                    created_at, project_slug, title, category, impact,
+                    simple_description, change_prompt, source, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'nueva');
+                """,
+                (
+                    now_iso,
+                    clean_slug,
+                    title[:140],
+                    category[:40],
+                    impact,
+                    simple_desc[:400],
+                    change_prompt[:2500],
+                    eff_source,
+                ),
+            )
+            row = conn.execute(
+                "SELECT id, created_at, project_slug, title, category, impact, "
+                "simple_description, change_prompt, source, status "
+                "FROM project_ideas WHERE id = ?;",
+                (int(cur.lastrowid),),
+            ).fetchone()
+            if row is not None:
+                inserted.append(_row_to_project_idea(row))
+        conn.commit()
+        return inserted
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _summarize_project_workspace(workspace_dir: Path) -> str:
+    """Collect a compact, read-only summary of files inside a generated project's workspace."""
+    root = Path(workspace_dir).resolve()
+    if not root.is_dir():
+        return "(Workspace no encontrado)"
+    ignored = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", "dist", "build"}
+    entries: list[str] = []
+    for path in sorted(root.rglob("*")):
+        if len(entries) >= 80:
+            break
+        parts = path.relative_to(root).parts
+        if any(p in ignored or p.startswith(".") for p in parts[:-1]):
+            continue
+        if path.is_file():
+            rel = "/".join(parts)
+            entries.append(rel)
+    readme_excerpt = ""
+    for name in ("README.md", "package.json", "pyproject.toml"):
+        candidate = root / name
+        if candidate.is_file():
+            try:
+                text = redact_secrets(candidate.read_text(encoding="utf-8", errors="ignore"))[:800]
+                readme_excerpt += f"\n--- {name} ---\n{text}"
+            except OSError:
+                pass
+    listing = "\n".join(f"- {e}" for e in entries) or "(Sin archivos relevantes)"
+    return f"Archivos del proyecto:\n{listing}{readme_excerpt}"
+
+
+def generate_project_ideas(
+    project_slug: str,
+    workspace_dir: Path | str,
+    *,
+    count: int = DEFAULT_IDEATION_COUNT,
+    source: str = "manual",
+    db_path: Path | str | None = None,
+    runner: Runner | None = None,
+    agy_command: Sequence[str] | None = None,
+    model: str | None = None,
+    timeout_seconds: float = DEFAULT_IDEATION_TIMEOUT_SECONDS,
+) -> list[dict[str, Any]]:
+    """Inspect a generated project's workspace in read-only mode via agy.EXE and store actionable improvements."""
+    clean_slug = _validate_project_slug(project_slug)
+    eff_source = _validate_project_idea_source(source)
+    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+        raise ValueError("count debe ser un entero positivo.")
+    bounded_count = min(count, MAX_IDEATION_COUNT)
+
+    ws_path = Path(workspace_dir).resolve()
+    summary = _summarize_project_workspace(ws_path)
+    prompt = (
+        f"Eres un Arquitecto de Producto revisando el proyecto '{clean_slug}' de Agent Factory.\n"
+        "REGLAS: MODO SOLO LECTURA. PROHIBIDO modificar archivos o leer .env/secretos.\n"
+        f"Devuelve ÚNICAMENTE un arreglo JSON válido con exactamente {bounded_count} objetos.\n"
+        "Cada objeto debe tener exactamente: title (español con emoji), category "
+        "(Rendimiento|Seguridad|UX|Estabilidad|Producto), impact (Alto|Medio), "
+        "simple_description (máx 2 frases en español simple) y "
+        "change_prompt (instrucción concreta y realizable para implementar en el workspace).\n\n"
+        f"Contexto del proyecto '{clean_slug}':\n{summary}"
+    )
+
+    active_runner: Any = (
+        runner if runner is not None else SubprocessRunner(default_timeout_seconds=timeout_seconds)
+    )
+    base_cmd, err_reason = _resolve_agy_readonly_command(agy_command, active_runner)
+    if base_cmd is None:
+        logger.warning("Project ideation skipped for %s: %s", clean_slug, err_reason)
+        return []
+
+    is_batch = base_cmd[0].lower().endswith((".cmd", ".bat"))
+    clean_env = build_sanitized_cli_env()
+    tmp_prompt: Path | None = None
+    try:
+        if len(prompt) <= _MAX_INLINE_PROMPT_CHARS:
+            prompt_arg = re.sub(r"[\r\n]+", " ", prompt).strip() if is_batch else prompt
+        else:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                suffix=".txt",
+                prefix="af_proj_idea_",
+                delete=False,
+            ) as tf:
+                tf.write(prompt)
+                tmp_prompt = Path(tf.name).resolve()
+            prompt_arg = f"Lee y sigue exactamente las instrucciones del archivo: {tmp_prompt}"
+
+        cmd = [*base_cmd, "-p", prompt_arg]
+        if isinstance(model, str) and model.strip():
+            cmd.extend(["--model", model.strip()])
+
+        with tempfile.TemporaryDirectory(prefix="af_proj_radar_") as ro_cwd:
+            res = _run_port_command(
+                active_runner,
+                cmd,
+                cwd=Path(ro_cwd),
+                timeout_seconds=float(timeout_seconds),
+                env=clean_env,
+            )
+    except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
+        logger.warning("Project idea generation failed for %s: %s", clean_slug, redact_secrets(str(exc)))
+        return []
+    finally:
+        if tmp_prompt is not None:
+            tmp_prompt.unlink(missing_ok=True)
+
+    if res.exit_code != 0 or not res.stdout.strip():
+        detail = redact_secrets((res.stderr or res.stdout or f"exit code {res.exit_code}").strip())
+        if is_quota_429_error(detail):
+            record_agy_429_pause(detail, db_path=db_path)
+        else:
+            record_agy_usage(
+                len(prompt),
+                len(res.stdout or "") + len(res.stderr or ""),
+                db_path=db_path,
+            )
+        logger.warning("Project ideation CLI error for %s: %s", clean_slug, detail)
+        return []
+
+    record_agy_usage(
+        len(prompt),
+        len(res.stdout or "") + len(res.stderr or ""),
+        db_path=db_path,
+    )
+    parsed = parse_ideas_payload(res.stdout)
+    if not parsed:
+        return []
+    return save_project_ideas(
+        clean_slug,
+        parsed,
+        source=eff_source,
+        db_path=db_path,
+        max_items=bounded_count,
+    )
+

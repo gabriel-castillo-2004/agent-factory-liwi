@@ -611,3 +611,79 @@ def test_revert_autonomous_improvement_does_not_mark_reverted_when_verification_
     assert reloaded_entry is not None
     assert reloaded_entry["status"] == "activa"
     assert idea_engine.get_idea(idea["id"], db_path=db_path)["status"] == "nueva"  # type: ignore[index]
+
+
+def test_quota_meter_reserve_threshold_and_429_auto_calibration_without_circuit_breaker(
+    tmp_path: Path,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    db_path = tmp_path / "telemetry.db"
+    _seed_idea(db_path, title="⚡ Mejorar caché", impact="Alto")
+    idea_engine.set_autonomous_config(autonomous_enabled=True, cooldown_minutes=20, db_path=db_path)
+
+    initial_q = idea_engine.get_quota_status(db_path=db_path)
+    assert initial_q["estimated_window_capacity"] == 180000
+    assert initial_q["reserve_threshold_pct"] == 30
+    assert initial_q["quota_remaining_pct"] == 100
+
+    # Accumulate 130,000 units (<30% left -> ~28% <= 30% threshold)
+    after_usage = idea_engine.record_agy_usage(65000, 65000, db_path=db_path)
+    assert after_usage is not None
+    assert after_usage["quota_remaining_pct"] == 28
+    assert after_usage["reserve_reached"] is True
+
+    engine = idea_engine.AutonomousEngine(
+        db_path=db_path,
+        repo_root=tmp_path,
+        activity_checker=lambda: None,
+        triage_provider=lambda: None,
+        staging_executor=lambda _w: (_ for _ in ()).throw(AssertionError("should yield at reserve threshold")),
+    )
+    cycle_reserve = engine.run_cycle()
+    assert cycle_reserve["status"] == "paused_quota"
+    assert engine.get_state()["state"] == "pausado_cuota"
+
+    # Lower reserve threshold to 5% and raise 429 during staging execution -> auto-calibrates without circuit breaker
+    idea_engine.set_quota_config(reserve_threshold_pct=5, db_path=db_path)
+    engine2 = idea_engine.AutonomousEngine(
+        db_path=db_path,
+        repo_root=tmp_path,
+        activity_checker=lambda: None,
+        triage_provider=lambda: None,
+        staging_executor=lambda _w: {"ok": False, "error": "RESOURCE_EXHAUSTED 429 Resets in 20m0s"},
+    )
+    cycle_429 = engine2.run_cycle()
+    assert cycle_429["status"] == "paused_quota"
+    assert cycle_429["quota"]["is_paused"] is True
+    assert cycle_429["quota"]["quota_remaining_pct"] == 0
+    assert cycle_429["quota"]["estimated_window_capacity"] == 130000
+    st_after = idea_engine.get_autonomous_state(db_path=db_path)
+    assert st_after["consecutive_failures"] == 0
+    assert st_after["autonomous_enabled"] is True
+
+    # Once pause expires in future clock check, quota resets cleanly to 100%
+    future = datetime.now(UTC) + timedelta(minutes=35)
+    recovered_q = idea_engine.get_quota_status(db_path=db_path, now=future)
+    assert recovered_q["is_paused"] is False
+    assert recovered_q["quota_remaining_pct"] == 100
+
+
+def test_autonomous_engine_get_status_snapshot_tracks_cediendo_paso_and_apagado(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "telemetry.db"
+    engine = idea_engine.AutonomousEngine(
+        db_path=db_path,
+        repo_root=tmp_path,
+        has_running_local_apps=lambda: True,
+    )
+    snap_off = engine.get_status_snapshot()
+    assert snap_off["state"] == "apagado"
+    assert snap_off["quota"]["quota_remaining_pct"] == 100
+
+    idea_engine.set_autonomous_config(autonomous_enabled=True, db_path=db_path)
+    snap_yield = engine.get_status_snapshot()
+    assert snap_yield["state"] == "cediendo_paso"
+    assert snap_yield["busy_reason"] == "app local encendida"
+

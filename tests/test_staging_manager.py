@@ -339,3 +339,70 @@ def test_promote_rebases_diverged_main_before_ff_merge_and_syncs_empty_worktree(
         assert _git(wt, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "liwi-staging"
     finally:
         manager.shutdown()
+
+
+def test_staging_manager_429_preserves_dirty_worktree_wip_and_resumes_with_diff(
+    temp_git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    import time
+    from datetime import datetime, timedelta
+
+    from agent_factory.staging_manager import StagingManager
+
+    db_path = tmp_path / "telemetry_429.db"
+    seen_prompts: list[str] = []
+    attempt_counter = [0]
+
+    def _exec_429_then_finish(worktree: Path, task: dict[str, Any]) -> None:
+        attempt_counter[0] += 1
+        seen_prompts.append(str(task["prompt"]))
+        if attempt_counter[0] == 1:
+            # Dirty edit in worktree before 429 occurs
+            (worktree / "partial_feature.txt").write_text("avance parcial importante\n", encoding="utf-8")
+            raise RuntimeError("RESOURCE_EXHAUSTED HTTP 429 Resets in 25m0s")
+        # Second attempt (auto-resumed) sees preserved wip file + diff in prompt and completes
+        assert (worktree / "partial_feature.txt").read_text(encoding="utf-8") == "avance parcial importante\n"
+        (worktree / "final_feature.txt").write_text("completado\n", encoding="utf-8")
+        assert _git(worktree, "add", "final_feature.txt").returncode == 0
+        assert _git(worktree, "commit", "-m", str(task["title"])).returncode == 0
+
+    manager = StagingManager(
+        repo_root=temp_git_repo,
+        executor=_exec_429_then_finish,
+        db_path=db_path,
+    )
+    try:
+        manager.enqueue_improvement(
+            title="feat: resiliente a 429",
+            prompt="Crea feature completo sin perder avance.",
+        )
+        assert manager.wait_until_idle(timeout=15.0) is True
+
+        status_paused = manager.get_staging_status()
+        assert status_paused["paused_count"] == 1
+        assert status_paused["last_error"] is not None
+        assert "⏳ Sin cuota disponible por ahora" in status_paused["last_error"]
+        wt = manager.worktree_path
+        assert "wip(quota-pause): avance parcial" in _git(wt, "log", "--format=%s", "-n", "1").stdout
+
+        # Expire timer deterministically and wake worker so it resumes with previous git diff
+        with manager._cond:
+            manager._paused_tasks[0]["resume_at_dt"] = datetime.now().astimezone() - timedelta(seconds=5)
+            manager._cond.notify_all()
+
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            st = manager.get_staging_status()
+            if st["paused_count"] == 0 and not st["is_building"] and len(st["commits"]) >= 2:
+                break
+            time.sleep(0.05)
+
+        final_status = manager.get_staging_status()
+        assert final_status["paused_count"] == 0
+        assert attempt_counter[0] == 2
+        assert "wip(quota-pause)" in seen_prompts[1]
+        assert "partial_feature.txt" in seen_prompts[1]
+    finally:
+        manager.shutdown()
+

@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from agent_factory import idea_engine, telemetry
+from agent_factory import idea_engine, telemetry, visual_qa_agent
 from agent_factory.adapters.github_vcs_adapter import VcsError
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.builder import BuildWorker
@@ -94,6 +94,7 @@ class DashboardController:
         runner: Runner | None = None,
         self_improver: FactorySelfImprover | None = None,
         staging_manager: StagingManager | None = None,
+        autonomous_engine: idea_engine.AutonomousEngine | None = None,
         secrets_to_redact: Sequence[str] = (),
     ) -> None:
         self.orchestrator = orchestrator
@@ -164,6 +165,7 @@ class DashboardController:
         self._threads: list[threading.Thread] = []
         self._self_improver: FactorySelfImprover | None = self_improver
         self._staging_manager: StagingManager | None = staging_manager
+        self._autonomous_engine: idea_engine.AutonomousEngine | None = autonomous_engine
         self._legacy_direct_self_improver: bool = (
             isinstance(self_improver, FactorySelfImprover) and staging_manager is None
         )
@@ -1648,6 +1650,14 @@ class DashboardController:
                 local_status = self.local_runner.start(project_id, install_deps=True)
             except (LocalAppError, SandboxViolationError, ValueError) as exc:
                 clean_msg = redact_secrets(str(exc), extra_secrets=self.secrets_to_redact)
+                try:
+                    idea_engine.create_project_error_idea(
+                        project_id,
+                        clean_msg,
+                        db_path=self._resolve_idea_db_path(),
+                    )
+                except Exception as idea_exc:  # noqa: BLE001
+                    logger.debug("create_project_error_idea skipped for %s: %s", project_id, idea_exc)
                 raise ProjectConflictError(clean_msg) from exc
 
         updated = self.orchestrator.get_status(project_id) if events else None
@@ -2469,6 +2479,265 @@ class DashboardController:
                 "ok": True,
                 "dismissed": True,
                 "idea": dismissed,
+            },
+            self.secrets_to_redact,
+        )
+
+    def _has_active_factory_builds(self) -> bool:
+        with self._lock:
+            if self._active_projects or self._active_ops:
+                return True
+        for proj in self.list_projects():
+            if str(proj.get("state") or "").upper() in {"BUILDING", "RECOVERING"}:
+                return True
+        return False
+
+    def _has_running_local_apps(self) -> bool:
+        for proj in self.list_projects():
+            pid = str(proj.get("project_id") or "").strip()
+            if not pid:
+                continue
+            try:
+                if self.local_runner.get_status(pid).running:
+                    return True
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("local_runner.get_status skipped for %s: %s", pid, exc)
+        return False
+
+    def _get_autonomous_engine(self) -> idea_engine.AutonomousEngine:
+        with self._lock:
+            if self._autonomous_engine is None:
+                db_path = self._resolve_idea_db_path()
+                raw_root = getattr(self._self_improver, "repo_root", None)
+                repo_root = Path(raw_root).resolve() if raw_root is not None else Path.cwd()
+                eff_runner = (
+                    self.runner
+                    if self.runner is not None
+                    else getattr(self.build_worker, "runner", None)
+                )
+                self._autonomous_engine = idea_engine.AutonomousEngine(
+                    db_path=db_path,
+                    repo_root=repo_root,
+                    staging_manager=self._staging_manager,
+                    has_active_builds=self._has_active_factory_builds,
+                    has_running_local_apps=self._has_running_local_apps,
+                    command_runner=eff_runner,
+                )
+            return self._autonomous_engine
+
+    def get_autonomous_status(self) -> dict[str, Any]:
+        """Return live 24/7 autonomous status, quota meter telemetry, and recent autonomous history."""
+        engine = self._get_autonomous_engine()
+        return _scrub_value(engine.get_status_snapshot(), self.secrets_to_redact)
+
+    def toggle_autonomous_mode(
+        self,
+        *,
+        autonomous_enabled: bool | None = None,
+        cooldown_minutes: int | None = None,
+        reserve_threshold_pct: int | None = None,
+    ) -> dict[str, Any]:
+        """Toggle 24/7 autonomous mode or update cooldown / reserve threshold cleanly."""
+        engine = self._get_autonomous_engine()
+        engine.update_config(
+            autonomous_enabled=autonomous_enabled,
+            cooldown_minutes=cooldown_minutes,
+            reserve_threshold_pct=reserve_threshold_pct,
+        )
+        if autonomous_enabled is True:
+            engine.start()
+        return _scrub_value(
+            {"ok": True, **engine.get_status_snapshot()},
+            self.secrets_to_redact,
+        )
+
+    def revert_autonomous_improvement(self, entry_id: int) -> dict[str, Any]:
+        """Revert an autonomous improvement commit on main, verify tests, and discard linked idea."""
+        engine = self._get_autonomous_engine()
+        try:
+            res = engine.revert_autonomous_improvement(entry_id)
+        except KeyError as exc:
+            raise ProjectNotFoundError(str(exc)) from exc
+        except ValueError as exc:
+            raise ValueError(redact_secrets(str(exc), extra_secrets=self.secrets_to_redact)) from exc
+        except RuntimeError as exc:
+            raise ProjectConflictError(
+                redact_secrets(str(exc), extra_secrets=self.secrets_to_redact)
+            ) from exc
+
+        restart_scheduled = False
+        if "PYTEST_CURRENT_TEST" not in os.environ:
+            self._trigger_supervised_restart()
+            restart_scheduled = True
+
+        return _scrub_value(
+            {
+                **res,
+                "restart_scheduled": restart_scheduled,
+                "status": engine.get_status_snapshot(),
+            },
+            self.secrets_to_redact,
+        )
+
+    def run_visual_audit(self, *, base_url: str | None = None) -> dict[str, Any]:
+        """Execute headless Playwright synthetic-user audit against dashboard UI and persist ideas."""
+        eff_url = str(base_url or f"http://{LOOPBACK_HOST}:8000").strip()
+        db_path = self._resolve_idea_db_path()
+        raw_root = getattr(self._self_improver, "repo_root", None)
+        repo_root = Path(raw_root).resolve() if raw_root is not None else None
+        eff_runner = (
+            self.runner
+            if self.runner is not None
+            else getattr(self.build_worker, "runner", None)
+        )
+        eff_model = None
+        if self.model_resolver is not None and hasattr(self.model_resolver, "resolve_model"):
+            try:
+                eff_model = self.model_resolver.resolve_model("INTERVIEW")
+            except (RuntimeError, ValueError, OSError):
+                eff_model = None
+
+        audit_res = visual_qa_agent.run_synthetic_user_audit(
+            base_url=eff_url,
+            db_path=db_path,
+            runner=eff_runner,
+            repo_root=repo_root,
+            model=eff_model,
+        )
+        ideas = idea_engine.list_ideas(db_path=db_path)
+        return _scrub_value(
+            {
+                **audit_res,
+                "ideas": ideas,
+            },
+            self.secrets_to_redact,
+        )
+
+    def _assert_project_exists_for_ideas(self, project_id: str) -> tuple[WorkspaceManager | None, Path | None]:
+        validate_project_id(project_id)
+        events = self.orchestrator.store.get_events(project_id)
+        ws_mgr = self._sync_external_workspace(project_id)
+        ws_dir = ws_mgr.get_workspace_dir(project_id) if ws_mgr is not None else None
+        if not events and (ws_dir is None or not ws_dir.is_dir()):
+            raise ProjectNotFoundError(f"Project '{project_id}' not found")
+        return ws_mgr, ws_dir
+
+    def list_project_ideas(self, project_id: str) -> dict[str, Any]:
+        """List auto-improvement ideas for a generated project."""
+        self._assert_project_exists_for_ideas(project_id)
+        db_path = self._resolve_idea_db_path()
+        ideas = idea_engine.list_project_ideas(project_id, db_path=db_path)
+        return _scrub_value(
+            {
+                "ok": True,
+                "project_id": project_id,
+                "ideas": ideas,
+            },
+            self.secrets_to_redact,
+        )
+
+    def generate_project_ideas(
+        self,
+        project_id: str,
+        *,
+        count: int = idea_engine.DEFAULT_IDEATION_COUNT,
+    ) -> dict[str, Any]:
+        """Run read-only project inspection via agy.EXE and store actionable improvements for project_id."""
+        _ws_mgr, ws_dir = self._assert_project_exists_for_ideas(project_id)
+        if ws_dir is None or not ws_dir.is_dir():
+            raise ProjectNotFoundError(f"Workspace de '{project_id}' no encontrado")
+
+        db_path = self._resolve_idea_db_path()
+        eff_runner = (
+            self.runner
+            if self.runner is not None
+            else getattr(self.build_worker, "runner", None)
+        )
+        eff_model = None
+        if self.model_resolver is not None and hasattr(self.model_resolver, "resolve_model"):
+            try:
+                eff_model = self.model_resolver.resolve_model("INTERVIEW")
+            except (RuntimeError, ValueError, OSError):
+                eff_model = None
+
+        created = idea_engine.generate_project_ideas(
+            project_id,
+            ws_dir,
+            count=count,
+            source="manual",
+            db_path=db_path,
+            runner=eff_runner,
+            model=eff_model,
+        )
+        ideas = idea_engine.list_project_ideas(project_id, db_path=db_path)
+        return _scrub_value(
+            {
+                "ok": True,
+                "project_id": project_id,
+                "created": created,
+                "created_count": len(created),
+                "ideas": ideas,
+            },
+            self.secrets_to_redact,
+        )
+
+    def approve_project_idea(self, project_id: str, idea_id: int) -> dict[str, Any]:
+        """Approve a per-project idea, mark 'implementando', and enqueue its change_prompt in modify_project."""
+        self._assert_project_exists_for_ideas(project_id)
+        db_path = self._resolve_idea_db_path()
+        idea = idea_engine.get_project_idea(idea_id, db_path=db_path)
+        if idea is None or idea["project_slug"] != project_id:
+            raise ProjectNotFoundError(f"Idea '{idea_id}' no encontrada para '{project_id}'.")
+
+        updated = idea_engine.update_project_idea_status(
+            idea_id,
+            "implementando",
+            project_slug=project_id,
+            db_path=db_path,
+        )
+        try:
+            modify_res = self.modify_project(project_id, idea["change_prompt"])
+        except Exception:
+            idea_engine.update_project_idea_status(
+                idea_id,
+                "nueva",
+                project_slug=project_id,
+                db_path=db_path,
+            )
+            raise
+        ideas = idea_engine.list_project_ideas(project_id, db_path=db_path)
+        return _scrub_value(
+            {
+                "ok": True,
+                "project_id": project_id,
+                "idea": updated,
+                "ideas": ideas,
+                "modify": modify_res,
+            },
+            self.secrets_to_redact,
+        )
+
+    def dismiss_project_idea(self, project_id: str, idea_id: int) -> dict[str, Any]:
+        """Dismiss a per-project improvement idea."""
+        self._assert_project_exists_for_ideas(project_id)
+        db_path = self._resolve_idea_db_path()
+        try:
+            updated = idea_engine.update_project_idea_status(
+                idea_id,
+                "descartada",
+                project_slug=project_id,
+                db_path=db_path,
+            )
+        except KeyError as exc:
+            raise ProjectNotFoundError(str(exc)) from exc
+        ideas = idea_engine.list_project_ideas(project_id, db_path=db_path)
+        return _scrub_value(
+            {
+                "ok": True,
+                "dismissed": True,
+                "project_id": project_id,
+                "idea": updated,
+                "ideas": ideas,
             },
             self.secrets_to_redact,
         )
@@ -4791,7 +5060,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       .factory-composer-capsule,
       .factory-paste-previews,
       .factory-composer-row,
-      .factory-fs-card {
+      .factory-fs-card,
+      .autonomous-controls-wrap,
+      .liwi-radar-controls,
+      .liwi-radar-subtabs,
+      .liwi-history-card,
+      .liwi-history-head,
+      .proj-ideas-head,
+      .proj-ideas-grid,
+      .proj-idea-card {
         min-width: 0;
         max-width: 100%;
         box-sizing: border-box;
@@ -6473,6 +6750,126 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       color: var(--muted);
       font-size: 0.88rem;
     }
+    .autonomous-controls-wrap {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: nowrap;
+      flex: 0 0 auto;
+    }
+    .autonomous-switch.is-on {
+      border-color: var(--ok);
+      background: var(--ok-bg);
+      color: var(--text);
+      font-weight: 600;
+    }
+    .autonomous-switch.is-paused {
+      border-color: var(--warn);
+      background: rgba(245, 158, 11, 0.16);
+      color: var(--text);
+    }
+    .quota-meter-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
+      color: var(--text);
+      white-space: nowrap;
+    }
+    .quota-meter-pill.is-healthy {
+      border-color: rgba(34, 197, 94, 0.45);
+      background: rgba(34, 197, 94, 0.14);
+    }
+    .quota-meter-pill.is-warn,
+    .quota-meter-pill.is-paused {
+      border-color: rgba(245, 158, 11, 0.55);
+      background: rgba(245, 158, 11, 0.16);
+    }
+    .liwi-radar-subtabs {
+      display: flex;
+      gap: 6px;
+      margin: 8px 0 10px 0;
+      flex-wrap: wrap;
+    }
+    .liwi-subtab-btn {
+      padding: 5px 11px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
+      color: var(--muted);
+      font-size: 0.8rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .liwi-subtab-btn.active {
+      border-color: var(--accent);
+      color: var(--text);
+      background: rgba(56, 189, 248, 0.16);
+    }
+    .liwi-history-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 290px;
+      overflow-y: auto;
+    }
+    .liwi-history-card {
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .liwi-history-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .liwi-history-meta {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      font-size: 0.76rem;
+      color: var(--muted);
+    }
+    .proj-ideas-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+    .proj-ideas-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 10px;
+    }
+    .proj-idea-card {
+      padding: 12px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .proj-idea-card-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: auto;
+    }
     @media (prefers-reduced-motion: reduce) {
       .factory-fs-ring,
       .factory-fs-ring-wrap,
@@ -6520,6 +6917,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
           </div>
         </div>
+      </div>
+      <div id="autonomous-controls-wrap" class="autonomous-controls-wrap">
+        <button id="autonomous-toggle-btn" class="btn btn-sm autonomous-switch" type="button" aria-pressed="false" title="Activar o pausar modo Automejora 24/7">🤖 Automejora: OFF</button>
+        <span id="quota-meter-pill" class="quota-meter-pill is-healthy" title="Cuota estimada disponible en esta ventana">🔋 ~100%</span>
       </div>
       <button id="auto-ideas-btn" class="btn btn-sm" type="button" title="Abrir Radar de Auto-Mejoras de Liwi">💡 Auto-Mejoras<span id="auto-ideas-count" class="auto-ideas-badge" style="display:none">0</span></button>
       <button id="improve-factory-btn" class="btn btn-sm" type="button" title="Abrir chat padre de auto-mejora de Liwi">🏭 Mejorar Fábrica</button>
@@ -6695,8 +7096,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                   <option value="24">Cada 24h</option>
                   <option value="72">Cada 3 días</option>
                 </select>
+                <select id="liwi-reserve-threshold" class="liwi-radar-select" aria-label="Reserva de cuota" title="Umbral mínimo de reserva de cuota antes de pausar automejoras">
+                  <option value="20">Reserva 20%</option>
+                  <option value="30" selected>Reserva 30%</option>
+                  <option value="40">Reserva 40%</option>
+                  <option value="50">Reserva 50%</option>
+                </select>
+                <select id="liwi-autonomous-cooldown" class="liwi-radar-select" aria-label="Cooldown autónomo" title="Pausa mínima entre mejoras autónomas">
+                  <option value="15">Cada 15m</option>
+                  <option value="20">Cada 20m</option>
+                  <option value="25" selected>Cada 25m</option>
+                  <option value="30">Cada 30m</option>
+                </select>
+                <button id="liwi-visual-audit-btn" class="btn btn-sm" type="button" title="Auditar interfaz como usuario sintético con Playwright">🕵️ Simular usuario</button>
                 <button id="liwi-radar-generate-btn" class="btn btn-sm liwi-radar-gen-btn" type="button">💡 Generar ideas</button>
               </div>
+            </div>
+            <div class="liwi-radar-subtabs" role="tablist" aria-label="Vistas de auto-mejoras">
+              <button id="liwi-subtab-ideas-btn" class="liwi-subtab-btn active" type="button" role="tab" aria-selected="true">💡 Ideas pendientes</button>
+              <button id="liwi-subtab-history-btn" class="liwi-subtab-btn" type="button" role="tab" aria-selected="false">📜 Bitácora Autónoma</button>
             </div>
             <div id="liwi-radar-live-status" class="liwi-radar-live-status" role="status" aria-live="polite" style="display:none">
               <span id="liwi-radar-spinner" class="btn-spinner" aria-hidden="true" style="display:none"></span>
@@ -6705,6 +7123,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
             <div id="liwi-radar-empty" class="liwi-radar-empty" style="display:none">Sin ideas pendientes por ahora. Pulsa «💡 Generar ideas» para descubrir mejoras.</div>
             <div id="liwi-radar-grid" class="liwi-radar-grid" aria-live="polite"></div>
+            <div id="liwi-autonomous-history-panel" class="liwi-history-list" style="display:none" aria-live="polite"></div>
           </section>
         </div>
         <div id="factory-chat-stream" class="factory-chat-stream">
@@ -6796,12 +7215,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <div class="tabs">
                 <button id="tab-audit-btn" class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-audit" tabindex="-1" data-tab="audit" type="button" title="Consultar y Auditar proyecto" style="display:none">💬 Consultar y Auditar</button>
                 <button id="tab-modify-btn" class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-modify" tabindex="-1" data-tab="modify" type="button" style="display:none">✨ Pedir cambios</button>
+                <button id="tab-ideas-btn" class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-ideas" tabindex="-1" data-tab="ideas" type="button" style="display:none">💡 Auto-Mejoras <span id="project-ideas-tab-badge" class="auto-ideas-badge" style="display:none">0</span></button>
                 <button id="tab-spec-btn" class="tab-btn active" role="tab" aria-selected="true" aria-controls="tab-spec" tabindex="0" data-tab="spec" type="button">📋 Resumen y Plan</button>
                 <button id="tab-events-btn" class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-events" tabindex="-1" data-tab="events" type="button">🕒 Historial</button>
               </div>
             </div>
             <div id="tab-audit" class="tab-content" role="tabpanel" aria-labelledby="tab-audit-btn" style="display:none"></div>
             <div id="tab-modify" class="tab-content" role="tabpanel" aria-labelledby="tab-modify-btn" style="display:none"></div>
+            <div id="tab-ideas" class="tab-content" role="tabpanel" aria-labelledby="tab-ideas-btn" style="display:none"></div>
             <div id="tab-spec" class="tab-content" role="tabpanel" aria-labelledby="tab-spec-btn"></div>
             <div id="tab-events" class="tab-content" role="tabpanel" aria-labelledby="tab-events-btn" style="display:none"></div>
 
@@ -6861,6 +7282,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       diffOpen: {},
       filesOpen: {},
       rollbackOpen: {},
+      projectIdeasByPid: {},
+      projectIdeasLoadedFor: {},
       voiceTts: false,
       lastSpokenQuestionKey: null,
       editingTitlePid: null,
@@ -7584,6 +8007,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (auditPane) auditPane.style.display = state.activeTab === 'audit' ? 'block' : 'none';
       const modifyPane = document.getElementById('tab-modify');
       if (modifyPane) modifyPane.style.display = state.activeTab === 'modify' ? 'block' : 'none';
+      const ideasPane = document.getElementById('tab-ideas');
+      if (ideasPane) ideasPane.style.display = state.activeTab === 'ideas' ? 'block' : 'none';
     }
 
     function speakSpanishText(rawText) {
@@ -9415,6 +9840,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const readOnlyAuditModifying = wasDeliveredBefore && !isDelivered;
       const auditTabBtn = document.getElementById('tab-audit-btn');
       const modifyTabBtn = document.getElementById('tab-modify-btn');
+      const ideasTabBtn = document.getElementById('tab-ideas-btn');
+      if (ideasTabBtn) ideasTabBtn.style.display = st.project_id ? '' : 'none';
+      if (st.project_id && typeof window.loadProjectIdeasFor === 'function') {
+        if (!state.projectIdeasLoadedFor[st.project_id]) {
+          window.loadProjectIdeasFor(st.project_id);
+        } else if (typeof window.renderProjectIdeasTab === 'function') {
+          window.renderProjectIdeasTab(st.project_id);
+        }
+      }
       if (isDelivered || readOnlyAuditModifying) {
         if (auditTabBtn) auditTabBtn.style.display = '';
         if (modifyTabBtn) modifyTabBtn.style.display = isDelivered ? '' : 'none';
@@ -12360,397 +12794,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         stopStatusPolling();
         stopClockTicker();
         if (fsOverlay) fsOverlay.style.display = 'none';
-        if (buildBanner) buildBanner.style.display = 'none';
-        if (progressCard) progressCard.style.display = 'none';
-        setFactoryControlsLocked(false);
-        updateLiveClockAndHeader();
-      }
-      window.clearFactoryBlockingForStaging = clearFactoryBlockingForStaging;
-
-      function applyStatusSnapshot(st) {
-        const s = st && typeof st === 'object' ? st : {};
-        const wasRunning = lastServerRunning;
-        const isRunning = !!s.running;
-        const prevStep = lastActiveStep;
-        activeStatus = {
-          running: isRunning,
-          step: Number(s.step) || 0,
-          total_steps: Number(s.total_steps) || 3,
-          stage: String(s.stage || ''),
-          detail: String(s.detail || ''),
-          title: String(s.title || ''),
-          elapsed_seconds: Number(s.elapsed_seconds) || 0,
-          last_outcome: String(s.last_outcome || ''),
-          syncedAtMs: Date.now(),
-        };
-        lastServerRunning = isRunning;
-
-        if (window.__liwiStagingActive && !applyInFlight) {
-          clearFactoryBlockingForStaging();
-          if (typeof window.refreshSelfImproveStaging === 'function') {
-            window.refreshSelfImproveStaging();
-          }
-          if (wasRunning && !isRunning) {
-            refreshHistory();
-          }
-          return;
-        }
-
-        if (isRunning) {
-          ensureStatusPolling();
-          ensureClockTicker();
-          setFactoryControlsLocked(true);
-          const stepNum = Math.max(1, activeStatus.step || 1);
-          lastActiveStep = stepNum;
-          const totalSteps = Math.max(3, activeStatus.total_steps || 3);
-          const headline = activeStatus.title || activeStatus.stage || ('Paso ' + stepNum + '/' + totalSteps);
-          const detailLine = (activeStatus.stage ? (activeStatus.stage + ': ') : '') + (activeStatus.detail || 'Procesando mejora en Liwi...');
-          if (buildBanner) buildBanner.style.display = 'block';
-          if (buildBannerTitle) buildBannerTitle.textContent = '🔨 ' + headline;
-          if (buildBannerDetail) buildBannerDetail.textContent = detailLine;
-          if (progressCard) {
-            progressCard.style.display = 'flex';
-            if (progressTitle) progressTitle.textContent = '🔨 ' + headline;
-            if (progressDetail) progressDetail.textContent = detailLine;
-            progressCard.querySelectorAll('.factory-step-pill').forEach((pill) => {
-              const pStep = Number(pill.getAttribute('data-fstep') || 0);
-              pill.classList.toggle('is-done', pStep < stepNum);
-              pill.classList.toggle('is-active', pStep === stepNum);
-            });
-          }
-          syncFullscreenOverlay(true, stepNum, headline, detailLine);
-          updateLiveClockAndHeader();
-          return;
-        }
-
-        if (!applyInFlight && !reconnectTimer) {
-          stopStatusPolling();
-          stopClockTicker();
-        }
-        if (buildBanner) buildBanner.style.display = 'none';
-        if (progressCard) progressCard.style.display = 'none';
-        updateLiveClockAndHeader();
-
-        if (wasRunning && !applyInFlight && !reconnectTimer) {
-          setFactoryControlsLocked(false);
-          if (activeStatus.last_outcome === 'applied' || prevStep >= 3) {
-            finishWithUpdatedReload('✓ ¡Liwi actualizado! Recargando...');
-            return;
-          }
-          if (fsOverlay) fsOverlay.style.display = 'none';
-          if (statusEl && activeStatus.last_outcome === 'rolled_back') {
-            statusEl.textContent = 'Mejora revertida automáticamente tras fallo en verificación.';
-          }
-          refreshHistory();
-        } else if (!isRunning && fsOverlay && !applyInFlight && !reconnectTimer) {
-          fsOverlay.style.display = 'none';
-        }
-      }
-
-      async function pollFactoryStatus() {
-        try {
-          const st = await apiFetch('/api/factory/assistant/status', { cache: 'no-store' });
-          applyStatusSnapshot(st);
-          return st;
-        } catch (_) {
-          return null;
-        }
-      }
-
-      function startReconnectPolling() {
-        if (restartBanner) restartBanner.style.display = 'block';
-        if (buildBanner) buildBanner.style.display = 'none';
-        if (fsOverlay && !buildOverlayMinimized) {
-          fsOverlay.style.display = 'flex';
-          if (fsTitle) fsTitle.textContent = 'Guardando y reiniciando Liwi...';
-          if (fsDetail) fsDetail.textContent = 'Esperando reconexión automática tras verificar todas las pruebas.';
-        }
-        stopStatusPolling();
-        if (reconnectTimer) clearInterval(reconnectTimer);
-        let sawDrop = false;
-        const startedAt = Date.now();
-        reconnectTimer = setInterval(async () => {
-          try {
-            const resp = await fetch('/api/factory/assistant/status', { cache: 'no-store' });
-            if (resp.ok) {
-              const st = await resp.json().catch(() => ({}));
-              if (!st.running && (sawDrop || (Date.now() - startedAt) > 1200)) {
-                finishWithUpdatedReload('✓ ¡Liwi actualizado! Recargando...');
-              }
-            } else {
-              sawDrop = true;
-            }
-          } catch (_) {
-            sawDrop = true;
-          }
-        }, 1200);
-      }
-
-      function autoResizeFactoryInput() {
-        if (!inputEl) return;
-        inputEl.style.height = 'auto';
-        const maxH = 180;
-        const sh = inputEl.scrollHeight || 0;
-        if (sh > 0) {
-          inputEl.style.height = Math.min(sh, maxH) + 'px';
-          inputEl.style.overflowY = sh > maxH ? 'auto' : 'hidden';
-        } else {
-          inputEl.style.overflowY = 'hidden';
-        }
-      }
-
-      function renderPreviews() {
-        if (!previewsEl) return;
-        previewsEl.style.display = pendingImages.length ? 'flex' : 'none';
-        previewsEl.innerHTML = pendingImages.map((img, idx) =>
-          '<span class="factory-paste-chip">' +
-            '<img src="' + escapeHtml(img.previewUrl) + '" alt="' + escapeHtml(img.filename) + '" />' +
-            '<span class="factory-paste-chip-name">' + escapeHtml(img.filename) + '</span>' +
-            '<button type="button" class="btn-icon" data-rm-paste="' + idx + '" aria-label="Quitar captura">✕</button>' +
-          '</span>'
-        ).join('');
-        previewsEl.querySelectorAll('button[data-rm-paste]').forEach((b) => {
-          b.addEventListener('click', () => {
-            const i = Number(b.getAttribute('data-rm-paste'));
-            pendingImages.splice(i, 1);
-            renderPreviews();
-          });
-        });
-      }
-
-      function appendImageFile(file) {
-        if (!file || !String(file.type || '').startsWith('image/')) return;
-        if (pendingImages.length >= 4) {
-          if (statusEl) statusEl.textContent = 'Máximo 4 capturas por mensaje.';
-          return;
-        }
-        const reader = new FileReader();
-        reader.onload = () => {
-          const dataUrl = String(reader.result || '');
-          const b64Idx = dataUrl.indexOf('base64,');
-          const b64 = b64Idx >= 0 ? dataUrl.slice(b64Idx + 7) : dataUrl;
-          pendingImages.push({
-            filename: file.name || ('captura_' + (pendingImages.length + 1) + '.png'),
-            data_base64: b64,
-            previewUrl: dataUrl,
-          });
-          renderPreviews();
-        };
-        reader.readAsDataURL(file);
-      }
-
-      function renderMemory(rules) {
-        const list = Array.isArray(rules) ? rules : [];
-        memToggle.textContent = '🧠 Memoria de Liwi (' + list.length + ')';
-        if (!list.length) {
-          memPanel.innerHTML = '<div class="muted">Sin reglas guardadas todavía. Las preferencias detectadas en el chat aparecerán aquí.</div>';
-          return;
-        }
-        memPanel.innerHTML = list.map((r) =>
-          '<div class="factory-memory-item">' +
-            '<span>• ' + escapeHtml(String(r.rule_text || '')) + '</span>' +
-            '<button type="button" class="btn btn-sm" data-del-frule="' + escapeHtml(String(r.id || '')) + '">Eliminar</button>' +
-          '</div>'
-        ).join('');
-        memPanel.querySelectorAll('button[data-del-frule]').forEach((btn) => {
-          btn.addEventListener('click', async () => {
-            const rid = btn.getAttribute('data-del-frule');
-            if (!rid) return;
-            btn.disabled = true;
-            try {
-              const res = await apiFetch('/api/factory/assistant/memory/' + encodeURIComponent(rid), { method: 'DELETE' });
-              renderMemory(res.memory_rules || []);
-            } catch (err) {
-              if (statusEl) statusEl.textContent = 'Error eliminando regla: ' + err.message;
-              btn.disabled = false;
-            }
-          });
-        });
-      }
-
-      async function copyTextToClipboard(text) {
-        const value = String(text == null ? '' : text);
-        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-          try {
-            await navigator.clipboard.writeText(value);
-            return true;
-          } catch (_) {
-            // Fallback to execCommand('copy') when Clipboard API is unavailable or rejected (HTTP/Tailscale/mobile)
-          }
-        }
-        const ta = document.createElement('textarea');
-        ta.value = value;
-        ta.setAttribute('readonly', '');
-        ta.style.position = 'fixed';
-        ta.style.top = '-9999px';
-        ta.style.left = '-9999px';
-        ta.style.opacity = '0';
-        ta.style.pointerEvents = 'none';
-        document.body.appendChild(ta);
-        try {
-          if (typeof ta.focus === 'function') {
-            try { ta.focus({ preventScroll: true }); } catch (_) { ta.focus(); }
-          }
-          ta.select();
-          if (typeof ta.setSelectionRange === 'function') {
-            ta.setSelectionRange(0, value.length);
-          }
-          return Boolean(document.execCommand('copy'));
-        } catch (_) {
-          return false;
-        } finally {
-          if (ta.parentNode) ta.parentNode.removeChild(ta);
-        }
-      }
-
-      function extractCleanCopyText(node) {
-        if (!node) return '';
-        const clone = node.cloneNode(true);
-        clone.querySelectorAll('.copy-msg-btn, .md-copy-btn, button, .factory-proposal-actions, .md-code-head, .factory-pre-bar').forEach((el) => {
-          el.remove();
-        });
-        return String(clone.textContent || '').trim();
-      }
-
-      function createCopyButton(getTextFn, ariaLabel) {
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'copy-msg-btn';
-        btn.setAttribute('aria-label', ariaLabel || 'Copiar contenido');
-        btn.textContent = '📋 Copiar';
-        let resetTimer = null;
-        btn.addEventListener('click', async (ev) => {
-          ev.stopPropagation();
-          const cleanText = typeof getTextFn === 'function' ? String(getTextFn() || '').trim() : '';
-          if (!cleanText) return;
-          await copyTextToClipboard(cleanText);
-          if (resetTimer) {
-            clearTimeout(resetTimer);
-            resetTimer = null;
-          }
-          btn.textContent = '✓ Copiado';
-          btn.classList.add('is-copied');
-          resetTimer = setTimeout(() => {
-            btn.textContent = '📋 Copiar';
-            btn.classList.remove('is-copied');
-            resetTimer = null;
-          }, 1500);
-        });
-        return btn;
-      }
-
-      function attachFactoryCopyButtons(rootEl, assistantRawTexts) {
-        if (!rootEl) return;
-        const rawList = Array.isArray(assistantRawTexts) ? assistantRawTexts : [];
-
-        // 1. Copy button on each assistant (Liwi) message
-        rootEl.querySelectorAll('.factory-msg-assistant').forEach((msgEl) => {
-          if (msgEl.id === 'factory-thinking-bubble') return;
-          const headEl = msgEl.querySelector('.factory-msg-head');
-          if (!headEl || headEl.querySelector('.copy-msg-btn')) return;
-          const bodyEl = msgEl.querySelector('.factory-msg-body');
-          const rawIdxAttr = msgEl.getAttribute('data-assistant-idx');
-          const rawIdx = rawIdxAttr !== null ? Number(rawIdxAttr) : -1;
-          const rawText = rawIdx >= 0 && typeof rawList[rawIdx] === 'string' ? rawList[rawIdx].trim() : '';
-          const msgCopyBtn = createCopyButton(
-            () => rawText || extractCleanCopyText(bodyEl),
-            'Copiar mensaje de Liwi'
-          );
-          headEl.appendChild(msgCopyBtn);
-        });
-
-        // 2. Copy button on each proposal box
-        rootEl.querySelectorAll('.factory-proposal-card').forEach((cardEl) => {
-          const preEl = cardEl.querySelector('.doctor-prompt-pre');
-          if (preEl) preEl.setAttribute('data-copy-attached', '1');
-          const headEl = cardEl.querySelector('.factory-proposal-head');
-          if (!headEl || headEl.querySelector('.copy-msg-btn') || !preEl) return;
-          const propCopyBtn = createCopyButton(
-            () => extractCleanCopyText(preEl),
-            'Copiar propuesta'
-          );
-          headEl.appendChild(propCopyBtn);
-        });
-
-        // 3. Upgrade markdown code block copy buttons inside #factory-chat-stream (zero duplicates)
-        rootEl.querySelectorAll('.md-code-wrap').forEach((wrapEl) => {
-          const preEl = wrapEl.querySelector('pre');
-          if (preEl) preEl.setAttribute('data-copy-attached', '1');
-          const headEl = wrapEl.querySelector('.md-code-head');
-          if (!headEl || headEl.querySelector('.copy-msg-btn')) return;
-          const legacyBtn = headEl.querySelector('button.md-copy-btn[data-md-code-idx]');
-          const idx = legacyBtn ? Number(legacyBtn.getAttribute('data-md-code-idx')) : -1;
-          const entry = idx >= 0 ? allFactoryCodeBlocks[idx] : null;
-          const codeCopyBtn = createCopyButton(
-            () => (entry && typeof entry.raw === 'string' ? entry.raw : extractCleanCopyText(preEl)),
-            'Copiar bloque de código'
-          );
-          if (legacyBtn) {
-            legacyBtn.replaceWith(codeCopyBtn);
-          } else {
-            headEl.appendChild(codeCopyBtn);
-          }
-        });
-
-        // 4. Any standalone <pre> inside #factory-chat-stream not already wrapped
-        rootEl.querySelectorAll('pre').forEach((preEl) => {
-          if (
-            preEl.getAttribute('data-copy-attached') === '1' ||
-            preEl.closest('.md-code-wrap') ||
-            preEl.closest('.factory-proposal-card') ||
-            preEl.closest('.factory-pre-wrap')
-          ) {
-            return;
-          }
-          preEl.setAttribute('data-copy-attached', '1');
-          const wrapEl = document.createElement('div');
-          wrapEl.className = 'factory-pre-wrap';
-          const barEl = document.createElement('div');
-          barEl.className = 'factory-pre-bar';
-          barEl.appendChild(createCopyButton(() => extractCleanCopyText(preEl), 'Copiar bloque'));
-          if (preEl.parentNode) {
-            preEl.parentNode.insertBefore(wrapEl, preEl);
-            wrapEl.appendChild(barEl);
-            wrapEl.appendChild(preEl);
-          }
-        });
-      }
-
-      function renderMessages(msgs) {
-        const list = Array.isArray(msgs) ? msgs : [];
-        if (!list.length) {
-          allFactoryCodeBlocks = [];
-          streamEl.innerHTML = '<div class="factory-chat-empty">¿Qué quieres consultar o mejorar en Liwi?</div>';
-          return;
-        }
-        allFactoryCodeBlocks = [];
-        const assistantRawTexts = [];
-        const isLocked = isBlockingApplyActive();
-        streamEl.innerHTML = list.map((m) => {
-          const isUser = m.role === 'user';
-          const cls = isUser ? 'factory-msg factory-msg-user' : 'factory-msg factory-msg-assistant';
-          const imgs = Array.isArray(m.image_urls) ? m.image_urls : [];
-          const thumbs = imgs.length
-            ? '<div class="factory-chat-thumbs">' + imgs.map((u) => '<img src="' + escapeHtml(String(u)) + '" alt="Captura adjunta" />').join('') + '</div>'
-            : '';
-          let propHtml = '';
-          if (!isUser && m.proposal_prompt) {
-            const msgIdStr = String(m.id || '');
-            const isApplied = m.status === 'applied';
-            const isQueuedLocal = !isApplied && msgIdStr !== '' && locallyQueuedProposalIds.has(msgIdStr);
-            const isDisabledProp = isApplied || isQueuedLocal || isLocked;
-            const applyLabel = isApplied
-              ? '✓ Mejora aplicada'
-              : (isQueuedLocal ? '✓ Encolada en staging' : '✨ Aplicar mejora a Liwi');
-            const queuedNoticeHtml = isQueuedLocal
-              ? '<div class="factory-staging-notice" role="status">✓ Mejora encolada en segundo plano (staging)</div>'
-              : '';
-            propHtml = '<div class="factory-proposal-card">' +
-              '<div class="factory-proposal-head">' +
-                '<div class="factory-proposal-title">Propuesta: ' + escapeHtml(String(m.proposal_title || 'Auto-mejora')) + '</div>' +
-              '</div>' +
-              '<pre class="doctor-prompt-pre">' + escapeHtml(String(m.proposal_prompt)) + '</pre>' +
-              '<div class="factory-proposal-actions">' +
                 '<button type="button" class="btn btn-primary btn-sm" data-apply-factory-proposal="1" data-applied="' + ((isApplied || isQueuedLocal) ? '1' : '0') + '" data-msg-id="' + escapeHtml(msgIdStr) + '" data-prop-title="' + escapeHtml(String(m.proposal_title || '')) + '"' + (isDisabledProp ? ' disabled' : '') + '>' + applyLabel + '</button>' +
               '</div>' +
               queuedNoticeHtml +
@@ -13795,6 +13838,433 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       loadIdeas();
     })();
 
+    (function initAutonomousAndProjectIdeas() {
+      const toggleBtn = document.getElementById('autonomous-toggle-btn');
+      const quotaPill = document.getElementById('quota-meter-pill');
+      const reserveSelect = document.getElementById('liwi-reserve-threshold');
+      const cooldownSelect = document.getElementById('liwi-autonomous-cooldown');
+      const visualAuditBtn = document.getElementById('liwi-visual-audit-btn');
+      const subtabIdeasBtn = document.getElementById('liwi-subtab-ideas-btn');
+      const subtabHistoryBtn = document.getElementById('liwi-subtab-history-btn');
+      const radarGridEl = document.getElementById('liwi-radar-grid');
+      const radarEmptyEl = document.getElementById('liwi-radar-empty');
+      const historyPanelEl = document.getElementById('liwi-autonomous-history-panel');
+      const liveStatusEl = document.getElementById('liwi-radar-live-status');
+      const liveStatusTextEl = document.getElementById('liwi-radar-status-text');
+      const liveSpinnerEl = document.getElementById('liwi-radar-spinner');
+      const liveClockEl = document.getElementById('liwi-radar-clock');
+
+      let autoSubtab = 'ideas';
+      let lastAutoStatus = null;
+      let toggleBusy = false;
+      let visualAuditBusy = false;
+      let projectIdeasGenerateBusy = false;
+
+      function setRadarNotice(text, opts) {
+        const cfg = opts || {};
+        if (!liveStatusEl) return;
+        if (!text) {
+          liveStatusEl.style.display = 'none';
+          return;
+        }
+        liveStatusEl.style.display = 'flex';
+        liveStatusEl.classList.toggle('is-ok', Boolean(cfg.ok));
+        liveStatusEl.classList.toggle('is-error', Boolean(cfg.error));
+        if (liveSpinnerEl) liveSpinnerEl.style.display = cfg.spinner ? 'inline-block' : 'none';
+        if (liveStatusTextEl) liveStatusTextEl.textContent = String(text);
+        if (liveClockEl) {
+          liveClockEl.style.display = cfg.clock ? 'inline' : 'none';
+          if (cfg.clockText) liveClockEl.textContent = cfg.clockText;
+        }
+      }
+
+      function renderQuotaAndAutonomousHeader(st) {
+        if (!st || typeof st !== 'object') return;
+        lastAutoStatus = st;
+        const enabled = Boolean(st.autonomous_enabled);
+        const liveState = String(st.state || (enabled ? 'activo' : 'apagado'));
+        const curTask = String(st.current_task || '').trim();
+        const quota = (st.quota && typeof st.quota === 'object') ? st.quota : {};
+        const remPct = Number.isFinite(Number(quota.quota_remaining_pct)) ? Number(quota.quota_remaining_pct) : 100;
+        const reservePct = Number.isFinite(Number(quota.reserve_threshold_pct)) ? Number(quota.reserve_threshold_pct) : 30;
+        const turnsLeft = Number.isFinite(Number(quota.estimated_turns_left)) ? Number(quota.estimated_turns_left) : 0;
+        const isPaused = Boolean(quota.is_paused);
+        const resumeHhmm = quota.resume_hhmm ? String(quota.resume_hhmm) : '';
+
+        if (toggleBtn) {
+          let label = '🤖 Automejora: OFF';
+          if (enabled) {
+            if (liveState === 'construyendo') label = '🤖 Automejora: Construyendo';
+            else if (liveState === 'cediendo_paso') label = '🤖 Automejora: Cediendo paso';
+            else if (liveState === 'pausado_cuota') label = '🤖 Automejora: Pausa cuota';
+            else label = '🤖 Automejora: ON';
+          }
+          toggleBtn.textContent = label;
+          toggleBtn.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+          toggleBtn.classList.toggle('is-on', enabled && liveState !== 'pausado_cuota');
+          toggleBtn.classList.toggle('is-paused', enabled && liveState === 'pausado_cuota');
+          toggleBtn.title = curTask
+            ? ('Construyendo: ' + curTask)
+            : (st.pause_reason || st.busy_reason || 'Activar o pausar modo Automejora 24/7');
+        }
+
+        if (quotaPill) {
+          quotaPill.classList.remove('is-healthy', 'is-warn', 'is-paused');
+          if (isPaused) {
+            quotaPill.classList.add('is-paused');
+            quotaPill.textContent = '⏳ Pausa ' + (resumeHhmm ? ('hasta ' + resumeHhmm) : 'cuota');
+            quotaPill.title = 'Cuota agotada temporalmente; reanudación automática programada';
+          } else if (remPct <= reservePct || remPct <= reservePct + 15) {
+            quotaPill.classList.add('is-warn');
+            quotaPill.textContent = '🔋 ~' + remPct + '% (' + turnsLeft + 't)';
+            quotaPill.title = 'Cerca del umbral de reserva (' + reservePct + '%)';
+          } else {
+            quotaPill.classList.add('is-healthy');
+            quotaPill.textContent = '🔋 ~' + remPct + '% (' + turnsLeft + 't)';
+            quotaPill.title = 'Cuota saludable (' + turnsLeft + ' turnos estimados restantes)';
+          }
+        }
+
+        if (reserveSelect && Number.isFinite(reservePct)) {
+          const valStr = String(reservePct);
+          if (Array.from(reserveSelect.options).some((o) => o.value === valStr)) {
+            reserveSelect.value = valStr;
+          }
+        }
+        if (cooldownSelect && Number.isFinite(Number(st.cooldown_minutes))) {
+          const cdStr = String(Number(st.cooldown_minutes));
+          if (Array.from(cooldownSelect.options).some((o) => o.value === cdStr)) {
+            cooldownSelect.value = cdStr;
+          }
+        }
+        if (autoSubtab === 'history') {
+          renderAutonomousHistory();
+        }
+      }
+
+      function renderAutonomousHistory() {
+        if (!historyPanelEl) return;
+        const rows = (lastAutoStatus && Array.isArray(lastAutoStatus.history)) ? lastAutoStatus.history : [];
+        if (!rows.length) {
+          historyPanelEl.innerHTML = '<div class="liwi-radar-empty">Aún no hay mejoras autónomas registradas.</div>';
+          return;
+        }
+        historyPanelEl.innerHTML = rows.map((entry) => {
+          const idStr = String(entry.id || '');
+          const title = String(entry.title || 'Mejora autónoma');
+          const desc = String(entry.simple_description || '');
+          const hash = String(entry.commit_hash || '').slice(0, 8);
+          const appliedAt = String(entry.applied_at || '').replace('T', ' ').slice(0, 16);
+          const isReverted = String(entry.status || '') === 'revertida';
+          return (
+            '<div class="liwi-history-card">' +
+              '<div class="liwi-history-head">' +
+                '<div>' +
+                  '<strong style="font-size:0.88rem;">' + escapeHtml(title) + '</strong>' +
+                  '<div class="liwi-history-meta">' +
+                    '<span>' + escapeHtml(appliedAt) + '</span>' +
+                    (hash ? (' · <code>' + escapeHtml(hash) + '</code>') : '') +
+                    ' · <span>' + (isReverted ? 'Revertida' : 'Activa') + '</span>' +
+                  '</div>' +
+                '</div>' +
+                (!isReverted
+                  ? ('<button type="button" class="btn btn-sm btn-warn" data-autonomous-revert="' + escapeHtml(idStr) + '">↩️ Deshacer</button>')
+                  : '<span class="badge">Revertida</span>') +
+              '</div>' +
+              (desc ? ('<div class="muted" style="font-size:0.82rem;">' + escapeHtml(desc) + '</div>') : '') +
+            '</div>'
+          );
+        }).join('');
+
+        historyPanelEl.querySelectorAll('button[data-autonomous-revert]').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            const entryId = btn.getAttribute('data-autonomous-revert') || '';
+            if (!entryId || btn.disabled) return;
+            btn.disabled = true;
+            btn.textContent = 'Revirtiendo...';
+            try {
+              const res = await apiFetch('/api/autonomous/revert/' + encodeURIComponent(entryId), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                timeoutMs: 195000,
+                body: '{}',
+              });
+              if (res && res.status) renderQuotaAndAutonomousHeader(res.status);
+              if (typeof window.refreshLiwiRadarIdeas === 'function') window.refreshLiwiRadarIdeas();
+              setRadarNotice('↩️ Mejora revertida y verificada correctamente.', { ok: true });
+              if (res && res.restart_scheduled) {
+                const rb = document.getElementById('factory-restart-banner');
+                if (rb) rb.style.display = 'block';
+              }
+            } catch (err) {
+              btn.disabled = false;
+              btn.textContent = '↩️ Deshacer';
+              setRadarNotice('Error al revertir: ' + (err && err.message ? err.message : String(err || '')), { error: true });
+            }
+          });
+        });
+      }
+
+      function switchAutoSubtab(nextTab) {
+        autoSubtab = nextTab === 'history' ? 'history' : 'ideas';
+        if (subtabIdeasBtn) {
+          subtabIdeasBtn.classList.toggle('active', autoSubtab === 'ideas');
+          subtabIdeasBtn.setAttribute('aria-selected', autoSubtab === 'ideas' ? 'true' : 'false');
+        }
+        if (subtabHistoryBtn) {
+          subtabHistoryBtn.classList.toggle('active', autoSubtab === 'history');
+          subtabHistoryBtn.setAttribute('aria-selected', autoSubtab === 'history' ? 'true' : 'false');
+        }
+        if (autoSubtab === 'history') {
+          if (radarGridEl) radarGridEl.style.display = 'none';
+          if (radarEmptyEl) radarEmptyEl.style.display = 'none';
+          if (historyPanelEl) historyPanelEl.style.display = 'flex';
+          renderAutonomousHistory();
+        } else {
+          if (historyPanelEl) historyPanelEl.style.display = 'none';
+          if (typeof window.refreshLiwiRadarIdeas === 'function') window.refreshLiwiRadarIdeas();
+        }
+      }
+
+      if (subtabIdeasBtn) subtabIdeasBtn.addEventListener('click', () => switchAutoSubtab('ideas'));
+      if (subtabHistoryBtn) subtabHistoryBtn.addEventListener('click', () => switchAutoSubtab('history'));
+
+      async function pollAutonomousStatus() {
+        try {
+          const st = await apiFetch('/api/autonomous/status', { cache: 'no-store' });
+          renderQuotaAndAutonomousHeader(st);
+        } catch (_) {}
+      }
+
+      if (toggleBtn) {
+        toggleBtn.addEventListener('click', async () => {
+          if (toggleBusy) return;
+          toggleBusy = true;
+          const nextEnabled = !(lastAutoStatus && lastAutoStatus.autonomous_enabled);
+          try {
+            const res = await apiFetch('/api/autonomous/toggle', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ autonomous_enabled: nextEnabled }),
+            });
+            renderQuotaAndAutonomousHeader(res);
+          } catch (err) {
+            setNote('No se pudo cambiar modo autónomo: ' + (err && err.message ? err.message : ''));
+          } finally {
+            toggleBusy = false;
+          }
+        });
+      }
+
+      async function saveAutoSetting(payload) {
+        try {
+          const res = await apiFetch('/api/autonomous/toggle', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          renderQuotaAndAutonomousHeader(res);
+          setRadarNotice('✓ Configuración autónoma guardada.', { ok: true });
+        } catch (err) {
+          setRadarNotice('Error guardando ajuste autónomo: ' + (err && err.message ? err.message : ''), { error: true });
+        }
+      }
+
+      if (reserveSelect) {
+        reserveSelect.addEventListener('change', () => {
+          saveAutoSetting({ reserve_threshold_pct: Number(reserveSelect.value) });
+        });
+      }
+      if (cooldownSelect) {
+        cooldownSelect.addEventListener('change', () => {
+          saveAutoSetting({ cooldown_minutes: Number(cooldownSelect.value) });
+        });
+      }
+
+      if (visualAuditBtn) {
+        visualAuditBtn.addEventListener('click', async () => {
+          if (visualAuditBusy) return;
+          visualAuditBusy = true;
+          visualAuditBtn.disabled = true;
+          const t0 = Date.now();
+          setRadarNotice('🕵️ Simulando navegación desktop y móvil con Playwright...', {
+            spinner: true,
+            clock: true,
+            clockText: '0s',
+          });
+          const auditTimer = setInterval(() => {
+            if (liveClockEl) {
+              liveClockEl.textContent = Math.max(0, Math.floor((Date.now() - t0) / 1000)) + 's';
+            }
+          }, 1000);
+          try {
+            const res = await apiFetch('/api/ideas/visual-audit', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              timeoutMs: 195000,
+              body: JSON.stringify({ base_url: window.location.origin }),
+            });
+            const createdNum = Number((res && res.ideas_created_count) || 0);
+            const findingsNum = Number((res && res.findings_count) || 0);
+            setRadarNotice(
+              '✓ Simulación completada: ' + findingsNum + ' hallazgos, ' + createdNum + ' ideas nuevas.',
+              { ok: true }
+            );
+            switchAutoSubtab('ideas');
+          } catch (err) {
+            setRadarNotice('Error en simulación visual: ' + (err && err.message ? err.message : ''), { error: true });
+          } finally {
+            clearInterval(auditTimer);
+            visualAuditBusy = false;
+            visualAuditBtn.disabled = false;
+          }
+        });
+      }
+
+      function syncProjectIdeasBadge(pid) {
+        const badgeEl = document.getElementById('project-ideas-tab-badge');
+        if (!badgeEl) return;
+        const list = (state.projectIdeasByPid && Array.isArray(state.projectIdeasByPid[pid]))
+          ? state.projectIdeasByPid[pid]
+          : [];
+        const activeCount = list.filter((it) => it && String(it.status) === 'nueva').length;
+        if (activeCount > 0) {
+          badgeEl.textContent = String(activeCount);
+          badgeEl.style.display = 'inline-flex';
+        } else {
+          badgeEl.textContent = '0';
+          badgeEl.style.display = 'none';
+        }
+      }
+
+      function renderProjectIdeasTab(pid) {
+        const pane = document.getElementById('tab-ideas');
+        if (!pane || !pid) return;
+        const list = (state.projectIdeasByPid && Array.isArray(state.projectIdeasByPid[pid]))
+          ? state.projectIdeasByPid[pid].filter((it) => it && String(it.status) !== 'descartada')
+          : [];
+        syncProjectIdeasBadge(pid);
+
+        const cardsHtml = list.length
+          ? ('<div class="proj-ideas-grid">' + list.map((it) => {
+              const iid = String(it.id || '');
+              const title = String(it.title || '');
+              const impact = String(it.impact || 'Medio');
+              const desc = String(it.simple_description || '');
+              const source = String(it.source || 'manual');
+              const status = String(it.status || 'nueva');
+              const isImpl = status === 'implementando' || status === 'aplicada';
+              return (
+                '<article class="proj-idea-card">' +
+                  '<div style="display:flex; justify-content:space-between; align-items:flex-start; gap:6px; flex-wrap:wrap;">' +
+                    '<strong style="font-size:0.9rem;">' + escapeHtml(title) + '</strong>' +
+                    '<span class="badge">' + (source === 'runtime_error' ? '🩹 Error en ejecución' : escapeHtml('Impacto ' + impact)) + '</span>' +
+                  '</div>' +
+                  '<p class="muted" style="margin:0; font-size:0.84rem;">' + escapeHtml(desc) + '</p>' +
+                  '<div class="proj-idea-card-actions">' +
+                    '<button type="button" class="btn btn-primary btn-sm" data-proj-idea-approve="' + escapeHtml(iid) + '"' + (isImpl ? ' disabled' : '') + '>' +
+                      (isImpl ? '⏳ Implementando' : '✨ Aprobar e implementar') +
+                    '</button>' +
+                    '<button type="button" class="btn btn-sm" data-proj-idea-dismiss="' + escapeHtml(iid) + '">Descartar</button>' +
+                  '</div>' +
+                '</article>'
+              );
+            }).join('') + '</div>')
+          : '<div class="liwi-radar-empty">Sin mejoras detectadas para este proyecto todavía. Pulsa «💡 Detectar mejoras».</div>';
+
+        pane.innerHTML =
+          '<div class="proj-ideas-head">' +
+            '<div><strong>💡 Auto-Mejoras del Proyecto</strong><div class="muted" style="font-size:0.8rem;">Sugerencias específicas de producto, UX y errores detectados para esta app.</div></div>' +
+            '<button id="project-ideas-generate-btn" class="btn btn-primary btn-sm" type="button"' + (projectIdeasGenerateBusy ? ' disabled' : '') + '>' +
+              (projectIdeasGenerateBusy ? '⏳ Detectando...' : '💡 Detectar mejoras') +
+            '</button>' +
+          '</div>' +
+          cardsHtml;
+
+        const genProjBtn = document.getElementById('project-ideas-generate-btn');
+        if (genProjBtn) {
+          genProjBtn.addEventListener('click', async () => {
+            if (projectIdeasGenerateBusy) return;
+            projectIdeasGenerateBusy = true;
+            renderProjectIdeasTab(pid);
+            try {
+              const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/ideas/generate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                timeoutMs: 195000,
+                body: JSON.stringify({ count: 3 }),
+              });
+              state.projectIdeasByPid[pid] = Array.isArray(res && res.ideas) ? res.ideas : [];
+              state.projectIdeasLoadedFor[pid] = true;
+            } catch (err) {
+              setNote('Error detectando mejoras: ' + (err && err.message ? err.message : ''));
+            } finally {
+              projectIdeasGenerateBusy = false;
+              renderProjectIdeasTab(pid);
+            }
+          });
+        }
+
+        pane.querySelectorAll('button[data-proj-idea-approve]').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            const ideaId = btn.getAttribute('data-proj-idea-approve') || '';
+            if (!ideaId || btn.disabled) return;
+            btn.disabled = true;
+            btn.textContent = '⏳ Aplicando...';
+            try {
+              const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/ideas/' + encodeURIComponent(ideaId) + '/approve', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: '{}',
+              });
+              if (Array.isArray(res && res.ideas)) state.projectIdeasByPid[pid] = res.ideas;
+              renderProjectIdeasTab(pid);
+              loadProjects();
+            } catch (err) {
+              btn.disabled = false;
+              btn.textContent = '✨ Aprobar e implementar';
+              setNote('Error aplicando mejora: ' + (err && err.message ? err.message : ''));
+            }
+          });
+        });
+
+        pane.querySelectorAll('button[data-proj-idea-dismiss]').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            const ideaId = btn.getAttribute('data-proj-idea-dismiss') || '';
+            if (!ideaId || btn.disabled) return;
+            btn.disabled = true;
+            try {
+              const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/ideas/' + encodeURIComponent(ideaId) + '/dismiss', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: '{}',
+              });
+              if (Array.isArray(res && res.ideas)) state.projectIdeasByPid[pid] = res.ideas;
+              renderProjectIdeasTab(pid);
+            } catch (_) {
+              btn.disabled = false;
+            }
+          });
+        });
+      }
+
+      async function loadProjectIdeasFor(pid) {
+        if (!pid) return;
+        try {
+          const res = await apiFetch('/api/projects/' + encodeURIComponent(pid) + '/ideas', { cache: 'no-store' });
+          state.projectIdeasByPid[pid] = Array.isArray(res && res.ideas) ? res.ideas : [];
+          state.projectIdeasLoadedFor[pid] = true;
+          if (state.selectedId === pid) renderProjectIdeasTab(pid);
+        } catch (_) {}
+      }
+
+      window.loadProjectIdeasFor = loadProjectIdeasFor;
+      window.renderProjectIdeasTab = renderProjectIdeasTab;
+      window.pollAutonomousStatus = pollAutonomousStatus;
+      pollAutonomousStatus();
+      setInterval(pollAutonomousStatus, 12000);
+    })();
+
     setInterval(updateLiveTimers, 1000);
     setInterval(() => {
       loadProjects();
@@ -13826,14 +14296,19 @@ class DashboardHTTPServer(http.server.ThreadingHTTPServer):
         super().__init__((host, port), _DashboardRequestHandler)
 
     def server_close(self) -> None:
-        """Ensure locally launched apps and any staging worker stop cleanly on shutdown."""
+        """Ensure locally launched apps, staging worker, and autonomous engine stop cleanly on shutdown."""
         try:
             self.controller.local_runner.stop_all()
         finally:
             try:
-                self.controller.shutdown_staging(timeout=2.0)
+                eng = getattr(self.controller, "_autonomous_engine", None)
+                if eng is not None and hasattr(eng, "stop"):
+                    eng.stop(timeout=2.0)
             finally:
-                super().server_close()
+                try:
+                    self.controller.shutdown_staging(timeout=2.0)
+                finally:
+                    super().server_close()
 
 
 class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -14070,6 +14545,42 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             raise ValueError("ID de idea inválido; debe ser un entero positivo.")
         return idea_id, action
 
+    def _parse_autonomous_revert_route(self) -> int | None:
+        """Parse /api/autonomous/revert/<id> safely (INV-22)."""
+        raw_path = urllib.parse.urlsplit(self.path).path
+        prefix = "/api/autonomous/revert/"
+        if not raw_path.startswith(prefix):
+            return None
+        raw_id = urllib.parse.unquote(raw_path[len(prefix) :]).strip("/")
+        if not (raw_id.isascii() and raw_id.isdigit()):
+            raise ValueError("ID de historial autónomo inválido; debe ser un entero positivo.")
+        entry_id = int(raw_id)
+        if entry_id <= 0:
+            raise ValueError("ID de historial autónomo inválido; debe ser un entero positivo.")
+        return entry_id
+
+    def _parse_project_ideas_route(self) -> tuple[str | None, str | None, int | None]:
+        """Parse /api/projects/<slug>/ideas[/generate|/<id>/approve|/<id>/dismiss] safely (INV-22)."""
+        raw_path = urllib.parse.urlsplit(self.path).path
+        prefix = "/api/projects/"
+        if not raw_path.startswith(prefix):
+            return None, None, None
+        rest = raw_path[len(prefix) :]
+        parts = rest.split("/")
+        if len(parts) == 2 and parts[1] == "ideas":
+            return urllib.parse.unquote(parts[0]), "list", None
+        if len(parts) == 3 and parts[1] == "ideas" and parts[2] == "generate":
+            return urllib.parse.unquote(parts[0]), "generate", None
+        if len(parts) == 4 and parts[1] == "ideas" and parts[3] in {"approve", "dismiss"}:
+            raw_id = urllib.parse.unquote(parts[2])
+            if not (raw_id.isascii() and raw_id.isdigit()):
+                raise ValueError("ID de idea de proyecto inválido; debe ser un entero positivo.")
+            idea_id = int(raw_id)
+            if idea_id <= 0:
+                raise ValueError("ID de idea de proyecto inválido; debe ser un entero positivo.")
+            return urllib.parse.unquote(parts[0]), parts[3], idea_id
+        return None, None, None
+
     def do_GET(self) -> None:
         parsed_url = urllib.parse.urlsplit(self.path)
         path = parsed_url.path
@@ -14119,6 +14630,15 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/ideas":
             self._send_controller_json(ctrl.list_improvement_ideas)
+            return
+
+        if path == "/api/autonomous/status":
+            self._send_controller_json(ctrl.get_autonomous_status)
+            return
+
+        proj_ideas_pid, proj_ideas_action, _proj_idea_id = self._parse_project_ideas_route()
+        if proj_ideas_pid is not None and proj_ideas_action == "list":
+            self._send_controller_json(lambda: ctrl.list_project_ideas(proj_ideas_pid))
             return
 
         if path == "/api/factory/assistant/versions":
@@ -14323,6 +14843,80 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
                 return ctrl.set_idea_radar_settings(body["auto_interval_hours"])
 
             self._send_controller_json(_post_ideas_settings)
+            return
+
+        if path == "/api/ideas/visual-audit":
+            def _post_visual_audit() -> dict[str, Any]:
+                body = self._read_json_body()
+                raw_url = body.get("base_url")
+                if raw_url is not None and not isinstance(raw_url, str):
+                    raise TypeError("El campo 'base_url' debe ser texto.")
+                eff_url = (
+                    raw_url.strip()
+                    if isinstance(raw_url, str) and raw_url.strip()
+                    else f"http://{LOOPBACK_HOST}:{self.server.server_address[1]}"
+                )
+                return ctrl.run_visual_audit(base_url=eff_url)
+
+            self._send_controller_json(_post_visual_audit)
+            return
+
+        if path == "/api/autonomous/toggle":
+            def _post_autonomous_toggle() -> dict[str, Any]:
+                body = self._read_json_body()
+                raw_enabled = body.get("autonomous_enabled")
+                if raw_enabled is None and "enabled" in body:
+                    raw_enabled = body.get("enabled")
+                if raw_enabled is not None and not isinstance(raw_enabled, bool):
+                    raise TypeError("El campo 'autonomous_enabled' debe ser booleano.")
+                raw_cooldown = body.get("cooldown_minutes")
+                if raw_cooldown is not None and (
+                    isinstance(raw_cooldown, bool) or not isinstance(raw_cooldown, int)
+                ):
+                    raise TypeError("El campo 'cooldown_minutes' debe ser entero.")
+                raw_reserve = body.get("reserve_threshold_pct")
+                if raw_reserve is not None and (
+                    isinstance(raw_reserve, bool) or not isinstance(raw_reserve, int)
+                ):
+                    raise TypeError("El campo 'reserve_threshold_pct' debe ser entero.")
+                return ctrl.toggle_autonomous_mode(
+                    autonomous_enabled=raw_enabled,
+                    cooldown_minutes=raw_cooldown,
+                    reserve_threshold_pct=raw_reserve,
+                )
+
+            self._send_controller_json(_post_autonomous_toggle)
+            return
+
+        if path.startswith("/api/autonomous/revert/"):
+            def _post_autonomous_revert() -> dict[str, Any]:
+                entry_id = self._parse_autonomous_revert_route()
+                if entry_id is None:
+                    raise ProjectNotFoundError("Endpoint not found")
+                self._drain_body()
+                return ctrl.revert_autonomous_improvement(entry_id)
+
+            self._send_controller_json(_post_autonomous_revert)
+            return
+
+        proj_ideas_pid, proj_ideas_action, proj_idea_id = self._parse_project_ideas_route()
+        if proj_ideas_pid is not None and proj_ideas_action is not None:
+            def _post_project_ideas() -> dict[str, Any]:
+                if proj_ideas_action == "generate":
+                    body = self._read_json_body()
+                    raw_count = body.get("count", idea_engine.DEFAULT_IDEATION_COUNT)
+                    if isinstance(raw_count, bool) or not isinstance(raw_count, int) or raw_count <= 0:
+                        raise ValueError("El campo 'count' debe ser un entero positivo.")
+                    return ctrl.generate_project_ideas(proj_ideas_pid, count=raw_count)
+                if proj_ideas_action == "approve" and proj_idea_id is not None:
+                    self._drain_body()
+                    return ctrl.approve_project_idea(proj_ideas_pid, proj_idea_id)
+                if proj_ideas_action == "dismiss" and proj_idea_id is not None:
+                    self._drain_body()
+                    return ctrl.dismiss_project_idea(proj_ideas_pid, proj_idea_id)
+                raise ProjectNotFoundError("Endpoint not found")
+
+            self._send_controller_json(_post_project_ideas)
             return
 
         if path.startswith("/api/ideas/"):
@@ -14549,6 +15143,7 @@ def start_dashboard_server(
     runner: Runner | None = None,
     self_improver: FactorySelfImprover | None = None,
     staging_manager: StagingManager | None = None,
+    autonomous_engine: idea_engine.AutonomousEngine | None = None,
     secrets_to_redact: Sequence[str] = (),
 ) -> tuple[DashboardHTTPServer, threading.Thread, str]:
     """Create and start DashboardHTTPServer on 127.0.0.1:<port> in a daemon thread."""
@@ -14566,8 +15161,16 @@ def start_dashboard_server(
         runner=runner,
         self_improver=self_improver,
         staging_manager=staging_manager,
+        autonomous_engine=autonomous_engine,
         secrets_to_redact=secrets_to_redact,
     )
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        try:
+            auto_st = idea_engine.get_autonomous_state(db_path=controller._resolve_idea_db_path())
+            if auto_st["autonomous_enabled"]:
+                controller._get_autonomous_engine().start()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Autonomous engine auto-start skipped: %s", exc)
     server = DashboardHTTPServer((LOOPBACK_HOST, port), controller)
     actual_port = int(server.server_address[1])
     thread = threading.Thread(

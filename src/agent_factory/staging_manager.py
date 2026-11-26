@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -12,9 +13,11 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from agent_factory.error_triage import format_agent_error, is_quota_429_error
 from agent_factory.secrets import redact_secrets
 
 if TYPE_CHECKING:
@@ -86,6 +89,7 @@ class StagingManager:
         base_branch: str = "main",
         executor: Callable[[Path, dict[str, Any]], Any] | None = None,
         on_restart: Callable[[], None] | None = None,
+        db_path: Path | str | None = None,
     ) -> None:
         self.repo_root = Path(repo_root).resolve()
         self.worktree_name, self.worktree_path = _validate_worktree_name(
@@ -96,11 +100,13 @@ class StagingManager:
         self.base_branch = _validate_branch_name(base_branch, "base")
         self._executor = executor
         self._on_restart = on_restart
+        self._db_path = db_path
 
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._worktree_setup_lock = threading.RLock()
         self._queue: deque[dict[str, Any]] = deque()
+        self._paused_tasks: deque[dict[str, Any]] = deque()
         self._worker: threading.Thread | None = None
         self._is_building: bool = False
         self._is_promoting: bool = False
@@ -446,29 +452,121 @@ class StagingManager:
             proposal_title=str(task["title"]),
             message_id=str(meta["message_id"]) if meta.get("message_id") else None,
             github_token="",
+            preserve_on_quota_429=True,
         )
         if not result.get("ok"):
+            if result.get("quota_429") or is_quota_429_error(
+                str(result.get("technical_detail") or result.get("error") or "")
+            ):
+                raise RuntimeError(
+                    str(result.get("technical_detail") or result.get("error") or "RESOURCE_EXHAUSTED 429")
+                )
             err = str(result.get("error") or "La auto-mejora falló en el worktree de staging.")
             raise RuntimeError(err)
         return result
 
+    def _preserve_429_partial_work(
+        self,
+        worktree_path: Path | None,
+        task: dict[str, Any],
+        raw_error: str,
+    ) -> None:
+        """Preserve dirty .liwi-staging edits as a wip commit on 429 and schedule auto-resume."""
+        if worktree_path is not None and worktree_path.is_dir():
+            self._run_git(["add", "-A"], cwd=worktree_path)
+            cached = self._run_git(["diff", "--cached", "--quiet"], cwd=worktree_path)
+            if cached.returncode != 0:
+                prefix = self._git_identity_prefix(worktree_path)
+                self._run_git(
+                    [*prefix, "commit", "-m", "wip(quota-pause): avance parcial"],
+                    cwd=worktree_path,
+                )
+            diff_stat = self._run_git(
+                ["diff", f"{self.base_branch}..HEAD", "--stat"],
+                cwd=worktree_path,
+            ).stdout.strip()
+            diff_patch = self._run_git(
+                ["diff", f"{self.base_branch}..HEAD"],
+                cwd=worktree_path,
+            ).stdout[:1800].strip()
+            previous_diff = "\n".join(part for part in (diff_stat, diff_patch) if part)
+        else:
+            previous_diff = ""
+
+        err_info = format_agent_error(raw_error)
+        try:
+            from agent_factory.idea_engine import record_agy_429_pause
+
+            meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+            db_override = meta.get("db_path") if meta.get("db_path") is not None else self._db_path
+            record_agy_429_pause(raw_error, db_path=db_override)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).debug("Quota 429 pause record skipped: %s", exc)
+
+        paused_until_iso = str(err_info.get("quota_paused_until") or "")
+        try:
+            resume_dt = datetime.fromisoformat(paused_until_iso)
+        except ValueError:
+            resume_dt = datetime.now().astimezone()
+
+        paused_entry = {
+            "task": dict(task),
+            "resume_at_dt": resume_dt,
+            "quota_paused_until": resume_dt.isoformat(),
+            "previous_diff": previous_diff,
+            "friendly_error": str(err_info.get("message") or raw_error),
+        }
+        with self._cond:
+            self._paused_tasks.append(paused_entry)
+            self._last_error = str(err_info.get("message") or raw_error)
+            self._cond.notify_all()
+
     def _worker_loop(self) -> None:
         while True:
+            task: dict[str, Any] | None = None
             with self._cond:
-                while (not self._queue or self._is_promoting) and not self._shutdown_requested:
+                while not self._shutdown_requested:
+                    if self._is_promoting:
+                        self._cond.wait()
+                        continue
+                    if self._queue:
+                        task = self._queue.popleft()
+                        break
+                    if self._paused_tasks:
+                        front = self._paused_tasks[0]
+                        now_dt = datetime.now().astimezone()
+                        resume_dt = front["resume_at_dt"]
+                        if resume_dt.tzinfo is None:
+                            resume_dt = resume_dt.replace(tzinfo=now_dt.tzinfo)
+                        if now_dt >= resume_dt:
+                            paused = self._paused_tasks.popleft()
+                            task = dict(paused["task"])
+                            prev_diff = str(paused.get("previous_diff") or "").strip()
+                            if prev_diff:
+                                task["prompt"] = (
+                                    "[REANUDACIÓN AUTOMÁTICA TRAS PAUSA DE CUOTA 429 — "
+                                    "Avance previo ya guardado en commit wip(quota-pause) en .liwi-staging]\n"
+                                    f"Resumen/diff acumulado:\n{prev_diff}\n\n"
+                                    f"Continúa y completa la tarea original:\n{task['prompt']}"
+                                )
+                            break
+                        wait_sec = min(2.0, max(0.05, (resume_dt - now_dt).total_seconds()))
+                        self._cond.wait(timeout=wait_sec)
+                        continue
                     self._cond.wait()
+
                 if self._shutdown_requested:
                     self._is_building = False
                     self._current_task = None
                     self._cond.notify_all()
                     return
-                if self._is_promoting:
-                    continue
-                task = self._queue.popleft()
+
+                assert task is not None
                 self._is_building = True
                 self._current_task = str(task["title"])
                 self._cond.notify_all()
 
+            worktree_path: Path | None = None
             try:
                 worktree_path = self.ensure_worktree()
                 self._sync_empty_staging_to_base(worktree_path)
@@ -479,10 +577,14 @@ class StagingManager:
                 with self._cond:
                     self._last_error = None
             except Exception as exc:  # noqa: BLE001
-                err_msg = redact_secrets(str(exc) or type(exc).__name__)
-                self._cleanup_worktree()
-                with self._cond:
-                    self._last_error = err_msg
+                raw_exc = str(exc) or type(exc).__name__
+                err_msg = redact_secrets(raw_exc)
+                if is_quota_429_error(err_msg):
+                    self._preserve_429_partial_work(worktree_path, task, raw_exc)
+                else:
+                    self._cleanup_worktree()
+                    with self._cond:
+                        self._last_error = err_msg
             finally:
                 with self._cond:
                     self._is_building = False
@@ -570,11 +672,15 @@ class StagingManager:
         """Return JSON-serializable staging status including pending commits and worker state."""
         commits = self._list_pending_commits()
         with self._lock:
+            paused = self._paused_tasks[0] if self._paused_tasks else None
             return {
                 "pending_count": len(commits),
                 "commits": commits,
                 "is_building": bool(self._is_building),
                 "queue_size": len(self._queue),
+                "paused_count": len(self._paused_tasks),
+                "paused_until": paused["quota_paused_until"] if paused else None,
+                "quota_paused_message": paused["friendly_error"] if paused else None,
                 "last_error": self._last_error,
                 "current_task": self._current_task,
             }

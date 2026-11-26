@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sys
@@ -608,7 +609,7 @@ class ParallelImprover:
         prompt: str,
         cwd: Path,
     ) -> tuple[bool, str]:
-        base_cmd, is_real_agy, err_reason = self._resolve_agy_cmd()
+        base_cmd, _is_real_agy, err_reason = self._resolve_agy_cmd()
         if base_cmd is None:
             return False, err_reason
         is_batch = bool(base_cmd and base_cmd[0].lower().endswith((".cmd", ".bat")))
@@ -637,8 +638,6 @@ class ParallelImprover:
                 str(cwd),
                 "--dangerously-skip-permissions",
             ]
-            if is_real_agy:
-                cmd.extend(["--mode", "auto"])
             if self.model:
                 cmd.extend(["--model", self.model])
 
@@ -653,6 +652,18 @@ class ParallelImprover:
         finally:
             if tmp_prompt is not None:
                 tmp_prompt.unlink(missing_ok=True)
+
+        raw_out = (res.stdout or "") + "\n" + (res.stderr or "")
+        try:
+            from agent_factory.error_triage import is_quota_429_error
+            from agent_factory.idea_engine import record_agy_429_pause, record_agy_usage
+
+            if res.exit_code != 0 and is_quota_429_error(raw_out):
+                record_agy_429_pause(raw_out)
+            else:
+                record_agy_usage(len(prompt), len(raw_out))
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).debug("Quota telemetry skipped in parallel_improver: %s", exc)
 
         if res.exit_code != 0:
             raw = (res.stderr or res.stdout or f"exit code {res.exit_code}").strip()

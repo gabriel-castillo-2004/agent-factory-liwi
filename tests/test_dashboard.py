@@ -8122,6 +8122,200 @@ def test_dashboard_compact_header_groups_themes_inside_settings_menu(
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_autonomous_quota_visual_audit_and_project_ideas_endpoints_and_ui(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json
+    import subprocess
+
+    from agent_factory import idea_engine, visual_qa_agent
+    from agent_factory.builder import BuildWorker
+
+    monkeypatch.setenv("AGENT_FACTORY_TELEMETRY_DB", str(tmp_path / "telemetry_dash.db"))
+    store = SqliteEventStore(db_path=tmp_path / "dash_auto.db")
+    chats_dir = tmp_path / "chats_auto"
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_auto")
+    pid = "auto-proj-app"
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / "README.md").write_text("# Auto Project\n", encoding="utf-8")
+    (ws_dir / "index.html").write_text("<html><body><h1>Auto</h1></body></html>\n", encoding="utf-8")
+
+    subprocess.run(["git", "init"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "branch", "-M", "main"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "add", "-A"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@local", "commit", "-m", "init"],
+        cwd=ws_dir,
+        check=True,
+        capture_output=True,
+    )
+
+    llm = FakeLLM(responses=[])
+    orch = Orchestrator(store=store, llm=llm, workspace_manager=ws_mgr)
+    now = datetime(2026, 6, 1, 10, 0, tzinfo=UTC)
+    plan_dict = _plan_payload("Auto Project App")
+    plan_hash = Plan.model_validate(plan_dict).compute_hash()
+    for ev in (
+        create_event(pid, EventType.PROJECT_CREATED, {"name": "Auto Project", "objective": "App", "state": "INTERVIEW"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "INTERVIEW", "to": "DEBATE"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "DEBATE", "to": "MEDIATION"}, at=now),
+        create_event(pid, EventType.PLAN_CREATED, {"plan": plan_dict, "plan_hash": plan_hash, "from": "MEDIATION", "to": "WAITING_APPROVAL"}, at=now),
+        create_event(pid, EventType.APPROVAL_RECORDED, {"plan_hash": plan_hash, "decision": "approved", "from": "WAITING_APPROVAL", "to": "BUILDING"}, at=now),
+        create_event(pid, EventType.STATE_TRANSITIONED, {"from": "BUILDING", "to": "VERIFYING"}, at=now),
+        create_event(pid, EventType.PROJECT_DELIVERED, {"repo_url": "", "deploy_url": "", "commit_sha": "abc1234", "version_label": "v1"}, at=now),
+    ):
+        store.append(ev)
+
+    idea_json = json.dumps(
+        [
+            {
+                "title": "✨ Mejorar accesibilidad",
+                "category": "UX",
+                "impact": "Alto",
+                "simple_description": "Agrega etiquetas ARIA claras.",
+                "change_prompt": "Añade atributos aria-label al formulario principal.",
+            }
+        ]
+    )
+    fake_runner = FakeRunner(results=[CommandResult(exit_code=0, stdout=idea_json, stderr="")])
+    fake_agy = tmp_path / ("agy.EXE" if os.name == "nt" else "agy")
+    fake_agy.write_text("stub", encoding="utf-8")
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", ""))
+
+    worker = BuildWorker(
+        orchestrator=orch,
+        workspace_manager=ws_mgr,
+        code_agent=FakeCodeAgent(impl_steps=[{"index.html": "<html><body><main>Updated</main></body></html>\n"}]),
+        runner=FakeRunner(results=[CommandResult(exit_code=0, stdout="1 passed", test_results={"AT-01": True})]),
+        vcs=FakeVCS(ci_results=[CIRunResult(passed=True, summary="ok")]),
+        chats_dir=chats_dir,
+    )
+
+    monkeypatch.setattr(
+        visual_qa_agent,
+        "run_synthetic_user_audit",
+        lambda **_kwargs: {
+            "ok": True,
+            "findings_count": 1,
+            "ideas_created_count": 1,
+            "findings": ["Botón sin contraste en móvil"],
+            "created": [],
+        },
+    )
+
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        build_worker=worker,
+        workspace_manager=ws_mgr,
+        chats_dir=chats_dir,
+        runner=fake_runner,
+    )
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            assert html_resp.status == 200
+            html = html_resp.read().decode("utf-8")
+
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+        for marker in (
+            'id="autonomous-toggle-btn"',
+            'id="quota-meter-pill"',
+            'id="liwi-reserve-threshold"',
+            'id="liwi-autonomous-cooldown"',
+            'id="liwi-visual-audit-btn"',
+            'id="liwi-subtab-history-btn"',
+            'id="liwi-autonomous-history-panel"',
+            'id="tab-ideas-btn"',
+            'id="tab-ideas"',
+            "/api/autonomous/status",
+            "/api/autonomous/toggle",
+            "/api/autonomous/revert/",
+            "/api/ideas/visual-audit",
+        ):
+            assert marker in html
+
+        style_start = html.index("<style>") + len("<style>")
+        style_end = html.index("</style>", style_start)
+        media_768 = _extract_css_block(html[style_start:style_end], "@media (max-width: 768px)")
+        assert ".autonomous-controls-wrap" in media_768
+        assert ".proj-ideas-grid" in media_768
+
+        # 1. Autonomous status & toggle
+        c_st, r_st = _http_json(f"{base_url}/api/autonomous/status")
+        assert c_st == 200
+        assert r_st["state"] == "apagado"
+        assert "quota" in r_st
+
+        c_tog, r_tog = _http_json(
+            f"{base_url}/api/autonomous/toggle",
+            method="POST",
+            body={"autonomous_enabled": False, "cooldown_minutes": 20, "reserve_threshold_pct": 40},
+        )
+        assert c_tog == 200
+        assert r_tog["cooldown_minutes"] == 20
+        assert r_tog["quota"]["reserve_threshold_pct"] == 40
+
+        # 2. Visual audit endpoint
+        c_va, r_va = _http_json(f"{base_url}/api/ideas/visual-audit", method="POST", body={})
+        assert c_va == 200
+        assert r_va["findings_count"] == 1
+        assert r_va["ideas_created_count"] == 1
+
+        # 3. Per-project ideas endpoints
+        c_gen, r_gen = _http_json(
+            f"{base_url}/api/projects/{pid}/ideas/generate",
+            method="POST",
+            body={"count": 1},
+        )
+        assert c_gen == 200
+        assert r_gen["created_count"] == 1
+        proj_idea_id = r_gen["created"][0]["id"]
+
+        c_list, r_list = _http_json(f"{base_url}/api/projects/{pid}/ideas")
+        assert c_list == 200
+        assert len(r_list["ideas"]) == 1
+
+        c_app, r_app = _http_json(
+            f"{base_url}/api/projects/{pid}/ideas/{proj_idea_id}/approve",
+            method="POST",
+            body={},
+        )
+        assert c_app == 200
+        assert r_app["idea"]["status"] == "implementando"
+        assert server.controller.wait_for_idle(timeout=10.0)
+
+        c_dis, r_dis = _http_json(
+            f"{base_url}/api/projects/{pid}/ideas/{proj_idea_id}/dismiss",
+            method="POST",
+            body={},
+        )
+        assert c_dis == 200
+        assert r_dis["idea"]["status"] == "descartada"
+
+        # 4. start_local_app failure creates runtime_error idea
+        monkeypatch.setattr(
+            server.controller.local_runner,
+            "start",
+            lambda *_a, **_kw: (_ for _ in ()).throw(ValueError("Fallo simulado al arrancar puerto")),
+        )
+        c_fail, _ = _http_json(f"{base_url}/api/projects/{pid}/start", method="POST", body={})
+        assert c_fail == 409
+        after_err_ideas = idea_engine.list_project_ideas(pid, db_path=tmp_path / "telemetry_dash.db")
+        assert any(it["source"] == "runtime_error" for it in after_err_ideas)
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+
 
 
 

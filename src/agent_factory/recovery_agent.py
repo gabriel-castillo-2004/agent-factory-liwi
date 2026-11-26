@@ -745,7 +745,8 @@ class RecoveryAgent:
                 cmd.extend(["--add-dir", str(add_dir)])
             if allow_writes:
                 cmd.append("--dangerously-skip-permissions")
-                cmd.extend(["--mode", "auto" if is_real_agy else mode_arg])
+                if not is_real_agy and mode_arg:
+                    cmd.extend(["--mode", mode_arg])
             if self.model:
                 cmd.extend(["--model", self.model])
 

@@ -633,3 +633,99 @@ def test_start_auto_idea_worker_daemon_respects_busy_state_and_stops_cleanly(
         worker.stop(timeout=2.0)
 
     assert worker.is_running is False
+
+
+def test_format_agent_error_handles_quota_429_and_collapses_technical_detail() -> None:
+    from datetime import UTC, datetime
+
+    from agent_factory.error_triage import format_agent_error
+
+    fixed_now = datetime(2026, 11, 26, 10, 0, 0, tzinfo=UTC)
+    res_timed = format_agent_error(
+        "Error: RESOURCE_EXHAUSTED (HTTP 429). Resets in 15m30s at upstream.",
+        now=fixed_now,
+    )
+    assert res_timed["is_quota_429"] is True
+    assert res_timed["reset_seconds"] == 930
+    assert "⏳ Sin cuota disponible por ahora." in res_timed["message"]
+    assert "continuará automáticamente a las " in res_timed["message"]
+    assert "<details><summary>Ver detalle técnico</summary>" in res_timed["details_html"]
+    assert "RESOURCE_EXHAUSTED" in res_timed["details_html"]
+
+    # Missing explicit countdown falls back to 30m (1800s)
+    res_fallback = format_agent_error("HTTP 429 Too Many Requests", now=fixed_now)
+    assert res_fallback["is_quota_429"] is True
+    assert res_fallback["reset_seconds"] == 1800
+
+
+def test_project_ideas_crud_dedup_error_and_generate_readonly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json
+    import os
+
+    from agent_factory.ports.runner import CommandResult
+
+    db_path = tmp_path / "telemetry.db"
+    ws_dir = tmp_path / "workspaces" / "mi-app"
+    ws_dir.mkdir(parents=True)
+    (ws_dir / "README.md").write_text("# Mi App\nDemo local.\n", encoding="utf-8")
+
+    # Runtime error deduplication
+    err1 = idea_engine.create_project_error_idea(
+        "mi-app",
+        "Port 9001 already in use when booting server",
+        db_path=db_path,
+    )
+    err2 = idea_engine.create_project_error_idea(
+        "mi-app",
+        "Port 9001 already in use when booting server",
+        db_path=db_path,
+    )
+    assert err1 is not None and err2 is not None
+    assert err1["id"] == err2["id"]
+    assert err1["source"] == "runtime_error"
+
+    fake_runner_calls: list[list[str]] = []
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_agy = bin_dir / ("agy.EXE" if os.name == "nt" else "agy")
+    fake_agy.write_text("stub", encoding="utf-8")
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+
+    class _FakeProjRunner:
+        def run(self, command, *, cwd, timeout_seconds=30.0, env=None):
+            fake_runner_calls.append(list(command))
+            payload = [
+                {
+                    "title": "🎨 Mejorar contraste",
+                    "category": "UX",
+                    "impact": "Alto",
+                    "simple_description": "Ajusta contraste en botones.",
+                    "change_prompt": "Actualiza CSS de botones para cumplir contraste AA.",
+                }
+            ]
+            return CommandResult(exit_code=0, stdout=json.dumps(payload), stderr="")
+
+    created = idea_engine.generate_project_ideas(
+        "mi-app",
+        ws_dir,
+        count=2,
+        db_path=db_path,
+        runner=_FakeProjRunner(),
+        agy_command=[str(fake_agy)],
+    )
+    assert len(created) == 1
+    assert created[0]["project_slug"] == "mi-app"
+    assert "--mode" not in fake_runner_calls[0]
+
+    updated = idea_engine.update_project_idea_status(
+        created[0]["id"],
+        "implementando",
+        project_slug="mi-app",
+        db_path=db_path,
+    )
+    assert updated["status"] == "implementando"
+    assert len(idea_engine.list_project_ideas("mi-app", db_path=db_path)) == 2
+
