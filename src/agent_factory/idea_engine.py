@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_IDEA_DB_PATH: Path = DEFAULT_TELEMETRY_DB_PATH
 IDEA_VALID_STATUSES: frozenset[str] = frozenset({"nueva", "encolada", "descartada"})
-IDEA_VALID_SOURCES: frozenset[str] = frozenset({"manual", "auto"})
+IDEA_VALID_SOURCES: frozenset[str] = frozenset({"manual", "auto", "visual_qa"})
 IDEA_VALID_IMPACTS: frozenset[str] = frozenset({"Alto", "Medio"})
 DEFAULT_AUTO_INTERVAL_HOURS: float = 0.0
 DEFAULT_IDEATION_COUNT: int = 3
@@ -78,24 +78,45 @@ def _default_repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+_CREATE_IMPROVEMENT_IDEAS_SQL = """
+CREATE TABLE IF NOT EXISTS improvement_ideas (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    title TEXT NOT NULL,
+    category TEXT NOT NULL,
+    impact TEXT NOT NULL,
+    simple_description TEXT NOT NULL,
+    technical_prompt TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'nueva'
+        CHECK(status IN ('nueva', 'encolada', 'descartada')),
+    source TEXT NOT NULL DEFAULT 'manual'
+        CHECK(source IN ('manual', 'auto', 'visual_qa'))
+);
+"""
+
+
 def _ensure_idea_schema(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS improvement_ideas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            title TEXT NOT NULL,
-            category TEXT NOT NULL,
-            impact TEXT NOT NULL,
-            simple_description TEXT NOT NULL,
-            technical_prompt TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'nueva'
-                CHECK(status IN ('nueva', 'encolada', 'descartada')),
-            source TEXT NOT NULL DEFAULT 'manual'
-                CHECK(source IN ('manual', 'auto'))
-        );
-        """
-    )
+    existing = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='improvement_ideas';"
+    ).fetchone()
+    if existing is None:
+        conn.execute(_CREATE_IMPROVEMENT_IDEAS_SQL)
+    elif "visual_qa" not in str(existing["sql"] or ""):
+        conn.execute("ALTER TABLE improvement_ideas RENAME TO _improvement_ideas_legacy;")
+        conn.execute(_CREATE_IMPROVEMENT_IDEAS_SQL)
+        conn.execute(
+            """
+            INSERT INTO improvement_ideas (
+                id, created_at, title, category, impact,
+                simple_description, technical_prompt, status, source
+            )
+            SELECT
+                id, created_at, title, category, impact,
+                simple_description, technical_prompt, status, source
+            FROM _improvement_ideas_legacy;
+            """
+        )
+        conn.execute("DROP TABLE _improvement_ideas_legacy;")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS idea_radar_settings (
@@ -481,6 +502,21 @@ def save_ideas(
     finally:
         if conn is not None:
             conn.close()
+
+
+def save_visual_qa_ideas(
+    ideas: Sequence[Mapping[str, Any]],
+    db_path: Path | str | None = None,
+    *,
+    max_items: int | None = 2,
+) -> list[dict[str, Any]]:
+    """Persist deduplicated UX improvement ideas originating from visual QA audits."""
+    return save_ideas(
+        ideas,
+        source="visual_qa",
+        db_path=db_path,
+        max_items=max_items,
+    )
 
 
 def dismiss_idea(
