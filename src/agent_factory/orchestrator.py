@@ -855,6 +855,7 @@ class Orchestrator:
         workspace_manager: WorkspaceManager | None = None,
         vcs: Any | None = None,
         recovery_agent: Any | None = None,
+        notifier: Any | None = None,
     ) -> None:
         self.store = store
         self.llm = llm
@@ -868,6 +869,7 @@ class Orchestrator:
         self.workspace_manager = workspace_manager
         self.vcs = vcs
         self.recovery_agent = recovery_agent
+        self.notifier = notifier
         self._lock = threading.RLock()
         self._chat_io_lock = threading.RLock()
         self._bg_op_heal_lock = threading.RLock()
@@ -876,6 +878,7 @@ class Orchestrator:
         self._active_bg_ops: dict[str, str] = {}
         self._specs: dict[str, Spec] = {}
         self._last_published_status: dict[str, tuple[object, ...]] = {}
+        self._last_notified_state: dict[str, ProjectState] = {}
         self.build_worker: Any | None = None
 
     def _project_lock(self, project_id: str) -> threading.RLock:
@@ -1061,7 +1064,9 @@ class Orchestrator:
                     at=self._now(),
                 )
             )
-        return self.get_status(project_id)
+        final_status = self.get_status(project_id, notify_notifier=False)
+        self._notify_status_transition(final_status, summary=clean_msg, stage=stage_label)
+        return final_status
 
     def create_project(
         self,
@@ -3747,7 +3752,9 @@ class Orchestrator:
                     at=self._now(),
                 )
             )
-            return self.get_status(project_id)
+            waiting_status = self.get_status(project_id, notify_notifier=False)
+            self._notify_status_transition(waiting_status, summary=plan.summary)
+            return waiting_status
 
     def submit_approval(
         self,
@@ -4130,7 +4137,61 @@ class Orchestrator:
         with self._lock:
             self._last_published_status[status.project_id] = self._status_publish_key(status)
 
-    def get_status(self, project_id: str, *, notify_publisher: bool = True) -> ProjectStatus:
+    def _notify_status_transition(
+        self,
+        status: ProjectStatus,
+        *,
+        summary: str = "",
+        stage: str = "",
+    ) -> None:
+        """Emit best-effort classified notification on project state transitions when notifier is configured."""
+        if self.notifier is None:
+            return
+        with self._lock:
+            if self._last_notified_state.get(status.project_id) == status.state:
+                return
+            self._last_notified_state[status.project_id] = status.state
+
+        try:
+            if status.state == ProjectState.DELIVERED:
+                repo_url = status.links.repo if status.links else ""
+                deploy_url = status.links.deploy if status.links else ""
+                self.notifier.notify_finished(
+                    status.project_id,
+                    summary=summary or status.name or "Proyecto entregado con éxito.",
+                    repo_url=repo_url or "",
+                    deploy_url=deploy_url or "",
+                )
+            elif status.state == ProjectState.FAILED:
+                self.notifier.notify_needs_attention(
+                    status.project_id,
+                    cause=status.failure_reason or summary or "Error en el proyecto.",
+                    stage=stage,
+                )
+            elif status.state == ProjectState.WAITING_APPROVAL:
+                self.notifier.notify_decision(
+                    status.project_id,
+                    prompt=summary or f"Plan listo para aprobación ({status.name or status.project_id}).",
+                    action_expected="Aprueba o ajusta el plan.",
+                    progress_pct=status.progress_pct,
+                )
+            else:
+                self.notifier.notify_progress(
+                    status.project_id,
+                    state=status.state.value,
+                    summary=summary,
+                    progress_pct=status.progress_pct,
+                )
+        except (OSError, RuntimeError, ValueError, TypeError):
+            pass
+
+    def get_status(
+        self,
+        project_id: str,
+        *,
+        notify_publisher: bool = True,
+        notify_notifier: bool = True,
+    ) -> ProjectStatus:
         """Project current ProjectStatus from the append-only event log (INV-11)."""
         validate_project_id(project_id)
         events = self.store.get_events(project_id)
@@ -4147,6 +4208,8 @@ class Orchestrator:
                     self.publisher.publish(status)
                 except (RegistryPublishError, OSError, RuntimeError, ValueError):
                     pass
+        if notify_notifier and self.notifier is not None:
+            self._notify_status_transition(status)
         return status
 
     def get_plan(self, project_id: str) -> Plan | None:

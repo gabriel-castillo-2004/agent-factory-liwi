@@ -7,13 +7,26 @@ import urllib.request
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from agent_factory.config import (
+    normalize_telegram_notification_level,
+    parse_telegram_notification_level,
+)
+from agent_factory.notifications import (
+    format_decision_notification,
+    format_finished_notification,
+    format_needs_attention_notification,
+    format_progress_notification,
+)
 from agent_factory.ports.notifier import (
     HttpResponse,
     HttpTransport,
     InlineButton,
+    NotificationCategory,
     SentMessage,
     TelegramTransportError,
     TelegramUpdate,
+    normalize_notification_category,
+    resolve_notification_delivery,
 )
 from agent_factory.secrets import redact_secrets
 
@@ -178,12 +191,26 @@ class TelegramHttpClient:
         bot_token: str,
         transport: HttpTransport | None = None,
         api_base_url: str = "https://api.telegram.org",
+        notification_level: str | None = None,
     ) -> None:
         self.bot_token = bot_token
         self.transport: HttpTransport = (
             transport if transport is not None else UrllibHttpTransport()
         )
         self.api_base_url = api_base_url.rstrip("/")
+        self.notification_level: str | None = (
+            normalize_telegram_notification_level(notification_level)
+            if notification_level is not None
+            else None
+        )
+
+    def effective_notification_level(self, override: str | None = None) -> str:
+        """Resolve active notification level from explicit override, instance config, or env."""
+        if override is not None:
+            return normalize_telegram_notification_level(override)
+        if self.notification_level is not None:
+            return self.notification_level
+        return parse_telegram_notification_level()
 
     def _scrub(self, text: str) -> str:
         """Redact bot_token and other credentials from diagnostic text."""
@@ -303,11 +330,37 @@ class TelegramHttpClient:
         text: str,
         buttons: Sequence[Sequence[InlineButton]] | None = None,
         parse_mode: str | None = None,
+        disable_notification: bool = False,
+        *,
+        category: NotificationCategory | str | None = None,
+        notification_level: str | None = None,
     ) -> SentMessage:
-        """Call Telegram sendMessage API with optional inline keyboard."""
+        """Call Telegram sendMessage API with optional inline keyboard, disable_notification, and level policy."""
+        norm_category: NotificationCategory | None = None
+        effective_disable = bool(disable_notification)
+        if category is not None:
+            norm_category = normalize_notification_category(category)
+            should_send, policy_disable = resolve_notification_delivery(
+                self.effective_notification_level(notification_level),
+                norm_category,
+            )
+            if not should_send:
+                return SentMessage(
+                    message_id=0,
+                    chat_id=chat_id,
+                    text=text,
+                    buttons=[list(r) for r in (buttons or [])],
+                    parse_mode=parse_mode,
+                    disable_notification=True,
+                    skipped=True,
+                    category=norm_category,
+                )
+            effective_disable = bool(disable_notification or policy_disable)
+
         payload: dict[str, Any] = {
             "chat_id": chat_id,
             "text": text,
+            "disable_notification": effective_disable,
         }
         if parse_mode:
             payload["parse_mode"] = parse_mode
@@ -331,7 +384,31 @@ class TelegramHttpClient:
             text=text,
             buttons=[list(r) for r in (buttons or [])],
             parse_mode=parse_mode,
+            disable_notification=effective_disable,
+            skipped=False,
+            category=norm_category,
         )
+
+    def send_notification(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        category: NotificationCategory | str = NotificationCategory.PROGRESS,
+        buttons: Sequence[Sequence[InlineButton]] | None = None,
+        parse_mode: str | None = None,
+        notification_level: str | None = None,
+    ) -> SentMessage | None:
+        """Send an automatic categorized notification applying level policy (returns None when suppressed)."""
+        msg = self.send_message(
+            chat_id=chat_id,
+            text=text,
+            buttons=buttons,
+            parse_mode=parse_mode,
+            category=category,
+            notification_level=notification_level,
+        )
+        return None if msg.skipped else msg
 
     def answer_callback_query(
         self,
@@ -343,3 +420,15 @@ class TelegramHttpClient:
         if text:
             payload["text"] = text
         self._post("answerCallbackQuery", payload)
+
+
+__all__ = [
+    "NotificationCategory",
+    "TelegramHttpClient",
+    "UrllibHttpTransport",
+    "format_decision_notification",
+    "format_finished_notification",
+    "format_needs_attention_notification",
+    "format_progress_notification",
+    "resolve_notification_delivery",
+]

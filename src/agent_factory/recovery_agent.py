@@ -512,6 +512,7 @@ class RecoveryAgent:
         model: str | None = None,
         secrets_to_redact: Sequence[str] = (),
         timeout_seconds: float = 120.0,
+        notifier: Any | None = None,
     ) -> None:
         self.clock: Clock = clock if clock is not None else _SystemClock()
         self.lesson_store: ErrorLessonStore = (
@@ -530,6 +531,32 @@ class RecoveryAgent:
         self.model = model.strip() if isinstance(model, str) and model.strip() else None
         self.secrets_to_redact: tuple[str, ...] = tuple(secrets_to_redact)
         self.timeout_seconds = float(timeout_seconds)
+        self.notifier = notifier
+
+    def _notify_recovery_outcome(
+        self,
+        project_id: str,
+        stage: str,
+        result: RecoveryResult,
+    ) -> None:
+        """Send best-effort classified notification for recovery outcome when notifier is configured."""
+        if self.notifier is None:
+            return
+        try:
+            if result.recovered:
+                self.notifier.notify_progress(
+                    project_id,
+                    state="RECOVERED",
+                    summary=result.diagnosis or f"Recuperado automáticamente en {stage}.",
+                )
+            else:
+                self.notifier.notify_needs_attention(
+                    project_id,
+                    cause=result.diagnosis or result.last_error or "Recuperación automática agotada.",
+                    stage=stage,
+                )
+        except (OSError, RuntimeError, ValueError, TypeError):
+            pass
 
     def _redact(self, text: str, extra_secrets: Sequence[str] = ()) -> str:
         combined = (*self.secrets_to_redact, *extra_secrets)
@@ -920,6 +947,36 @@ class RecoveryAgent:
         extra_secrets: Sequence[str] = (),
     ) -> RecoveryResult:
         """Intercept workspace or factory failure prior to NEEDS_ATTENTION/FAILED with at most 2 recovery attempts."""
+        result = self._attempt_recovery_inner(
+            project_id=project_id,
+            stage=stage,
+            error=error,
+            workspace_dir=workspace_dir,
+            retry_fn=retry_fn,
+            recent_logs=recent_logs,
+            traceback_text=traceback_text,
+            github_token=github_token,
+            repo_base_url=repo_base_url,
+            extra_secrets=extra_secrets,
+        )
+        self._notify_recovery_outcome(project_id, stage, result)
+        return result
+
+    def _attempt_recovery_inner(
+        self,
+        *,
+        project_id: str,
+        stage: str,
+        error: BaseException | str,
+        workspace_dir: Path | None = None,
+        retry_fn: Callable[[], Any] | None = None,
+        recent_logs: str = "",
+        traceback_text: str | None = None,
+        github_token: str = "",
+        repo_base_url: str = "https://github.com",
+        extra_secrets: Sequence[str] = (),
+    ) -> RecoveryResult:
+        """Core recovery workflow returning structured RecoveryResult."""
         all_secrets = (*self.secrets_to_redact, *extra_secrets)
         if github_token:
             all_secrets = (*all_secrets, github_token)

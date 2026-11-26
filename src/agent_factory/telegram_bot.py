@@ -5,19 +5,32 @@ import unicodedata
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from agent_factory.builder import BuildWorker, JobState
+from agent_factory.config import (
+    DEFAULT_DASHBOARD_PUBLIC_URL,
+    DEFAULT_TELEGRAM_NOTIFICATION_LEVEL,
+    normalize_dashboard_public_url,
+    normalize_telegram_notification_level,
+)
 from agent_factory.domain.events import EventType
 from agent_factory.domain.models import ApprovalEvent, ProjectStatus, validate_project_id
 from agent_factory.domain.states import IllegalTransition, ProjectState
 from agent_factory.inbox import Inbox
+from agent_factory.notifications import (
+    format_decision_notification,
+    format_finished_notification,
+    format_needs_attention_notification,
+)
 from agent_factory.orchestrator import ApprovalError, Orchestrator
 from agent_factory.ports.notifier import (
     InlineButton,
+    NotificationCategory,
     TelegramClient,
     TelegramTransportError,
     TelegramUpdate,
+    resolve_notification_delivery,
 )
 from agent_factory.ports.publisher import RegistryPublisher, RegistryPublishError
 from agent_factory.scaffold import TemplateScaffold
@@ -72,6 +85,18 @@ class TelegramBotConfig(BaseModel):
     allowed_user_ids: frozenset[int] = Field(default_factory=frozenset)
     poll_timeout_seconds: int = 30
     secrets_to_redact: tuple[str, ...] = ()
+    notification_level: str = DEFAULT_TELEGRAM_NOTIFICATION_LEVEL
+    dashboard_public_url: str = DEFAULT_DASHBOARD_PUBLIC_URL
+
+    @field_validator("notification_level", mode="before")
+    @classmethod
+    def _validate_notification_level(cls, value: object) -> str:
+        return normalize_telegram_notification_level(value)
+
+    @field_validator("dashboard_public_url", mode="before")
+    @classmethod
+    def _validate_dashboard_public_url(cls, value: object) -> str:
+        return normalize_dashboard_public_url(value)
 
 
 class UpdateOutcome(BaseModel):
@@ -153,43 +178,35 @@ class TelegramBotService:
             and user_id in self.config.allowed_user_ids
         )
 
-    def _send_single_chunk(
+    def _call_client_send(
         self,
         chat_id: int,
         text: str,
-        buttons: Sequence[Sequence[InlineButton]] | None = None,
-        parse_mode: str | None = None,
+        buttons: Sequence[Sequence[InlineButton]] | None,
+        parse_mode: str | None,
+        disable_notification: bool,
     ) -> None:
-        """Send a single message chunk, falling back to parse_mode=None on 400 Bad Request."""
+        """Invoke client.send_message degrading gracefully for minimal test fakes."""
         try:
-            try:
-                self.client.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    buttons=buttons,
-                    parse_mode=parse_mode,
-                )
-            except TypeError as type_err:
-                if "parse_mode" in str(type_err) or "unexpected keyword argument" in str(type_err):
-                    self.client.send_message(
-                        chat_id=chat_id,
-                        text=text,
-                        buttons=buttons,
-                    )
-                else:
-                    raise
-        except TelegramTransportError as exc:
-            msg_str = str(exc).lower()
-            if parse_mode is not None and ("400" in msg_str or "bad request" in msg_str):
+            self.client.send_message(
+                chat_id=chat_id,
+                text=text,
+                buttons=buttons,
+                parse_mode=parse_mode,
+                disable_notification=disable_notification,
+            )
+        except TypeError as type_err:
+            err_msg = str(type_err)
+            if "disable_notification" in err_msg or "parse_mode" in err_msg or "unexpected keyword argument" in err_msg:
                 try:
                     self.client.send_message(
                         chat_id=chat_id,
                         text=text,
                         buttons=buttons,
-                        parse_mode=None,
+                        parse_mode=parse_mode,
                     )
-                except TypeError as type_err:
-                    if "parse_mode" in str(type_err) or "unexpected keyword argument" in str(type_err):
+                except TypeError as type_err_2:
+                    if "parse_mode" in str(type_err_2) or "unexpected keyword argument" in str(type_err_2):
                         self.client.send_message(
                             chat_id=chat_id,
                             text=text,
@@ -200,15 +217,58 @@ class TelegramBotService:
             else:
                 raise
 
+    def _send_single_chunk(
+        self,
+        chat_id: int,
+        text: str,
+        buttons: Sequence[Sequence[InlineButton]] | None = None,
+        parse_mode: str | None = None,
+        disable_notification: bool = False,
+    ) -> None:
+        """Send a single message chunk, falling back to parse_mode=None on 400 Bad Request."""
+        try:
+            self._call_client_send(
+                chat_id=chat_id,
+                text=text,
+                buttons=buttons,
+                parse_mode=parse_mode,
+                disable_notification=disable_notification,
+            )
+        except TelegramTransportError as exc:
+            msg_str = str(exc).lower()
+            if parse_mode is not None and ("400" in msg_str or "bad request" in msg_str):
+                self._call_client_send(
+                    chat_id=chat_id,
+                    text=text,
+                    buttons=buttons,
+                    parse_mode=None,
+                    disable_notification=disable_notification,
+                )
+            else:
+                raise
+
     def send_message(
         self,
         chat_id: int,
         text: str,
         buttons: Sequence[Sequence[InlineButton]] | None = None,
         parse_mode: str | None = None,
+        disable_notification: bool = False,
+        *,
+        category: NotificationCategory | str | None = None,
     ) -> str:
-        """Send message via client after redacting secrets, chunking, and falling back if needed."""
+        """Send message via client after redacting secrets, applying level policy if categorized, chunking, and falling back."""
         clean_text = redact_secrets(text, extra_secrets=self.config.secrets_to_redact)
+        effective_disable = bool(disable_notification)
+        if category is not None:
+            should_send, policy_disable = resolve_notification_delivery(
+                self.config.notification_level,
+                category,
+            )
+            if not should_send:
+                return clean_text
+            effective_disable = bool(disable_notification or policy_disable)
+
         chunks = _chunk_text(clean_text, max_chars=4000)
         for idx, chunk in enumerate(chunks):
             is_last = idx == len(chunks) - 1
@@ -218,6 +278,7 @@ class TelegramBotService:
                 text=chunk,
                 buttons=chunk_buttons,
                 parse_mode=parse_mode,
+                disable_notification=effective_disable,
             )
         return clean_text
 
@@ -227,6 +288,7 @@ class TelegramBotService:
         text: str,
         buttons: Sequence[Sequence[InlineButton]] | None = None,
         parse_mode: str | None = None,
+        disable_notification: bool = False,
     ) -> str:
         """Send message via client after redacting secrets and return sanitized text."""
         return self.send_message(
@@ -234,6 +296,7 @@ class TelegramBotService:
             text=text,
             buttons=buttons,
             parse_mode=parse_mode,
+            disable_notification=disable_notification,
         )
 
     def _publish_status_to_registry(self, pid: str) -> None:
@@ -371,9 +434,13 @@ class TelegramBotService:
 
         plan = self.orchestrator.get_plan(pid)
         plan_summary = plan.summary if plan else pid
-        msg_text = (
-            f"Plan listo para aprobación:\n{plan_summary}\n\n"
-            f"Progreso: {waiting_status.progress_pct}%"
+        msg_text = format_decision_notification(
+            pid,
+            prompt=f"Plan listo para aprobación:\n{plan_summary}",
+            action_expected="Aprueba o ajusta el plan.",
+            progress_pct=waiting_status.progress_pct,
+            dashboard_url=self.config.dashboard_public_url,
+            extra_secrets=self.config.secrets_to_redact,
         )
         hash_prefix = (waiting_status.plan_hash or "")[:12]
         cb_approve = f"approve:{hash_prefix}"
@@ -472,19 +539,29 @@ class TelegramBotService:
             if final_status.state == ProjectState.DELIVERED:
                 repo_url = final_status.links.repo if final_status.links else ""
                 deploy_url = final_status.links.deploy if final_status.links else ""
-                text = f"Proyecto {pid} entregado con éxito!\nRepo: {repo_url}\nDeploy: {deploy_url}"
-                if report.failure_cause:
-                    text += f"\nAviso: {report.failure_cause}"
+                text = format_finished_notification(
+                    pid,
+                    summary="Proyecto entregado con éxito.",
+                    repo_url=repo_url or "",
+                    deploy_url=deploy_url or "",
+                    warning=report.failure_cause or "",
+                    dashboard_url=self.config.dashboard_public_url,
+                    extra_secrets=self.config.secrets_to_redact,
+                )
                 reply_msg = self._send_reply(update.chat_id, text)
             elif final_status.state == ProjectState.FAILED:
                 cause = (
                     final_status.failure_reason
                     or (report.failure_cause if report else "Error de construcción")
                 )
-                reply_msg = self._send_reply(
-                    update.chat_id,
-                    f"Proyecto {pid} falló durante el build: {cause}",
+                text = format_needs_attention_notification(
+                    pid,
+                    cause=cause,
+                    stage="BUILDING",
+                    dashboard_url=self.config.dashboard_public_url,
+                    extra_secrets=self.config.secrets_to_redact,
                 )
+                reply_msg = self._send_reply(update.chat_id, text)
         elif command:
             reply_msg = self._send_reply(
                 update.chat_id,

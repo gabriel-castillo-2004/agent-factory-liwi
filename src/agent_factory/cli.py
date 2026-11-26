@@ -30,8 +30,12 @@ from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.adapters.telegram_client import TelegramHttpClient, UrllibHttpTransport
 from agent_factory.builder import BuildWorker
 from agent_factory.config import (
+    DEFAULT_DASHBOARD_PUBLIC_URL,
+    DEFAULT_TELEGRAM_NOTIFICATION_LEVEL,
     DEFAULT_WORKSPACE_PYTEST_TIMEOUT,
+    parse_dashboard_public_url,
     parse_positive_timeout,
+    parse_telegram_notification_level,
     parse_workspace_pytest_timeout,
 )
 from agent_factory.dashboard import DashboardHTTPServer, start_dashboard_server
@@ -300,6 +304,8 @@ class CliConfig(BaseModel):
     workspace_pytest_timeout: float = DEFAULT_WORKSPACE_PYTEST_TIMEOUT
     dashboard_port: int = 8000
     lan_mode: bool = False
+    telegram_notification_level: str = DEFAULT_TELEGRAM_NOTIFICATION_LEVEL
+    dashboard_public_url: str = DEFAULT_DASHBOARD_PUBLIC_URL
 
 
 class RuntimeBundle(BaseModel):
@@ -535,6 +541,8 @@ def load_cli_config(env: Mapping[str, str] | None = None) -> CliConfig:
 
     raw_lan_mode = effective.get("AGENT_FACTORY_LAN_MODE", "false").strip().lower() or "false"
     lan_mode = raw_lan_mode in {"1", "true", "yes", "on"}
+    telegram_notification_level = parse_telegram_notification_level(effective)
+    dashboard_public_url = parse_dashboard_public_url(effective)
 
     return CliConfig(
         telegram_bot_token=token,
@@ -560,6 +568,8 @@ def load_cli_config(env: Mapping[str, str] | None = None) -> CliConfig:
         workspace_pytest_timeout=workspace_pytest_timeout,
         dashboard_port=dashboard_port,
         lan_mode=lan_mode,
+        telegram_notification_level=telegram_notification_level,
+        dashboard_public_url=dashboard_public_url,
     )
 
 
@@ -823,6 +833,7 @@ def build_runtime(
             else TelegramHttpClient(
                 bot_token=config.telegram_bot_token,
                 transport=effective_transport,
+                notification_level=config.telegram_notification_level,
             )
         )
 
@@ -831,6 +842,8 @@ def build_runtime(
             allowed_user_ids=config.allowed_user_ids,
             poll_timeout_seconds=config.poll_timeout_seconds,
             secrets_to_redact=active_secrets,
+            notification_level=config.telegram_notification_level,
+            dashboard_public_url=config.dashboard_public_url,
         )
 
         bot_service = TelegramBotService(
