@@ -8351,7 +8351,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const res = await fetch(url, opts);
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          if (res.status >= 500 && typeof window.reportLiwiClientError === 'function' && String(url || '').indexOf('/api/telemetry/client-error') < 0) {
+          if (res.status >= 500 && res.status !== 502 && res.status !== 503 && res.status !== 504 && typeof window.reportLiwiClientError === 'function' && String(url || '').indexOf('/api/telemetry/client-error') < 0) {
             window.reportLiwiClientError('fetch_500', 'HTTP ' + res.status + ' en ' + String(url || '') + ': ' + String(data.error || 'Error interno'), { url: String(url || ''), status: res.status });
           }
           throw new Error(data.error || ('HTTP ' + res.status));
@@ -16107,6 +16107,7 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
 def start_dashboard_server(
     *,
     orchestrator: Orchestrator,
+    host: str = LOOPBACK_HOST,
     port: int = 8000,
     build_worker: BuildWorker | None = None,
     template_scaffold: TemplateScaffold | None = None,
@@ -16148,7 +16149,7 @@ def start_dashboard_server(
                 controller._get_autonomous_engine().start()
         except Exception as exc:  # noqa: BLE001
             logger.debug("Autonomous engine auto-start skipped: %s", exc)
-    server = DashboardHTTPServer((LOOPBACK_HOST, port), controller)
+    server = DashboardHTTPServer((host, port), controller)
     actual_port = int(server.server_address[1])
     thread = threading.Thread(
         target=server.serve_forever,
@@ -16156,4 +16157,4 @@ def start_dashboard_server(
         daemon=True,
     )
     thread.start()
-    return server, thread, f"http://{LOOPBACK_HOST}:{actual_port}"
+    return server, thread, f"http://{host}:{actual_port}"

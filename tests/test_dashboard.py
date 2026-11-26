@@ -8373,6 +8373,7 @@ def test_dashboard_triage_client_error_tickets_and_banner_ui(
             "return 8000;",
             'id="retry-load-projects-btn"',
             "🔄 Reintentar",
+            "res.status !== 502 && res.status !== 503 && res.status !== 504",
             "/api/telemetry/client-error",
             "/api/triage/tickets",
         ):
