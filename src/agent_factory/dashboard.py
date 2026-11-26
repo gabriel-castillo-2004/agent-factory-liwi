@@ -11779,6 +11779,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
       } catch (err) {
         updateServerHealth(false);
+        const listEl = document.getElementById('project-list');
+        if (listEl && !state.projects.length) {
+          listEl.innerHTML =
+            '<div class="empty-box" role="alert">No se pudieron cargar los proyectos: ' +
+            escapeHtml(err && err.message ? err.message : 'Error de conexión') +
+            '</div>';
+        }
         setNote('Error de conexión: ' + err.message, 'err');
       }
     }
@@ -12794,6 +12801,397 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         stopStatusPolling();
         stopClockTicker();
         if (fsOverlay) fsOverlay.style.display = 'none';
+        if (buildBanner) buildBanner.style.display = 'none';
+        if (progressCard) progressCard.style.display = 'none';
+        setFactoryControlsLocked(false);
+        updateLiveClockAndHeader();
+      }
+      window.clearFactoryBlockingForStaging = clearFactoryBlockingForStaging;
+
+      function applyStatusSnapshot(st) {
+        const s = st && typeof st === 'object' ? st : {};
+        const wasRunning = lastServerRunning;
+        const isRunning = !!s.running;
+        const prevStep = lastActiveStep;
+        activeStatus = {
+          running: isRunning,
+          step: Number(s.step) || 0,
+          total_steps: Number(s.total_steps) || 3,
+          stage: String(s.stage || ''),
+          detail: String(s.detail || ''),
+          title: String(s.title || ''),
+          elapsed_seconds: Number(s.elapsed_seconds) || 0,
+          last_outcome: String(s.last_outcome || ''),
+          syncedAtMs: Date.now(),
+        };
+        lastServerRunning = isRunning;
+
+        if (window.__liwiStagingActive && !applyInFlight) {
+          clearFactoryBlockingForStaging();
+          if (typeof window.refreshSelfImproveStaging === 'function') {
+            window.refreshSelfImproveStaging();
+          }
+          if (wasRunning && !isRunning) {
+            refreshHistory();
+          }
+          return;
+        }
+
+        if (isRunning) {
+          ensureStatusPolling();
+          ensureClockTicker();
+          setFactoryControlsLocked(true);
+          const stepNum = Math.max(1, activeStatus.step || 1);
+          lastActiveStep = stepNum;
+          const totalSteps = Math.max(3, activeStatus.total_steps || 3);
+          const headline = activeStatus.title || activeStatus.stage || ('Paso ' + stepNum + '/' + totalSteps);
+          const detailLine = (activeStatus.stage ? (activeStatus.stage + ': ') : '') + (activeStatus.detail || 'Procesando mejora en Liwi...');
+          if (buildBanner) buildBanner.style.display = 'block';
+          if (buildBannerTitle) buildBannerTitle.textContent = '🔨 ' + headline;
+          if (buildBannerDetail) buildBannerDetail.textContent = detailLine;
+          if (progressCard) {
+            progressCard.style.display = 'flex';
+            if (progressTitle) progressTitle.textContent = '🔨 ' + headline;
+            if (progressDetail) progressDetail.textContent = detailLine;
+            progressCard.querySelectorAll('.factory-step-pill').forEach((pill) => {
+              const pStep = Number(pill.getAttribute('data-fstep') || 0);
+              pill.classList.toggle('is-done', pStep < stepNum);
+              pill.classList.toggle('is-active', pStep === stepNum);
+            });
+          }
+          syncFullscreenOverlay(true, stepNum, headline, detailLine);
+          updateLiveClockAndHeader();
+          return;
+        }
+
+        if (!applyInFlight && !reconnectTimer) {
+          stopStatusPolling();
+          stopClockTicker();
+        }
+        if (buildBanner) buildBanner.style.display = 'none';
+        if (progressCard) progressCard.style.display = 'none';
+        updateLiveClockAndHeader();
+
+        if (wasRunning && !applyInFlight && !reconnectTimer) {
+          setFactoryControlsLocked(false);
+          if (activeStatus.last_outcome === 'applied' || prevStep >= 3) {
+            finishWithUpdatedReload('✓ ¡Liwi actualizado! Recargando...');
+            return;
+          }
+          if (fsOverlay) fsOverlay.style.display = 'none';
+          if (statusEl && activeStatus.last_outcome === 'rolled_back') {
+            statusEl.textContent = 'Mejora revertida automáticamente tras fallo en verificación.';
+          }
+          refreshHistory();
+        } else if (!isRunning && fsOverlay && !applyInFlight && !reconnectTimer) {
+          fsOverlay.style.display = 'none';
+        }
+      }
+
+      async function pollFactoryStatus() {
+        try {
+          const st = await apiFetch('/api/factory/assistant/status', { cache: 'no-store' });
+          applyStatusSnapshot(st);
+          return st;
+        } catch (_) {
+          return null;
+        }
+      }
+
+      function startReconnectPolling() {
+        if (restartBanner) restartBanner.style.display = 'block';
+        if (buildBanner) buildBanner.style.display = 'none';
+        if (fsOverlay && !buildOverlayMinimized) {
+          fsOverlay.style.display = 'flex';
+          if (fsTitle) fsTitle.textContent = 'Guardando y reiniciando Liwi...';
+          if (fsDetail) fsDetail.textContent = 'Esperando reconexión automática tras verificar todas las pruebas.';
+        }
+        stopStatusPolling();
+        if (reconnectTimer) clearInterval(reconnectTimer);
+        let sawDrop = false;
+        const startedAt = Date.now();
+        reconnectTimer = setInterval(async () => {
+          try {
+            const resp = await fetch('/api/factory/assistant/status', { cache: 'no-store' });
+            if (resp.ok) {
+              const st = await resp.json().catch(() => ({}));
+              if (!st.running && (sawDrop || (Date.now() - startedAt) > 1200)) {
+                finishWithUpdatedReload('✓ ¡Liwi actualizado! Recargando...');
+              }
+            } else {
+              sawDrop = true;
+            }
+          } catch (_) {
+            sawDrop = true;
+          }
+        }, 1200);
+      }
+
+      function autoResizeFactoryInput() {
+        if (!inputEl) return;
+        inputEl.style.height = 'auto';
+        const maxH = 180;
+        const sh = inputEl.scrollHeight || 0;
+        if (sh > 0) {
+          inputEl.style.height = Math.min(sh, maxH) + 'px';
+          inputEl.style.overflowY = sh > maxH ? 'auto' : 'hidden';
+        } else {
+          inputEl.style.overflowY = 'hidden';
+        }
+      }
+
+      function renderPreviews() {
+        if (!previewsEl) return;
+        previewsEl.style.display = pendingImages.length ? 'flex' : 'none';
+        previewsEl.innerHTML = pendingImages.map((img, idx) =>
+          '<span class="factory-paste-chip">' +
+            '<img src="' + escapeHtml(img.previewUrl) + '" alt="' + escapeHtml(img.filename) + '" />' +
+            '<span class="factory-paste-chip-name">' + escapeHtml(img.filename) + '</span>' +
+            '<button type="button" class="btn-icon" data-rm-paste="' + idx + '" aria-label="Quitar captura">✕</button>' +
+          '</span>'
+        ).join('');
+        previewsEl.querySelectorAll('button[data-rm-paste]').forEach((b) => {
+          b.addEventListener('click', () => {
+            const i = Number(b.getAttribute('data-rm-paste'));
+            pendingImages.splice(i, 1);
+            renderPreviews();
+          });
+        });
+      }
+
+      function appendImageFile(file) {
+        if (!file || !String(file.type || '').startsWith('image/')) return;
+        if (pendingImages.length >= 4) {
+          if (statusEl) statusEl.textContent = 'Máximo 4 capturas por mensaje.';
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = String(reader.result || '');
+          const b64Idx = dataUrl.indexOf('base64,');
+          const b64 = b64Idx >= 0 ? dataUrl.slice(b64Idx + 7) : dataUrl;
+          pendingImages.push({
+            filename: file.name || ('captura_' + (pendingImages.length + 1) + '.png'),
+            data_base64: b64,
+            previewUrl: dataUrl,
+          });
+          renderPreviews();
+        };
+        reader.readAsDataURL(file);
+      }
+
+      function renderMemory(rules) {
+        const list = Array.isArray(rules) ? rules : [];
+        memToggle.textContent = '🧠 Memoria de Liwi (' + list.length + ')';
+        if (!list.length) {
+          memPanel.innerHTML = '<div class="muted">Sin reglas guardadas todavía. Las preferencias detectadas en el chat aparecerán aquí.</div>';
+          return;
+        }
+        memPanel.innerHTML = list.map((r) =>
+          '<div class="factory-memory-item">' +
+            '<span>• ' + escapeHtml(String(r.rule_text || '')) + '</span>' +
+            '<button type="button" class="btn btn-sm" data-del-frule="' + escapeHtml(String(r.id || '')) + '">Eliminar</button>' +
+          '</div>'
+        ).join('');
+        memPanel.querySelectorAll('button[data-del-frule]').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            const rid = btn.getAttribute('data-del-frule');
+            if (!rid) return;
+            btn.disabled = true;
+            try {
+              const res = await apiFetch('/api/factory/assistant/memory/' + encodeURIComponent(rid), { method: 'DELETE' });
+              renderMemory(res.memory_rules || []);
+            } catch (err) {
+              if (statusEl) statusEl.textContent = 'Error eliminando regla: ' + err.message;
+              btn.disabled = false;
+            }
+          });
+        });
+      }
+
+      async function copyTextToClipboard(text) {
+        const value = String(text == null ? '' : text);
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          try {
+            await navigator.clipboard.writeText(value);
+            return true;
+          } catch (_) {
+            // Fallback to execCommand('copy') when Clipboard API is unavailable or rejected (HTTP/Tailscale/mobile)
+          }
+        }
+        const ta = document.createElement('textarea');
+        ta.value = value;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.top = '-9999px';
+        ta.style.left = '-9999px';
+        ta.style.opacity = '0';
+        ta.style.pointerEvents = 'none';
+        document.body.appendChild(ta);
+        try {
+          if (typeof ta.focus === 'function') {
+            try { ta.focus({ preventScroll: true }); } catch (_) { ta.focus(); }
+          }
+          ta.select();
+          if (typeof ta.setSelectionRange === 'function') {
+            ta.setSelectionRange(0, value.length);
+          }
+          return Boolean(document.execCommand('copy'));
+        } catch (_) {
+          return false;
+        } finally {
+          if (ta.parentNode) ta.parentNode.removeChild(ta);
+        }
+      }
+
+      function extractCleanCopyText(node) {
+        if (!node) return '';
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('.copy-msg-btn, .md-copy-btn, button, .factory-proposal-actions, .md-code-head, .factory-pre-bar').forEach((el) => {
+          el.remove();
+        });
+        return String(clone.textContent || '').trim();
+      }
+
+      function createCopyButton(getTextFn, ariaLabel) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'copy-msg-btn';
+        btn.setAttribute('aria-label', ariaLabel || 'Copiar contenido');
+        btn.textContent = '📋 Copiar';
+        let resetTimer = null;
+        btn.addEventListener('click', async (ev) => {
+          ev.stopPropagation();
+          const cleanText = typeof getTextFn === 'function' ? String(getTextFn() || '').trim() : '';
+          if (!cleanText) return;
+          await copyTextToClipboard(cleanText);
+          if (resetTimer) {
+            clearTimeout(resetTimer);
+            resetTimer = null;
+          }
+          btn.textContent = '✓ Copiado';
+          btn.classList.add('is-copied');
+          resetTimer = setTimeout(() => {
+            btn.textContent = '📋 Copiar';
+            btn.classList.remove('is-copied');
+            resetTimer = null;
+          }, 1500);
+        });
+        return btn;
+      }
+
+      function attachFactoryCopyButtons(rootEl, assistantRawTexts) {
+        if (!rootEl) return;
+        const rawList = Array.isArray(assistantRawTexts) ? assistantRawTexts : [];
+
+        // 1. Copy button on each assistant (Liwi) message
+        rootEl.querySelectorAll('.factory-msg-assistant').forEach((msgEl) => {
+          if (msgEl.id === 'factory-thinking-bubble') return;
+          const headEl = msgEl.querySelector('.factory-msg-head');
+          if (!headEl || headEl.querySelector('.copy-msg-btn')) return;
+          const bodyEl = msgEl.querySelector('.factory-msg-body');
+          const rawIdxAttr = msgEl.getAttribute('data-assistant-idx');
+          const rawIdx = rawIdxAttr !== null ? Number(rawIdxAttr) : -1;
+          const rawText = rawIdx >= 0 && typeof rawList[rawIdx] === 'string' ? rawList[rawIdx].trim() : '';
+          const msgCopyBtn = createCopyButton(
+            () => rawText || extractCleanCopyText(bodyEl),
+            'Copiar mensaje de Liwi'
+          );
+          headEl.appendChild(msgCopyBtn);
+        });
+
+        // 2. Copy button on each proposal box
+        rootEl.querySelectorAll('.factory-proposal-card').forEach((cardEl) => {
+          const preEl = cardEl.querySelector('.doctor-prompt-pre');
+          if (preEl) preEl.setAttribute('data-copy-attached', '1');
+          const headEl = cardEl.querySelector('.factory-proposal-head');
+          if (!headEl || headEl.querySelector('.copy-msg-btn') || !preEl) return;
+          const propCopyBtn = createCopyButton(
+            () => extractCleanCopyText(preEl),
+            'Copiar propuesta'
+          );
+          headEl.appendChild(propCopyBtn);
+        });
+
+        // 3. Upgrade markdown code block copy buttons inside #factory-chat-stream (zero duplicates)
+        rootEl.querySelectorAll('.md-code-wrap').forEach((wrapEl) => {
+          const preEl = wrapEl.querySelector('pre');
+          if (preEl) preEl.setAttribute('data-copy-attached', '1');
+          const headEl = wrapEl.querySelector('.md-code-head');
+          if (!headEl || headEl.querySelector('.copy-msg-btn')) return;
+          const legacyBtn = headEl.querySelector('button.md-copy-btn[data-md-code-idx]');
+          const idx = legacyBtn ? Number(legacyBtn.getAttribute('data-md-code-idx')) : -1;
+          const entry = idx >= 0 ? allFactoryCodeBlocks[idx] : null;
+          const codeCopyBtn = createCopyButton(
+            () => (entry && typeof entry.raw === 'string' ? entry.raw : extractCleanCopyText(preEl)),
+            'Copiar bloque de código'
+          );
+          if (legacyBtn) {
+            legacyBtn.replaceWith(codeCopyBtn);
+          } else {
+            headEl.appendChild(codeCopyBtn);
+          }
+        });
+
+        // 4. Any standalone <pre> inside #factory-chat-stream not already wrapped
+        rootEl.querySelectorAll('pre').forEach((preEl) => {
+          if (
+            preEl.getAttribute('data-copy-attached') === '1' ||
+            preEl.closest('.md-code-wrap') ||
+            preEl.closest('.factory-proposal-card') ||
+            preEl.closest('.factory-pre-wrap')
+          ) {
+            return;
+          }
+          preEl.setAttribute('data-copy-attached', '1');
+          const wrapEl = document.createElement('div');
+          wrapEl.className = 'factory-pre-wrap';
+          const barEl = document.createElement('div');
+          barEl.className = 'factory-pre-bar';
+          barEl.appendChild(createCopyButton(() => extractCleanCopyText(preEl), 'Copiar bloque'));
+          if (preEl.parentNode) {
+            preEl.parentNode.insertBefore(wrapEl, preEl);
+            wrapEl.appendChild(barEl);
+            wrapEl.appendChild(preEl);
+          }
+        });
+      }
+
+      function renderMessages(msgs) {
+        const list = Array.isArray(msgs) ? msgs : [];
+        if (!list.length) {
+          allFactoryCodeBlocks = [];
+          streamEl.innerHTML = '<div class="factory-chat-empty">¿Qué quieres consultar o mejorar en Liwi?</div>';
+          return;
+        }
+        allFactoryCodeBlocks = [];
+        const assistantRawTexts = [];
+        const isLocked = isBlockingApplyActive();
+        streamEl.innerHTML = list.map((m) => {
+          const isUser = m.role === 'user';
+          const cls = isUser ? 'factory-msg factory-msg-user' : 'factory-msg factory-msg-assistant';
+          const imgs = Array.isArray(m.image_urls) ? m.image_urls : [];
+          const thumbs = imgs.length
+            ? '<div class="factory-chat-thumbs">' + imgs.map((u) => '<img src="' + escapeHtml(String(u)) + '" alt="Captura adjunta" />').join('') + '</div>'
+            : '';
+          let propHtml = '';
+          if (!isUser && m.proposal_prompt) {
+            const msgIdStr = String(m.id || '');
+            const isApplied = m.status === 'applied';
+            const isQueuedLocal = !isApplied && msgIdStr !== '' && locallyQueuedProposalIds.has(msgIdStr);
+            const isDisabledProp = isApplied || isQueuedLocal || isLocked;
+            const applyLabel = isApplied
+              ? '✓ Mejora aplicada'
+              : (isQueuedLocal ? '✓ Encolada en staging' : '✨ Aplicar mejora a Liwi');
+            const queuedNoticeHtml = isQueuedLocal
+              ? '<div class="factory-staging-notice" role="status">✓ Mejora encolada en segundo plano (staging)</div>'
+              : '';
+            propHtml = '<div class="factory-proposal-card">' +
+              '<div class="factory-proposal-head">' +
+                '<div class="factory-proposal-title">Propuesta: ' + escapeHtml(String(m.proposal_title || 'Auto-mejora')) + '</div>' +
+              '</div>' +
+              '<pre class="doctor-prompt-pre">' + escapeHtml(String(m.proposal_prompt)) + '</pre>' +
+              '<div class="factory-proposal-actions">' +
                 '<button type="button" class="btn btn-primary btn-sm" data-apply-factory-proposal="1" data-applied="' + ((isApplied || isQueuedLocal) ? '1' : '0') + '" data-msg-id="' + escapeHtml(msgIdStr) + '" data-prop-title="' + escapeHtml(String(m.proposal_title || '')) + '"' + (isDisabledProp ? ' disabled' : '') + '>' + applyLabel + '</button>' +
               '</div>' +
               queuedNoticeHtml +

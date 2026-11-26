@@ -8231,6 +8231,8 @@ def test_dashboard_autonomous_quota_visual_audit_and_project_ideas_endpoints_and
             'id="liwi-autonomous-history-panel"',
             'id="tab-ideas-btn"',
             'id="tab-ideas"',
+            "No se pudieron cargar los proyectos:",
+            "function clearFactoryBlockingForStaging()",
             "/api/autonomous/status",
             "/api/autonomous/toggle",
             "/api/autonomous/revert/",
