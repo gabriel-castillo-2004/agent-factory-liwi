@@ -28,6 +28,11 @@ from agent_factory.ports.runner import CommandTimeoutError, Runner
 from agent_factory.recovery_agent import _parse_json_dict_loose
 from agent_factory.secrets import redact_secrets
 from agent_factory.supervisor import RESTART_EXIT_CODE
+from agent_factory.telemetry import (
+    TELEMETRY_DB_ENV_VAR,
+    record_safe_event,
+    record_safe_incident,
+)
 
 if TYPE_CHECKING:
     from agent_factory.adapters.sqlite_store import SqliteEventStore
@@ -314,8 +319,15 @@ class FactorySelfImprover:
         restart_fn: Callable[[int], Any] | None = None,
         restart_delay_seconds: float = DEFAULT_RESTART_DELAY_SECONDS,
         pre_exit_hook: Callable[[], Any] | None = None,
+        telemetry_db_path: Path | str | None = None,
     ) -> None:
         self.clock: Clock = clock if clock is not None else _WallClock()
+        self._raw_db_path = (
+            getattr(sqlite_store, "db_path", db_path) if sqlite_store is not None else db_path
+        )
+        self._telemetry_db_path: Path | None = (
+            Path(telemetry_db_path) if telemetry_db_path is not None else None
+        )
         self.memory_store = FactoryMemoryStore(
             sqlite_store=sqlite_store,
             db_path=db_path,
@@ -369,6 +381,22 @@ class FactorySelfImprover:
 
     def _redact(self, text: str, extra_secrets: Sequence[str] = ()) -> str:
         return redact_secrets(text, extra_secrets=(*self.secrets_to_redact, *extra_secrets))
+
+    def _resolve_telemetry_db_path(self) -> Path | None:
+        """Resolve telemetry SQLite path respecting explicit override, env var, and test isolation."""
+        if self._telemetry_db_path is not None:
+            return self._telemetry_db_path
+        env_val = os.environ.get(TELEMETRY_DB_ENV_VAR, "").strip()
+        if env_val:
+            return Path(env_val)
+        raw_db = self._raw_db_path
+        if raw_db and str(raw_db) != ":memory:":
+            db_parent = Path(str(raw_db)).resolve().parent
+            repo_data_dir = Path("data").resolve()
+            if db_parent == repo_data_dir:
+                return (repo_data_dir / "telemetry.db").resolve()
+            return (db_parent / "telemetry.db").resolve()
+        return None
 
     def _save_uploaded_images(self, images: Sequence[Mapping[str, Any]]) -> list[str]:
         if not images:
@@ -686,108 +714,164 @@ class FactorySelfImprover:
             raise ValueError("El mensaje o una captura adjunta es obligatorio.")
         eff_msg = raw_msg or "Analiza la captura adjunta y sugiere mejoras."
         saved_images = self._save_uploaded_images(images)
-
-        user_rec = self.memory_store.add_message(
-            role="user",
-            content=self._redact(eff_msg),
-            image_paths=saved_images,
-            status="ok",
+        consult_started = self.clock.now()
+        telemetry_db = self._resolve_telemetry_db_path()
+        record_safe_event(
+            component="self_improver",
+            stage="consult_start",
+            command="consult_message",
+            duration_ms=0,
+            db_path=telemetry_db,
         )
 
-        src_files = _list_factory_source_files(self.repo_root)
-        rules = self.memory_store.list_rules()
-        history = self.memory_store.list_messages(limit=14)[:-1]
-
-        rules_block = "\n".join(f"- [{r['id']}] {r['rule_text']}" for r in rules) or "(ninguna)"
-        hist_block = (
-            "\n".join(f"{m['role']}: {m['content'][:500]}" for m in history[-8:])
-            or "(inicio de conversación)"
-        )
-        files_block = "\n".join(src_files[:120]) or "(sin archivos)"
-        img_block = "\n".join(saved_images) if saved_images else "(sin imágenes adjuntas)"
-
-        consult_prompt = (
-            "MODO CONSULTA DE SOLO LECTURA (PROHIBIDO editar archivos o ejecutar comandos mutantes).\n"
-            "Eres Liwi, el asistente de auto-mejora de Agent Factory. Responde siempre en español claro.\n\n"
-            f"Archivos en src/agent_factory/:\n{files_block}\n\n"
-            f"Reglas persistentes en Memoria de Liwi:\n{rules_block}\n\n"
-            f"Historial reciente:\n{hist_block}\n\n"
-            f"Imágenes adjuntas (rutas locales):\n{img_block}\n\n"
-            f"Solicitud del usuario:\n{self._redact(eff_msg)}\n\n"
-            "IMPORTANTE SOBRE PROPUESTAS ATÓMICAS Y PRUEBAS EN actionable_proposal:\n"
-            "- Si el usuario pide múltiples cambios o cambios sobre archivos grandes (como dashboard.py), divide el plan "
-            "en pasos pequeños (<3 min cada uno), explica los pasos siguientes en 'reply' y genera 'actionable_proposal' "
-            "ÚNICAMENTE para el Paso 1 atómico.\n"
-            "- En el campo 'prompt' de actionable_proposal, indica explícitamente que el agente ejecute ÚNICAMENTE las "
-            "pruebas dirigidas de los archivos modificados (por ejemplo: `pytest -q --no-cov tests/test_dashboard.py`) "
-            "y NO ejecute toda la suite completa de pruebas, ya que la verificación final la ejecuta el gate automático de la fábrica.\n\n"
-            "Devuelve ÚNICAMENTE un JSON válido con esta estructura exacta:\n"
-            '{"reply": "<respuesta en español claro>", '
-            '"new_memory_rules": ["<regla o preferencia detectada, si aplica>"], '
-            '"actionable_proposal": {"title": "<título corto>", "prompt": "<instrucciones técnicas detalladas TDD con pruebas dirigidas únicamente>"} | null}'
-        )
-
-        with tempfile.TemporaryDirectory(prefix="af_liwi_consult_") as ro_cwd:
-            ok, out = self._run_agy(
-                prompt=consult_prompt,
-                cwd=Path(ro_cwd),
-                allow_writes=False,
-                timeout_seconds=self.consult_timeout_seconds,
+        try:
+            user_rec = self.memory_store.add_message(
+                role="user",
+                content=self._redact(eff_msg),
+                image_paths=saved_images,
+                status="ok",
             )
 
-        reply = ""
-        added_rules: list[dict[str, Any]] = []
-        proposal_title: str | None = None
-        proposal_prompt: str | None = None
-        if ok and out:
-            parsed = _parse_json_dict_loose(out)
-            if parsed is not None:
-                reply = self._redact(str(parsed.get("reply") or "").strip())
-                raw_rules = parsed.get("new_memory_rules")
-                if isinstance(raw_rules, list):
-                    for item in raw_rules[:5]:
-                        cleaned_rule = self._redact(str(item or "").strip())
-                        saved_r = self.memory_store.add_rule(cleaned_rule)
-                        if saved_r is not None:
-                            added_rules.append(saved_r)
-                raw_prop = parsed.get("actionable_proposal")
-                if isinstance(raw_prop, Mapping):
-                    p_title = self._redact(str(raw_prop.get("title") or "").strip())
-                    p_prompt = self._redact(str(raw_prop.get("prompt") or "").strip())
-                    if p_title and p_prompt:
-                        proposal_title = p_title[:160]
-                        proposal_prompt = p_prompt
-            if not reply:
-                reply = self._redact(out[:3000])
-        else:
-            detail = out or "No se pudo consultar a agy."
-            reply = self._redact(
-                f"No pude obtener respuesta del agente en modo lectura ({detail}). "
-                "Puedes revisar la configuración de agy e intentarlo nuevamente."
+            src_files = _list_factory_source_files(self.repo_root)
+            rules = self.memory_store.list_rules()
+            history = self.memory_store.list_messages(limit=14)[:-1]
+
+            rules_block = "\n".join(f"- [{r['id']}] {r['rule_text']}" for r in rules) or "(ninguna)"
+            hist_block = (
+                "\n".join(f"{m['role']}: {m['content'][:500]}" for m in history[-8:])
+                or "(inicio de conversación)"
+            )
+            files_block = "\n".join(src_files[:120]) or "(sin archivos)"
+            img_block = "\n".join(saved_images) if saved_images else "(sin imágenes adjuntas)"
+
+            consult_prompt = (
+                "MODO CONSULTA DE SOLO LECTURA (PROHIBIDO editar archivos o ejecutar comandos mutantes).\n"
+                "Eres Liwi, el asistente de auto-mejora de Agent Factory. Responde siempre en español claro.\n\n"
+                f"Archivos en src/agent_factory/:\n{files_block}\n\n"
+                f"Reglas persistentes en Memoria de Liwi:\n{rules_block}\n\n"
+                f"Historial reciente:\n{hist_block}\n\n"
+                f"Imágenes adjuntas (rutas locales):\n{img_block}\n\n"
+                f"Solicitud del usuario:\n{self._redact(eff_msg)}\n\n"
+                "IMPORTANTE SOBRE PROPUESTAS ATÓMICAS Y PRUEBAS EN actionable_proposal:\n"
+                "- Si el usuario pide múltiples cambios o cambios sobre archivos grandes (como dashboard.py), divide el plan "
+                "en pasos pequeños (<3 min cada uno), explica los pasos siguientes en 'reply' y genera 'actionable_proposal' "
+                "ÚNICAMENTE para el Paso 1 atómico.\n"
+                "- En el campo 'prompt' de actionable_proposal, indica explícitamente que el agente ejecute ÚNICAMENTE las "
+                "pruebas dirigidas de los archivos modificados (por ejemplo: `pytest -q --no-cov tests/test_dashboard.py`) "
+                "y NO ejecute toda la suite completa de pruebas, ya que la verificación final la ejecuta el gate automático de la fábrica.\n\n"
+                "Devuelve ÚNICAMENTE un JSON válido con esta estructura exacta:\n"
+                '{"reply": "<respuesta en español claro>", '
+                '"new_memory_rules": ["<regla o preferencia detectada, si aplica>"], '
+                '"actionable_proposal": {"title": "<título corto>", "prompt": "<instrucciones técnicas detalladas TDD con pruebas dirigidas únicamente>"} | null}'
             )
 
-        assistant_rec = self.memory_store.add_message(
-            role="assistant",
-            content=reply,
-            proposal_title=proposal_title,
-            proposal_prompt=proposal_prompt,
-            status="proposal" if proposal_prompt else "ok",
-        )
-        all_rules = self.memory_store.list_rules()
-        return {
-            "ok": True,
-            "user_message": user_rec,
-            "assistant_message": assistant_rec,
-            "reply": reply,
-            "new_memory_rules": [r["rule_text"] for r in added_rules],
-            "actionable_proposal": (
-                {"title": proposal_title, "prompt": proposal_prompt}
-                if proposal_title and proposal_prompt
-                else None
-            ),
-            "memory_rules": all_rules,
-            "memory_count": len(all_rules),
-        }
+            with tempfile.TemporaryDirectory(prefix="af_liwi_consult_") as ro_cwd:
+                ok, out = self._run_agy(
+                    prompt=consult_prompt,
+                    cwd=Path(ro_cwd),
+                    allow_writes=False,
+                    timeout_seconds=self.consult_timeout_seconds,
+                )
+
+            reply = ""
+            added_rules: list[dict[str, Any]] = []
+            proposal_title: str | None = None
+            proposal_prompt: str | None = None
+            if ok and out:
+                parsed = _parse_json_dict_loose(out)
+                if parsed is not None:
+                    reply = self._redact(str(parsed.get("reply") or "").strip())
+                    raw_rules = parsed.get("new_memory_rules")
+                    if isinstance(raw_rules, list):
+                        for item in raw_rules[:5]:
+                            cleaned_rule = self._redact(str(item or "").strip())
+                            saved_r = self.memory_store.add_rule(cleaned_rule)
+                            if saved_r is not None:
+                                added_rules.append(saved_r)
+                    raw_prop = parsed.get("actionable_proposal")
+                    if isinstance(raw_prop, Mapping):
+                        p_title = self._redact(str(raw_prop.get("title") or "").strip())
+                        p_prompt = self._redact(str(raw_prop.get("prompt") or "").strip())
+                        if p_title and p_prompt:
+                            proposal_title = p_title[:160]
+                            proposal_prompt = p_prompt
+                if not reply:
+                    reply = self._redact(out[:3000])
+            else:
+                detail = self._redact(out or "No se pudo consultar a agy.")
+                reply = self._redact(
+                    f"No pude obtener respuesta del agente en modo lectura ({detail}). "
+                    "Puedes revisar la configuración de agy e intentarlo nuevamente."
+                )
+
+            assistant_rec = self.memory_store.add_message(
+                role="assistant",
+                content=reply,
+                proposal_title=proposal_title,
+                proposal_prompt=proposal_prompt,
+                status="proposal" if proposal_prompt else "ok",
+            )
+            all_rules = self.memory_store.list_rules()
+            duration_ms = max(0.0, (self.clock.now() - consult_started).total_seconds() * 1000.0)
+            if ok:
+                record_safe_event(
+                    component="self_improver",
+                    stage="consult_finish",
+                    command="consult_message",
+                    duration_ms=duration_ms,
+                    exit_code=0,
+                    db_path=telemetry_db,
+                )
+            else:
+                err_detail = self._redact(out or "No se pudo consultar a agy.")
+                record_safe_event(
+                    component="self_improver",
+                    stage="consult_finish",
+                    command="consult_message",
+                    duration_ms=duration_ms,
+                    exit_code=1,
+                    timed_out=("timeout" in err_detail.lower() or "timed out" in err_detail.lower()),
+                    error_text=err_detail,
+                    db_path=telemetry_db,
+                )
+                record_safe_incident(
+                    stage="consult_message",
+                    raw_error=err_detail,
+                    db_path=telemetry_db,
+                )
+            return {
+                "ok": True,
+                "user_message": user_rec,
+                "assistant_message": assistant_rec,
+                "reply": reply,
+                "new_memory_rules": [r["rule_text"] for r in added_rules],
+                "actionable_proposal": (
+                    {"title": proposal_title, "prompt": proposal_prompt}
+                    if proposal_title and proposal_prompt
+                    else None
+                ),
+                "memory_rules": all_rules,
+                "memory_count": len(all_rules),
+            }
+        except Exception as exc:
+            duration_ms = max(0.0, (self.clock.now() - consult_started).total_seconds() * 1000.0)
+            redacted_err = self._redact(str(exc) or type(exc).__name__)
+            record_safe_incident(
+                stage="consult_message",
+                raw_error=redacted_err,
+                db_path=telemetry_db,
+            )
+            record_safe_event(
+                component="self_improver",
+                stage="consult_error",
+                command="consult_message",
+                duration_ms=duration_ms,
+                exit_code=1,
+                timed_out=isinstance(exc, CommandTimeoutError),
+                error_text=redacted_err,
+                db_path=telemetry_db,
+            )
+            raise
 
     def _snapshot_forbidden_state(self) -> dict[str, Any]:
         """Record mtime/size and git status for forbidden paths without reading .env contents (INV-19)."""
@@ -1019,6 +1103,7 @@ class FactorySelfImprover:
 
         clean_env = build_sanitized_cli_env()
         started_at = self.clock.now()
+        telemetry_db = self._resolve_telemetry_db_path()
         outcome = "error"
         self._set_apply_status(
             running=True,
@@ -1029,6 +1114,13 @@ class FactorySelfImprover:
             title=clean_title,
             started_at=started_at,
             last_outcome="",
+        )
+        record_safe_event(
+            component="self_improver",
+            stage="apply_start",
+            command=clean_title,
+            duration_ms=0,
+            db_path=telemetry_db,
         )
         try:
             # 1. Create Git savepoint tag
@@ -1126,6 +1218,26 @@ class FactorySelfImprover:
             if failure_reason:
                 outcome = "rolled_back"
                 self._rollback_savepoint(clean_env)
+                redacted_failure = self._redact(failure_reason)
+                duration_ms = max(0.0, (self.clock.now() - started_at).total_seconds() * 1000.0)
+                record_safe_incident(
+                    stage="apply_proposal",
+                    raw_error=redacted_failure,
+                    db_path=telemetry_db,
+                )
+                record_safe_event(
+                    component="self_improver",
+                    stage="apply_finish",
+                    command=clean_title,
+                    duration_ms=duration_ms,
+                    exit_code=1,
+                    timed_out=(
+                        "timeout" in redacted_failure.lower()
+                        or "timed out" in redacted_failure.lower()
+                    ),
+                    error_text=redacted_failure,
+                    db_path=telemetry_db,
+                )
                 if message_id:
                     self.memory_store.update_message_status(message_id, "rolled_back")
                 err_msg = self.memory_store.add_message(
@@ -1140,7 +1252,7 @@ class FactorySelfImprover:
                     "applied": False,
                     "rolled_back": True,
                     "restart_scheduled": False,
-                    "error": self._redact(failure_reason),
+                    "error": redacted_failure,
                     "assistant_message": err_msg,
                     "messages": self.memory_store.list_messages(),
                 }
@@ -1208,8 +1320,12 @@ class FactorySelfImprover:
                     timeout_seconds=20.0,
                     env=push_env,
                 )
-            except (CommandTimeoutError, OSError, RuntimeError, ValueError):
-                pass
+            except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
+                record_safe_incident(
+                    stage="apply_git_push",
+                    raw_error=self._redact(str(exc) or type(exc).__name__),
+                    db_path=telemetry_db,
+                )
 
             if message_id:
                 self.memory_store.update_message_status(message_id, "applied")
@@ -1222,6 +1338,15 @@ class FactorySelfImprover:
                 status="applied",
             )
             outcome = "applied"
+            duration_ms = max(0.0, (self.clock.now() - started_at).total_seconds() * 1000.0)
+            record_safe_event(
+                component="self_improver",
+                stage="apply_finish",
+                command=clean_title,
+                duration_ms=duration_ms,
+                exit_code=0,
+                db_path=telemetry_db,
+            )
             self._schedule_process_restart()
             return {
                 "ok": True,
@@ -1233,6 +1358,25 @@ class FactorySelfImprover:
                 "assistant_message": ok_msg,
                 "messages": self.memory_store.list_messages(),
             }
+        except Exception as exc:
+            duration_ms = max(0.0, (self.clock.now() - started_at).total_seconds() * 1000.0)
+            redacted_err = self._redact(str(exc) or type(exc).__name__)
+            record_safe_incident(
+                stage="apply_proposal",
+                raw_error=redacted_err,
+                db_path=telemetry_db,
+            )
+            record_safe_event(
+                component="self_improver",
+                stage="apply_error",
+                command=clean_title,
+                duration_ms=duration_ms,
+                exit_code=1,
+                timed_out=isinstance(exc, CommandTimeoutError),
+                error_text=redacted_err,
+                db_path=telemetry_db,
+            )
+            raise
         finally:
             self._set_apply_status(
                 running=False,

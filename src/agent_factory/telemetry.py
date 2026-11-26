@@ -339,6 +339,68 @@ def record_incident(
             conn.close()
 
 
+def record_safe_event(
+    component: str,
+    stage: str,
+    command: str | None = None,
+    duration_ms: float = 0,
+    exit_code: int | None = None,
+    timed_out: bool = False,
+    error_signature: str | None = None,
+    project_id: str | None = None,
+    error_text: str | None = None,
+    timestamp: str | None = None,
+    db_path: Path | str | None = None,
+) -> int | None:
+    """Fail-safe wrapper around record_execution_event that silences SQLite/IO/runtime errors."""
+    try:
+        return record_execution_event(
+            component=component,
+            stage=stage,
+            command=command,
+            duration_ms=duration_ms,
+            exit_code=exit_code,
+            timed_out=timed_out,
+            error_signature=error_signature,
+            project_id=project_id,
+            error_text=error_text,
+            timestamp=timestamp,
+            db_path=db_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Telemetry record_safe_event silenced error: %s", exc)
+        return None
+
+
+def record_safe_incident(
+    stage: str,
+    raw_error: str,
+    project_id: str | None = None,
+    error_signature: str | None = None,
+    root_cause: str | None = None,
+    fix_summary: str | None = None,
+    resolved: bool = False,
+    timestamp: str | None = None,
+    db_path: Path | str | None = None,
+) -> int | None:
+    """Fail-safe wrapper around record_incident that silences SQLite/IO/runtime errors."""
+    try:
+        return record_incident(
+            stage=stage,
+            raw_error=raw_error,
+            project_id=project_id,
+            error_signature=error_signature,
+            root_cause=root_cause,
+            fix_summary=fix_summary,
+            resolved=resolved,
+            timestamp=timestamp,
+            db_path=db_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Telemetry record_safe_incident silenced error: %s", exc)
+        return None
+
+
 def _empty_summary(limit: int) -> dict[str, Any]:
     return {
         "limit": limit,

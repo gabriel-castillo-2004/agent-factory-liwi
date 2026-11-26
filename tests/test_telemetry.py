@@ -24,6 +24,8 @@ from agent_factory.telemetry import (
     init_telemetry_db,
     record_execution_event,
     record_incident,
+    record_safe_event,
+    record_safe_incident,
 )
 
 _LOOPBACK_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -566,3 +568,202 @@ def test_dashboard_get_telemetry_summary_endpoint(
         if thread.is_alive():
             thread.join(timeout=2.0)
         store.close()
+
+
+def test_record_safe_event_and_incident_persist_and_silence_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """record_safe_event and record_safe_incident persist to temp DB and swallow any SQLite/IO/unexpected error."""
+    import agent_factory.telemetry as telemetry_mod
+
+    db_path = tmp_path / "safe_telemetry.db"
+
+    ev_id = record_safe_event(
+        component="self_improver",
+        stage="apply_start",
+        command="Telemetría viva",
+        duration_ms=25,
+        exit_code=0,
+        db_path=db_path,
+    )
+    inc_id = record_safe_incident(
+        stage="apply_proposal",
+        raw_error="ruff check failed: F401 unused import",
+        db_path=db_path,
+    )
+    assert isinstance(ev_id, int) and ev_id > 0
+    assert isinstance(inc_id, int) and inc_id > 0
+
+    summary = get_telemetry_summary(limit=10, db_path=db_path)
+    assert summary["totals"] == {
+        "execution_events": 1,
+        "incidents": 1,
+        "unresolved_incidents": 1,
+    }
+    assert summary["slowest_executions"][0]["component"] == "self_improver"
+    assert summary["slowest_executions"][0]["stage"] == "apply_start"
+    assert summary["recent_incidents"][0]["stage"] == "apply_proposal"
+    assert summary["recent_incidents"][0]["error_signature"] == "syntax_or_lint"
+
+    # Unwritable directory path never raises
+    bad_dir = tmp_path / "unwritable_dir"
+    bad_dir.mkdir()
+    assert (
+        record_safe_event(
+            component="self_improver",
+            stage="apply_finish",
+            duration_ms=10,
+            db_path=bad_dir,
+        )
+        is None
+    )
+    assert (
+        record_safe_incident(
+            stage="apply_proposal",
+            raw_error="disk error",
+            db_path=bad_dir,
+        )
+        is None
+    )
+
+    # Unexpected exceptions raised by underlying functions are completely silenced
+    def _boom_event(*args: Any, **kwargs: Any) -> Any:
+        raise sqlite3.DatabaseError("corrupted wal")
+
+    def _boom_incident(*args: Any, **kwargs: Any) -> Any:
+        raise PermissionError("read-only filesystem")
+
+    monkeypatch.setattr(telemetry_mod, "record_execution_event", _boom_event)
+    monkeypatch.setattr(telemetry_mod, "record_incident", _boom_incident)
+
+    assert record_safe_event(component="self_improver", stage="apply_start", db_path=db_path) is None
+    assert record_safe_incident(stage="apply_proposal", raw_error="boom", db_path=db_path) is None
+
+
+def test_self_improver_records_live_telemetry_and_never_breaks_on_telemetry_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FactorySelfImprover records start/finish/exception telemetry in temp DB and continues cleanly when telemetry fails."""
+    import subprocess
+    from collections.abc import Mapping, Sequence
+
+    import agent_factory.telemetry as telemetry_mod
+    from agent_factory.adapters.subprocess_runner import SubprocessRunner
+    from agent_factory.ports.runner import CommandResult
+    from agent_factory.self_improver import FactorySelfImprover
+
+    repo_root = tmp_path / "repo_tel"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "TestFactory"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.email", "factory@local"], cwd=repo_root, check=True)
+    (repo_root / "src" / "agent_factory").mkdir(parents=True, exist_ok=True)
+    (repo_root / "tests").mkdir(parents=True, exist_ok=True)
+    (repo_root / "src" / "agent_factory" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (repo_root / "tests" / "test_sample.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "chore: seed"], cwd=repo_root, check=True, capture_output=True)
+
+    telemetry_db = tmp_path / "live_telemetry.db"
+    monkeypatch.setenv("AGENT_FACTORY_TELEMETRY_DB", str(telemetry_db))
+
+    real_runner = SubprocessRunner(default_timeout_seconds=15.0)
+    mode = ["ok"]
+
+    class _TelemetryTestRunner(SubprocessRunner):
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            exe_stem = Path(command[0]).stem.lower()
+            if exe_stem == "agy":
+                if "--dangerously-skip-permissions" not in command:
+                    return CommandResult(
+                        exit_code=0,
+                        stdout=json.dumps(
+                            {"reply": "Consulta lista", "new_memory_rules": [], "actionable_proposal": None}
+                        ),
+                    )
+                if mode[0] == "fail_agy":
+                    return CommandResult(exit_code=1, stderr="SyntaxError: bad token SECRET_TEL_999")
+                (repo_root / "src" / "agent_factory" / "sample.py").write_text("VALUE = 2\n", encoding="utf-8")
+                return CommandResult(exit_code=0, stdout="ok")
+            if exe_stem == "ruff":
+                return CommandResult(exit_code=0, stdout="All checks passed!")
+            if exe_stem == "pytest":
+                return CommandResult(exit_code=0, stdout="1 passed")
+            if mode[0] == "fail_tag" and exe_stem == "git" and len(command) >= 2 and command[1] == "tag":
+                return CommandResult(exit_code=1, stderr="fatal: cannot lock ref pre-self-improve")
+            return real_runner.run(command, cwd, timeout_seconds=timeout_seconds, env=env)
+
+    improver = FactorySelfImprover(
+        db_path=tmp_path / "factory.db",
+        repo_root=repo_root,
+        uploads_dir=tmp_path / "uploads",
+        runner=_TelemetryTestRunner(),
+        secrets_to_redact=("SECRET_TEL_999",),
+        restart_fn=lambda _code: None,
+        restart_delay_seconds=0.01,
+    )
+
+    # 1. Consult success records consult_start and consult_finish
+    consult_res = improver.consult_message("Revisa telemetría")
+    assert consult_res["ok"] is True
+
+    # 2. Apply success records apply_start and apply_finish (exit_code=0)
+    apply_ok = improver.apply_proposal("Actualiza VALUE", proposal_title="Mejora verde")
+    assert apply_ok["applied"] is True
+
+    # 3. Apply rollback records incident with secret redacted and failed apply_finish
+    mode[0] = "fail_agy"
+    apply_rb = improver.apply_proposal("Provoca error", proposal_title="Mejora roja")
+    assert apply_rb["rolled_back"] is True
+
+    # 4. Apply exception (git tag failure) records incident + apply_error and still raises
+    mode[0] = "fail_tag"
+    with pytest.raises(RuntimeError, match="punto de guardado Git"):
+        improver.apply_proposal("Fallo en git tag", proposal_title="Mejora excepcion")
+
+    conn = sqlite3.connect(str(telemetry_db))
+    conn.row_factory = sqlite3.Row
+    try:
+        events = conn.execute(
+            "SELECT component, stage, exit_code, error_signature FROM execution_events ORDER BY id ASC"
+        ).fetchall()
+        stages = [row["stage"] for row in events]
+        assert all(row["component"] == "self_improver" for row in events)
+        assert "consult_start" in stages
+        assert "consult_finish" in stages
+        assert stages.count("apply_start") == 3
+        assert stages.count("apply_finish") == 2
+        assert "apply_error" in stages
+
+        incidents = conn.execute(
+            "SELECT stage, error_signature, raw_error FROM incidents ORDER BY id ASC"
+        ).fetchall()
+        assert len(incidents) == 2
+        assert incidents[0]["stage"] == "apply_proposal"
+        assert incidents[0]["error_signature"] == "syntax_or_lint"
+        assert "SECRET_TEL_999" not in incidents[0]["raw_error"]
+        assert "[REDACTED]" in incidents[0]["raw_error"]
+        assert incidents[1]["stage"] == "apply_proposal"
+        assert "punto de guardado Git" in incidents[1]["raw_error"]
+    finally:
+        conn.close()
+
+    # 5. Telemetry failure NEVER breaks FactorySelfImprover caller
+    def _broken_record(*args: Any, **kwargs: Any) -> Any:
+        raise sqlite3.OperationalError("simulated telemetry disk failure")
+
+    monkeypatch.setattr(telemetry_mod, "record_execution_event", _broken_record)
+    monkeypatch.setattr(telemetry_mod, "record_incident", _broken_record)
+    mode[0] = "ok"
+    res_still_ok = improver.consult_message("Funciona aun sin telemetria")
+    assert res_still_ok["ok"] is True
+    apply_still_ok = improver.apply_proposal("Otro cambio", proposal_title="Sin telemetria")
+    assert apply_still_ok["applied"] is True
