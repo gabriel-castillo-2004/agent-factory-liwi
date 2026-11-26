@@ -83,6 +83,19 @@ _IGNORED_SCAN_DIRS: frozenset[str] = frozenset(
         ".ruff_cache",
     }
 )
+_PYTHON_WORKSPACE_IGNORED_DIRS: frozenset[str] = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".agent-factory",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+    }
+)
 _MAIN_GUARD_RE = re.compile(r"""if\s+__name__\s*==\s*["']__main__["']\s*:""")
 _WEB_SERVER_HINT_RE = re.compile(
     r"\b(?:HTTPServer|ThreadingHTTPServer|Flask|FastAPI|uvicorn|Bottle|Tornado|http\.server)\b"
@@ -192,10 +205,18 @@ def detect_local_lan_ip() -> str | None:
     return None
 
 
-def _ensure_contained(path: Path, workspace_dir: Path) -> Path:
-    """Validate path is non-symlink (if present) and resolves strictly inside workspace_dir (INV-22)."""
-    ws_resolved = workspace_dir.resolve()
+def _is_link_or_junction(path: Path) -> bool:
+    """Return True if path is a POSIX/Windows symlink or NTFS junction."""
     if path.is_symlink():
+        return True
+    is_junc = getattr(os.path, "isjunction", None)
+    return bool(is_junc and is_junc(path))
+
+
+def _ensure_contained(path: Path, workspace_dir: Path) -> Path:
+    """Validate path is non-symlink/non-junction (if present) and resolves strictly inside workspace_dir (INV-22)."""
+    ws_resolved = workspace_dir.resolve()
+    if _is_link_or_junction(path):
         raise SandboxViolationError(
             f"Symlink rejected inside workspace '{ws_resolved}': {path}"
         )
@@ -244,7 +265,7 @@ def _scan_workspace_files(
         except OSError:
             return
         for entry in entries:
-            if entry.is_symlink():
+            if _is_link_or_junction(entry):
                 _ensure_contained(entry, ws_resolved)
             if entry.is_dir():
                 if entry.name in _IGNORED_SCAN_DIRS or entry.name.startswith("."):
@@ -552,6 +573,83 @@ def _venv_python_path(venv_dir: Path) -> Path:
     return venv_dir / "bin" / "python"
 
 
+def is_python_workspace(workspace_dir: Path) -> bool:
+    """Return True if workspace contains requirements*.txt, pyproject.toml, or any .py file (incl. tests/) (INV-22)."""
+    ws_raw = workspace_dir if isinstance(workspace_dir, Path) else Path(workspace_dir)
+    if _is_link_or_junction(ws_raw):
+        raise SandboxViolationError(f"Symlink rejected for workspace: {ws_raw}")
+    ws_resolved = ws_raw.resolve()
+    if not ws_resolved.is_dir():
+        return False
+
+    raw_venv = ws_resolved / ".venv"
+    if _is_link_or_junction(raw_venv):
+        _ensure_contained(raw_venv, ws_resolved)
+
+    def _walk(current: Path) -> bool:
+        try:
+            entries = sorted(current.iterdir(), key=lambda p: (not p.is_file(), p.name.lower()))
+        except OSError:
+            return False
+        for entry in entries:
+            if _is_link_or_junction(entry):
+                _ensure_contained(entry, ws_resolved)
+            if entry.is_dir():
+                if entry.name in _PYTHON_WORKSPACE_IGNORED_DIRS or entry.name.startswith("."):
+                    continue
+                _ensure_contained(entry, ws_resolved)
+                if _walk(entry):
+                    return True
+            elif entry.is_file():
+                _ensure_contained(entry, ws_resolved)
+                name_low = entry.name.lower()
+                if (
+                    entry.suffix.lower() == ".py"
+                    or name_low == "pyproject.toml"
+                    or (name_low.startswith("requirements") and name_low.endswith(".txt"))
+                ):
+                    return True
+        return False
+
+    return _walk(ws_resolved)
+
+
+def get_workspace_venv_python(workspace_dir: Path) -> Path:
+    """Return contained path to <workspace>/.venv/Scripts/python.exe (Windows) or .venv/bin/python (POSIX) (INV-22)."""
+    ws_raw = workspace_dir if isinstance(workspace_dir, Path) else Path(workspace_dir)
+    if _is_link_or_junction(ws_raw):
+        raise SandboxViolationError(f"Symlink rejected for workspace: {ws_raw}")
+    ws_dir = ws_raw.resolve()
+    venv_dir = _ensure_contained(ws_dir / ".venv", ws_dir)
+    venv_py_raw = _venv_python_path(venv_dir)
+    _ensure_contained(venv_py_raw.parent, ws_dir)
+    return _ensure_contained(venv_py_raw, ws_dir)
+
+
+def build_venv_env(base_env: Mapping[str, str], venv_dir: Path) -> dict[str, str]:
+    """Return a copy of base_env with VIRTUAL_ENV set and venv Scripts/bin prepended to PATH."""
+    env: dict[str, str] = {str(k): str(v) for k, v in base_env.items()}
+    venv_path = venv_dir if isinstance(venv_dir, Path) else Path(venv_dir)
+    venv_bin = str(_venv_python_path(venv_path).parent)
+
+    existing_path = env.get("PATH", "").strip()
+    if not existing_path:
+        for key in list(env):
+            if key.upper() == "PATH":
+                existing_path = env.pop(key).strip()
+                break
+
+    if existing_path:
+        parts = [part for part in existing_path.split(os.pathsep) if part]
+        if not parts or parts[0] != venv_bin:
+            parts = [venv_bin, *parts]
+        env["PATH"] = os.pathsep.join(parts)
+    else:
+        env["PATH"] = venv_bin
+    env["VIRTUAL_ENV"] = str(venv_path)
+    return env
+
+
 def _is_pyproject_dependency_manifest(pyproject_path: Path) -> bool:
     """Return True if pyproject.toml defines package metadata/dependencies rather than pytest/tool settings only."""
     try:
@@ -730,8 +828,10 @@ def _compute_deps_hash(
     ws_dir: Path,
     manifests: Sequence[Path],
     ast_packages: Sequence[str] = (),
+    *,
+    ensure_pytest: bool = False,
 ) -> str:
-    """Compute deterministic SHA-256 over manifests and sorted AST-detected packages."""
+    """Compute deterministic SHA-256 over manifests, sorted AST-detected packages, and ensure_pytest flag."""
     hasher = hashlib.sha256()
     for manifest in sorted(manifests, key=lambda p: p.relative_to(ws_dir).as_posix()):
         rel = manifest.relative_to(ws_dir).as_posix().encode("utf-8")
@@ -743,7 +843,195 @@ def _compute_deps_hash(
         hasher.update(b"__ast__\0")
         hasher.update("\n".join(sorted(set(ast_packages))).encode("utf-8"))
         hasher.update(b"\0")
+    if ensure_pytest:
+        hasher.update(b"__pytest__\01\0")
     return hasher.hexdigest()
+
+
+def _run_venv_command(
+    cmd: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    timeout_seconds: float,
+    context: str,
+    command_runner: Callable[..., Any] | None = None,
+    secrets_to_redact: Sequence[str] = (),
+    check_zero: bool = True,
+) -> Any:
+    """Run an isolated venv/pip command synchronously with timeout and redact secrets on error."""
+    runner = command_runner if command_runner is not None else subprocess.run
+    resolved_cmd = resolve_command([str(part) for part in cmd], env=env)
+    try:
+        res = runner(
+            resolved_cmd,
+            cwd=str(cwd),
+            env=dict(env),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise LocalAppError(
+            f"{context}: tiempo de espera agotado tras {timeout_seconds:.0f}s."
+        ) from None
+    except (OSError, ValueError) as exc:
+        detail = redact_secrets(str(exc) or type(exc).__name__, extra_secrets=secrets_to_redact)
+        raise LocalAppError(f"{context}: {detail}") from None
+
+    exit_code = int(getattr(res, "exit_code", getattr(res, "returncode", 1)))
+    if check_zero and exit_code != 0:
+        raw_out = getattr(res, "stderr", "") or getattr(res, "stdout", "") or ""
+        tail = " | ".join(line.strip() for line in str(raw_out).splitlines()[-6:] if line.strip())
+        detail = (
+            redact_secrets(tail, extra_secrets=secrets_to_redact)
+            if tail
+            else "código de salida distinto de cero"
+        )
+        raise LocalAppError(f"{context}: {detail}")
+    return res
+
+
+def ensure_workspace_venv(
+    workspace_dir: Path,
+    *,
+    project_id: str = "",
+    install_deps: bool = True,
+    ensure_pytest: bool = False,
+    dep_install_timeout: float = 180.0,
+    dep_command_runner: Callable[..., Any] | None = None,
+    secrets_to_redact: Sequence[str] = (),
+) -> tuple[Path, Path] | None:
+    """Ensure isolated <workspace>/.venv for Python workspaces with cached dependency/pytest install (INV-22)."""
+    ws_raw = workspace_dir if isinstance(workspace_dir, Path) else Path(workspace_dir)
+    if _is_link_or_junction(ws_raw):
+        raise SandboxViolationError(f"Symlink rejected for workspace: {ws_raw}")
+    ws_dir = ws_raw.resolve()
+    if not is_python_workspace(ws_dir):
+        return None
+
+    venv_dir = _ensure_contained(ws_dir / ".venv", ws_dir)
+    venv_py = get_workspace_venv_python(ws_dir)
+    hash_file = _ensure_contained(venv_dir / ".deps_hash", ws_dir)
+
+    ensure_workspace_git_excludes(ws_dir, write_gitignore=True)
+
+    req_files, pyproject_files = _find_python_dependency_manifests(ws_dir)
+    manifests: list[Path] = [*req_files, *pyproject_files]
+    ast_packages = _detect_workspace_third_party_packages(ws_dir)
+    target_hash = _compute_deps_hash(
+        ws_dir,
+        manifests,
+        ast_packages=ast_packages,
+        ensure_pytest=ensure_pytest,
+    )
+
+    if venv_py.is_file() and hash_file.is_file():
+        try:
+            if hash_file.read_text(encoding="utf-8").strip() == target_hash:
+                return venv_py, venv_dir
+        except OSError:
+            pass
+
+    label = project_id or ws_dir.name
+    base_dep_env = sanitize_subprocess_env()
+    base_dep_env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    base_dep_env["PIP_NO_INPUT"] = "1"
+    base_dep_env["PYTHONUNBUFFERED"] = "1"
+    dep_env = build_venv_env(base_dep_env, venv_dir)
+
+    if not venv_py.is_file():
+        _run_venv_command(
+            [sys.executable, "-m", "venv", str(venv_dir)],
+            cwd=ws_dir,
+            env=dep_env,
+            timeout_seconds=min(dep_install_timeout, 120.0),
+            context=f"No se pudo crear el entorno virtual en '{label}'",
+            command_runner=dep_command_runner,
+            secrets_to_redact=secrets_to_redact,
+        )
+        venv_py = get_workspace_venv_python(ws_dir)
+        if not venv_py.is_file():
+            raise LocalAppError(
+                f"El entorno virtual '{venv_dir}' no generó el intérprete '{venv_py.name}'"
+            )
+
+    if install_deps:
+        for req_file in req_files:
+            rel_req = req_file.relative_to(ws_dir).as_posix()
+            _run_venv_command(
+                [str(venv_py), "-m", "pip", "install", "-r", str(req_file)],
+                cwd=ws_dir,
+                env=dep_env,
+                timeout_seconds=dep_install_timeout,
+                context=f"No se pudieron instalar dependencias desde '{rel_req}'",
+                command_runner=dep_command_runner,
+                secrets_to_redact=secrets_to_redact,
+            )
+
+        if pyproject_files and not req_files:
+            for pyproj in pyproject_files:
+                pkg_target = (
+                    "."
+                    if pyproj.parent == ws_dir
+                    else pyproj.parent.relative_to(ws_dir).as_posix()
+                )
+                _run_venv_command(
+                    [str(venv_py), "-m", "pip", "install", "-e", pkg_target],
+                    cwd=ws_dir,
+                    env=dep_env,
+                    timeout_seconds=dep_install_timeout,
+                    context="No se pudieron instalar dependencias desde 'pyproject.toml'",
+                    command_runner=dep_command_runner,
+                    secrets_to_redact=secrets_to_redact,
+                )
+
+        declared_norm = _extract_declared_manifest_packages(req_files, pyproject_files)
+        missing_ast_pkgs = [
+            pkg for pkg in ast_packages if _norm_pypi_name(pkg) not in declared_norm
+        ]
+        if missing_ast_pkgs:
+            _run_venv_command(
+                [str(venv_py), "-m", "pip", "install", *missing_ast_pkgs],
+                cwd=ws_dir,
+                env=dep_env,
+                timeout_seconds=dep_install_timeout,
+                context="No se pudieron instalar dependencias detectadas por AST",
+                command_runner=dep_command_runner,
+                secrets_to_redact=secrets_to_redact,
+            )
+
+    if ensure_pytest:
+        pytest_probe = _run_venv_command(
+            [str(venv_py), "-c", "import pytest"],
+            cwd=ws_dir,
+            env=dep_env,
+            timeout_seconds=min(dep_install_timeout, 30.0),
+            context=f"No se pudo verificar pytest en el entorno virtual de '{label}'",
+            command_runner=dep_command_runner,
+            secrets_to_redact=secrets_to_redact,
+            check_zero=False,
+        )
+        if int(getattr(pytest_probe, "exit_code", getattr(pytest_probe, "returncode", 1))) != 0:
+            _run_venv_command(
+                [str(venv_py), "-m", "pip", "install", "pytest"],
+                cwd=ws_dir,
+                env=dep_env,
+                timeout_seconds=dep_install_timeout,
+                context=f"No se pudo instalar pytest en el entorno virtual de '{label}'",
+                command_runner=dep_command_runner,
+                secrets_to_redact=secrets_to_redact,
+            )
+
+    if install_deps or (not manifests and not ast_packages):
+        hash_file = _ensure_contained(venv_dir / ".deps_hash", ws_dir)
+        hash_file.parent.mkdir(parents=True, exist_ok=True)
+        hash_file.write_text(target_hash, encoding="utf-8")
+
+    return venv_py, venv_dir
 
 
 class LocalAppRunner:
@@ -855,12 +1143,7 @@ class LocalAppRunner:
             clean["HOST"] = bind_host
             clean["PYTHONUNBUFFERED"] = "1"
             if venv_dir is not None:
-                venv_bin = str(_venv_python_path(venv_dir).parent)
-                existing_path = clean.get("PATH", "").strip()
-                clean["PATH"] = (
-                    f"{venv_bin}{os.pathsep}{existing_path}" if existing_path else venv_bin
-                )
-                clean["VIRTUAL_ENV"] = str(venv_dir)
+                clean = build_venv_env(clean, venv_dir)
             if pythonpath is not None:
                 existing_pp = clean.get("PYTHONPATH", "").strip()
                 clean["PYTHONPATH"] = (
@@ -881,32 +1164,16 @@ class LocalAppRunner:
         context: str,
     ) -> None:
         """Run isolated venv/pip command synchronously with timeout and redact any stderr on error."""
-        resolved_cmd = resolve_command([str(part) for part in cmd], env=env)
-        try:
-            res = self._dep_command_runner(
-                resolved_cmd,
-                cwd=str(cwd),
-                env=dict(env),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout_seconds,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            raise LocalAppError(
-                f"{context}: tiempo de espera agotado tras {timeout_seconds:.0f}s."
-            ) from None
-        except (OSError, ValueError) as exc:
-            detail = self._redact(str(exc) or type(exc).__name__)
-            raise LocalAppError(f"{context}: {detail}") from None
-
-        if int(getattr(res, "exit_code", getattr(res, "returncode", 1))) != 0:
-            raw_out = getattr(res, "stderr", "") or getattr(res, "stdout", "") or ""
-            tail = " | ".join(line.strip() for line in str(raw_out).splitlines()[-6:] if line.strip())
-            detail = self._redact(tail) if tail else "código de salida distinto de cero"
-            raise LocalAppError(f"{context}: {detail}")
+        _run_venv_command(
+            cmd,
+            cwd=cwd,
+            env=env,
+            timeout_seconds=timeout_seconds,
+            context=context,
+            command_runner=self._dep_command_runner,
+            secrets_to_redact=self.secrets_to_redact,
+            check_zero=True,
+        )
 
     def _prepare_python_interpreter(
         self,
@@ -916,18 +1183,10 @@ class LocalAppRunner:
         install_deps: bool,
         dep_install_timeout: float,
     ) -> tuple[Path, Path | None]:
-        """Ensure per-workspace .venv and cached dependency install from manifests + AST imports."""
-        req_files, pyproject_files = _find_python_dependency_manifests(ws_dir)
-        manifests: list[Path] = [*req_files, *pyproject_files]
-        ast_packages = _detect_workspace_third_party_packages(ws_dir)
-        raw_venv = ws_dir / ".venv"
-        venv_dir = _ensure_contained(raw_venv, ws_dir)
-        venv_py = _ensure_contained(_venv_python_path(venv_dir), ws_dir)
-
-        if not manifests and not ast_packages:
-            return Path(sys.executable), None
-
+        """Ensure per-workspace .venv and cached dependency install via ensure_workspace_venv."""
         if not install_deps:
+            venv_dir = _ensure_contained(ws_dir / ".venv", ws_dir)
+            venv_py = get_workspace_venv_python(ws_dir)
             if venv_py.is_file():
                 return venv_py, venv_dir
             return Path(sys.executable), None
@@ -936,82 +1195,18 @@ class LocalAppRunner:
             dep_lock = self._dep_locks.setdefault(project_id, threading.Lock())
 
         with dep_lock:
-            target_hash = _compute_deps_hash(ws_dir, manifests, ast_packages=ast_packages)
-            hash_file = _ensure_contained(venv_dir / ".deps_hash", ws_dir)
-            if venv_py.is_file() and hash_file.is_file():
-                try:
-                    if hash_file.read_text(encoding="utf-8").strip() == target_hash:
-                        return venv_py, venv_dir
-                except OSError:
-                    pass
-
-            ensure_workspace_git_excludes(ws_dir)
-
-            dep_env = sanitize_subprocess_env()
-            dep_env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
-            dep_env["PIP_NO_INPUT"] = "1"
-            dep_env["PYTHONUNBUFFERED"] = "1"
-            dep_env["VIRTUAL_ENV"] = str(venv_dir)
-
-            if not venv_py.is_file():
-                self._run_dep_command(
-                    [sys.executable, "-m", "venv", str(venv_dir)],
-                    cwd=ws_dir,
-                    env=dep_env,
-                    timeout_seconds=min(dep_install_timeout, 120.0),
-                    context=f"No se pudo crear el entorno virtual en '{project_id}'",
-                )
-                venv_py = _ensure_contained(_venv_python_path(venv_dir), ws_dir)
-                if not venv_py.is_file():
-                    raise LocalAppError(
-                        f"El entorno virtual '{venv_dir}' no generó el intérprete '{venv_py.name}'"
-                    )
-
-            existing_path = dep_env.get("PATH", "").strip()
-            venv_bin = str(venv_py.parent)
-            dep_env["PATH"] = f"{venv_bin}{os.pathsep}{existing_path}" if existing_path else venv_bin
-
-            for req_file in req_files:
-                rel_req = req_file.relative_to(ws_dir).as_posix()
-                self._run_dep_command(
-                    [str(venv_py), "-m", "pip", "install", "-r", str(req_file)],
-                    cwd=ws_dir,
-                    env=dep_env,
-                    timeout_seconds=dep_install_timeout,
-                    context=f"No se pudieron instalar dependencias desde '{rel_req}'",
-                )
-
-            if pyproject_files and not req_files:
-                for pyproj in pyproject_files:
-                    pkg_target = (
-                        "."
-                        if pyproj.parent == ws_dir
-                        else pyproj.parent.relative_to(ws_dir).as_posix()
-                    )
-                    self._run_dep_command(
-                        [str(venv_py), "-m", "pip", "install", "-e", pkg_target],
-                        cwd=ws_dir,
-                        env=dep_env,
-                        timeout_seconds=dep_install_timeout,
-                        context="No se pudieron instalar dependencias desde 'pyproject.toml'",
-                    )
-
-            declared_norm = _extract_declared_manifest_packages(req_files, pyproject_files)
-            missing_ast_pkgs = [
-                pkg for pkg in ast_packages if _norm_pypi_name(pkg) not in declared_norm
-            ]
-            if missing_ast_pkgs:
-                self._run_dep_command(
-                    [str(venv_py), "-m", "pip", "install", *missing_ast_pkgs],
-                    cwd=ws_dir,
-                    env=dep_env,
-                    timeout_seconds=dep_install_timeout,
-                    context="No se pudieron instalar dependencias detectadas por AST",
-                )
-
-            hash_file.parent.mkdir(parents=True, exist_ok=True)
-            hash_file.write_text(target_hash, encoding="utf-8")
-            return venv_py, venv_dir
+            result = ensure_workspace_venv(
+                ws_dir,
+                project_id=project_id,
+                install_deps=True,
+                ensure_pytest=False,
+                dep_install_timeout=dep_install_timeout,
+                dep_command_runner=self._dep_command_runner,
+                secrets_to_redact=self.secrets_to_redact,
+            )
+        if result is None:
+            return Path(sys.executable), None
+        return result
 
     def get_status(
         self,

@@ -2386,7 +2386,7 @@ def test_local_app_runner_isolated_venv_deps_hash_cache_and_git_exclude(
     try:
         st_no = runner_pyproj.start(pid_pytest_only, install_deps=True)
         assert st_no.running is True
-        assert not (ws_pytest_only / ".venv").exists()
+        assert (ws_pytest_only / ".venv").is_dir()
         assert pip_pyproj_cmds == []
         runner_pyproj.stop(pid_pytest_only)
 

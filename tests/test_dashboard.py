@@ -1932,7 +1932,23 @@ def test_dashboard_local_app_runner_start_stop_for_static_and_python_apps(
     py_info = detect_workspace_app(ws_py)
     assert py_info.app_type == "python_local"
 
-    local_runner = LocalAppRunner(workspace_manager=ws_mgr)
+    import subprocess
+
+    real_run = subprocess.run
+
+    def _fast_venv_runner(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        cmd_list = [str(c) for c in cmd]
+        if len(cmd_list) >= 4 and cmd_list[1:3] == ["-m", "venv"]:
+            return real_run(
+                [cmd_list[0], "-m", "venv", "--without-pip", *cmd_list[3:]],
+                **kwargs,
+            )
+        return real_run(cmd_list, **kwargs)
+
+    local_runner = LocalAppRunner(
+        workspace_manager=ws_mgr,
+        dep_command_runner=_fast_venv_runner,
+    )
     orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
     server, thread, base_url = start_dashboard_server(
         orchestrator=orch,
@@ -2882,9 +2898,23 @@ def test_dashboard_import_project_and_lan_mode(
 
     store = SqliteEventStore(str(tmp_path / "import_lan.db"))
     ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_internal")
+    import subprocess
+
+    real_run = subprocess.run
+
+    def _fast_venv_runner(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        cmd_list = [str(c) for c in cmd]
+        if len(cmd_list) >= 4 and cmd_list[1:3] == ["-m", "venv"]:
+            return real_run(
+                [cmd_list[0], "-m", "venv", "--without-pip", *cmd_list[3:]],
+                **kwargs,
+            )
+        return real_run(cmd_list, **kwargs)
+
     local_runner = LocalAppRunner(
         workspace_manager=ws_mgr,
         lan_ip_resolver=lambda: "192.168.1.42",
+        dep_command_runner=_fast_venv_runner,
     )
     orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
     server, thread, base_url = start_dashboard_server(
