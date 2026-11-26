@@ -8332,6 +8332,94 @@ def test_dashboard_autonomous_quota_visual_audit_and_project_ideas_endpoints_and
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_triage_client_error_tickets_and_banner_ui(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENT_FACTORY_TELEMETRY_DB", str(tmp_path / "telemetry_triage.db"))
+    store = SqliteEventStore(db_path=tmp_path / "dash_triage.db")
+    orch = Orchestrator(store=store, llm=FakeLLM())
+
+    enqueued_repairs: list[dict[str, Any]] = []
+
+    class _SpyStaging:
+        def enqueue_improvement(self, *, title: str, prompt: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+            enqueued_repairs.append({"title": title, "prompt": prompt, "metadata": metadata or {}})
+            return {"pending_count": 0, "is_building": True, "queue_size": 1, "commits": []}
+
+        def shutdown(self, timeout: float = 2.0) -> None:
+            _ = timeout
+
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        staging_manager=_SpyStaging(),  # type: ignore[arg-type]
+    )
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as html_resp:
+            assert html_resp.status == 200
+            html = html_resp.read().decode("utf-8")
+
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+        for marker in (
+            'id="triage-alert-banner"',
+            'id="triage-repair-btn"',
+            'id="triage-copy-prompt-btn"',
+            'id="triage-dismiss-btn"',
+            "ANTI_SPAM_MS = 15000",
+            "/api/telemetry/client-error",
+            "/api/triage/tickets",
+        ):
+            assert marker in html
+
+        # 1. Report JS error -> creates ticket with simple_summary + repair_prompt
+        c_post, r_post = _http_json(
+            f"{base_url}/api/telemetry/client-error",
+            method="POST",
+            body={
+                "source": "window.onerror",
+                "error_text": "ReferenceError: foo is not defined at src/agent_factory/dashboard.py:7001",
+                "context": {"lineno": 7001},
+            },
+        )
+        assert c_post == 200
+        assert r_post["ok"] is True
+        tid = r_post["ticket"]["id"]
+        assert "src/agent_factory/dashboard.py:7001" in r_post["ticket"]["repair_prompt"]
+
+        # 2. List pending tickets
+        c_list, r_list = _http_json(f"{base_url}/api/triage/tickets")
+        assert c_list == 200
+        assert len(r_list["tickets"]) == 1
+        assert r_list["tickets"][0]["id"] == tid
+
+        # 3. Repair enqueues repair_prompt into .liwi-staging
+        c_rep, r_rep = _http_json(f"{base_url}/api/triage/tickets/{tid}/repair", method="POST", body={})
+        assert c_rep == 200
+        assert r_rep["queued"] is True
+        assert r_rep["ticket"]["status"] == "reparando"
+        assert len(enqueued_repairs) == 1
+        assert "src/agent_factory/dashboard.py:7001" in enqueued_repairs[0]["prompt"]
+
+        # 4. Dismiss hides ticket from pending list
+        c_dis, r_dis = _http_json(f"{base_url}/api/triage/tickets/{tid}/dismiss", method="POST", body={})
+        assert c_dis == 200
+        assert r_dis["ticket"]["status"] == "descartado"
+        _, r_after = _http_json(f"{base_url}/api/triage/tickets")
+        assert r_after["tickets"] == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+
 
 
 

@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from agent_factory import idea_engine, telemetry, visual_qa_agent
+from agent_factory import error_triage, idea_engine, telemetry, visual_qa_agent
 from agent_factory.adapters.github_vcs_adapter import VcsError
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.builder import BuildWorker
@@ -2739,6 +2739,78 @@ class DashboardController:
                 "idea": updated,
                 "ideas": ideas,
             },
+            self.secrets_to_redact,
+        )
+
+    def report_client_error(
+        self,
+        *,
+        source: str,
+        error_text: str,
+        context: Mapping[str, Any] | str | None = None,
+    ) -> dict[str, Any]:
+        """Record a browser JS or HTTP >= 500 error as an actionable triage ticket."""
+        ticket = error_triage.build_actionable_fix_ticket(
+            source,
+            error_text,
+            context=context,
+            db_path=self._resolve_idea_db_path(),
+        )
+        return _scrub_value({"ok": True, "ticket": ticket}, self.secrets_to_redact)
+
+    def list_triage_tickets(self) -> dict[str, Any]:
+        """List pending actionable triage tickets."""
+        tickets = error_triage.list_triage_tickets(
+            status="pendiente",
+            db_path=self._resolve_idea_db_path(),
+        )
+        return _scrub_value({"ok": True, "tickets": tickets}, self.secrets_to_redact)
+
+    def repair_triage_ticket(self, ticket_id: int) -> dict[str, Any]:
+        """Enqueue a pending triage ticket's repair_prompt into .liwi-staging."""
+        db_path = self._resolve_idea_db_path()
+        ticket = error_triage.get_triage_ticket(ticket_id, db_path=db_path)
+        if ticket is None:
+            raise ProjectNotFoundError(f"Ticket de diagnóstico '{ticket_id}' no encontrado.")
+        updated = error_triage.update_triage_ticket_status(
+            ticket_id,
+            "reparando",
+            db_path=db_path,
+        )
+        mgr = self._get_staging_manager()
+        try:
+            staging_status = mgr.enqueue_improvement(
+                title=f"🩹 Auto-reparación #{ticket_id}",
+                prompt=ticket["repair_prompt"],
+                metadata={"triage_ticket_id": ticket_id},
+            )
+        except Exception as exc:
+            error_triage.update_triage_ticket_status(ticket_id, "pendiente", db_path=db_path)
+            raise ProjectConflictError(
+                redact_secrets(str(exc), extra_secrets=self.secrets_to_redact)
+            ) from exc
+        return _scrub_value(
+            {
+                "ok": True,
+                "queued": True,
+                "ticket": updated,
+                "staging": staging_status,
+            },
+            self.secrets_to_redact,
+        )
+
+    def dismiss_triage_ticket(self, ticket_id: int) -> dict[str, Any]:
+        """Dismiss a triage ticket so its alert banner hides."""
+        try:
+            updated = error_triage.update_triage_ticket_status(
+                ticket_id,
+                "descartado",
+                db_path=self._resolve_idea_db_path(),
+            )
+        except KeyError as exc:
+            raise ProjectNotFoundError(str(exc)) from exc
+        return _scrub_value(
+            {"ok": True, "dismissed": True, "ticket": updated},
             self.secrets_to_redact,
         )
 
@@ -6779,6 +6851,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       line-height: 1.45;
       max-width: 460px;
     }
+    .triage-alert-banner {
+      padding: 10px 14px;
+      border-radius: 10px;
+      border: 1px solid rgba(245, 158, 11, 0.55);
+      background: rgba(245, 158, 11, 0.14);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .triage-alert-main {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .triage-alert-copy {
+      flex: 1 1 260px;
+      min-width: 0;
+    }
+    .triage-alert-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
     .factory-thinking-bubble {
       display: inline-flex;
       align-items: center;
@@ -7052,6 +7151,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div id="factory-restart-subtext" class="muted" style="font-size:0.78rem;">Esperando reconexión automática con el servidor supervisado.</div>
         </div>
       </div>
+    </div>
+    <div id="triage-alert-banner" class="triage-alert-banner" role="alert" style="display:none; margin-top:8px;">
+      <div class="triage-alert-main">
+        <div class="triage-alert-copy">
+          <strong id="triage-alert-title" style="font-size:0.88rem;">🩺 Se detectó un inconveniente técnico</strong>
+          <div id="triage-alert-summary" class="muted" style="font-size:0.82rem;"></div>
+        </div>
+        <div class="triage-alert-actions">
+          <button id="triage-repair-btn" class="btn btn-primary btn-sm" type="button">✨ Reparar ahora</button>
+          <button id="triage-copy-prompt-btn" class="btn btn-sm" type="button">📋 Copiar prompt para Antigravity</button>
+          <button id="triage-dismiss-btn" class="btn btn-sm" type="button" aria-label="Descartar aviso" title="Descartar aviso">✕</button>
+        </div>
+      </div>
+      <div id="triage-alert-feedback" class="muted" style="font-size:0.78rem; display:none;"></div>
     </div>
   </div>
 
@@ -8170,6 +8283,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const res = await fetch(url, opts);
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
+          if (res.status >= 500 && typeof window.reportLiwiClientError === 'function' && String(url || '').indexOf('/api/telemetry/client-error') < 0) {
+            window.reportLiwiClientError('fetch_500', 'HTTP ' + res.status + ' en ' + String(url || '') + ': ' + String(data.error || 'Error interno'), { url: String(url || ''), status: res.status });
+          }
           throw new Error(data.error || ('HTTP ' + res.status));
         }
         return data;
@@ -12795,8 +12911,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       function stopStatusPolling() {
         if (statusPollTimer) {
           clearInterval(statusPollTimer);
-        setFactoryControlsLocked(false);
-        setTimeout(() => { window.location.reload(); }, 650);
+          statusPollTimer = null;
+        }
       }
 
       function clearFactoryBlockingForStaging() {
@@ -14689,6 +14805,147 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       setInterval(pollAutonomousStatus, 12000);
     })();
 
+    (function initClientTriageSensorAndBanner() {
+      const recentErrorSentAt = new Map();
+      const ANTI_SPAM_MS = 15000;
+      const bannerEl = document.getElementById('triage-alert-banner');
+      const summaryEl = document.getElementById('triage-alert-summary');
+      const feedbackEl = document.getElementById('triage-alert-feedback');
+      const repairBtn = document.getElementById('triage-repair-btn');
+      const copyBtn = document.getElementById('triage-copy-prompt-btn');
+      const dismissBtn = document.getElementById('triage-dismiss-btn');
+      let currentTicket = null;
+
+      function showBannerFeedback(msg) {
+        if (!feedbackEl) return;
+        feedbackEl.textContent = String(msg || '');
+        feedbackEl.style.display = msg ? 'block' : 'none';
+      }
+
+      function renderTriageBanner(tickets) {
+        const list = Array.isArray(tickets) ? tickets : [];
+        currentTicket = list.length ? list[0] : null;
+        if (!bannerEl) return;
+        if (!currentTicket) {
+          bannerEl.style.display = 'none';
+          return;
+        }
+        if (summaryEl) {
+          summaryEl.textContent = String(currentTicket.simple_summary || currentTicket.error_text || '');
+        }
+        bannerEl.style.display = 'flex';
+      }
+
+      async function refreshTriageTickets() {
+        try {
+          const data = await apiFetch('/api/triage/tickets', { cache: 'no-store' });
+          renderTriageBanner(data && data.tickets);
+        } catch (_) {}
+      }
+
+      function reportLiwiClientError(source, errorText, context) {
+        const cleanText = String(errorText || '').trim();
+        if (!cleanText) return;
+        const key = String(source || 'browser_js') + '::' + cleanText.slice(0, 180);
+        const now = Date.now();
+        const prev = recentErrorSentAt.get(key) || 0;
+        if (now - prev < ANTI_SPAM_MS) return;
+        recentErrorSentAt.set(key, now);
+        fetch('/api/telemetry/client-error', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            source: String(source || 'browser_js'),
+            error_text: cleanText.slice(0, 4000),
+            context: context || { href: window.location.href },
+          }),
+        }).then(() => refreshTriageTickets()).catch(() => {});
+      }
+      window.reportLiwiClientError = reportLiwiClientError;
+
+      window.addEventListener('error', (ev) => {
+        const detail = (ev && ev.error && ev.error.stack)
+          ? String(ev.error.stack)
+          : (String((ev && ev.message) || 'Error JS') + ' @ ' + String((ev && ev.filename) || '') + ':' + String((ev && ev.lineno) || 0));
+        reportLiwiClientError('window.onerror', detail, {
+          filename: ev ? ev.filename : '',
+          lineno: ev ? ev.lineno : 0,
+          colno: ev ? ev.colno : 0,
+        });
+      });
+
+      window.addEventListener('unhandledrejection', (ev) => {
+        const reason = ev ? ev.reason : null;
+        const detail = (reason && reason.stack) ? String(reason.stack) : String(reason || 'Unhandled promise rejection');
+        reportLiwiClientError('unhandledrejection', detail);
+      });
+
+      if (repairBtn) {
+        repairBtn.addEventListener('click', async () => {
+          if (!currentTicket || repairBtn.disabled) return;
+          repairBtn.disabled = true;
+          repairBtn.textContent = '⏳ Reparando...';
+          try {
+            await apiFetch('/api/triage/tickets/' + encodeURIComponent(String(currentTicket.id)) + '/repair', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: '{}',
+            });
+            showBannerFeedback('✓ Auto-reparación encolada en .liwi-staging.');
+            setTimeout(refreshTriageTickets, 1200);
+          } catch (err) {
+            showBannerFeedback('Error lanzando auto-reparación: ' + (err && err.message ? err.message : ''));
+          } finally {
+            repairBtn.disabled = false;
+            repairBtn.textContent = '✨ Reparar ahora';
+          }
+        });
+      }
+
+      if (copyBtn) {
+        copyBtn.addEventListener('click', async () => {
+          if (!currentTicket || !currentTicket.repair_prompt) return;
+          const txt = String(currentTicket.repair_prompt);
+          try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              await navigator.clipboard.writeText(txt);
+            } else {
+              const ta = document.createElement('textarea');
+              ta.value = txt;
+              ta.style.position = 'fixed';
+              ta.style.opacity = '0';
+              document.body.appendChild(ta);
+              ta.select();
+              document.execCommand('copy');
+              document.body.removeChild(ta);
+            }
+            copyBtn.textContent = '✓ Prompt copiado';
+            showBannerFeedback('Prompt técnico copiado al portapapeles.');
+            setTimeout(() => { copyBtn.textContent = '📋 Copiar prompt para Antigravity'; }, 2500);
+          } catch (_) {
+            showBannerFeedback('No se pudo copiar automáticamente al portapapeles.');
+          }
+        });
+      }
+
+      if (dismissBtn) {
+        dismissBtn.addEventListener('click', async () => {
+          if (!currentTicket) return;
+          try {
+            await apiFetch('/api/triage/tickets/' + encodeURIComponent(String(currentTicket.id)) + '/dismiss', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: '{}',
+            });
+            refreshTriageTickets();
+          } catch (_) {}
+        });
+      }
+
+      refreshTriageTickets();
+      setInterval(refreshTriageTickets, 15000);
+    })();
+
     setInterval(updateLiveTimers, 1000);
     setInterval(() => {
       loadProjects();
@@ -15005,6 +15262,24 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             return urllib.parse.unquote(parts[0]), parts[3], idea_id
         return None, None, None
 
+    def _parse_triage_ticket_route(self) -> tuple[int | None, str | None]:
+        """Parse /api/triage/tickets/<id>/<repair|dismiss> safely (INV-22)."""
+        raw_path = urllib.parse.urlsplit(self.path).path
+        prefix = "/api/triage/tickets/"
+        if not raw_path.startswith(prefix):
+            return None, None
+        rest = raw_path[len(prefix) :]
+        parts = rest.split("/")
+        if len(parts) == 2 and parts[1] in {"repair", "dismiss"}:
+            raw_id = urllib.parse.unquote(parts[0])
+            if not (raw_id.isascii() and raw_id.isdigit()):
+                raise ValueError("ID de ticket inválido; debe ser un entero positivo.")
+            tid = int(raw_id)
+            if tid <= 0:
+                raise ValueError("ID de ticket inválido; debe ser un entero positivo.")
+            return tid, parts[1]
+        return None, None
+
     def do_GET(self) -> None:
         parsed_url = urllib.parse.urlsplit(self.path)
         path = parsed_url.path
@@ -15058,6 +15333,10 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/autonomous/status":
             self._send_controller_json(ctrl.get_autonomous_status)
+            return
+
+        if path == "/api/triage/tickets":
+            self._send_controller_json(ctrl.list_triage_tickets)
             return
 
         proj_ideas_pid, proj_ideas_action, _proj_idea_id = self._parse_project_ideas_route()
@@ -15283,6 +15562,37 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
                 return ctrl.run_visual_audit(base_url=eff_url)
 
             self._send_controller_json(_post_visual_audit)
+            return
+
+        if path == "/api/telemetry/client-error":
+            def _post_client_error() -> dict[str, Any]:
+                body = self._read_json_body()
+                raw_source = str(body.get("source") or "browser_js").strip()
+                raw_err = body.get("error_text")
+                if raw_err is None:
+                    raw_err = body.get("message")
+                if not isinstance(raw_err, str) or not raw_err.strip():
+                    raise ValueError("El campo 'error_text' es obligatorio.")
+                return ctrl.report_client_error(
+                    source=raw_source,
+                    error_text=raw_err,
+                    context=body.get("context"),
+                )
+
+            self._send_controller_json(_post_client_error)
+            return
+
+        if path.startswith("/api/triage/tickets/"):
+            def _post_triage_ticket_action() -> dict[str, Any]:
+                tid, t_action = self._parse_triage_ticket_route()
+                if tid is None or t_action not in {"repair", "dismiss"}:
+                    raise ProjectNotFoundError("Endpoint not found")
+                self._drain_body()
+                if t_action == "repair":
+                    return ctrl.repair_triage_ticket(tid)
+                return ctrl.dismiss_triage_ticket(tid)
+
+            self._send_controller_json(_post_triage_ticket_action)
             return
 
         if path == "/api/autonomous/toggle":

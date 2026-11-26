@@ -6,14 +6,16 @@ import atexit
 import concurrent.futures
 import hashlib
 import html
+import json
 import logging
 import os
 import re
+import sqlite3
 import tempfile
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +24,7 @@ from agent_factory.adapters.subprocess_runner import SubprocessRunner, resolve_e
 from agent_factory.ports.runner import CommandTimeoutError, Runner
 from agent_factory.recovery_agent import _parse_json_dict_loose
 from agent_factory.secrets import redact_secrets
-from agent_factory.telemetry import update_triage_solution, upsert_triage_error
+from agent_factory.telemetry import _resolve_db_path, update_triage_solution, upsert_triage_error
 
 logger = logging.getLogger(__name__)
 
@@ -435,4 +437,291 @@ def format_agent_error(
         "technical_detail": clean_detail,
         "details_html": summary_html,
     }
+
+
+TICKET_VALID_STATUSES: frozenset[str] = frozenset(
+    {"pendiente", "reparando", "resuelto", "descartado"}
+)
+_SRC_FACTORY_FILE_RE = re.compile(
+    r"(src[\\/]agent_factory[\\/][A-Za-z0-9_./\\-]+\.py)(?:[\"']?\s*,?\s*line\s*(\d+)|:(\d+))?",
+    re.IGNORECASE,
+)
+_JS_LINE_RE = re.compile(r"(?::(\d+)(?::(\d+))?|\bline\s+(\d+))", re.IGNORECASE)
+
+
+def _ensure_triage_tickets_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS triage_tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            error_signature TEXT NOT NULL,
+            source TEXT NOT NULL,
+            error_text TEXT NOT NULL,
+            affected_file TEXT NOT NULL DEFAULT '',
+            affected_lines TEXT NOT NULL DEFAULT '',
+            simple_summary TEXT NOT NULL,
+            repair_prompt TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pendiente'
+                CHECK(status IN ('pendiente', 'reparando', 'resuelto', 'descartado')),
+            occurrences INTEGER NOT NULL DEFAULT 1 CHECK(occurrences >= 1)
+        );
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_triage_tickets_status "
+        "ON triage_tickets(status, updated_at DESC);"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_triage_tickets_sig "
+        "ON triage_tickets(error_signature);"
+    )
+
+
+def _open_tickets_conn(db_path: Path | str | None = None) -> sqlite3.Connection:
+    resolved = _resolve_db_path(db_path)
+    if str(resolved) != ":memory:":
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(resolved), timeout=5.0)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+        _ensure_triage_tickets_schema(conn)
+        conn.commit()
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+def _row_to_ticket(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "created_at": str(row["created_at"]),
+        "updated_at": str(row["updated_at"]),
+        "error_signature": str(row["error_signature"]),
+        "source": str(row["source"]),
+        "error_text": str(row["error_text"]),
+        "affected_file": str(row["affected_file"]),
+        "affected_lines": str(row["affected_lines"]),
+        "simple_summary": str(row["simple_summary"]),
+        "repair_prompt": str(row["repair_prompt"]),
+        "status": str(row["status"]),
+        "occurrences": int(row["occurrences"]),
+    }
+
+
+def _locate_suspect_file_and_lines(
+    source: str,
+    error_text: str,
+) -> tuple[str, str]:
+    matches = _SRC_FACTORY_FILE_RE.findall(error_text)
+    if matches:
+        last_file, py_line, colon_line = matches[-1]
+        norm_file = last_file.replace("\\", "/")
+        line_str = py_line or colon_line or ""
+        return norm_file, line_str
+
+    src_lower = source.lower()
+    if any(tok in src_lower for tok in ("browser", "client", "js", "fetch", "ui")):
+        line_m = _JS_LINE_RE.search(error_text)
+        line_str = (line_m.group(1) or line_m.group(3) or "") if line_m else ""
+        return "src/agent_factory/dashboard.py", line_str
+    if "boot" in src_lower or "startup" in src_lower or "8000" in src_lower:
+        return "src/agent_factory/dashboard.py", ""
+    return "src/agent_factory/", ""
+
+
+def _targeted_test_for_file(affected_file: str) -> str:
+    norm = affected_file.replace("\\", "/")
+    if norm == "src/agent_factory/dashboard.py":
+        return 'tests/test_dashboard.py -k "triage or autonomous or ideas"'
+    if norm.startswith("src/agent_factory/") and norm.endswith(".py"):
+        stem = Path(norm).stem
+        return f"tests/test_{stem}.py"
+    return "tests/test_error_triage.py"
+
+
+def build_actionable_fix_ticket(
+    source: str,
+    error_text: str,
+    context: Mapping[str, Any] | str | None = None,
+    *,
+    db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Analyze a runtime/JS/HTTP500/startup error, build simple_summary + repair_prompt, and persist/deduplicate ticket."""
+    clean_source = redact_secrets(str(source or "server").strip())[:80] or "server"
+    clean_error = redact_secrets(str(error_text or "").strip())[:4000]
+    if not clean_error:
+        raise ValueError("error_text es obligatorio para generar un ticket de diagnóstico.")
+
+    if isinstance(context, Mapping):
+        clean_ctx = redact_secrets(json.dumps(dict(context), ensure_ascii=False, default=str))[:1200]
+    elif context is not None:
+        clean_ctx = redact_secrets(str(context).strip())[:1200]
+    else:
+        clean_ctx = ""
+
+    affected_file, affected_lines = _locate_suspect_file_and_lines(clean_source, clean_error)
+    sig = compute_error_signature(clean_error, source_file=affected_file or clean_source)
+
+    first_line = clean_error.splitlines()[0].strip()[:180]
+    loc_label = f"{affected_file}:{affected_lines}" if affected_lines else (affected_file or clean_source)
+
+    src_lower = clean_source.lower()
+    if any(tok in src_lower for tok in ("browser", "client", "js", "window.onerror", "unhandledrejection")):
+        simple_summary = f"Ocurrió un error en la interfaz del navegador ({loc_label}): {first_line}"
+    elif "500" in src_lower or "fetch" in src_lower:
+        simple_summary = f"El servidor respondió con error interno (HTTP 500) en {loc_label}: {first_line}"
+    elif "startup" in src_lower or "boot" in src_lower or "watchdog" in src_lower:
+        simple_summary = f"El servidor en el puerto 8000 falló al arrancar y fue restaurado automáticamente ({loc_label}): {first_line}"
+    else:
+        simple_summary = f"Se detectó un fallo técnico en {loc_label}: {first_line}"
+
+    target_test = _targeted_test_for_file(affected_file)
+    ruff_target = affected_file if affected_file.endswith(".py") else "src/agent_factory/"
+    ctx_section = f"\nContexto adicional:\n{clean_ctx}\n" if clean_ctx else ""
+
+    repair_prompt = (
+        "Diagnostica y corrige el siguiente error real capturado en Agent Factory (Liwi) siguiendo TDD.\n"
+        "REGLAS: NO modifiques .env, MASTER_PROMPT.md, AGENTS.md, config/models.toml, data/ ni workspaces/.\n"
+        f"Origen del fallo: {clean_source}\n"
+        f"Archivo sospechoso: {loc_label}\n"
+        f"{ctx_section}\n"
+        f"Error / Stacktrace exacto:\n{clean_error}\n\n"
+        "Pasos requeridos:\n"
+        "1. Escribe o actualiza primero una prueba unitaria dirigida que reproduzca el fallo.\n"
+        "2. Aplica la corrección mínima y limpia en el archivo afectado.\n"
+        f"3. Verifica con:\n   ruff check {ruff_target}\n   pytest -q --no-cov {target_test}\n"
+    )
+
+    now_iso = datetime.now(UTC).isoformat()
+    conn = _open_tickets_conn(db_path)
+    try:
+        existing = conn.execute(
+            "SELECT * FROM triage_tickets "
+            "WHERE error_signature = ? AND status IN ('pendiente', 'reparando') "
+            "ORDER BY id DESC LIMIT 1;",
+            (sig,),
+        ).fetchone()
+        if existing is not None:
+            conn.execute(
+                "UPDATE triage_tickets SET occurrences = occurrences + 1, updated_at = ? WHERE id = ?;",
+                (now_iso, int(existing["id"])),
+            )
+            conn.commit()
+            refreshed = conn.execute(
+                "SELECT * FROM triage_tickets WHERE id = ?;",
+                (int(existing["id"]),),
+            ).fetchone()
+            assert refreshed is not None
+            payload = _row_to_ticket(refreshed)
+            payload["deduplicated"] = True
+            return payload
+
+        cur = conn.execute(
+            """
+            INSERT INTO triage_tickets (
+                created_at, updated_at, error_signature, source, error_text,
+                affected_file, affected_lines, simple_summary, repair_prompt, status, occurrences
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pendiente', 1);
+            """,
+            (
+                now_iso,
+                now_iso,
+                sig,
+                clean_source,
+                clean_error,
+                affected_file,
+                affected_lines,
+                simple_summary[:500],
+                repair_prompt[:4000],
+            ),
+        )
+        conn.commit()
+        created = conn.execute(
+            "SELECT * FROM triage_tickets WHERE id = ?;",
+            (int(cur.lastrowid),),
+        ).fetchone()
+        assert created is not None
+        payload = _row_to_ticket(created)
+        payload["deduplicated"] = False
+        return payload
+    finally:
+        conn.close()
+
+
+def list_triage_tickets(
+    *,
+    status: str | None = "pendiente",
+    limit: int = 20,
+    db_path: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    """List actionable fix tickets ordered newest/most-recent first."""
+    bounded = max(1, min(int(limit), 200))
+    conn = _open_tickets_conn(db_path)
+    try:
+        if status is not None:
+            clean_st = str(status).strip().lower()
+            if clean_st not in TICKET_VALID_STATUSES:
+                raise ValueError(f"Estado de ticket inválido: {status!r}")
+            rows = conn.execute(
+                "SELECT * FROM triage_tickets WHERE status = ? ORDER BY updated_at DESC, id DESC LIMIT ?;",
+                (clean_st, bounded),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM triage_tickets ORDER BY updated_at DESC, id DESC LIMIT ?;",
+                (bounded,),
+            ).fetchall()
+        return [_row_to_ticket(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_triage_ticket(
+    ticket_id: int,
+    *,
+    db_path: Path | str | None = None,
+) -> dict[str, Any] | None:
+    """Return a single triage ticket by id, or None."""
+    if isinstance(ticket_id, bool) or not isinstance(ticket_id, int) or ticket_id <= 0:
+        raise ValueError(f"ticket_id inválido: {ticket_id!r}")
+    conn = _open_tickets_conn(db_path)
+    try:
+        row = conn.execute("SELECT * FROM triage_tickets WHERE id = ?;", (ticket_id,)).fetchone()
+        return _row_to_ticket(row) if row is not None else None
+    finally:
+        conn.close()
+
+
+def update_triage_ticket_status(
+    ticket_id: int,
+    status: str,
+    *,
+    db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Update ticket status cleanly and return updated row."""
+    if isinstance(ticket_id, bool) or not isinstance(ticket_id, int) or ticket_id <= 0:
+        raise ValueError(f"ticket_id inválido: {ticket_id!r}")
+    clean_st = str(status or "").strip().lower()
+    if clean_st not in TICKET_VALID_STATUSES:
+        raise ValueError(f"Estado de ticket inválido: {status!r}")
+    conn = _open_tickets_conn(db_path)
+    try:
+        cur = conn.execute(
+            "UPDATE triage_tickets SET status = ?, updated_at = ? WHERE id = ?;",
+            (clean_st, datetime.now(UTC).isoformat(), ticket_id),
+        )
+        conn.commit()
+        if cur.rowcount <= 0:
+            raise KeyError(f"Ticket de diagnóstico {ticket_id} no encontrado.")
+        row = conn.execute("SELECT * FROM triage_tickets WHERE id = ?;", (ticket_id,)).fetchone()
+        assert row is not None
+        return _row_to_ticket(row)
+    finally:
+        conn.close()
+
 

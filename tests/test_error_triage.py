@@ -470,3 +470,101 @@ def test_report_factory_error_never_propagates_unhandled_exceptions(
         db_path=tmp_path / "telemetry.db",
     )
     assert result is None
+
+
+def test_build_actionable_fix_ticket_locates_suspect_file_deduplicates_and_updates_status(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "telemetry_tickets.db"
+    t1 = error_triage.build_actionable_fix_ticket(
+        "browser_js",
+        "TypeError: Cannot read properties of null at src/agent_factory/dashboard.py:1234",
+        context={"url": "http://127.0.0.1:8000/"},
+        db_path=db_path,
+    )
+    assert t1["status"] == "pendiente"
+    assert t1["occurrences"] == 1
+    assert t1["deduplicated"] is False
+    assert t1["affected_file"] == "src/agent_factory/dashboard.py"
+    assert t1["affected_lines"] == "1234"
+    assert "interfaz del navegador" in t1["simple_summary"]
+    assert "src/agent_factory/dashboard.py:1234" in t1["repair_prompt"]
+    assert "ruff check src/agent_factory/dashboard.py" in t1["repair_prompt"]
+
+    # Repeated error deduplicates and increments occurrences
+    t2 = error_triage.build_actionable_fix_ticket(
+        "browser_js",
+        "TypeError: Cannot read properties of null at src/agent_factory/dashboard.py:1234",
+        db_path=db_path,
+    )
+    assert t2["id"] == t1["id"]
+    assert t2["occurrences"] == 2
+    assert t2["deduplicated"] is True
+    assert len(error_triage.list_triage_tickets(status="pendiente", db_path=db_path)) == 1
+
+    # Resolving hides from pending queue
+    resolved = error_triage.update_triage_ticket_status(t1["id"], "resuelto", db_path=db_path)
+    assert resolved["status"] == "resuelto"
+    assert error_triage.list_triage_tickets(status="pendiente", db_path=db_path) == []
+
+
+def test_supervisor_startup_watchdog_rolls_back_bad_commit_and_records_ticket(
+    tmp_path: Path,
+) -> None:
+    import subprocess
+    import sys
+
+    from agent_factory.supervisor import RESTART_EXIT_CODE, _run_child_with_watchdog
+
+    repo = tmp_path / "repo_watchdog"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "branch", "-M", "main"], cwd=repo, check=True, capture_output=True)
+    (repo / "app.py").write_text("OK = True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@local", "commit", "-m", "good commit"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    good_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    (repo / "app.py").write_text("BROKEN\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@local", "commit", "-m", "bad commit"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    db_path = tmp_path / "watchdog_telemetry.db"
+    exit_code, did_rollback = _run_child_with_watchdog(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.write('SyntaxError in src/agent_factory/dashboard.py:99\\n'); sys.exit(1)",
+        ],
+        health_url="http://127.0.0.1:8000/api/autonomous/status",
+        startup_timeout_seconds=0.8,
+        health_check_fn=lambda _u: False,
+        sleep_fn=lambda _s: None,
+        repo_root=repo,
+        db_path=db_path,
+        allow_rollback=True,
+    )
+    assert did_rollback is True
+    assert exit_code == RESTART_EXIT_CODE
+    head_after = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    assert head_after == good_sha
+
+    tickets = error_triage.list_triage_tickets(status="pendiente", db_path=db_path)
+    assert len(tickets) == 1
+    assert tickets[0]["source"] == "startup_watchdog"
+    assert tickets[0]["affected_file"] == "src/agent_factory/dashboard.py"
+
