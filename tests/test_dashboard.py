@@ -7974,6 +7974,155 @@ def test_dashboard_auto_ideas_header_button_scrolls_to_radar_and_auto_loads_idea
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_header_popover_controller_staging_autoclose_and_mutual_exclusion(
+    tmp_path: Path,
+) -> None:
+    """Header popovers (staging & settings) use a central JS controller with outside-click, Escape, mutual exclusion, and non-invasive staging close/positioning."""
+    store = SqliteEventStore(str(tmp_path / "popover_ctrl_staging.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as resp:
+            assert resp.status == 200
+            html = resp.read().decode("utf-8")
+
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+
+        header_start = html.index("<header>")
+        header_end = html.index("</header>", header_start)
+        header_html = html[header_start:header_end]
+
+        # Staging popover has an explicit non-invasive close button inside its header
+        assert 'id="staging-popover-close"' in header_html
+        assert 'id="staging-popover"' in header_html
+        assert header_html.index('id="staging-popover"') < header_html.index('id="staging-popover-close"')
+
+        style_start = html.index("<style>") + len("<style>")
+        style_end = html.index("</style>", style_start)
+        css = html[style_start:style_end]
+        staging_pop_desktop = _extract_css_block(css, ".staging-popover {")
+        assert staging_pop_desktop
+        assert "max-height:" in staging_pop_desktop
+        assert "overflow-y: auto;" in staging_pop_desktop
+
+        media_768 = _extract_css_block(css, "@media (max-width: 768px)")
+        assert media_768
+        staging_pop_mobile = _extract_css_block(media_768, "header .staging-popover")
+        assert staging_pop_mobile
+        assert "max-height:" in staging_pop_mobile
+        assert "overflow-y: auto;" in staging_pop_mobile
+
+        script_js = html[html.index("<script>") :]
+        assert "headerPopoverController" in script_js
+        assert "createHeaderPopoverController" in script_js
+        assert "handleOutsideClick" in script_js
+        assert "handleKeydown" in script_js
+        assert "exceptId" in script_js
+        assert "document.addEventListener('click'" in script_js
+        assert "document.addEventListener('keydown'" in script_js
+        assert "ev.key === 'Escape'" in script_js
+        assert "headerPopoverController.register('settings'" in script_js
+        assert "headerPopoverController.register('staging'" in script_js
+        assert "headerPopoverController.toggle('settings')" in script_js
+        assert "headerPopoverController.toggle('staging')" in script_js
+        assert "headerPopoverController.close('staging'" in script_js
+        assert "getBoundingClientRect()" in script_js
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_compact_header_groups_themes_inside_settings_menu(
+    tmp_path: Path,
+) -> None:
+    """Compact header groups Temas inside the single Ajustes dropdown while preserving all existing HTML IDs, 5 themes, zero CDNs, and desktop/mobile CSS boundaries."""
+    store = SqliteEventStore(str(tmp_path / "compact_header_themes.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as resp:
+            assert resp.status == 200
+            html = resp.read().decode("utf-8")
+
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+
+        header_start = html.index("<header>")
+        header_end = html.index("</header>", header_start)
+        header_html = html[header_start:header_end]
+
+        # All existing header IDs preserved
+        for dom_id in (
+            "server-health-dot",
+            "server-health-label",
+            "status-note",
+            "view-mode-segmented",
+            "view-mode-simple",
+            "view-mode-dev",
+            "tech-mode-toggle",
+            "staging-banner-wrap",
+            "staging-banner-btn",
+            "staging-popover",
+            "auto-ideas-btn",
+            "auto-ideas-count",
+            "improve-factory-btn",
+            "settings-menu-btn",
+            "settings-popover",
+            "lan-mode-toggle",
+            "voice-tts-toggle",
+            "theme-btn",
+            "themes-menu-btn",
+            "themes-popover",
+            "settings-feedback",
+        ):
+            assert f'id="{dom_id}"' in header_html, f"Missing preserved header ID: {dom_id}"
+
+        # Temas selector is grouped inside #settings-popover instead of adding a standalone top-bar button
+        settings_pop_idx = header_html.index('id="settings-popover"')
+        themes_btn_idx = header_html.index('id="themes-menu-btn"')
+        themes_pop_idx = header_html.index('id="themes-popover"')
+        settings_fb_idx = header_html.index('id="settings-feedback"')
+        assert settings_pop_idx < themes_btn_idx < themes_pop_idx < settings_fb_idx
+
+        # All 5 theme choices remain intact inside #themes-popover
+        themes_section = header_html[themes_pop_idx:settings_fb_idx]
+        for choice in ("dark", "light", "emerald", "sunset", "lavender"):
+            assert f'data-theme-choice="{choice}"' in themes_section
+
+        # Mobile responsive rules for the compact grouped settings/themes dropdown live inside @media (max-width: 768px)
+        style_start = html.index("<style>") + len("<style>")
+        style_end = html.index("</style>", style_start)
+        css = html[style_start:style_end]
+        media_768 = _extract_css_block(css, "@media (max-width: 768px)")
+        assert media_768
+        assert "header .settings-popover .themes-popover" in media_768
+        assert "header .settings-popover .themes-menu-wrap" in media_768
+
+        # Desktop header and controls rules remain untouched outside @media (max-width: 768px)
+        desktop_css = css.replace(media_768, "")
+        desktop_header = _extract_css_block(desktop_css, "header {")
+        assert "display: flex;" in desktop_header
+        assert "justify-content: space-between;" in desktop_header
+        assert ".controls { display: flex; align-items: center; gap: 10px; }" in desktop_css
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+
 
 
 

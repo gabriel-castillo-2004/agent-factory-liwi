@@ -3886,10 +3886,38 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       z-index: 35;
     }
     .settings-popover {
-      min-width: 260px;
+      min-width: 268px;
+      max-width: min(320px, calc(100vw - 24px));
+      max-height: min(75vh, 520px);
+      overflow-y: auto;
       padding: 12px;
       gap: 10px;
-      z-index: 30;
+      z-index: 45;
+    }
+    .settings-popover .themes-menu-wrap {
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 6px;
+      padding-top: 8px;
+      border-top: 1px solid var(--border);
+    }
+    .settings-themes-trigger {
+      width: 100%;
+      justify-content: space-between;
+    }
+    .settings-popover .themes-popover {
+      position: static;
+      top: auto;
+      right: auto;
+      min-width: 0;
+      width: 100%;
+      padding: 6px;
+      gap: 4px;
+      background: var(--bg);
+      box-shadow: none;
+      z-index: auto;
     }
     .staging-banner-wrap {
       position: relative;
@@ -3924,7 +3952,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       top: calc(100% + 8px);
       right: 0;
       min-width: 280px;
-      max-width: 360px;
+      max-width: min(340px, calc(100vw - 24px));
+      max-height: min(60vh, 420px);
+      overflow-y: auto;
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 10px;
@@ -3941,6 +3971,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       justify-content: space-between;
       gap: 8px;
       font-size: 0.85rem;
+    }
+    .staging-popover-head-right {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .staging-popover-close {
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      border-radius: 6px;
+      width: 24px;
+      height: 24px;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 0.85rem;
+      line-height: 1;
+    }
+    .staging-popover-close:hover {
+      background: var(--surface-alt);
+      border-color: var(--border);
+      color: var(--text);
     }
     .staging-commits-list {
       list-style: none;
@@ -4857,6 +4913,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         max-width: calc(100vw - 24px);
         z-index: 80;
       }
+      header .settings-popover {
+        max-height: calc(100vh - 124px);
+        overflow-y: auto;
+      }
+      header .settings-popover .themes-menu-wrap {
+        width: 100%;
+        flex-direction: column;
+        align-items: stretch;
+      }
+      header .settings-popover #themes-menu-btn {
+        width: 100%;
+        justify-content: space-between;
+      }
+      header .settings-popover .themes-popover {
+        position: static;
+        top: auto;
+        right: auto;
+        left: auto;
+        min-width: 0;
+        width: 100%;
+        max-width: 100%;
+        box-shadow: none;
+        z-index: auto;
+      }
       header .controls .staging-banner-wrap {
         flex-shrink: 0;
         display: inline-flex;
@@ -4880,6 +4960,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         left: 12px;
         min-width: 0;
         max-width: calc(100vw - 24px);
+        max-height: calc(100vh - 124px);
+        overflow-y: auto;
         z-index: 85;
       }
       .staging-popover .staging-commits-list {
@@ -6414,31 +6496,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <button id="view-mode-dev" type="button" class="seg-btn" data-view-mode="dev" aria-label="Vista Desarrollador">Desarrollador</button>
         <input id="tech-mode-toggle" type="checkbox" class="sr-only" aria-label="Modo técnico" />
       </div>
-      <div class="themes-menu-wrap">
-        <button id="themes-menu-btn" class="btn btn-sm" type="button" aria-expanded="false" aria-controls="themes-popover">🎨 Temas</button>
-        <div id="themes-popover" class="themes-popover" role="menu" aria-label="Temas de color" style="display:none">
-          <button type="button" class="theme-option active" data-theme-choice="dark" role="menuitemradio" aria-checked="true">
-            <span class="theme-swatch" style="background:linear-gradient(135deg,#0b0f19 50%,#38bdf8 50%);"></span>
-            <span>Noche Profunda (Oscuro)</span>
-          </button>
-          <button type="button" class="theme-option" data-theme-choice="light" role="menuitemradio" aria-checked="false">
-            <span class="theme-swatch" style="background:linear-gradient(135deg,#f8fafc 50%,#0369a1 50%);"></span>
-            <span>Luz Editorial (Claro)</span>
-          </button>
-          <button type="button" class="theme-option" data-theme-choice="emerald" role="menuitemradio" aria-checked="false">
-            <span class="theme-swatch" style="background:linear-gradient(135deg,#0b1915 50%,#34d399 50%);"></span>
-            <span>Bosque Esmeralda</span>
-          </button>
-          <button type="button" class="theme-option" data-theme-choice="sunset" role="menuitemradio" aria-checked="false">
-            <span class="theme-swatch" style="background:linear-gradient(135deg,#1b1311 50%,#fb923c 50%);"></span>
-            <span>Atardecer Terracota</span>
-          </button>
-          <button type="button" class="theme-option" data-theme-choice="lavender" role="menuitemradio" aria-checked="false">
-            <span class="theme-swatch" style="background:linear-gradient(135deg,#14141f 50%,#a78bfa 50%);"></span>
-            <span>Grafito Lavanda</span>
-          </button>
-        </div>
-      </div>
       <div id="staging-banner-wrap" class="staging-banner-wrap" style="display:none">
         <button id="staging-banner-btn" class="btn btn-sm staging-pill" type="button" aria-expanded="false" aria-controls="staging-popover" title="Estado de auto-mejoras en staging">
           <span id="staging-banner-spinner" class="btn-spinner" aria-hidden="true" style="display:none"></span>
@@ -6447,7 +6504,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div id="staging-popover" class="staging-popover" role="region" aria-label="Mejoras en staging" style="display:none">
           <div class="staging-popover-head">
             <strong id="staging-popover-title">Mejoras listas para aplicar</strong>
-            <span id="staging-popover-meta" class="muted"></span>
+            <div class="staging-popover-head-right">
+              <span id="staging-popover-meta" class="muted"></span>
+              <button id="staging-popover-close" class="staging-popover-close" type="button" aria-label="Cerrar panel de staging" title="Cerrar">✕</button>
+            </div>
           </div>
           <ul id="staging-commits-list" class="staging-commits-list"></ul>
           <div id="staging-popover-error" class="staging-popover-error" role="alert" style="display:none"></div>
@@ -6477,6 +6537,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="settings-item" style="padding-top:6px; border-top:1px solid var(--border);">
             <span>Apariencia</span>
             <button id="theme-btn" class="btn btn-sm" type="button">Modo claro</button>
+          </div>
+          <div class="themes-menu-wrap">
+            <button id="themes-menu-btn" class="btn btn-sm settings-themes-trigger" type="button" aria-expanded="false" aria-controls="themes-popover">🎨 Temas</button>
+            <div id="themes-popover" class="themes-popover" role="menu" aria-label="Temas de color" style="display:none">
+              <button type="button" class="theme-option active" data-theme-choice="dark" role="menuitemradio" aria-checked="true">
+                <span class="theme-swatch" style="background:linear-gradient(135deg,#0b0f19 50%,#38bdf8 50%);"></span>
+                <span>Noche Profunda (Oscuro)</span>
+              </button>
+              <button type="button" class="theme-option" data-theme-choice="light" role="menuitemradio" aria-checked="false">
+                <span class="theme-swatch" style="background:linear-gradient(135deg,#f8fafc 50%,#0369a1 50%);"></span>
+                <span>Luz Editorial (Claro)</span>
+              </button>
+              <button type="button" class="theme-option" data-theme-choice="emerald" role="menuitemradio" aria-checked="false">
+                <span class="theme-swatch" style="background:linear-gradient(135deg,#0b1915 50%,#34d399 50%);"></span>
+                <span>Bosque Esmeralda</span>
+              </button>
+              <button type="button" class="theme-option" data-theme-choice="sunset" role="menuitemradio" aria-checked="false">
+                <span class="theme-swatch" style="background:linear-gradient(135deg,#1b1311 50%,#fb923c 50%);"></span>
+                <span>Atardecer Terracota</span>
+              </button>
+              <button type="button" class="theme-option" data-theme-choice="lavender" role="menuitemradio" aria-checked="false">
+                <span class="theme-swatch" style="background:linear-gradient(135deg,#14141f 50%,#a78bfa 50%);"></span>
+                <span>Grafito Lavanda</span>
+              </button>
+            </div>
           </div>
           <div id="settings-feedback" class="settings-feedback" style="display:none"></div>
         </div>
@@ -7139,33 +7224,153 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       setNote('✓ ' + label, 'ok');
     });
 
-    function closeFloatingDropdowns() {
-      document.querySelectorAll('.more-popover, .themes-popover, .settings-popover').forEach((pop) => {
-        pop.style.display = 'none';
-      });
-      if (!window.__stagingPromoteInFlight) {
-        const stPop = document.getElementById('staging-popover');
-        if (stPop) stPop.style.display = 'none';
-        const stBtn = document.getElementById('staging-banner-btn');
-        if (stBtn) stBtn.setAttribute('aria-expanded', 'false');
+    const headerPopoverController = (function createHeaderPopoverController() {
+      const entries = new Map();
+
+      function positionPopover(entry) {
+        if (!entry || !entry.popover) return;
+        const headerEl = document.querySelector('header');
+        if (window.innerWidth <= 768 && headerEl && typeof headerEl.getBoundingClientRect === 'function') {
+          const rect = headerEl.getBoundingClientRect();
+          const topPx = Math.max(56, Math.round(rect.bottom + 6));
+          entry.popover.style.top = topPx + 'px';
+        } else {
+          entry.popover.style.top = '';
+        }
       }
-      document.querySelectorAll('[aria-controls="project-more-popover"], [aria-controls="header-more-popover"], [aria-controls="audit-more-actions-menu"], [aria-controls="quality-more-actions-menu"], #themes-menu-btn, #settings-menu-btn').forEach((b) => {
-        b.setAttribute('aria-expanded', 'false');
-      });
+
+      function isOpen(id) {
+        const entry = entries.get(id);
+        return Boolean(entry && entry.popover && entry.popover.style.display !== 'none');
+      }
+
+      function close(id, opts) {
+        const entry = entries.get(id);
+        if (!entry || !entry.popover) return false;
+        const force = Boolean(opts && opts.force);
+        if (!force && typeof entry.canClose === 'function' && !entry.canClose()) {
+          return false;
+        }
+        entry.popover.style.display = 'none';
+        entry.popover.setAttribute('data-open', 'false');
+        if (entry.trigger) entry.trigger.setAttribute('aria-expanded', 'false');
+        if (typeof entry.onClose === 'function') entry.onClose();
+        return true;
+      }
+
+      function closeMoreDropdowns() {
+        document.querySelectorAll('.more-popover').forEach((pop) => {
+          pop.style.display = 'none';
+        });
+        document.querySelectorAll('[aria-controls="project-more-popover"], [aria-controls="header-more-popover"], [aria-controls="audit-more-actions-menu"], [aria-controls="quality-more-actions-menu"]').forEach((b) => {
+          b.setAttribute('aria-expanded', 'false');
+        });
+      }
+
+      function closeAll(opts) {
+        const exceptId = opts && opts.exceptId ? String(opts.exceptId) : '';
+        const force = Boolean(opts && opts.force);
+        entries.forEach((entry, id) => {
+          if (id === exceptId) return;
+          close(id, { force: force });
+        });
+        closeMoreDropdowns();
+      }
+
+      function open(id) {
+        const entry = entries.get(id);
+        if (!entry || !entry.popover) return false;
+        closeAll({ exceptId: id });
+        entry.popover.style.display = 'flex';
+        entry.popover.setAttribute('data-open', 'true');
+        if (entry.trigger) entry.trigger.setAttribute('aria-expanded', 'true');
+        positionPopover(entry);
+        if (typeof entry.onOpen === 'function') entry.onOpen();
+        return true;
+      }
+
+      function toggle(id) {
+        if (isOpen(id)) {
+          return close(id);
+        }
+        return open(id);
+      }
+
+      function register(id, config) {
+        if (!id || !config || !config.popover) return;
+        entries.set(String(id), {
+          id: String(id),
+          container: config.container || null,
+          trigger: config.trigger || null,
+          popover: config.popover,
+          canClose: typeof config.canClose === 'function' ? config.canClose : null,
+          onOpen: typeof config.onOpen === 'function' ? config.onOpen : null,
+          onClose: typeof config.onClose === 'function' ? config.onClose : null,
+        });
+      }
+
+      function handleOutsideClick(target) {
+        entries.forEach((entry, id) => {
+          if (!isOpen(id)) return;
+          const inContainer = Boolean(entry.container && target && entry.container.contains(target));
+          const inTrigger = Boolean(entry.trigger && target && entry.trigger.contains(target));
+          const inPopover = Boolean(entry.popover && target && entry.popover.contains(target));
+          if (!inContainer && !inTrigger && !inPopover) {
+            close(id);
+          }
+        });
+        const insideMore = target && target.closest ? target.closest('.more-menu-wrap, .audit-primary-split') : null;
+        if (!insideMore) {
+          closeMoreDropdowns();
+        }
+      }
+
+      function handleKeydown(ev) {
+        if (ev && ev.key === 'Escape') {
+          closeAll();
+        }
+      }
+
+      function repositionOpen() {
+        entries.forEach((entry, id) => {
+          if (isOpen(id)) positionPopover(entry);
+        });
+      }
+
+      return {
+        register: register,
+        isOpen: isOpen,
+        open: open,
+        close: close,
+        toggle: toggle,
+        closeAll: closeAll,
+        handleOutsideClick: handleOutsideClick,
+        handleKeydown: handleKeydown,
+        repositionOpen: repositionOpen,
+      };
+    })();
+    window.headerPopoverController = headerPopoverController;
+
+    function closeFloatingDropdowns(opts) {
+      headerPopoverController.closeAll(opts);
     }
 
     document.addEventListener('click', (ev) => {
-      const target = ev.target;
-      const insideWrap = target && target.closest ? target.closest('.themes-menu-wrap, .settings-menu-wrap, .staging-banner-wrap, .more-menu-wrap, .audit-primary-split') : null;
-      if (!insideWrap) {
-        closeFloatingDropdowns();
-      }
+      headerPopoverController.handleOutsideClick(ev.target);
     });
     document.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Escape') {
-        closeFloatingDropdowns();
-      }
+      headerPopoverController.handleKeydown(ev);
     });
+    window.addEventListener('resize', () => {
+      headerPopoverController.repositionOpen();
+    });
+
+    function collapseNestedThemesMenu() {
+      const btn = document.getElementById('themes-menu-btn');
+      const pop = document.getElementById('themes-popover');
+      if (pop) pop.style.display = 'none';
+      if (btn) btn.setAttribute('aria-expanded', 'false');
+    }
 
     (function initThemesPopover() {
       const btn = document.getElementById('themes-menu-btn');
@@ -7173,19 +7378,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (!btn || !pop) return;
       btn.addEventListener('click', (ev) => {
         ev.stopPropagation();
+        headerPopoverController.close('staging');
         const isOpen = pop.style.display !== 'none';
-        closeFloatingDropdowns();
-        if (!isOpen) {
-          pop.style.display = 'flex';
-          btn.setAttribute('aria-expanded', 'true');
-        }
+        pop.style.display = isOpen ? 'none' : 'flex';
+        btn.setAttribute('aria-expanded', isOpen ? 'false' : 'true');
       });
       pop.querySelectorAll('.theme-option[data-theme-choice]').forEach((opt) => {
         opt.addEventListener('click', () => {
           const chosen = opt.getAttribute('data-theme-choice') || 'dark';
           applyTheme(chosen);
-          closeFloatingDropdowns();
+          headerPopoverController.closeAll();
           const title = THEME_LABELS[chosen] || chosen;
+          showSettingsFeedback('✓ Tema: ' + title);
           setNote('✓ Tema aplicado: ' + title, 'ok');
         });
       });
@@ -7234,14 +7438,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const btn = document.getElementById('settings-menu-btn');
       const pop = document.getElementById('settings-popover');
       if (!btn || !pop) return;
+      const wrap = btn.closest('.settings-menu-wrap') || pop.parentElement;
+      headerPopoverController.register('settings', {
+        container: wrap,
+        trigger: btn,
+        popover: pop,
+        onClose: collapseNestedThemesMenu,
+      });
       btn.addEventListener('click', (ev) => {
         ev.stopPropagation();
-        const isOpen = pop.style.display !== 'none';
-        closeFloatingDropdowns();
-        if (!isOpen) {
-          pop.style.display = 'flex';
-          btn.setAttribute('aria-expanded', 'true');
-        }
+        headerPopoverController.toggle('settings');
       });
     })();
 
@@ -12876,6 +13082,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const popover = document.getElementById('staging-popover');
       const popTitleEl = document.getElementById('staging-popover-title');
       const popMetaEl = document.getElementById('staging-popover-meta');
+      const popCloseBtn = document.getElementById('staging-popover-close');
       const commitsListEl = document.getElementById('staging-commits-list');
       const popErrorEl = document.getElementById('staging-popover-error');
       const promoteBtn = document.getElementById('staging-promote-btn');
@@ -13093,13 +13300,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       btn.addEventListener('click', (ev) => {
         ev.stopPropagation();
-        const isOpen = popover.style.display !== 'none';
-        closeFloatingDropdowns();
-        if (!isOpen) {
-          popover.style.display = 'flex';
-          btn.setAttribute('aria-expanded', 'true');
+        headerPopoverController.toggle('staging');
+      });
+
+      if (popCloseBtn) {
+        popCloseBtn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          headerPopoverController.close('staging');
+        });
+      }
+
+      headerPopoverController.register('staging', {
+        container: wrap,
+        trigger: btn,
+        popover: popover,
+        canClose: () => !promoteInFlight,
+        onOpen: () => {
           pollStagingStatus();
-        }
+        },
       });
 
       promoteBtn.addEventListener('click', async () => {
