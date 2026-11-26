@@ -3882,18 +3882,185 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
     @media (max-width: 768px) {
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
       html,
       body {
-        max-width: 100%;
+        max-width: 100vw;
         overflow-x: hidden;
         box-sizing: border-box;
       }
-      header,
+      main.layout,
       .layout,
-      #sidebar-panel {
-        max-width: 100%;
+      header,
+      .panel,
+      #sidebar-panel,
+      #detail-panel,
+      #detail-content,
+      #detail-work-split,
+      #detail-main-col,
+      .live-activity-shell,
+      .live-activity-banner,
+      .live-activity-main,
+      .live-activity-stall,
+      .panel-header,
+      .project-card,
+      .card-header,
+      .card-title-wrap,
+      .model-usage-row,
+      .stage-segments,
+      .detail-header,
+      .detail-titles,
+      .title-row,
+      .detail-header-status,
+      .banner-content,
+      .banner-body,
+      .banner-actions,
+      .doctor-recovery-card,
+      .doctor-recovery-badges,
+      .factory-progress-card,
+      .factory-steps-bar,
+      .secondary-actions,
+      .tab-content,
+      .plan-meta,
+      .file-card,
+      .timeline-header,
+      .timeline-title-group,
+      .phase-card,
+      .phase-summary,
+      .phase-summary-left,
+      .edit-title-form,
+      .input-inline,
+      .local-controls-row,
+      .modify-box,
+      .modify-panel-card,
+      .new-project-form,
+      .new-project-actions,
+      .history-toolbar,
+      .round-card,
+      .round-meta,
+      .file-chips,
+      .input-row-with-mic,
+      .modal-card,
+      .audit-toolbar,
+      #audit-chat-panel,
+      .audit-thread,
+      #audit-chat-stream,
+      .audit-chat-stream,
+      .audit-chat-composer,
+      .audit-msg,
+      .chat-msg,
+      .audit-msg-head,
+      .audit-msg-actions,
+      .chat-msg-footer,
+      .versions-panel,
+      .versions-row,
+      .versions-row > select,
+      .preview-card,
+      .preview-toolbar,
+      .example-prompts,
+      .toast-item,
+      .inline-error-box,
+      .simple-rollback-bar,
+      .audit-filters,
+      .audit-card,
+      .audit-card-head,
+      .audit-reader,
+      .audit-reader-bar,
+      .audit-toc,
+      .quality-scorecard,
+      .quality-scorecard-head,
+      .quality-bars-grid,
+      .quality-bar-item,
+      .quality-bar-label,
+      .md-code-wrap,
+      .md-table-wrap,
+      .target-picker,
+      .target-chips,
+      .file-check-row,
+      .diff-file-card,
+      .diff-file-head,
+      .version-card,
+      .version-head,
+      .version-actions,
+      .history-versions-section,
+      .history-versions-header,
+      .version-quality-row,
+      .version-quality-bars,
+      .factory-chat-modal,
+      .factory-chat-head,
+      .factory-chat-head-left,
+      .factory-chat-meta-col,
+      .factory-memory-panel,
+      .factory-memory-item,
+      .factory-chat-stream,
+      .factory-msg,
+      .factory-pre-wrap,
+      .factory-proposal-card,
+      .factory-composer-wrap,
+      .factory-composer-inner,
+      .factory-composer-capsule,
+      .factory-paste-previews,
+      .factory-composer-row,
+      .factory-fs-card {
         min-width: 0;
+        max-width: 100%;
         box-sizing: border-box;
+      }
+      code,
+      .md-body code,
+      .md-code-wrap pre code,
+      .file-path,
+      .file-chip,
+      .md-file-ref,
+      .audit-card-diag,
+      .doctor-recovery-card,
+      .inline-error-box,
+      .audit-msg-body,
+      .factory-fs-detail,
+      #live-activity-subtext,
+      #factory-build-banner-detail,
+      #factory-progress-detail {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+        max-width: 100%;
+      }
+      .md-body,
+      .banner-desc,
+      .banner-subdesc,
+      .audit-card-excerpt,
+      .spec-section p,
+      .spec-section li,
+      .plan-summary,
+      .round-summary,
+      .timeline-next,
+      .factory-msg-user,
+      .factory-msg-assistant,
+      .version-polish-note,
+      .toast-item,
+      .readonly-mod-notice,
+      .inactivity-note {
+        overflow-wrap: anywhere;
+        word-break: break-word;
+        max-width: 100%;
+      }
+      pre,
+      details.tech-details pre,
+      .doctor-prompt-pre,
+      .diff-pre,
+      .md-code-wrap pre,
+      .factory-msg-body pre,
+      .factory-pre-wrap pre,
+      .factory-proposal-card .doctor-prompt-pre {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+        max-width: 100%;
+        overflow-x: auto;
       }
       header {
         width: 100%;
@@ -3924,6 +4091,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         flex-shrink: 0;
         display: inline-flex;
         align-items: center;
+      }
+      header .controls > button,
+      header .controls > div > button {
+        min-height: 38px;
+        white-space: nowrap;
+        flex-shrink: 0;
+        font-size: 0.84rem;
+        padding: 6px 10px;
       }
       header .controls .btn,
       header .controls .seg-btn,

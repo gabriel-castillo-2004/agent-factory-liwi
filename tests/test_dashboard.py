@@ -6462,3 +6462,154 @@ def test_dashboard_mobile_responsive_topbar_and_project_card_refinements(
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_mobile_responsive_overflow_containment_and_header(
+    tmp_path: Path,
+) -> None:
+    """Step 1 mobile audit: global anti-overflow containment, long-path/code wrapping, top-bar scroll, and single-line project selector live strictly inside @media (max-width: 768px)."""
+    store = SqliteEventStore(str(tmp_path / "mobile_overflow_step1.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as resp:
+            assert resp.status == 200
+            html = resp.read().decode("utf-8")
+
+        # 1. Zero external CDNs and all key HTML IDs intact
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+        for dom_id in (
+            "view-mode-simple",
+            "view-mode-dev",
+            "themes-menu-btn",
+            "improve-factory-btn",
+            "settings-menu-btn",
+            "sidebar-panel",
+            "detail-panel",
+            "mobile-project-switcher",
+            "mobile-new-project-shortcut",
+        ):
+            assert f'id="{dom_id}"' in html, f"Missing existing HTML id: {dom_id}"
+
+        style_start = html.index("<style>") + len("<style>")
+        style_end = html.index("</style>", style_start)
+        css = html[style_start:style_end]
+
+        media_768 = _extract_css_block(css, "@media (max-width: 768px)")
+        assert media_768, "Expected @media (max-width: 768px) block in dashboard CSS"
+
+        # 2. Global box-sizing and 100vw / overflow-x: hidden containment
+        universal_box_rule = _extract_css_block(media_768, "*,\n      *::before,\n      *::after")
+        assert universal_box_rule, "Expected *, *::before, *::after rule inside @media (max-width: 768px)"
+        assert "box-sizing: border-box;" in universal_box_rule
+
+        html_body_rule = _extract_css_block(media_768, "html,\n      body")
+        assert html_body_rule, "Expected html, body rule inside @media (max-width: 768px)"
+        assert "max-width: 100vw;" in html_body_rule
+        assert "overflow-x: hidden;" in html_body_rule
+
+        # 3. Main containers, cards, panels, and flex/grid rows enforce min-width: 0 and max-width: 100%
+        containment_rule = _extract_css_block(media_768, "main.layout")
+        assert containment_rule, "Expected containers/cards/panels/flex/grid containment rule inside @media (max-width: 768px)"
+        assert "min-width: 0;" in containment_rule
+        assert "max-width: 100%;" in containment_rule
+        for container_sel in (
+            ".panel",
+            ".project-card",
+            ".phase-card",
+            ".audit-card",
+            ".version-card",
+            ".doctor-recovery-card",
+            ".live-activity-banner",
+            ".live-activity-main",
+            ".quality-bars-grid",
+            ".factory-steps-bar",
+            ".versions-row",
+            ".audit-toolbar",
+            ".modal-card",
+        ):
+            assert container_sel in media_768, f"Expected {container_sel} contained inside @media (max-width: 768px)"
+
+        # 4. Long text, Windows paths, logs, diagnostics, errors, <code>, and <pre> wrapping + scroll
+        wrap_rule = _extract_css_block(media_768, "code,\n      .md-body code")
+        assert wrap_rule, "Expected code/logs/diagnostics wrapping rule inside @media (max-width: 768px)"
+        assert "white-space: pre-wrap;" in wrap_rule
+        assert "overflow-wrap: anywhere;" in wrap_rule
+        assert "word-break: break-word;" in wrap_rule
+        assert "max-width: 100%;" in wrap_rule
+        for diag_sel in (
+            "details.tech-details pre",
+            ".doctor-prompt-pre",
+            ".diff-pre",
+            ".audit-card-diag",
+            ".inline-error-box",
+            ".file-path",
+            ".md-file-ref",
+        ):
+            assert diag_sel in media_768, f"Expected {diag_sel} in mobile wrap rules"
+
+        pre_scroll_rule = _extract_css_block(media_768, "pre,\n      details.tech-details pre")
+        assert pre_scroll_rule, "Expected <pre> wrapping and overflow-x: auto rule inside @media (max-width: 768px)"
+        assert "white-space: pre-wrap;" in pre_scroll_rule
+        assert "overflow-wrap: anywhere;" in pre_scroll_rule
+        assert "word-break: break-word;" in pre_scroll_rule
+        assert "max-width: 100%;" in pre_scroll_rule
+        assert "overflow-x: auto;" in pre_scroll_rule
+
+        # 5. Top bar scrollable button strip and touch-friendly button sizing
+        controls_rule = _extract_css_block(media_768, "header .controls {")
+        assert controls_rule, "Expected header .controls rule inside @media (max-width: 768px)"
+        assert "display: flex;" in controls_rule
+        assert "align-items: center;" in controls_rule
+        assert "gap: 6px;" in controls_rule
+        assert "overflow-x: auto;" in controls_rule
+        assert "-webkit-overflow-scrolling: touch;" in controls_rule
+        assert "max-width: 100%;" in controls_rule
+
+        header_touch_rule = _extract_css_block(media_768, "header .controls > button")
+        assert header_touch_rule, "Expected top-bar button base touch rule inside @media (max-width: 768px)"
+        assert "min-height: 38px;" in header_touch_rule
+        assert "white-space: nowrap;" in header_touch_rule
+        assert "flex-shrink: 0;" in header_touch_rule
+        assert "font-size: 0.84rem;" in header_touch_rule
+        assert "padding: 6px 10px;" in header_touch_rule
+
+        # 6. Project selector + '+ Nuevo' single-line row
+        switcher_row_rule = _extract_css_block(media_768, ".mobile-switcher-row {")
+        assert switcher_row_rule, "Expected .mobile-switcher-row rule inside @media (max-width: 768px)"
+        assert "display: flex;" in switcher_row_rule
+        assert "align-items: center;" in switcher_row_rule
+        assert "gap: 8px;" in switcher_row_rule
+        assert "max-width: 100%;" in switcher_row_rule
+
+        selector_rule = _extract_css_block(media_768, ".mobile-switcher-row .mobile-switcher-btn")
+        assert selector_rule, "Expected project selector rule inside @media (max-width: 768px)"
+        assert ".mobile-switcher-row select" in media_768
+        assert "flex: 1;" in selector_rule
+        assert "min-width: 0;" in selector_rule
+        assert "text-overflow: ellipsis;" in selector_rule
+
+        new_btn_rule = _extract_css_block(media_768, "#mobile-new-project-shortcut {")
+        assert new_btn_rule, "Expected #mobile-new-project-shortcut rule inside @media (max-width: 768px)"
+        assert "white-space: nowrap;" in new_btn_rule
+        assert "flex-shrink: 0;" in new_btn_rule
+        assert "min-height: 38px;" in new_btn_rule
+
+        # 7. Desktop CSS outside @media (max-width: 768px) remains completely untouched
+        desktop_css = css.replace(media_768, "")
+        desktop_body = _extract_css_block(desktop_css, "body {")
+        assert "max-width: 100vw;" not in desktop_body
+        assert ".controls { display: flex; align-items: center; gap: 10px; }" in desktop_css
+        desktop_switcher = _extract_css_block(desktop_css, ".mobile-switcher-row {")
+        assert "display: none;" in desktop_switcher
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+
