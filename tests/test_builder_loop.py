@@ -5007,4 +5007,96 @@ def test_push_quality_improvement_work_branch_fetches_and_pushes_force_with_leas
     assert main_pushes and "--force-with-lease" not in main_pushes[-1]
 
 
+def test_builder_commit_git_checkpoint_hardens_gitignore_cached_purge_timeout_gpgsign_and_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BuildWorker._commit_git_checkpoint updates .gitignore, purges cached dirs before git add, uses timeout=120.0, disables gpgsign, and sets non-interactive Git env."""
+    import subprocess
+
+    from agent_factory.adapters.subprocess_runner import SubprocessRunner
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "TEST_TG_CKPT_SECRET")
+
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_ckpt")
+    pid = "proj-ckpt-harden"
+    ws_dir = ws_mgr.create_workspace(pid)
+    subprocess.run(["git", "init", "-b", "main"], cwd=ws_dir, check=True, capture_output=True)
+    (ws_dir / ".gitignore").write_text("keep_custom.txt", encoding="utf-8")
+    (ws_dir / "app.py").write_text("x = 1\n", encoding="utf-8")
+    (ws_dir / "downloads").mkdir()
+    (ws_dir / "downloads" / "song.mp3").write_bytes(b"mp3")
+
+    recorded: list[dict[str, object]] = []
+    real_runner = SubprocessRunner(default_timeout_seconds=15.0)
+
+    class _CkptSpyRunner(SubprocessRunner):
+        def run(
+            self,
+            command: list[str] | tuple[str, ...],
+            cwd: Path,
+            timeout_seconds: float | None = None,
+            env: dict[str, str] | None = None,
+            input: str | bytes | None = None,
+        ) -> CommandResult:
+            recorded.append(
+                {
+                    "command": list(command),
+                    "timeout_seconds": timeout_seconds,
+                    "env": dict(env) if env is not None else None,
+                }
+            )
+            return real_runner.run(command, cwd, timeout_seconds=timeout_seconds, env=env, input=input)
+
+    orch, _ = _create_approved_project(pid, num_tests=1, approve=True)
+    worker = BuildWorker(
+        orchestrator=orch,
+        workspace_manager=ws_mgr,
+        code_agent=FakeCodeAgent(),
+        runner=_CkptSpyRunner(),
+        vcs=FakeVCS(),
+    )
+
+    sha = worker._commit_git_checkpoint(pid, ws_dir, "checkpoint")
+    assert sha is not None
+
+    gi_lines = (ws_dir / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "keep_custom.txt" in gi_lines
+    for entry in (".venv/", "venv/", "__pycache__/", ".pytest_cache/", "downloads/", "*.mp3", "*.webm", "*.m4a"):
+        assert entry in gi_lines
+
+    expected_rm = [
+        "git",
+        "rm",
+        "-r",
+        "--cached",
+        "--ignore-unmatch",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".pytest_cache",
+        "downloads",
+    ]
+    rm_idx = next(i for i, r in enumerate(recorded) if r["command"] == expected_rm)
+    add_idx = next(i for i, r in enumerate(recorded) if r["command"] == ["git", "add", "-A"])
+    commit_idx = next(i for i, r in enumerate(recorded) if r["command"][:1] == ["git"] and "commit" in r["command"])
+    assert rm_idx < add_idx < commit_idx
+
+    for idx in (rm_idx, add_idx, commit_idx):
+        assert recorded[idx]["timeout_seconds"] == 120.0
+        env = recorded[idx]["env"]
+        assert env is not None
+        assert env.get("GIT_TERMINAL_PROMPT") == "0"
+        assert env.get("GCM_INTERACTIVE") == "never"
+        assert "TELEGRAM_BOT_TOKEN" not in env
+
+    commit_cmd = recorded[commit_idx]["command"]
+    c_pos = commit_cmd.index("commit")
+    assert any(
+        commit_cmd[j] == "-c" and commit_cmd[j + 1] == "commit.gpgsign=false"
+        for j in range(c_pos - 1)
+    )
+
+
+
 

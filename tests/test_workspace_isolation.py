@@ -138,3 +138,79 @@ def test_workspace_manager_rejects_symlink_or_junction_escaping_workspace(
         ws_mgr.write_file("proj-iso-link", "escaped_link/secret.txt", "TAMPERED")
 
     assert outside_secret.read_text(encoding="utf-8") == "SECRET_CONTENT"
+
+
+def test_ensure_workspace_gitignore_creates_and_merges_without_duplicates(
+    tmp_path: Path,
+) -> None:
+    """ensure_workspace_gitignore adds all 8 required entries, preserves existing rules, avoids duplicates, and ends with newline."""
+    from agent_factory.workspace import ensure_workspace_gitignore
+
+    expected_entries = (
+        ".venv/",
+        "venv/",
+        "__pycache__/",
+        ".pytest_cache/",
+        "downloads/",
+        "*.mp3",
+        "*.webm",
+        "*.m4a",
+    )
+
+    # 1. Creates .gitignore when missing
+    ws_new = tmp_path / "ws_new"
+    ws_new.mkdir()
+    created = ensure_workspace_gitignore(ws_new)
+    assert created == (ws_new / ".gitignore").resolve()
+    raw_new = created.read_text(encoding="utf-8")
+    assert raw_new.endswith("\n")
+    lines_new = raw_new.splitlines()
+    for entry in expected_entries:
+        assert entry in lines_new
+        assert lines_new.count(entry) == 1
+
+    # 2. Preserves prior custom rules, handles missing trailing newline, and avoids duplicates
+    ws_existing = tmp_path / "ws_existing"
+    ws_existing.mkdir()
+    gitignore_path = ws_existing / ".gitignore"
+    gitignore_path.write_text("# custom rule\ncustom.log\n.venv/\n*.mp3", encoding="utf-8")
+
+    ensure_workspace_gitignore(ws_existing)
+    ensure_workspace_gitignore(ws_existing)  # Idempotent
+
+    raw_existing = gitignore_path.read_text(encoding="utf-8")
+    assert raw_existing.endswith("\n")
+    lines_existing = raw_existing.splitlines()
+    assert lines_existing[0] == "# custom rule"
+    assert lines_existing[1] == "custom.log"
+    for entry in expected_entries:
+        assert entry in lines_existing
+        assert lines_existing.count(entry) == 1
+
+
+def test_build_workspace_git_env_sets_non_interactive_vars_and_preserves_safe_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """build_workspace_git_env sets GIT_TERMINAL_PROMPT=0 and GCM_INTERACTIVE=never while preserving host env and excluding host secrets."""
+    from agent_factory.workspace import build_workspace_git_env
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "TEST_TG_SECRET_GIT_ENV")
+    monkeypatch.setenv("LLM_API_KEY", "TEST_LLM_SECRET_GIT_ENV")
+    monkeypatch.setenv("GIT_EXEC_PATH", "/custom/git/exec")
+
+    env_default = build_workspace_git_env()
+    assert env_default["GIT_TERMINAL_PROMPT"] == "0"
+    assert env_default["GCM_INTERACTIVE"] == "never"
+    assert env_default.get("GIT_EXEC_PATH") == "/custom/git/exec"
+    assert "PATH" in env_default
+    assert "TELEGRAM_BOT_TOKEN" not in env_default
+    assert "LLM_API_KEY" not in env_default
+
+    base = {"PATH": "/usr/bin", "CUSTOM_NON_SECRET": "preserved", "GIT_TERMINAL_PROMPT": "1"}
+    env_from_base = build_workspace_git_env(base)
+    assert env_from_base["PATH"] == "/usr/bin"
+    assert env_from_base["CUSTOM_NON_SECRET"] == "preserved"
+    assert env_from_base["GIT_TERMINAL_PROMPT"] == "0"
+    assert env_from_base["GCM_INTERACTIVE"] == "never"
+    assert base["GIT_TERMINAL_PROMPT"] == "1"
+

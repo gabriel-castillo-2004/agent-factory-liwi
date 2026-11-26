@@ -21,7 +21,12 @@ from agent_factory.ports.runner import CommandResult, CommandTimeoutError, Runne
 from agent_factory.ports.vcs import VCS, CIRunResult
 from agent_factory.runtime_runner import detect_workspace_app
 from agent_factory.secrets import redact_secrets, sanitize_subprocess_env
-from agent_factory.workspace import ensure_workspace_git_excludes
+from agent_factory.workspace import (
+    WORKSPACE_GIT_CACHED_PURGE_PATHS,
+    WORKSPACE_GIT_TIMEOUT_SECONDS,
+    build_workspace_git_env,
+    ensure_workspace_git_excludes,
+)
 
 if TYPE_CHECKING:
     from agent_factory.adapters.static_deploy_publisher import StaticDeployPublisher
@@ -37,8 +42,7 @@ def build_git_push_env(
     repo_base_url: str = "https://github.com",
 ) -> tuple[dict[str, str], tuple[str, ...]]:
     """Build ephemeral Git auth env using GIT_CONFIG_COUNT without writing tokens to .git/config or argv (INV-19)."""
-    push_env = dict(clean_env)
-    push_env["GIT_TERMINAL_PROMPT"] = "0"
+    push_env = build_workspace_git_env(clean_env)
     cleaned_tok = token.strip()
     base = repo_base_url.rstrip("/")
     if not cleaned_tok or not base.startswith(("http://", "https://")):
@@ -416,7 +420,7 @@ class GitHubVCSAdapter(VCS):
 
     def build_clean_env(self, host_env: Mapping[str, str] | None = None) -> dict[str, str]:
         """Build sanitized subprocess env keeping system vars and stripping unrelated secrets (INV-19)."""
-        clean = sanitize_subprocess_env(host_env=host_env)
+        clean = build_workspace_git_env(sanitize_subprocess_env(host_env=host_env))
         if self.github_token:
             clean["GITHUB_TOKEN"] = self.github_token
             clean["GH_TOKEN"] = self.github_token
@@ -464,12 +468,16 @@ class GitHubVCSAdapter(VCS):
         env: Mapping[str, str],
         context: str,
         extra_secrets: Sequence[str] = (),
+        timeout_seconds: float | None = None,
     ) -> CommandResult:
         cmd = ["git", *args]
         res: CommandResult | None = None
         err_detail: str | None = None
         try:
-            res = self.runner.run(cmd, cwd=cwd, env=env)
+            if timeout_seconds is None:
+                res = self.runner.run(cmd, cwd=cwd, env=env)
+            else:
+                res = self.runner.run(cmd, cwd=cwd, timeout_seconds=timeout_seconds, env=env)
         except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
             err_detail = str(exc) or type(exc).__name__
         else:
@@ -693,6 +701,7 @@ class GitHubVCSAdapter(VCS):
         env: Mapping[str, str],
     ) -> str:
         """Initialize isolated .git repo inside workspace_dir if missing, set branch & commit, return existing origin URL."""
+        git_env = build_workspace_git_env(env)
         git_entry = workspace_dir / ".git"
         if git_entry.is_symlink():
             raise VcsError(f"Workspace .git must not be a symlink: {git_entry} (INV-22)")
@@ -701,12 +710,12 @@ class GitHubVCSAdapter(VCS):
             init_res = self.runner.run(
                 ["git", "init", "-b", self.default_branch],
                 cwd=workspace_dir,
-                env=env,
+                env=git_env,
             )
             if init_res.exit_code != 0:
-                self._run_git(["init"], cwd=workspace_dir, env=env, context="Git init failed")
+                self._run_git(["init"], cwd=workspace_dir, env=git_env, context="Git init failed")
 
-        self._validate_workspace_git_toplevel(workspace_dir, env=env)
+        self._validate_workspace_git_toplevel(workspace_dir, env=git_env)
 
         ensure_workspace_git_excludes(workspace_dir, write_gitignore=True)
 
@@ -721,37 +730,55 @@ class GitHubVCSAdapter(VCS):
                 pass
 
         if (workspace_dir / ".git" / "HEAD").is_file():
-            name_chk = self.runner.run(["git", "config", "--get", "user.name"], cwd=workspace_dir, env=env)
-            email_chk = self.runner.run(["git", "config", "--get", "user.email"], cwd=workspace_dir, env=env)
+            name_chk = self.runner.run(["git", "config", "--get", "user.name"], cwd=workspace_dir, env=git_env)
+            email_chk = self.runner.run(["git", "config", "--get", "user.email"], cwd=workspace_dir, env=git_env)
             if name_chk.exit_code != 0 or not name_chk.stdout.strip():
-                self.runner.run(["git", "config", "--local", "user.name", "AgentFactory"], cwd=workspace_dir, env=env)
+                self.runner.run(
+                    ["git", "config", "--local", "user.name", "AgentFactory"],
+                    cwd=workspace_dir,
+                    env=git_env,
+                )
             if email_chk.exit_code != 0 or not email_chk.stdout.strip():
                 self.runner.run(
                     ["git", "config", "--local", "user.email", "agent@factory.local"],
                     cwd=workspace_dir,
-                    env=env,
+                    env=git_env,
                 )
 
         cur_branch_res = self.runner.run(
             ["git", "symbolic-ref", "--short", "HEAD"],
             cwd=workspace_dir,
-            env=env,
+            env=git_env,
         )
         cur_branch = cur_branch_res.stdout.strip() if cur_branch_res.exit_code == 0 else ""
         if cur_branch != valid_branch:
             ref_res = self.runner.run(
                 ["git", "show-ref", "--verify", f"refs/heads/{valid_branch}"],
                 cwd=workspace_dir,
-                env=env,
+                env=git_env,
             )
             branch_cmd = (
                 ["checkout", valid_branch]
                 if ref_res.exit_code == 0
                 else ["checkout", "-b", valid_branch]
             )
-            self._run_git(branch_cmd, cwd=workspace_dir, env=env, context="Git branch setup failed")
+            self._run_git(branch_cmd, cwd=workspace_dir, env=git_env, context="Git branch setup failed")
 
-        self._run_git(["add", "-A"], cwd=workspace_dir, env=env, context="Git add failed")
+        ensure_workspace_git_excludes(workspace_dir, write_gitignore=True)
+        self._run_git(
+            ["rm", "-r", "--cached", "--ignore-unmatch", *WORKSPACE_GIT_CACHED_PURGE_PATHS],
+            cwd=workspace_dir,
+            env=git_env,
+            context="Git rm cached failed",
+            timeout_seconds=WORKSPACE_GIT_TIMEOUT_SECONDS,
+        )
+        self._run_git(
+            ["add", "-A"],
+            cwd=workspace_dir,
+            env=git_env,
+            context="Git add failed",
+            timeout_seconds=WORKSPACE_GIT_TIMEOUT_SECONDS,
+        )
         agent_dir = workspace_dir / ".agent-factory"
         manifest_path = agent_dir / "manifest.json"
         if (
@@ -762,17 +789,27 @@ class GitHubVCSAdapter(VCS):
             self._run_git(
                 ["add", "-f", ".agent-factory/manifest.json"],
                 cwd=workspace_dir,
-                env=env,
+                env=git_env,
                 context="Git add manifest failed",
+                timeout_seconds=WORKSPACE_GIT_TIMEOUT_SECONDS,
             )
-        head_res = self.runner.run(["git", "rev-parse", "--verify", "HEAD"], cwd=workspace_dir, env=env)
-        diff_res = self.runner.run(["git", "diff", "--cached", "--quiet"], cwd=workspace_dir, env=env)
+        head_res = self.runner.run(["git", "rev-parse", "--verify", "HEAD"], cwd=workspace_dir, env=git_env)
+        diff_res = self.runner.run(["git", "diff", "--cached", "--quiet"], cwd=workspace_dir, env=git_env)
         if head_res.exit_code != 0 or diff_res.exit_code != 0:
             allow_empty = ["--allow-empty"] if (head_res.exit_code != 0 and diff_res.exit_code == 0) else []
             if had_local_identity:
-                commit_args = ["commit", *allow_empty, "-m", f"chore({project_id}): update {valid_branch}"]
+                commit_args = [
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    *allow_empty,
+                    "-m",
+                    f"chore({project_id}): update {valid_branch}",
+                ]
             else:
                 commit_args = [
+                    "-c",
+                    "commit.gpgsign=false",
                     "-c",
                     "user.name=AgentFactory",
                     "-c",
@@ -782,9 +819,15 @@ class GitHubVCSAdapter(VCS):
                     "-m",
                     f"chore({project_id}): update {valid_branch}",
                 ]
-            self._run_git(commit_args, cwd=workspace_dir, env=env, context="Git commit failed")
+            self._run_git(
+                commit_args,
+                cwd=workspace_dir,
+                env=git_env,
+                context="Git commit failed",
+                timeout_seconds=WORKSPACE_GIT_TIMEOUT_SECONDS,
+            )
 
-        origin_res = self.runner.run(["git", "remote", "get-url", "origin"], cwd=workspace_dir, env=env)
+        origin_res = self.runner.run(["git", "remote", "get-url", "origin"], cwd=workspace_dir, env=git_env)
         existing_origin = origin_res.stdout.strip() if origin_res.exit_code == 0 else ""
         if existing_origin == "ok":
             existing_origin = ""
@@ -798,16 +841,25 @@ class GitHubVCSAdapter(VCS):
         clean_env: Mapping[str, str],
     ) -> str:
         """Preserve exact single-call FIFO behavior when tests run with FakeRunner."""
+        git_env = build_workspace_git_env(clean_env)
         if (workspace_dir / ".git").is_dir():
-            self.runner.run(["git", "add", "-A"], cwd=workspace_dir, env=clean_env)
+            ensure_workspace_git_excludes(workspace_dir, write_gitignore=True)
+            self.runner.run(
+                ["git", "add", "-A"],
+                cwd=workspace_dir,
+                timeout_seconds=WORKSPACE_GIT_TIMEOUT_SECONDS,
+                env=git_env,
+            )
             diff_res = self.runner.run(
                 ["git", "diff", "--cached", "--quiet"],
                 cwd=workspace_dir,
-                env=clean_env,
+                env=git_env,
             )
             if diff_res.exit_code != 0:
                 self._run_git(
                     [
+                        "-c",
+                        "commit.gpgsign=false",
                         "-c",
                         "user.name=AgentFactory",
                         "-c",
@@ -817,13 +869,14 @@ class GitHubVCSAdapter(VCS):
                         f"chore({project_id}): update {valid_branch}",
                     ],
                     cwd=workspace_dir,
-                    env=clean_env,
+                    env=git_env,
                     context="Git commit failed",
+                    timeout_seconds=WORKSPACE_GIT_TIMEOUT_SECONDS,
                 )
         res = self._run_git(
             work_branch_push_args(valid_branch, default_branch=self.default_branch),
             cwd=workspace_dir,
-            env=clean_env,
+            env=git_env,
             context="Git push failed",
         )
         return res.stdout.strip() if res.stdout.strip() else valid_branch

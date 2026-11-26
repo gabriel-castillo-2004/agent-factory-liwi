@@ -53,8 +53,10 @@ from agent_factory.ports.store import EventStore
 from agent_factory.secrets import redact_secrets
 from agent_factory.workspace import (
     DEFAULT_WORKSPACE_PYTEST_INI,
+    WORKSPACE_GIT_TIMEOUT_SECONDS,
     SandboxViolationError,
     WorkspaceManager,
+    build_workspace_git_env,
     collect_workspace_code_context,
     list_workspace_files,
     read_git_head_sha_from_disk,
@@ -2911,8 +2913,9 @@ class Orchestrator:
         env: Mapping[str, str] | None = None,
         context: str,
         extra_secrets: Sequence[str] = (),
+        timeout_seconds: float = 20.0,
     ) -> str:
-        res = runner.run(["git", *args], cwd=ws_dir, timeout_seconds=20.0, env=env)
+        res = runner.run(["git", *args], cwd=ws_dir, timeout_seconds=timeout_seconds, env=env)
         if res.exit_code != 0:
             detail = redact_secrets(
                 (res.stderr or res.stdout or f"exit code {res.exit_code}").strip(),
@@ -3031,7 +3034,7 @@ class Orchestrator:
 
             eff_runner = runner if runner is not None else SubprocessRunner(default_timeout_seconds=25.0)
             ws_resolved = verify_isolated_git_root(ws_dir, eff_runner)
-            clean_env = build_sanitized_cli_env()
+            clean_env = build_workspace_git_env(build_sanitized_cli_env())
 
             rev_res = eff_runner.run(
                 ["git", "rev-parse", "--verify", f"{target_sha}^{{commit}}"],
@@ -3087,6 +3090,8 @@ class Orchestrator:
                 eff_runner,
                 [
                     "-c",
+                    "commit.gpgsign=false",
+                    "-c",
                     "user.name=AgentFactory",
                     "-c",
                     "user.email=agent@factory.local",
@@ -3099,6 +3104,7 @@ class Orchestrator:
                 env=clean_env,
                 context="No se pudo crear el commit de rollback",
                 extra_secrets=extra_secrets,
+                timeout_seconds=WORKSPACE_GIT_TIMEOUT_SECONDS,
             )
 
             try:

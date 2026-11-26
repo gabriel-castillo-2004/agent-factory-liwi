@@ -17,7 +17,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from agent_factory.domain.models import validate_project_id
-from agent_factory.secrets import redact_secrets
+from agent_factory.secrets import redact_secrets, sanitize_subprocess_env
 
 _CACHE_DIR_NAMES: frozenset[str] = frozenset({"__pycache__", ".pytest_cache"})
 _BYTECODE_SUFFIXES: frozenset[str] = frozenset({".pyc", ".pyo"})
@@ -68,42 +68,91 @@ RUNNER_CONFIG_FILENAMES: tuple[str, ...] = (
 
 DEFAULT_WORKSPACE_PYTEST_INI: str = "[pytest]\ntestpaths = tests\naddopts = -ra --tb=short\n"
 
+WORKSPACE_GITIGNORE_ENTRIES: tuple[str, ...] = (
+    ".venv/",
+    "venv/",
+    "__pycache__/",
+    ".pytest_cache/",
+    "downloads/",
+    "*.mp3",
+    "*.webm",
+    "*.m4a",
+)
+
 WORKSPACE_GIT_EXCLUDES: tuple[str, ...] = (
+    ".venv/",
+    "venv/",
     "__pycache__/",
     "*.py[cod]",
     ".pytest_cache/",
-    ".venv/",
-    "venv/",
+    "downloads/",
+    "*.mp3",
+    "*.webm",
+    "*.m4a",
     ".agent-factory/",
 )
 
+WORKSPACE_GIT_TIMEOUT_SECONDS: float = 120.0
 
-def _merge_ignore_patterns(ignore_file: Path, ws_resolved: Path, patterns: Sequence[str]) -> None:
+WORKSPACE_GIT_CACHED_PURGE_PATHS: tuple[str, ...] = (
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    "downloads",
+)
+
+
+def build_workspace_git_env(base_env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Build non-interactive Git subprocess env preserving base_env (or sanitized host env) without prompts (INV-19)."""
+    env = dict(base_env) if base_env is not None else sanitize_subprocess_env()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "never"
+    return env
+
+
+def _merge_ignore_patterns(ignore_file: Path, ws_resolved: Path, patterns: Sequence[str]) -> bool:
     """Safely ensure ignore_file inside ws_resolved contains each pattern without following symlinks (INV-22)."""
     if ignore_file.is_symlink():
-        return
+        return False
     try:
         resolved = ignore_file.resolve()
     except OSError:
-        return
+        return False
     if resolved == ws_resolved or not resolved.is_relative_to(ws_resolved):
-        return
+        return False
     if resolved.exists() and not resolved.is_file():
-        return
+        return False
     try:
         existing = resolved.read_text(encoding="utf-8") if resolved.exists() else ""
     except OSError:
-        return
+        return False
     existing_lines = {ln.strip() for ln in existing.splitlines() if ln.strip()}
     missing = [pat for pat in patterns if pat not in existing_lines]
     if not missing:
-        return
+        return True
     prefix = "" if not existing or existing.endswith("\n") else "\n"
     updated = existing + prefix + "\n".join(missing) + "\n"
     try:
         resolved.write_text(updated, encoding="utf-8")
     except OSError:
-        pass
+        return False
+    return True
+
+
+def ensure_workspace_gitignore(
+    workspace_dir: Path,
+    *,
+    entries: Sequence[str] = WORKSPACE_GIT_EXCLUDES,
+) -> Path | None:
+    """Create or update <workspace>/.gitignore with required entries without duplicating or deleting prior rules."""
+    ws = Path(workspace_dir).resolve()
+    if not ws.is_dir():
+        return None
+    gitignore_path = ws / ".gitignore"
+    if not _merge_ignore_patterns(gitignore_path, ws, entries):
+        return None
+    return gitignore_path.resolve()
 
 
 def ensure_workspace_git_excludes(
@@ -111,12 +160,12 @@ def ensure_workspace_git_excludes(
     *,
     write_gitignore: bool = True,
 ) -> None:
-    """Ensure .venv/, .agent-factory/, and Python caches are excluded via .git/info/exclude and .gitignore."""
+    """Ensure .venv/, downloads/, media artifacts, .agent-factory/, and caches are excluded via .git/info/exclude and .gitignore."""
     ws = Path(workspace_dir).resolve()
     if not ws.is_dir():
         return
     if write_gitignore:
-        _merge_ignore_patterns(ws / ".gitignore", ws, WORKSPACE_GIT_EXCLUDES)
+        ensure_workspace_gitignore(ws, entries=WORKSPACE_GIT_EXCLUDES)
 
     git_dir = ws / ".git"
     if git_dir.is_symlink() or not git_dir.is_dir():

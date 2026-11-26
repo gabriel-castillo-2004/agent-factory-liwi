@@ -51,11 +51,15 @@ from agent_factory.recovery_agent import RecoveryAgent, RecoveryResult
 from agent_factory.runtime_runner import LocalAppRunner, detect_workspace_app, run_http_smoke_test
 from agent_factory.secrets import redact_secrets
 from agent_factory.workspace import (
+    WORKSPACE_GIT_CACHED_PURGE_PATHS,
+    WORKSPACE_GIT_TIMEOUT_SECONDS,
     SandboxViolationError,
     TestLockSnapshot,
     WorkspaceManager,
+    build_workspace_git_env,
     compute_test_lock,
     ensure_workspace_favicon,
+    ensure_workspace_git_excludes,
     ensure_workspace_pytest_ini,
     is_python_cache_path,
     read_workspace_git_diff,
@@ -1043,8 +1047,20 @@ class BuildWorker:
             ws_resolved = verify_isolated_git_root(ws_dir, self.runner)
         except (SandboxViolationError, ValueError, OSError):
             return None
-        clean_env = build_sanitized_cli_env()
-        self.runner.run(["git", "add", "-A"], cwd=ws_resolved, timeout_seconds=10.0, env=clean_env)
+        ensure_workspace_git_excludes(ws_resolved, write_gitignore=True)
+        clean_env = build_workspace_git_env(build_sanitized_cli_env())
+        self.runner.run(
+            ["git", "rm", "-r", "--cached", "--ignore-unmatch", *WORKSPACE_GIT_CACHED_PURGE_PATHS],
+            cwd=ws_resolved,
+            timeout_seconds=WORKSPACE_GIT_TIMEOUT_SECONDS,
+            env=clean_env,
+        )
+        self.runner.run(
+            ["git", "add", "-A"],
+            cwd=ws_resolved,
+            timeout_seconds=WORKSPACE_GIT_TIMEOUT_SECONDS,
+            env=clean_env,
+        )
         diff_res = self.runner.run(
             ["git", "diff", "--cached", "--quiet"],
             cwd=ws_resolved,
@@ -1058,6 +1074,8 @@ class BuildWorker:
                 [
                     "git",
                     "-c",
+                    "commit.gpgsign=false",
+                    "-c",
                     "user.name=AgentFactory",
                     "-c",
                     "user.email=agent@factory.local",
@@ -1068,7 +1086,7 @@ class BuildWorker:
                     f"chore({project_id}): {message}",
                 ],
                 cwd=ws_resolved,
-                timeout_seconds=10.0,
+                timeout_seconds=WORKSPACE_GIT_TIMEOUT_SECONDS,
                 env=clean_env,
             )
         return read_workspace_git_head_sha(ws_resolved, runner=self.runner)

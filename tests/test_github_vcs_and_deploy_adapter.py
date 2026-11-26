@@ -495,7 +495,9 @@ def test_github_vcs_prepares_dirty_git_repo_ensures_pr_deploys_site_branch_and_k
 
     cmd_strings = [" ".join(c["command"]) for c in calls]
     add_idxs = [i for i, s in enumerate(cmd_strings) if s.startswith("git add")]
-    commit_idxs = [i for i, s in enumerate(cmd_strings) if s.startswith("git commit")]
+    commit_idxs = [
+        i for i, c in enumerate(calls) if c["command"][:1] == ["git"] and "commit" in c["command"]
+    ]
     push_idxs = [i for i, s in enumerate(cmd_strings) if s.startswith("git push")]
     pr_create_idxs = [i for i, c in enumerate(calls) if c["command"][:3] == ["gh", "pr", "create"]]
     pr_merge_idxs = [i for i, c in enumerate(calls) if c["command"][:3] == ["gh", "pr", "merge"]]
@@ -1597,3 +1599,149 @@ def test_push_branch_work_fetches_origin_and_uses_force_with_lease_on_diverged_r
         c for c in recorded_cmds[main_cmds_before:] if len(c) >= 2 and c[0] == "git" and c[1] == "push"
     ]
     assert main_pushes and "--force-with-lease" not in main_pushes[-1]
+
+
+def test_github_vcs_hardens_workspace_gitignore_cached_purge_timeout_gpgsign_and_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hardens workspace git add/commit: updates .gitignore (8 entries), runs git rm --cached before git add, uses timeout=120.0, passes -c commit.gpgsign=false before commit, and sets non-interactive Git env."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "TEST_TG_SECRET_HARDEN")
+    monkeypatch.setenv("LLM_API_KEY", "TEST_LLM_SECRET_HARDEN")
+    monkeypatch.setenv("GIT_EXEC_PATH", "/test/git-core")
+
+    bare_remote = tmp_path / "hardened-remote.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare_remote)], check=True, capture_output=True)
+
+    ws_dir = tmp_path / "ws" / "app-harden-git"
+    ws_dir.mkdir(parents=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "LocalTester"], cwd=ws_dir, check=True)
+    subprocess.run(["git", "config", "user.email", "tester@local.dev"], cwd=ws_dir, check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare_remote)], cwd=ws_dir, check=True)
+
+    # Pre-existing custom .gitignore with partial entries and no trailing newline
+    (ws_dir / ".gitignore").write_text("custom_keep.txt\n.venv/", encoding="utf-8")
+    (ws_dir / "src").mkdir()
+    (ws_dir / "src" / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    # Simulate previously tracked heavy/ignored directories before hardening
+    (ws_dir / ".venv").mkdir()
+    (ws_dir / ".venv" / "marker.txt").write_text("venv-file\n", encoding="utf-8")
+    (ws_dir / "downloads").mkdir()
+    (ws_dir / "downloads" / "track.mp3").write_bytes(b"ID3fake")
+    (ws_dir / "audio.webm").write_bytes(b"WEBM")
+    (ws_dir / "clip.m4a").write_bytes(b"M4A")
+    subprocess.run(["git", "add", "-f", ".gitignore", "src/app.py", ".venv/marker.txt", "downloads/track.mp3"], cwd=ws_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "seed with tracked venv and downloads"], cwd=ws_dir, check=True, capture_output=True)
+    subprocess.run(["git", "checkout", "-b", "work"], cwd=ws_dir, check=True, capture_output=True)
+
+    # New workspace edit to stage and commit
+    (ws_dir / "src" / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
+    (ws_dir / "__pycache__").mkdir()
+    (ws_dir / "__pycache__" / "app.cpython-312.pyc").write_bytes(b"\x00\x01")
+    (ws_dir / ".pytest_cache").mkdir()
+    (ws_dir / ".pytest_cache" / "README.md").write_text("cache\n", encoding="utf-8")
+
+    real_runner = SubprocessRunner(default_timeout_seconds=15.0)
+    recorded: list[dict[str, Any]] = []
+    gitignore_at_add: list[str] = []
+
+    class _HardenSpyRunner(SubprocessRunner):
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float | None = None,
+            env: Mapping[str, str] | None = None,
+            input: str | bytes | None = None,
+        ) -> CommandResult:
+            cmd_list = list(command)
+            recorded.append(
+                {
+                    "command": cmd_list,
+                    "cwd": Path(cwd),
+                    "timeout_seconds": timeout_seconds,
+                    "env": dict(env) if env is not None else None,
+                }
+            )
+            if cmd_list[:2] == ["git", "add"]:
+                gitignore_at_add.append((ws_dir / ".gitignore").read_text(encoding="utf-8"))
+            return real_runner.run(
+                cmd_list,
+                cwd,
+                timeout_seconds=timeout_seconds,
+                env=env,
+                input=input,
+            )
+
+    vcs = GitHubVCSAdapter(runner=_HardenSpyRunner(), repo_base_url=str(tmp_path))
+    vcs.push_branch("app-harden-git", ws_dir, branch="work")
+
+    # (a) .gitignore updated BEFORE git add with all 8 entries, no duplicates, preserving prior rule
+    assert gitignore_at_add, "Expected git add to be invoked"
+    gi_text = gitignore_at_add[0]
+    assert gi_text.endswith("\n")
+    gi_lines = gi_text.splitlines()
+    assert "custom_keep.txt" in gi_lines
+    for req_entry in (".venv/", "venv/", "__pycache__/", ".pytest_cache/", "downloads/", "*.mp3", "*.webm", "*.m4a"):
+        assert req_entry in gi_lines
+        assert gi_lines.count(req_entry) == 1
+
+    # (b) git rm -r --cached --ignore-unmatch .venv venv __pycache__ .pytest_cache downloads runs BEFORE git add
+    expected_rm_cmd = [
+        "git",
+        "rm",
+        "-r",
+        "--cached",
+        "--ignore-unmatch",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".pytest_cache",
+        "downloads",
+    ]
+    rm_idxs = [i for i, r in enumerate(recorded) if r["command"] == expected_rm_cmd]
+    add_idxs = [i for i, r in enumerate(recorded) if r["command"] == ["git", "add", "-A"]]
+    commit_idxs = [
+        i for i, r in enumerate(recorded) if r["command"][:1] == ["git"] and "commit" in r["command"]
+    ]
+    assert rm_idxs and add_idxs and commit_idxs
+    assert rm_idxs[0] < add_idxs[0] < commit_idxs[0]
+
+    # (c) git rm --cached, git add, and git commit all use timeout=120.0
+    assert recorded[rm_idxs[0]]["timeout_seconds"] == 120.0
+    assert recorded[add_idxs[0]]["timeout_seconds"] == 120.0
+    assert recorded[commit_idxs[0]]["timeout_seconds"] == 120.0
+
+    # (d) git commit passes -c commit.gpgsign=false BEFORE "commit", and all git calls receive non-interactive env preserving safe os.environ
+    commit_cmd = recorded[commit_idxs[0]]["command"]
+    commit_sub_idx = commit_cmd.index("commit")
+    prefix_tokens = commit_cmd[:commit_sub_idx]
+    assert any(
+        prefix_tokens[j] == "-c" and prefix_tokens[j + 1] == "commit.gpgsign=false"
+        for j in range(len(prefix_tokens) - 1)
+    ), f"Expected -c commit.gpgsign=false before commit in {commit_cmd}"
+
+    for idx in (rm_idxs[0], add_idxs[0], commit_idxs[0]):
+        call_env = recorded[idx]["env"]
+        assert call_env is not None
+        assert call_env.get("GIT_TERMINAL_PROMPT") == "0"
+        assert call_env.get("GCM_INTERACTIVE") == "never"
+        assert call_env.get("GIT_EXEC_PATH") == "/test/git-core"
+        assert "PATH" in call_env
+        assert "TELEGRAM_BOT_TOKEN" not in call_env
+        assert "LLM_API_KEY" not in call_env
+
+    # Verify pushed remote tree excludes previously tracked .venv and downloads and media files, while keeping src/app.py
+    pushed_tree = subprocess.run(
+        ["git", "-C", str(bare_remote), "ls-tree", "-r", "refs/heads/work", "--name-only"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    assert "src/app.py" in pushed_tree
+    assert ".gitignore" in pushed_tree
+    assert not any(p.startswith((".venv/", "downloads/", "__pycache__/", ".pytest_cache/")) for p in pushed_tree)
+    assert "audio.webm" not in pushed_tree
+    assert "clip.m4a" not in pushed_tree
+
