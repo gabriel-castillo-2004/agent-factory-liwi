@@ -568,3 +568,212 @@ def test_supervisor_startup_watchdog_rolls_back_bad_commit_and_records_ticket(
     assert tickets[0]["source"] == "startup_watchdog"
     assert tickets[0]["affected_file"] == "src/agent_factory/dashboard.py"
 
+
+def test_error_triage_solution_listing_and_decision_helpers(tmp_path: Path) -> None:
+    """error_triage exposes listing and approve/dismiss decision helpers with strict validation."""
+    db_path = tmp_path / "telemetry_solutions.db"
+    first, _ = upsert_triage_error(
+        "sig-sol-1",
+        "KeyError: 'plan' in builder.py",
+        scope="factory",
+        db_path=db_path,
+    )
+    second, _ = upsert_triage_error(
+        "sig-sol-2",
+        "ValueError: invalid json in dashboard.py",
+        scope="factory",
+        db_path=db_path,
+    )
+    assert first is not None and second is not None
+    update_triage_solution(
+        first["id"],
+        title="Validar clave plan en builder",
+        proposed_fix="Usar .get('plan') con valor por defecto.",
+        status="lista",
+        db_path=db_path,
+    )
+    update_triage_solution(
+        second["id"],
+        title="Validar JSON en dashboard",
+        proposed_fix="Capturar JSONDecodeError de forma explícita.",
+        status="lista",
+        db_path=db_path,
+    )
+
+    ready = error_triage.list_triage_solutions(status="lista", db_path=db_path)
+    assert len(ready) == 2
+    assert {item["id"] for item in ready} == {first["id"], second["id"]}
+
+    approved = error_triage.decide_triage_solution(first["id"], "aprobada", db_path=db_path)
+    assert approved["id"] == first["id"]
+    assert approved["status"] == "encolada"
+
+    dismissed = error_triage.decide_triage_solution(second["id"], "descartada", db_path=db_path)
+    assert dismissed["id"] == second["id"]
+    assert dismissed["status"] == "descartada"
+
+    assert error_triage.list_triage_solutions(status="lista", db_path=db_path) == []
+    assert len(error_triage.list_triage_solutions(status="encolada", db_path=db_path)) == 1
+    assert len(error_triage.list_triage_solutions(status="descartada", db_path=db_path)) == 1
+
+    with pytest.raises(KeyError):
+        error_triage.decide_triage_solution(99999, "aprobada", db_path=db_path)
+
+    with pytest.raises(ValueError):
+        error_triage.decide_triage_solution(first["id"], "accion_invalida", db_path=db_path)
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_triage_solutions_endpoints_and_ui_block(tmp_path: Path) -> None:
+    """Dashboard exposes GET /api/triage/solutions, POST decision (200/400/404), and compact UI block."""
+    import urllib.error
+    import urllib.request
+
+    from agent_factory.adapters.fake_llm import FakeLLM
+    from agent_factory.adapters.sqlite_store import SqliteEventStore
+    from agent_factory.dashboard import start_dashboard_server
+    from agent_factory.orchestrator import Orchestrator
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def _http_json(
+        url: str,
+        *,
+        method: str = "GET",
+        body: dict[str, Any] | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        headers = {"Content-Type": "application/json"} if data is not None else {}
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with opener.open(req, timeout=5.0) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as err:
+            return err.code, json.loads(err.read().decode("utf-8"))
+
+    store = SqliteEventStore(db_path=tmp_path / "dash_triage.db")
+    telemetry_db = tmp_path / "telemetry.db"
+    sol_a, _ = upsert_triage_error(
+        "sig-http-a",
+        "RuntimeError: socket reset in orchestrator",
+        scope="factory",
+        db_path=telemetry_db,
+    )
+    sol_b, _ = upsert_triage_error(
+        "sig-http-b",
+        "KeyError: missing stage in dashboard",
+        scope="factory",
+        db_path=telemetry_db,
+    )
+    sol_c, _ = upsert_triage_error(
+        "sig-http-c",
+        "TimeoutError: pending analysis",
+        scope="factory",
+        db_path=telemetry_db,
+    )
+    assert sol_a is not None and sol_b is not None and sol_c is not None
+    update_triage_solution(
+        sol_a["id"],
+        title="Manejar reset de socket en orchestrator",
+        proposed_fix="Reintentar conexión con backoff acotado.",
+        status="lista",
+        db_path=telemetry_db,
+    )
+    update_triage_solution(
+        sol_b["id"],
+        title="Validar clave stage en dashboard",
+        proposed_fix="Usar .get('stage') seguro.",
+        status="lista",
+        db_path=telemetry_db,
+    )
+
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        # 1) Unfiltered list returns all 3 rows and pending_count == 2 ('lista')
+        code, payload = _http_json(f"{base_url}/api/triage/solutions")
+        assert code == 200
+        assert payload["ok"] is True
+        assert payload["pending_count"] == 2
+        assert len(payload["solutions"]) == 3
+
+        # 2) Filtered list by status='lista' returns only the 2 ready solutions
+        code_f, payload_f = _http_json(f"{base_url}/api/triage/solutions?status=lista")
+        assert code_f == 200
+        assert payload_f["status_filter"] == "lista"
+        assert payload_f["pending_count"] == 2
+        assert {item["id"] for item in payload_f["solutions"]} == {sol_a["id"], sol_b["id"]}
+
+        # 3) Invalid status filter returns 400
+        code_bad_st, _ = _http_json(f"{base_url}/api/triage/solutions?status=estado_desconocido")
+        assert code_bad_st == 400
+
+        # 4) Approve solution A -> status becomes 'encolada', pending_count drops to 1
+        code_ok, res_ok = _http_json(
+            f"{base_url}/api/triage/solutions/{sol_a['id']}/decision",
+            method="POST",
+            body={"decision": "aprobada"},
+        )
+        assert code_ok == 200
+        assert res_ok["ok"] is True
+        assert res_ok["status"] == "encolada"
+        assert res_ok["solution"]["status"] == "encolada"
+        assert res_ok["pending_count"] == 1
+
+        # 5) Dismiss solution B -> status becomes 'descartada', pending_count drops to 0
+        code_dis, res_dis = _http_json(
+            f"{base_url}/api/triage/solutions/{sol_b['id']}/decision",
+            method="POST",
+            body={"decision": "descartada"},
+        )
+        assert code_dis == 200
+        assert res_dis["ok"] is True
+        assert res_dis["status"] == "descartada"
+        assert res_dis["solution"]["status"] == "descartada"
+        assert res_dis["pending_count"] == 0
+
+        # Verify persisted list filtered by status='lista' is now empty
+        code_empty, payload_empty = _http_json(f"{base_url}/api/triage/solutions?status=lista")
+        assert code_empty == 200
+        assert payload_empty["solutions"] == []
+        assert payload_empty["pending_count"] == 0
+
+        # 6) Nonexistent ID returns 404
+        code_404, err_404 = _http_json(
+            f"{base_url}/api/triage/solutions/999999/decision",
+            method="POST",
+            body={"decision": "aprobada"},
+        )
+        assert code_404 == 404
+        assert "error" in err_404
+
+        # 7) Invalid decision or invalid ID returns 400
+        code_400_dec, _ = _http_json(
+            f"{base_url}/api/triage/solutions/{sol_a['id']}/decision",
+            method="POST",
+            body={"decision": "invalida"},
+        )
+        assert code_400_dec == 400
+
+        code_400_id, _ = _http_json(
+            f"{base_url}/api/triage/solutions/not-an-int/decision",
+            method="POST",
+            body={"decision": "aprobada"},
+        )
+        assert code_400_id == 400
+
+        # 8) Dashboard HTML includes compact Auto-Triage solutions block & counter
+        with opener.open(f"{base_url}/", timeout=5.0) as html_resp:
+            assert html_resp.status == 200
+            html_text = html_resp.read().decode("utf-8")
+        assert 'id="triage-solutions-banner"' in html_text
+        assert 'id="triage-solutions-count"' in html_text
+        assert "/api/triage/solutions" in html_text
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+        store.close()
+
+

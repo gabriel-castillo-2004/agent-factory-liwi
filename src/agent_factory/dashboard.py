@@ -2814,6 +2814,62 @@ class DashboardController:
             self.secrets_to_redact,
         )
 
+    def list_triage_solutions(
+        self,
+        *,
+        status: str | None = None,
+        scope: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """List Auto-Triage solutions with optional status/scope filter and pending count."""
+        db_path = self._resolve_idea_db_path()
+        solutions = error_triage.list_triage_solutions(
+            status=status,
+            scope=scope,
+            limit=limit,
+            db_path=db_path,
+        )
+        if status is not None and str(status).strip().lower() == "lista" and scope is None:
+            pending_count = len(solutions)
+        else:
+            pending_count = len(
+                error_triage.list_triage_solutions(status="lista", db_path=db_path)
+            )
+        return _scrub_value(
+            {
+                "ok": True,
+                "solutions": solutions,
+                "pending_count": pending_count,
+                "status_filter": str(status).strip().lower() if status is not None else None,
+            },
+            self.secrets_to_redact,
+        )
+
+    def decide_triage_solution(self, solution_id: int, decision: str) -> dict[str, Any]:
+        """Mark an Auto-Triage solution as approved ('encolada') or dismissed ('descartada')."""
+        db_path = self._resolve_idea_db_path()
+        try:
+            updated = error_triage.decide_triage_solution(
+                solution_id,
+                decision,
+                db_path=db_path,
+            )
+        except KeyError as exc:
+            raise ProjectNotFoundError(str(exc)) from exc
+        pending_count = len(
+            error_triage.list_triage_solutions(status="lista", db_path=db_path)
+        )
+        return _scrub_value(
+            {
+                "ok": True,
+                "decision": str(decision).strip().lower(),
+                "status": updated["status"],
+                "solution": updated,
+                "pending_count": pending_count,
+            },
+            self.secrets_to_redact,
+        )
+
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="es" data-theme="dark">
@@ -7165,6 +7221,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       </div>
       <div id="triage-alert-feedback" class="muted" style="font-size:0.78rem; display:none;"></div>
+    </div>
+    <div id="triage-solutions-banner" class="triage-alert-banner" role="region" aria-label="Soluciones pendientes de Auto-Triage" style="display:none; margin-top:8px;">
+      <div class="triage-alert-main">
+        <div class="triage-alert-copy">
+          <strong style="font-size:0.86rem;">🩺 Auto-Triage <span id="triage-solutions-count" class="auto-ideas-badge">0</span></strong>
+          <div id="triage-solutions-summary" class="muted" style="font-size:0.81rem;"></div>
+        </div>
+        <div class="triage-alert-actions">
+          <button id="triage-solution-approve-btn" class="btn btn-primary btn-sm" type="button">✓ Aprobar</button>
+          <button id="triage-solution-dismiss-btn" class="btn btn-sm" type="button" aria-label="Descartar solución" title="Descartar solución">✕ Descartar</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -12920,6 +12988,56 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
       }
 
+      function ensureStatusPolling() {
+        if (!statusPollTimer) {
+          statusPollTimer = setInterval(() => {
+            pollFactoryStatus();
+          }, 2500);
+        }
+      }
+
+      function syncFullscreenOverlay(isRunning, stepNum, headline, detailTxt) {
+        if (!fsOverlay) return;
+        if (!isRunning || buildOverlayMinimized) {
+          fsOverlay.style.display = 'none';
+          return;
+        }
+        fsOverlay.style.display = 'flex';
+        if (fsTitle) fsTitle.textContent = headline || 'Aplicando mejora...';
+        if (fsDetail) fsDetail.textContent = detailTxt || 'Procesando mejora en Liwi...';
+        fsOverlay.querySelectorAll('.factory-step-pill[data-fsstep]').forEach((pill) => {
+          const pStep = Number(pill.getAttribute('data-fsstep') || 0);
+          pill.classList.toggle('is-done', pStep < stepNum);
+          pill.classList.toggle('is-active', pStep === stepNum);
+        });
+      }
+
+      function finishWithUpdatedReload(messageText) {
+        stopStatusPolling();
+        stopClockTicker();
+        if (reconnectTimer) {
+          clearInterval(reconnectTimer);
+          reconnectTimer = null;
+        }
+        applyInFlight = false;
+        lastServerRunning = false;
+        activeStatus.running = false;
+        if (restartBanner) restartBanner.style.display = 'none';
+        if (buildBanner) buildBanner.style.display = 'none';
+        if (fsOverlay) {
+          fsOverlay.style.display = 'flex';
+          if (fsTitle) fsTitle.textContent = messageText || '✓ ¡Liwi actualizado! Recargando...';
+          if (fsDetail) fsDetail.textContent = 'La verificación completa pasó en verde y Liwi ya reinició.';
+          fsOverlay.querySelectorAll('.factory-step-pill[data-fsstep]').forEach((pill) => {
+            pill.classList.remove('is-active');
+            pill.classList.add('is-done');
+          });
+        }
+        if (statusEl) statusEl.textContent = '✅ Mejora aplicada y Liwi actualizado';
+        setFactoryControlsLocked(false);
+        setTimeout(() => { window.location.reload(); }, 650);
+      }
+
       function clearFactoryBlockingForStaging() {
         if (applyInFlight) return;
         stopStatusPolling();
@@ -14821,7 +14939,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const repairBtn = document.getElementById('triage-repair-btn');
       const copyBtn = document.getElementById('triage-copy-prompt-btn');
       const dismissBtn = document.getElementById('triage-dismiss-btn');
+      const solutionsBannerEl = document.getElementById('triage-solutions-banner');
+      const solutionsCountEl = document.getElementById('triage-solutions-count');
+      const solutionsSummaryEl = document.getElementById('triage-solutions-summary');
+      const solutionApproveBtn = document.getElementById('triage-solution-approve-btn');
+      const solutionDismissBtn = document.getElementById('triage-solution-dismiss-btn');
       let currentTicket = null;
+      let currentSolution = null;
 
       function showBannerFeedback(msg) {
         if (!feedbackEl) return;
@@ -14949,9 +15073,60 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         });
       }
 
+      function renderTriageSolutions(solutions, pendingCount) {
+        const list = Array.isArray(solutions) ? solutions : [];
+        const total = Number.isFinite(Number(pendingCount)) ? Number(pendingCount) : list.length;
+        currentSolution = list.length ? list[0] : null;
+        if (solutionsCountEl) {
+          solutionsCountEl.textContent = String(total);
+        }
+        if (!solutionsBannerEl) return;
+        if (!currentSolution || total <= 0) {
+          solutionsBannerEl.style.display = 'none';
+          return;
+        }
+        if (solutionsSummaryEl) {
+          const title = String(currentSolution.title || currentSolution.raw_error || 'Solución propuesta').trim();
+          const fix = String(currentSolution.proposed_fix || '').trim();
+          solutionsSummaryEl.textContent = fix ? (title + ' — ' + fix) : title;
+        }
+        solutionsBannerEl.style.display = 'flex';
+      }
+
+      async function refreshTriageSolutions() {
+        try {
+          const data = await apiFetch('/api/triage/solutions?status=lista', { cache: 'no-store' });
+          renderTriageSolutions(data && data.solutions, data && data.pending_count);
+        } catch (_) {}
+      }
+
+      async function submitTriageSolutionDecision(decision) {
+        if (!currentSolution) return;
+        try {
+          await apiFetch('/api/triage/solutions/' + encodeURIComponent(String(currentSolution.id)) + '/decision', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ decision }),
+          });
+          await refreshTriageSolutions();
+        } catch (_) {}
+      }
+
+      if (solutionApproveBtn) {
+        solutionApproveBtn.addEventListener('click', () => { submitTriageSolutionDecision('aprobada'); });
+      }
+      if (solutionDismissBtn) {
+        solutionDismissBtn.addEventListener('click', () => { submitTriageSolutionDecision('descartada'); });
+      }
+
       window.loadTriageTickets = refreshTriageTickets;
+      window.loadTriageSolutions = refreshTriageSolutions;
       try { refreshTriageTickets(); } catch (_) {}
-      setInterval(() => { try { refreshTriageTickets(); } catch (_) {} }, 15000);
+      try { refreshTriageSolutions(); } catch (_) {}
+      setInterval(() => {
+        try { refreshTriageTickets(); } catch (_) {}
+        try { refreshTriageSolutions(); } catch (_) {}
+      }, 15000);
     })();
 
     setInterval(updateLiveTimers, 1000);
@@ -15295,6 +15470,24 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             return tid, parts[1]
         return None, None
 
+    def _parse_triage_solution_decision_route(self) -> int | None:
+        """Parse /api/triage/solutions/<id>/decision safely (INV-22)."""
+        raw_path = urllib.parse.urlsplit(self.path).path
+        prefix = "/api/triage/solutions/"
+        if not raw_path.startswith(prefix):
+            return None
+        rest = raw_path[len(prefix) :]
+        parts = rest.split("/")
+        if len(parts) == 2 and parts[1] == "decision":
+            raw_id = urllib.parse.unquote(parts[0])
+            if not (raw_id.isascii() and raw_id.isdigit()):
+                raise ValueError("ID de solución inválido; debe ser un entero positivo.")
+            sol_id = int(raw_id)
+            if sol_id <= 0:
+                raise ValueError("ID de solución inválido; debe ser un entero positivo.")
+            return sol_id
+        return None
+
     def do_GET(self) -> None:
         parsed_url = urllib.parse.urlsplit(self.path)
         path = parsed_url.path
@@ -15352,6 +15545,29 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/triage/tickets":
             self._send_controller_json(ctrl.list_triage_tickets)
+            return
+
+        if path == "/api/triage/solutions":
+            def _get_triage_solutions() -> dict[str, Any]:
+                qs = urllib.parse.parse_qs(parsed_url.query, keep_blank_values=True)
+                raw_status = str(qs["status"][-1]).strip() if "status" in qs else ""
+                eff_status = raw_status or None
+                raw_scope = str(qs["scope"][-1]).strip() if "scope" in qs else ""
+                eff_scope = raw_scope or None
+                limit_val = 50
+                if "limit" in qs:
+                    raw_limit = str(qs["limit"][-1]).strip()
+                    try:
+                        limit_val = int(raw_limit)
+                    except ValueError as exc:
+                        raise ValueError("Parámetro 'limit' inválido; debe ser un entero.") from exc
+                return ctrl.list_triage_solutions(
+                    status=eff_status,
+                    scope=eff_scope,
+                    limit=limit_val,
+                )
+
+            self._send_controller_json(_get_triage_solutions)
             return
 
         proj_ideas_pid, proj_ideas_action, _proj_idea_id = self._parse_project_ideas_route()
@@ -15608,6 +15824,18 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
                 return ctrl.dismiss_triage_ticket(tid)
 
             self._send_controller_json(_post_triage_ticket_action)
+            return
+
+        if path.startswith("/api/triage/solutions/"):
+            def _post_triage_solution_decision() -> dict[str, Any]:
+                sol_id = self._parse_triage_solution_decision_route()
+                if sol_id is None:
+                    raise ProjectNotFoundError("Endpoint not found")
+                body = self._read_json_body()
+                decision = self._require_str_field(body, "decision")
+                return ctrl.decide_triage_solution(sol_id, decision)
+
+            self._send_controller_json(_post_triage_solution_decision)
             return
 
         if path == "/api/autonomous/toggle":

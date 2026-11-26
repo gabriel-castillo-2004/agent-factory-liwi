@@ -24,7 +24,17 @@ from agent_factory.adapters.subprocess_runner import SubprocessRunner, resolve_e
 from agent_factory.ports.runner import CommandTimeoutError, Runner
 from agent_factory.recovery_agent import _parse_json_dict_loose
 from agent_factory.secrets import redact_secrets
-from agent_factory.telemetry import _resolve_db_path, update_triage_solution, upsert_triage_error
+from agent_factory.telemetry import (
+    _resolve_db_path,
+    update_triage_solution,
+    upsert_triage_error,
+)
+from agent_factory.telemetry import (
+    get_triage_solution as _telemetry_get_triage_solution,
+)
+from agent_factory.telemetry import (
+    list_triage_solutions as _telemetry_list_triage_solutions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -723,5 +733,77 @@ def update_triage_ticket_status(
         return _row_to_ticket(row)
     finally:
         conn.close()
+
+
+TRIAGE_SOLUTION_DECISION_STATUS_MAP: dict[str, str] = {
+    "aprobada": "encolada",
+    "aprobar": "encolada",
+    "approved": "encolada",
+    "approve": "encolada",
+    "encolada": "encolada",
+    "descartada": "descartada",
+    "descartar": "descartada",
+    "dismissed": "descartada",
+    "dismiss": "descartada",
+    "discard": "descartada",
+    "rejected": "descartada",
+}
+
+
+def list_triage_solutions(
+    *,
+    status: str | None = None,
+    scope: str | None = None,
+    limit: int = 50,
+    db_path: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    """List Auto-Triage solutions ordered most-recent first with optional status/scope filter."""
+    return _telemetry_list_triage_solutions(
+        status=status,
+        scope=scope,
+        limit=limit,
+        db_path=db_path,
+    )
+
+
+def get_triage_solution(
+    solution_id: int,
+    *,
+    db_path: Path | str | None = None,
+) -> dict[str, Any] | None:
+    """Return a single Auto-Triage solution by ID, or None if not found."""
+    if isinstance(solution_id, bool) or not isinstance(solution_id, int) or solution_id <= 0:
+        raise ValueError(f"solution_id inválido: {solution_id!r}")
+    return _telemetry_get_triage_solution(solution_id, db_path=db_path)
+
+
+def decide_triage_solution(
+    solution_id: int,
+    decision: str,
+    *,
+    db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Mark an Auto-Triage solution as approved ('encolada') or dismissed ('descartada')."""
+    if isinstance(solution_id, bool) or not isinstance(solution_id, int) or solution_id <= 0:
+        raise ValueError(f"solution_id inválido: {solution_id!r}")
+    clean_decision = str(decision or "").strip().lower()
+    target_status = TRIAGE_SOLUTION_DECISION_STATUS_MAP.get(clean_decision)
+    if target_status is None:
+        raise ValueError(
+            f"Decisión de Auto-Triage inválida: {decision!r}. "
+            "Usa 'aprobada' o 'descartada'."
+        )
+    existing = _telemetry_get_triage_solution(solution_id, db_path=db_path)
+    if existing is None:
+        raise KeyError(f"Solución de Auto-Triage '{solution_id}' no encontrada.")
+    updated = update_triage_solution(
+        solution_id,
+        status=target_status,
+        db_path=db_path,
+    )
+    if updated is None:
+        raise KeyError(f"Solución de Auto-Triage '{solution_id}' no encontrada.")
+    return updated
+
 
 
