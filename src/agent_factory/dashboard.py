@@ -562,7 +562,11 @@ class DashboardController:
         if eff_status is None:
             try:
                 if self.orchestrator.store.get_events(project_id):
-                    eff_status = self.orchestrator.get_status(project_id)
+                    eff_status = self.orchestrator.get_status(
+                        project_id,
+                        notify_publisher=False,
+                        notify_notifier=False,
+                    )
             except (ValueError, IllegalTransition):
                 eff_status = None
 
@@ -586,8 +590,8 @@ class DashboardController:
             if ws_mgr is None:
                 return {"running": False, "url": None, "app_type": "unknown"}
             self.local_runner.workspace_manager = ws_mgr
-        self._sync_external_workspace(project_id)
         try:
+            self._sync_external_workspace(project_id)
             return self.local_runner.get_status(project_id).to_api_dict()
         except (SandboxViolationError, ValueError, OSError):
             return {"running": False, "url": None, "app_type": "unknown"}
@@ -633,7 +637,11 @@ class DashboardController:
             running, active_op, healed = self._reconcile_running_state(project_id)
             if healed:
                 events = self.orchestrator.store.get_events(project_id)
-                status = self.orchestrator.get_status(project_id)
+                status = self.orchestrator.get_status(
+                    project_id,
+                    notify_publisher=False,
+                    notify_notifier=False,
+                )
         else:
             running, active_op, _ = reconciled
         last_error = self._extract_last_error(status, events)
@@ -690,14 +698,26 @@ class DashboardController:
                 events = self.orchestrator.store.get_events(pid)
                 if not events:
                     continue
-                status = self.orchestrator.get_status(pid)
+                status = self.orchestrator.get_status(
+                    pid,
+                    notify_publisher=False,
+                    notify_notifier=False,
+                )
                 has_plan = self.orchestrator.get_plan(pid) is not None
                 summaries.append(
                     self._serialize_summary(pid, status, events, has_plan=has_plan)
                 )
-            except (ValueError, IllegalTransition) as exc:
-                running = self.is_running(pid)
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    running = self.is_running(pid)
+                except Exception:  # noqa: BLE001
+                    with self._lock:
+                        running = pid in self._active_projects
                 live_info = self._get_live_status_info(running)
+                clean_err = redact_secrets(
+                    str(exc) or exc.__class__.__name__,
+                    extra_secrets=self.secrets_to_redact,
+                )
                 summaries.append(
                     {
                         "project_id": pid,
@@ -706,8 +726,8 @@ class DashboardController:
                         "state": "ERROR",
                         "phase": "ERROR",
                         "progress_pct": 0,
-                        "last_error": redact_secrets(str(exc), extra_secrets=self.secrets_to_redact),
-                        "failure_reason": redact_secrets(str(exc), extra_secrets=self.secrets_to_redact),
+                        "last_error": clean_err,
+                        "failure_reason": clean_err,
                         "links": {"repo": None, "deploy": None},
                         "tests": {"total": 0, "passed": 0, "failed": 0},
                         "has_plan": False,
@@ -2908,6 +2928,26 @@ class DashboardController:
             self.secrets_to_redact,
         )
 
+    @staticmethod
+    def _is_transient_gateway_fetch_error(
+        source: str,
+        error_text: str,
+        context: Mapping[str, Any] | str | None,
+    ) -> bool:
+        """Return True for transient gateway/restart HTTP 502/503/504 errors from fetch_500."""
+        if str(source or "").strip().lower() != "fetch_500":
+            return False
+        if isinstance(context, Mapping):
+            raw_status = context.get("status")
+            if not isinstance(raw_status, bool) and raw_status is not None:
+                try:
+                    if int(raw_status) in {502, 503, 504}:
+                        return True
+                except (TypeError, ValueError):
+                    pass
+        lowered = str(error_text or "").lower()
+        return any(f"http {code}" in lowered for code in (502, 503, 504))
+
     def report_client_error(
         self,
         *,
@@ -2916,6 +2956,13 @@ class DashboardController:
         context: Mapping[str, Any] | str | None = None,
     ) -> dict[str, Any]:
         """Record a browser JS or HTTP >= 500 error as an actionable triage ticket."""
+        if self._is_transient_gateway_fetch_error(source, error_text, context):
+            return {
+                "ok": True,
+                "ignored": True,
+                "reason": "transient_gateway_status",
+                "ticket": None,
+            }
         ticket = error_triage.build_actionable_fix_ticket(
             source,
             error_text,
@@ -15666,7 +15713,24 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if path == "/api/projects":
-            self._send_json(200, {"projects": ctrl.list_projects()})
+            try:
+                projects = ctrl.list_projects()
+            except Exception as exc:  # noqa: BLE001
+                clean_err = redact_secrets(
+                    str(exc) or exc.__class__.__name__,
+                    extra_secrets=ctrl.secrets_to_redact,
+                )
+                logger.warning("GET /api/projects degraded after store error: %s", clean_err)
+                self._send_json(
+                    503,
+                    {
+                        "error": "No se pudo consultar la lista de proyectos temporalmente.",
+                        "detail": clean_err,
+                        "degraded": True,
+                    },
+                )
+                return
+            self._send_json(200, {"projects": projects})
             return
 
         if path == "/api/telemetry/summary":

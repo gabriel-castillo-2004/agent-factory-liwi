@@ -8535,11 +8535,141 @@ def test_dashboard_autonomous_status_watchdog_nonblocking_and_fault_tolerant(
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_projects_list_fault_tolerance_and_triage_ignores_transient_502(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /api/projects never drops connections (502) on bad/locked store rows, avoids sync publish, and client-error triage ignores transient 502/503/504."""
+    import sqlite3
 
+    monkeypatch.setenv("AGENT_FACTORY_TELEMETRY_DB", str(tmp_path / "telemetry_502.db"))
+    store = SqliteEventStore(db_path=tmp_path / "dash_502.db")
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_502")
+    secret = "SECRET_PROJECTS_502_TOKEN"
 
+    publish_calls: list[str] = []
 
+    class _SpyPublisher:
+        def publish(self, status: Any) -> None:
+            publish_calls.append(str(status.project_id))
 
+    orch = Orchestrator(
+        store=store,
+        llm=FakeLLM(),
+        publisher=_SpyPublisher(),  # type: ignore[arg-type]
+        workspace_manager=ws_mgr,
+    )
+    now = datetime(2026, 6, 1, 10, 0, tzinfo=UTC)
 
+    # 1. Healthy project
+    store.append(
+        create_event(
+            "healthy-proj",
+            EventType.PROJECT_CREATED,
+            {"name": "Healthy App", "objective": "Works cleanly", "state": "INTERVIEW"},
+            at=now,
+        )
+    )
+    # 2. Corrupted/invalid project_id stored in SQLite (previously double-raised ValueError inside is_running)
+    store.append(
+        create_event(
+            "INVALID_PID_ROW",
+            EventType.PROJECT_CREATED,
+            {"name": "Broken ID", "objective": "Bad id", "state": "INTERVIEW"},
+            at=now,
+        )
+    )
+    # 3. Imported project whose external folder no longer exists on disk
+    missing_ext = str((tmp_path / "deleted-external-dir").resolve())
+    store.append(
+        create_event(
+            "missing-ext-proj",
+            EventType.PROJECT_CREATED,
+            {
+                "name": "Moved External App",
+                "objective": "External folder removed",
+                "state": "INTERVIEW",
+                "external_workspace_path": missing_ext,
+            },
+            at=now,
+        )
+    )
 
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        workspace_manager=ws_mgr,
+        secrets_to_redact=(secret,),
+    )
+    try:
+        # GET /api/projects succeeds with 200, degrades invalid row cleanly, survives missing external dir, and never invokes publisher.publish()
+        code, payload = _http_json(f"{base_url}/api/projects", timeout=3.0)
+        assert code == 200
+        by_id = {p["project_id"]: p for p in payload["projects"]}
+        assert by_id["healthy-proj"]["state"] == "INTERVIEW"
+        assert by_id["INVALID_PID_ROW"]["state"] == "ERROR"
+        assert by_id["missing-ext-proj"]["state"] == "INTERVIEW"
+        assert by_id["missing-ext-proj"]["local_app"] == {
+            "running": False,
+            "url": None,
+            "app_type": "unknown",
+        }
+        assert publish_calls == []
 
+        # Transient SQLite lock on list_project_ids returns clean redacted 503 JSON (never drops connection / 502)
+        monkeypatch.setattr(
+            store,
+            "list_project_ids",
+            lambda: (_ for _ in ()).throw(
+                sqlite3.OperationalError(f"database is locked {secret}")
+            ),
+        )
+        err_code, err_payload = _http_json(f"{base_url}/api/projects", timeout=3.0)
+        assert err_code == 503
+        assert err_payload["degraded"] is True
+        assert "error" in err_payload
+        assert secret not in json.dumps(err_payload)
+
+        # POST /api/telemetry/client-error ignores transient fetch_500 gateway statuses (502/503/504) without creating tickets
+        c_502, r_502 = _http_json(
+            f"{base_url}/api/telemetry/client-error",
+            method="POST",
+            body={
+                "source": "fetch_500",
+                "error_text": "HTTP 502 en /api/projects: Error interno",
+                "context": {"url": "/api/projects", "status": 502},
+            },
+        )
+        assert c_502 == 200
+        assert r_502["ok"] is True
+        assert r_502["ignored"] is True
+        assert r_502["ticket"] is None
+
+        c_tickets_empty, r_tickets_empty = _http_json(f"{base_url}/api/triage/tickets")
+        assert c_tickets_empty == 200
+        assert r_tickets_empty["tickets"] == []
+
+        # Genuine HTTP 500 still creates a triage ticket
+        c_500, r_500 = _http_json(
+            f"{base_url}/api/telemetry/client-error",
+            method="POST",
+            body={
+                "source": "fetch_500",
+                "error_text": "HTTP 500 en /api/projects: Fallo real",
+                "context": {"url": "/api/projects", "status": 500},
+            },
+        )
+        assert c_500 == 200
+        assert r_500["ok"] is True
+        assert r_500["ticket"] is not None
+        assert r_500["ticket"]["source"] == "fetch_500"
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
 
