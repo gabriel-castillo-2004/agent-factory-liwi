@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
+import keyword
 import os
 import subprocess
 import sys
@@ -15,8 +17,10 @@ from typing import Any
 import pytest
 
 from agent_factory.runtime_runner import (
+    _IMPORT_TO_PYPI_PACKAGE,
     LocalAppError,
     LocalAppRunner,
+    _detect_workspace_third_party_packages,
     build_venv_env,
     ensure_workspace_venv,
     get_workspace_venv_python,
@@ -472,3 +476,125 @@ def test_workspace_venv_rejects_symlinks_and_junctions_inv22(
 
     with pytest.raises(SandboxViolationError):
         ensure_workspace_venv(ws_py_link, project_id="proj-py-exe-link", install_deps=True)
+
+
+def test_ast_dependency_filter_rejects_flag_underscore_stdlib_and_invalid_tokens(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AST dependency filter discards flag/underscore prefixes (pre- and post-normalization), stdlib modules, and non-PEP508 tokens while keeping valid external packages."""
+    # 1. Reproduces `__main__` -> `--main--` and `_interno` -> `-interno` plus non-ASCII identifier `café`
+    ws = tmp_path / "ws_ast_hardening"
+    ws.mkdir()
+    (ws / "app.py").write_text(
+        "import __main__\n"
+        "from __main__ import main_fn\n"
+        "import _interno\n"
+        "from _private_mod import helper\n"
+        "import café\n"
+        "import json\n"
+        "import os\n"
+        "import pathlib\n"
+        "import requests\n"
+        "import fastapi\n"
+        "import sklearn\n"
+        "import scikit_learn\n",
+        encoding="utf-8",
+    )
+
+    detected = _detect_workspace_third_party_packages(ws)
+    assert detected == ["fastapi", "requests", "scikit-learn", "uvicorn"]
+
+    # Verify `ensure_workspace_venv` never passes `--main--` or invalid tokens to `python -m pip install`
+    cmds: list[list[str]] = []
+    res = ensure_workspace_venv(
+        ws,
+        project_id="proj-ast-hardening",
+        install_deps=True,
+        ensure_pytest=False,
+        dep_command_runner=_make_offline_venv_runner(recorded_cmds=cmds),
+    )
+    assert res is not None
+    venv_py, _ = res
+    pip_cmds = [c for c in cmds if "-m" in c and "pip" in c and "install" in c]
+    assert pip_cmds == [
+        [str(venv_py), "-m", "pip", "install", "fastapi", "requests", "scikit-learn", "uvicorn"]
+    ]
+
+    # 2. Synthetic AST tokens covering leading `-`/`_`, regex violations, and whitespace/newline smuggling
+    ws_synth = tmp_path / "ws_ast_synthetic"
+    ws_synth.mkdir()
+    (ws_synth / "main.py").write_text("# placeholder\n", encoding="utf-8")
+
+    synthetic_tree = ast.Module(
+        body=[
+            ast.Import(
+                names=[
+                    ast.alias(name="__main__"),
+                    ast.alias(name="--main--"),
+                    ast.alias(name="_interno"),
+                    ast.alias(name="-opcion"),
+                    ast.alias(name=".leadingdot"),
+                    ast.alias(name="bad!pkg"),
+                    ast.alias(name="bad/slash"),
+                    ast.alias(name="bad;semi"),
+                    ast.alias(name="bad space"),
+                    ast.alias(name="requests\n--extra"),
+                    ast.alias(name="requests"),
+                    ast.alias(name="scikit_learn"),
+                ]
+            ),
+            ast.ImportFrom(module="--flag-from", names=[ast.alias(name="x")], level=0),
+            ast.ImportFrom(module="_under_from", names=[ast.alias(name="y")], level=0),
+            ast.ImportFrom(module="fastapi", names=[ast.alias(name="FastAPI")], level=0),
+        ],
+        type_ignores=[],
+    )
+    real_ast_parse = ast.parse
+    monkeypatch.setattr(ast, "parse", lambda source, filename="<unknown>": synthetic_tree)
+    try:
+        assert _detect_workspace_third_party_packages(ws_synth) == [
+            "fastapi",
+            "requests",
+            "scikit-learn",
+            "uvicorn",
+        ]
+    finally:
+        monkeypatch.setattr(ast, "parse", real_ast_parse)
+
+    # 3. Post-normalization rejection (even if a mapping yields `-`, `_`, invalid regex, or stdlib)
+    ws_mapped = tmp_path / "ws_ast_post_norm"
+    ws_mapped.mkdir()
+    (ws_mapped / "app.py").write_text(
+        "import alias_dash\n"
+        "import alias_opt\n"
+        "import alias_under\n"
+        "import alias_bad_chars\n"
+        "import alias_stdlib\n"
+        "import requests\n"
+        "import sklearn\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(_IMPORT_TO_PYPI_PACKAGE, "alias_dash", "--main--")
+    monkeypatch.setitem(_IMPORT_TO_PYPI_PACKAGE, "alias_opt", "-opcion")
+    monkeypatch.setitem(_IMPORT_TO_PYPI_PACKAGE, "alias_under", "_interno")
+    monkeypatch.setitem(_IMPORT_TO_PYPI_PACKAGE, "alias_bad_chars", "pkg!invalid")
+    monkeypatch.setitem(_IMPORT_TO_PYPI_PACKAGE, "alias_stdlib", "json")
+
+    assert _detect_workspace_third_party_packages(ws_mapped) == [
+        "requests",
+        "scikit-learn",
+    ]
+
+    # 4. Every module present in sys.stdlib_module_names is discarded
+    ws_stdlib = tmp_path / "ws_ast_stdlib_all"
+    ws_stdlib.mkdir()
+    stdlib_imports = [
+        f"import {mod}"
+        for mod in sorted(sys.stdlib_module_names)
+        if mod.isidentifier() and not keyword.iskeyword(mod)
+    ]
+    assert len(stdlib_imports) > 50
+    (ws_stdlib / "stdlib_only.py").write_text("\n".join(stdlib_imports) + "\n", encoding="utf-8")
+    assert _detect_workspace_third_party_packages(ws_stdlib) == []
+

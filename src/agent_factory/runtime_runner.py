@@ -691,6 +691,16 @@ _IMPORT_TO_PYPI_PACKAGE: dict[str, str] = {
 }
 
 
+_VALID_AST_PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _is_valid_ast_package_name(name: str) -> bool:
+    """Return True iff name is a safe non-flag package/module token matching ^[A-Za-z0-9][A-Za-z0-9._-]*$."""
+    if not name or name.startswith(("-", "_")):
+        return False
+    return _VALID_AST_PACKAGE_RE.fullmatch(name) is not None
+
+
 def _norm_pypi_name(name: str) -> str:
     """Normalize package names per PEP 503 for deduplication against manifests."""
     return re.sub(r"[-_.]+", "-", name.strip()).lower()
@@ -736,27 +746,32 @@ def _detect_workspace_third_party_packages(workspace_dir: Path) -> list[str]:
             top_names: list[str] = []
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    top = alias.name.split(".", 1)[0].strip()
+                    top = alias.name.split(".", 1)[0]
                     if top:
                         top_names.append(top)
             elif isinstance(node, ast.ImportFrom):
                 if node.level and node.level > 0:
                     continue
                 if node.module:
-                    top = node.module.split(".", 1)[0].strip()
+                    top = node.module.split(".", 1)[0]
                     if top:
                         top_names.append(top)
 
             for top in top_names:
-                if top in stdlib_names or top in local_modules:
+                if (
+                    not _is_valid_ast_package_name(top)
+                    or top in stdlib_names
+                    or top in local_modules
+                ):
                     continue
                 mapped = (
                     _IMPORT_TO_PYPI_PACKAGE.get(top)
                     or _IMPORT_TO_PYPI_PACKAGE.get(top.lower())
                     or top.replace("_", "-").lower()
                 )
-                if mapped:
-                    discovered.add(mapped)
+                if not _is_valid_ast_package_name(mapped) or mapped in stdlib_names:
+                    continue
+                discovered.add(mapped)
 
     if "fastapi" in discovered:
         discovered.add("uvicorn")
@@ -989,9 +1004,18 @@ def ensure_workspace_venv(
                     secrets_to_redact=secrets_to_redact,
                 )
 
+        stdlib_names = (
+            frozenset(sys.stdlib_module_names)
+            | frozenset(sys.builtin_module_names)
+            | {"__future__"}
+        )
         declared_norm = _extract_declared_manifest_packages(req_files, pyproject_files)
         missing_ast_pkgs = [
-            pkg for pkg in ast_packages if _norm_pypi_name(pkg) not in declared_norm
+            pkg
+            for pkg in ast_packages
+            if _is_valid_ast_package_name(pkg)
+            and pkg not in stdlib_names
+            and _norm_pypi_name(pkg) not in declared_norm
         ]
         if missing_ast_pkgs:
             _run_venv_command(
