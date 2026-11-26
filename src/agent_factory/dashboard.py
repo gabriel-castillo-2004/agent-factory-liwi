@@ -4222,6 +4222,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .liwi-radar-card-feedback.is-error {
       color: var(--err);
     }
+    .auto-ideas-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 18px;
+      height: 18px;
+      padding: 0 5px;
+      margin-left: 5px;
+      border-radius: 999px;
+      font-size: 0.7rem;
+      font-weight: 700;
+      line-height: 1;
+      background: var(--accent);
+      color: var(--btn-primary-fg);
+    }
+    .liwi-radar-section.is-radar-focused {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.25);
+    }
     .theme-option,
     .more-menu-item {
       width: 100%;
@@ -4812,6 +4831,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       #view-mode-simple,
       #view-mode-dev,
       #themes-menu-btn,
+      #auto-ideas-btn,
       #improve-factory-btn,
       #settings-menu-btn {
         display: inline-flex;
@@ -5863,6 +5883,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .factory-chat-meta-col {
       max-width: 800px;
       width: 100%;
+      max-height: 48vh;
+      overflow-y: auto;
+      scrollbar-width: thin;
       margin: 0 auto;
       padding: 0 20px;
       box-sizing: border-box;
@@ -6226,6 +6249,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
       .factory-chat-meta-col {
         padding: 0 12px;
+        max-height: 44dvh;
+        overflow-y: auto;
       }
       .factory-chat-stream {
         padding: 16px 14px 20px;
@@ -6432,6 +6457,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
         </div>
       </div>
+      <button id="auto-ideas-btn" class="btn btn-sm" type="button" title="Abrir Radar de Auto-Mejoras de Liwi">💡 Auto-Mejoras<span id="auto-ideas-count" class="auto-ideas-badge" style="display:none">0</span></button>
       <button id="improve-factory-btn" class="btn btn-sm" type="button" title="Abrir chat padre de auto-mejora de Liwi">🏭 Mejorar Fábrica</button>
       <div class="settings-menu-wrap">
         <button id="settings-menu-btn" class="btn btn-sm" type="button" aria-expanded="false" aria-controls="settings-popover">⚙️ Ajustes</button>
@@ -12659,7 +12685,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
       }
 
-      window.openFactoryImproveModal = (prefillText) => {
+      window.openFactoryImproveModal = (prefillText, opts) => {
+        const cfg = opts && typeof opts === 'object' ? opts : {};
         modal.style.display = 'flex';
         if (prefillText && inputEl) {
           inputEl.value = prefillText;
@@ -12670,10 +12697,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         if (typeof window.refreshLiwiRadarIdeas === 'function') {
           window.refreshLiwiRadarIdeas();
         }
-        if (inputEl && !isBlockingApplyActive()) inputEl.focus();
+        const radarEl = document.getElementById('liwi-radar-section');
+        if (cfg.focusRadar && radarEl) {
+          radarEl.style.display = 'flex';
+          radarEl.classList.add('is-radar-focused');
+          setTimeout(() => radarEl.classList.remove('is-radar-focused'), 1800);
+          requestAnimationFrame(() => {
+            try {
+              radarEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            } catch (_) {
+              radarEl.scrollIntoView();
+            }
+          });
+        } else if (inputEl && !isBlockingApplyActive()) {
+          inputEl.focus();
+        }
       };
 
       openBtn.addEventListener('click', () => window.openFactoryImproveModal(''));
+      const autoIdeasBtn = document.getElementById('auto-ideas-btn');
+      if (autoIdeasBtn) {
+        autoIdeasBtn.addEventListener('click', () => window.openFactoryImproveModal('', { focusRadar: true }));
+      }
       if (fsMinBtn) {
         fsMinBtn.addEventListener('click', () => {
           buildOverlayMinimized = true;
@@ -13221,8 +13266,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
       }
 
+      function syncHeaderIdeasBadge() {
+        const badgeEl = document.getElementById('auto-ideas-count');
+        if (!badgeEl) return;
+        const list = Array.isArray(currentIdeas) ? currentIdeas : [];
+        const newCount = list.filter((it) => !it || !it.status || String(it.status) === 'nueva').length;
+        if (newCount > 0) {
+          badgeEl.textContent = String(newCount);
+          badgeEl.style.display = 'inline-flex';
+        } else {
+          badgeEl.textContent = '0';
+          badgeEl.style.display = 'none';
+        }
+      }
+
       function renderIdeasGrid() {
         const list = Array.isArray(currentIdeas) ? currentIdeas : [];
+        syncHeaderIdeasBadge();
         if (!list.length) {
           gridEl.innerHTML = '';
           gridEl.style.display = 'none';
@@ -13510,6 +13570,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
 
       window.refreshLiwiRadarIdeas = loadIdeas;
+      loadIdeas();
     })();
 
     setInterval(updateLiveTimers, 1000);

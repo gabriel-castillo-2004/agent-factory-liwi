@@ -7922,6 +7922,58 @@ def test_dashboard_radar_idea_db_path_resolves_to_telemetry_db(
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_auto_ideas_header_button_scrolls_to_radar_and_auto_loads_ideas(
+    tmp_path: Path,
+) -> None:
+    """Header top bar exposes visible '💡 Auto-Mejoras' button with badge next to '#improve-factory-btn' (desktop + mobile), scrolls to '#liwi-radar-section', prevents modal meta clipping, and auto-loads '/api/ideas' on startup."""
+    store = SqliteEventStore(str(tmp_path / "auto_ideas_header.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as resp:
+            assert resp.status == 200
+            html = resp.read().decode("utf-8")
+
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+
+        header_start = html.index("<header>")
+        header_end = html.index("</header>", header_start)
+        header_html = html[header_start:header_end]
+
+        assert 'id="auto-ideas-btn"' in header_html
+        assert 'id="auto-ideas-count"' in header_html
+        assert "💡 Auto-Mejoras" in header_html
+        assert 'id="improve-factory-btn"' in header_html
+        assert header_html.index('id="improve-factory-btn"') != header_html.index('id="auto-ideas-btn"')
+
+        style_start = html.index("<style>") + len("<style>")
+        style_end = html.index("</style>", style_start)
+        css = html[style_start:style_end]
+        media_768 = _extract_css_block(css, "@media (max-width: 768px)")
+        assert "#auto-ideas-btn" in media_768
+
+        meta_col_rule = _extract_css_block(css, ".factory-chat-meta-col {")
+        assert "overflow-y: auto;" in meta_col_rule
+
+        script_js = html[html.index("<script>") :]
+        assert "auto-ideas-btn" in script_js
+        assert "focusRadar" in script_js
+        assert "scrollIntoView(" in script_js
+        assert "auto-ideas-count" in script_js
+        radar_init = script_js[script_js.index("(function initLiwiIdeaRadar()") :]
+        assert "\n      loadIdeas();" in radar_init
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
 
 
 
