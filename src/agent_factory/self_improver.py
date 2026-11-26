@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
 DEFAULT_SELF_IMPROVE_CONSULT_TIMEOUT_SECONDS: float = 180.0
 DEFAULT_SELF_IMPROVE_APPLY_TIMEOUT_SECONDS: float = 900.0
+DEFAULT_SELF_IMPROVE_VERIFY_TIMEOUT_SECONDS: float = 900.0
 DEFAULT_SELF_IMPROVE_TIMEOUT_SECONDS: float = DEFAULT_SELF_IMPROVE_APPLY_TIMEOUT_SECONDS
 DEFAULT_RESTART_DELAY_SECONDS: float = 1.0
 MAX_UPLOAD_IMAGE_BYTES: int = 5 * 1024 * 1024
@@ -307,6 +308,7 @@ class FactorySelfImprover:
         secrets_to_redact: Sequence[str] = (),
         consult_timeout_seconds: float = DEFAULT_SELF_IMPROVE_CONSULT_TIMEOUT_SECONDS,
         apply_timeout_seconds: float = DEFAULT_SELF_IMPROVE_APPLY_TIMEOUT_SECONDS,
+        verify_timeout_seconds: float = DEFAULT_SELF_IMPROVE_VERIFY_TIMEOUT_SECONDS,
         restart_fn: Callable[[int], Any] | None = None,
         restart_delay_seconds: float = DEFAULT_RESTART_DELAY_SECONDS,
         pre_exit_hook: Callable[[], Any] | None = None,
@@ -346,6 +348,7 @@ class FactorySelfImprover:
         self.secrets_to_redact: tuple[str, ...] = tuple(secrets_to_redact)
         self.consult_timeout_seconds = float(consult_timeout_seconds)
         self.apply_timeout_seconds = float(apply_timeout_seconds)
+        self.verify_timeout_seconds = float(verify_timeout_seconds)
         self.restart_fn: Callable[[int], Any] = restart_fn if restart_fn is not None else os._exit
         self.restart_delay_seconds = float(restart_delay_seconds)
         self.pre_exit_hook = pre_exit_hook
@@ -737,6 +740,61 @@ class FactorySelfImprover:
             return [sys.executable, "-m", tool_name]
         return [tool_name]
 
+    def _collect_changed_src_tests(self, env: Mapping[str, str]) -> list[str]:
+        """List modified or untracked files under src/ and tests/ relative to repo_root."""
+        try:
+            res = self.runner.run(
+                ["git", "status", "--porcelain", "-uall", "--", "src", "tests"],
+                cwd=self.repo_root,
+                timeout_seconds=15.0,
+                env=env,
+            )
+        except (CommandTimeoutError, OSError, RuntimeError, ValueError):
+            return []
+        if res.exit_code != 0 or not res.stdout:
+            return []
+        changed: list[str] = []
+        for line in res.stdout.splitlines():
+            if len(line) < 4:
+                continue
+            raw_path = line[3:].strip()
+            if " -> " in raw_path:
+                raw_path = raw_path.split(" -> ", 1)[1].strip()
+            norm = raw_path.strip('"').replace("\\", "/")
+            if norm and norm not in changed:
+                changed.append(norm)
+        return changed
+
+    def _select_targeted_pytest_targets(self, changed_paths: Sequence[str]) -> tuple[list[str], bool]:
+        """Select targeted test files for modified src/tests modules; fall back if none outside test_self_improver."""
+        tests_dir = self.repo_root / "tests"
+        selected: list[str] = []
+        seen: set[str] = set()
+
+        def _add_if_file(rel_path: str) -> None:
+            norm = rel_path.replace("\\", "/")
+            if norm not in seen and (self.repo_root / norm).is_file():
+                seen.add(norm)
+                selected.append(norm)
+
+        _add_if_file("tests/test_self_improver.py")
+
+        for rel in changed_paths:
+            norm = rel.replace("\\", "/")
+            name = Path(norm).name
+            if norm.startswith("tests/") and name.startswith("test_") and norm.endswith(".py"):
+                _add_if_file(norm)
+            elif norm.startswith("src/") and norm.endswith(".py"):
+                stem = Path(norm).stem
+                if stem and stem != "__init__" and tests_dir.is_dir():
+                    for match in sorted(tests_dir.glob(f"test_*{stem}*.py")):
+                        _add_if_file(f"tests/{match.name}")
+                if name == "cli.py":
+                    _add_if_file("tests/test_dashboard.py")
+
+        has_other_targeted = any(t != "tests/test_self_improver.py" for t in selected)
+        return (selected if has_other_targeted else []), has_other_targeted
+
     def _rollback_savepoint(self, env: Mapping[str, str]) -> None:
         self.runner.run(
             ["git", "reset", "--hard", "pre-self-improve"],
@@ -838,7 +896,7 @@ class FactorySelfImprover:
             elif not agy_ok:
                 failure_reason = f"Falló la ejecución de agy: {agy_out}"
             else:
-                # 3. Quality gate: ruff check src tests + full pytest -q --no-cov
+                # 3. Quality gate: ruff check src tests + targeted/full pytest -q --no-cov
                 self._set_apply_status(
                     running=True,
                     step=2,
@@ -853,23 +911,36 @@ class FactorySelfImprover:
                 ruff_res = self.runner.run(
                     ruff_cmd,
                     cwd=self.repo_root,
-                    timeout_seconds=self.apply_timeout_seconds,
+                    timeout_seconds=self.verify_timeout_seconds,
                     env=ws_env,
                 )
                 if ruff_res.exit_code != 0:
                     tail = (ruff_res.stdout or ruff_res.stderr or "ruff check failed").strip()[-1200:]
                     failure_reason = f"Falló ruff check src tests:\n{self._redact(tail)}"
                 else:
-                    pytest_cmd = [*self._resolve_venv_tool("pytest"), "-q", "--no-cov"]
+                    changed_paths = self._collect_changed_src_tests(clean_env)
+                    targeted_tests, has_targeted = self._select_targeted_pytest_targets(changed_paths)
+                    pytest_args = ["-q", "--no-cov", *targeted_tests] if has_targeted else ["-q", "--no-cov"]
+                    if has_targeted:
+                        self._set_apply_status(
+                            running=True,
+                            step=2,
+                            total_steps=3,
+                            stage="Verificando calidad y pruebas",
+                            detail=f"Ejecutando pruebas dirigidas ({', '.join(targeted_tests)})...",
+                            title=clean_title,
+                            started_at=started_at,
+                        )
+                    pytest_cmd = [*self._resolve_venv_tool("pytest"), *pytest_args]
                     pytest_res = self.runner.run(
                         pytest_cmd,
                         cwd=self.repo_root,
-                        timeout_seconds=self.apply_timeout_seconds,
+                        timeout_seconds=self.verify_timeout_seconds,
                         env=ws_env,
                     )
                     if pytest_res.exit_code != 0:
                         tail = (pytest_res.stdout or pytest_res.stderr or "pytest failed").strip()[-1200:]
-                        failure_reason = f"Falló pytest -q --no-cov:\n{self._redact(tail)}"
+                        failure_reason = f"Falló pytest {' '.join(pytest_args)}:\n{self._redact(tail)}"
 
             if failure_reason:
                 outcome = "rolled_back"

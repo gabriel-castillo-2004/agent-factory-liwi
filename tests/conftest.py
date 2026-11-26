@@ -31,7 +31,9 @@ def _dir_contains_host_agy(dir_path: Path, agy_names: frozenset[str]) -> bool:
 
 @pytest.fixture(autouse=True)
 def _isolate_host_agy_from_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Filter pre-existing system PATH directories containing real agy binaries so tests remain isolated (INV-03)."""
+    """Filter pre-existing system PATH directories containing real agy binaries and disable interactive Git prompts (INV-03)."""
+    monkeypatch.setenv("GIT_TERMINAL_PROMPT", "0")
+    monkeypatch.setenv("GCM_INTERACTIVE", "never")
     raw_path = os.environ.get("PATH", "")
     if not raw_path:
         return

@@ -683,3 +683,79 @@ def test_factory_assistant_status_endpoint_live_progress_apply_900s_and_targeted
         store.close()
 
 
+def test_factory_assistant_apply_selects_targeted_tests_for_modified_dashboard_file(
+    tmp_path: Path,
+) -> None:
+    """When agy modifies src/agent_factory/dashboard.py, verification runs pytest only on tests/test_self_improver.py and tests/test_dashboard.py (not unrelated heavy tests) with 900s timeout, and falls back to full suite if no matching test exists."""
+    repo_root = tmp_path / "repo_targeted"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "TestFactory"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.email", "factory@local"], cwd=repo_root, check=True)
+    (repo_root / "src" / "agent_factory").mkdir(parents=True, exist_ok=True)
+    (repo_root / "tests").mkdir(parents=True, exist_ok=True)
+    (repo_root / "src" / "agent_factory" / "dashboard.py").write_text("X = 1\n", encoding="utf-8")
+    (repo_root / "src" / "agent_factory" / "orphan_mod.py").write_text("Y = 1\n", encoding="utf-8")
+    (repo_root / "tests" / "test_self_improver.py").write_text("def test_si(): assert True\n", encoding="utf-8")
+    (repo_root / "tests" / "test_dashboard.py").write_text("def test_dash(): assert True\n", encoding="utf-8")
+    (repo_root / "tests" / "test_recovery_agent.py").write_text("def test_rec(): assert True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "chore: seed repo"], cwd=repo_root, check=True, capture_output=True)
+
+    real_runner = SubprocessRunner(default_timeout_seconds=15.0)
+    recorded_pytest_cmds: list[tuple[list[str], float]] = []
+    edit_target = ["src/agent_factory/dashboard.py"]
+
+    class _TargetedRunner(SubprocessRunner):
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            exe_stem = Path(command[0]).stem.lower()
+            if exe_stem == "agy":
+                target = repo_root / edit_target[0]
+                target.write_text("VALUE_UPDATED = True\n", encoding="utf-8")
+                return CommandResult(exit_code=0, stdout="ok")
+            if exe_stem == "ruff":
+                return CommandResult(exit_code=0, stdout="All checks passed!")
+            if exe_stem == "pytest":
+                recorded_pytest_cmds.append((list(command), timeout_seconds))
+                return CommandResult(exit_code=0, stdout="2 passed")
+            return real_runner.run(command, cwd, timeout_seconds=timeout_seconds, env=env)
+
+    store = SqliteEventStore(db_path=tmp_path / "targeted.db")
+    try:
+        improver = FactorySelfImprover(
+            sqlite_store=store,
+            repo_root=repo_root,
+            uploads_dir=tmp_path / "uploads_tgt",
+            runner=_TargetedRunner(),
+            restart_fn=lambda _code: None,
+            restart_delay_seconds=0.01,
+        )
+        res_dash = improver.apply_proposal("Actualiza dashboard.py", proposal_title="Dashboard fix")
+        assert res_dash["applied"] is True
+        assert len(recorded_pytest_cmds) == 1
+        cmd_dash, timeout_dash = recorded_pytest_cmds[0]
+        assert timeout_dash >= 900.0
+        assert "tests/test_self_improver.py" in cmd_dash
+        assert "tests/test_dashboard.py" in cmd_dash
+        assert "tests/test_recovery_agent.py" not in cmd_dash
+
+        # Unmatched module with no test_*<module>*.py triggers full suite fallback
+        recorded_pytest_cmds.clear()
+        edit_target[0] = "src/agent_factory/orphan_mod.py"
+        res_orphan = improver.apply_proposal("Actualiza orphan_mod.py", proposal_title="Orphan fix")
+        assert res_orphan["applied"] is True
+        assert len(recorded_pytest_cmds) == 1
+        cmd_orphan, timeout_orphan = recorded_pytest_cmds[0]
+        assert timeout_orphan >= 900.0
+        assert Path(cmd_orphan[0]).stem.lower() == "pytest"
+        assert cmd_orphan[1:] == ["-q", "--no-cov"]
+    finally:
+        store.close()
+
+
