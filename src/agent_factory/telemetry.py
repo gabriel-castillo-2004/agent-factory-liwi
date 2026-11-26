@@ -24,6 +24,11 @@ CANONICAL_COMPONENTS: tuple[str, ...] = (
 MIN_SUMMARY_LIMIT = 1
 MAX_SUMMARY_LIMIT = 100
 DEFAULT_SUMMARY_LIMIT = 10
+DEFAULT_TRIAGE_LIMIT = 50
+MAX_TRIAGE_LIMIT = 200
+TRIAGE_VALID_STATUSES: frozenset[str] = frozenset(
+    {"analizando", "lista", "encolada", "descartada"}
+)
 _TELEMETRY_ERRORS = (sqlite3.Error, OSError, ValueError, TypeError, OverflowError, RuntimeError)
 
 _KNOWN_SIGNATURES: frozenset[str] = frozenset(
@@ -112,6 +117,24 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS triage_solutions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            error_signature TEXT NOT NULL UNIQUE,
+            scope TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            raw_error TEXT NOT NULL,
+            root_cause TEXT NOT NULL DEFAULT '',
+            proposed_fix TEXT NOT NULL DEFAULT '',
+            technical_prompt TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'analizando'
+                CHECK(status IN ('analizando', 'lista', 'encolada', 'descartada')),
+            occurrences INTEGER NOT NULL DEFAULT 1
+        );
+        """
+    )
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_execution_events_duration ON execution_events(duration_ms DESC);"
     )
     conn.execute(
@@ -125,6 +148,12 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_incidents_error_sig ON incidents(error_signature);"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_triage_solutions_status ON triage_solutions(status);"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_triage_solutions_created_at ON triage_solutions(created_at DESC);"
     )
 
 
@@ -566,3 +595,221 @@ def format_telemetry_context(
                 f"{inc['raw_error'][:160]}"
             )
     return "\n".join(lines)
+
+
+_TRIAGE_SELECT_COLS = (
+    "id, created_at, error_signature, scope, title, raw_error, "
+    "root_cause, proposed_fix, technical_prompt, status, occurrences"
+)
+
+
+def _validate_triage_status(status: str) -> str:
+    clean = str(status or "").strip().lower()
+    if clean not in TRIAGE_VALID_STATUSES:
+        raise ValueError(
+            f"Invalid triage status {status!r}; expected one of {sorted(TRIAGE_VALID_STATUSES)}"
+        )
+    return clean
+
+
+def _row_to_triage_solution(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "created_at": str(row["created_at"]),
+        "error_signature": str(row["error_signature"]),
+        "scope": str(row["scope"]),
+        "title": str(row["title"]),
+        "raw_error": str(row["raw_error"]),
+        "root_cause": str(row["root_cause"]),
+        "proposed_fix": str(row["proposed_fix"]),
+        "technical_prompt": str(row["technical_prompt"]),
+        "status": str(row["status"]),
+        "occurrences": int(row["occurrences"]),
+    }
+
+
+def upsert_triage_error(
+    error_signature: str,
+    raw_error: str,
+    *,
+    scope: str = "factory",
+    title: str = "",
+    status: str = "analizando",
+    created_at: str | None = None,
+    db_path: Path | str | None = None,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Insert a new triage error or atomically increment occurrences for an existing signature."""
+    sig = str(error_signature or "").strip()
+    if not sig:
+        raise ValueError("error_signature must be a non-empty string")
+    eff_status = _validate_triage_status(status)
+    eff_scope = str(scope or "factory").strip().lower() or "factory"
+    eff_title = str(title or "").strip()
+    raw = str(raw_error or "")
+    ts = (
+        created_at.strip()
+        if isinstance(created_at, str) and created_at.strip()
+        else datetime.now(UTC).isoformat()
+    )
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO triage_solutions (
+                created_at,
+                error_signature,
+                scope,
+                title,
+                raw_error,
+                root_cause,
+                proposed_fix,
+                technical_prompt,
+                status,
+                occurrences
+            ) VALUES (?, ?, ?, ?, ?, '', '', '', ?, 1);
+            """,
+            (ts, sig, eff_scope, eff_title, raw, eff_status),
+        )
+        is_new = cursor.rowcount == 1
+        if not is_new:
+            conn.execute(
+                "UPDATE triage_solutions SET occurrences = occurrences + 1 WHERE error_signature = ?;",
+                (sig,),
+            )
+        row = conn.execute(
+            f"SELECT {_TRIAGE_SELECT_COLS} FROM triage_solutions WHERE error_signature = ?;",
+            (sig,),
+        ).fetchone()
+        conn.commit()
+        return (_row_to_triage_solution(row) if row is not None else None), is_new
+    except (sqlite3.Error, OSError) as exc:
+        logger.debug("Telemetry upsert_triage_error skipped due to error: %s", exc)
+        return None, False
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def update_triage_solution(
+    solution_id: int,
+    *,
+    title: str | None = None,
+    root_cause: str | None = None,
+    proposed_fix: str | None = None,
+    technical_prompt: str | None = None,
+    status: str | None = None,
+    db_path: Path | str | None = None,
+) -> dict[str, Any] | None:
+    """Update analysis fields and/or status of a triage_solutions record by ID."""
+    clean_status = _validate_triage_status(status) if status is not None else None
+    if isinstance(solution_id, bool) or not isinstance(solution_id, int) or solution_id <= 0:
+        return None
+
+    updates: list[str] = []
+    params: list[Any] = []
+    if title is not None:
+        updates.append("title = ?")
+        params.append(str(title))
+    if root_cause is not None:
+        updates.append("root_cause = ?")
+        params.append(str(root_cause))
+    if proposed_fix is not None:
+        updates.append("proposed_fix = ?")
+        params.append(str(proposed_fix))
+    if technical_prompt is not None:
+        updates.append("technical_prompt = ?")
+        params.append(str(technical_prompt))
+    if clean_status is not None:
+        updates.append("status = ?")
+        params.append(clean_status)
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        if updates:
+            params.append(solution_id)
+            conn.execute(
+                f"UPDATE triage_solutions SET {', '.join(updates)} WHERE id = ?;",
+                tuple(params),
+            )
+            conn.commit()
+        row = conn.execute(
+            f"SELECT {_TRIAGE_SELECT_COLS} FROM triage_solutions WHERE id = ?;",
+            (solution_id,),
+        ).fetchone()
+        return _row_to_triage_solution(row) if row is not None else None
+    except (sqlite3.Error, OSError) as exc:
+        logger.debug("Telemetry update_triage_solution skipped due to error: %s", exc)
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def list_triage_solutions(
+    *,
+    status: str | None = None,
+    scope: str | None = None,
+    limit: int = DEFAULT_TRIAGE_LIMIT,
+    db_path: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    """List triage_solutions ordered by most recent first, with optional status/scope filters."""
+    clean_status = _validate_triage_status(status) if status is not None else None
+    clean_scope = str(scope).strip().lower() if scope is not None and str(scope).strip() else None
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        bounded_limit = DEFAULT_TRIAGE_LIMIT
+    else:
+        bounded_limit = max(1, min(limit, MAX_TRIAGE_LIMIT))
+
+    clauses: list[str] = []
+    params: list[Any] = []
+    if clean_status is not None:
+        clauses.append("status = ?")
+        params.append(clean_status)
+    if clean_scope is not None:
+        clauses.append("scope = ?")
+        params.append(clean_scope)
+
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(bounded_limit)
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        rows = conn.execute(
+            f"SELECT {_TRIAGE_SELECT_COLS} FROM triage_solutions "
+            f"{where_sql} ORDER BY created_at DESC, id DESC LIMIT ?;",
+            tuple(params),
+        ).fetchall()
+        return [_row_to_triage_solution(row) for row in rows]
+    except (sqlite3.Error, OSError) as exc:
+        logger.debug("Telemetry list_triage_solutions fallback due to error: %s", exc)
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def get_triage_solution(
+    solution_id: int,
+    db_path: Path | str | None = None,
+) -> dict[str, Any] | None:
+    """Fetch a single triage_solutions record by ID, or None if not found."""
+    if isinstance(solution_id, bool) or not isinstance(solution_id, int) or solution_id <= 0:
+        return None
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        row = conn.execute(
+            f"SELECT {_TRIAGE_SELECT_COLS} FROM triage_solutions WHERE id = ?;",
+            (solution_id,),
+        ).fetchone()
+        return _row_to_triage_solution(row) if row is not None else None
+    except (sqlite3.Error, OSError) as exc:
+        logger.debug("Telemetry get_triage_solution fallback due to error: %s", exc)
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
