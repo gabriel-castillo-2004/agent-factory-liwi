@@ -2348,10 +2348,17 @@ class DashboardController:
         return _scrub_value(res, self.secrets_to_redact)
 
     def _resolve_idea_db_path(self) -> Path | None:
-        """Resolve SQLite path for improvement_ideas isolated to the active EventStore DB when available."""
+        """Resolve SQLite path for improvement_ideas targeting telemetry.db (respecting env override and test isolation)."""
+        env_val = os.environ.get(telemetry.TELEMETRY_DB_ENV_VAR, "").strip()
+        if env_val:
+            return Path(env_val).resolve()
         db_path = getattr(self.orchestrator.store, "db_path", None)
         if db_path and str(db_path) != ":memory:":
-            return Path(db_path).resolve()
+            db_parent = Path(db_path).resolve().parent
+            repo_data_dir = Path("data").resolve()
+            if db_parent == repo_data_dir:
+                return (repo_data_dir / "telemetry.db").resolve()
+            return (db_parent / "telemetry.db").resolve()
         return None
 
     def list_improvement_ideas(self) -> dict[str, Any]:
@@ -2383,32 +2390,40 @@ class DashboardController:
         self,
         *,
         count: int = idea_engine.DEFAULT_IDEATION_COUNT,
+        auto_interval_hours: float | None = None,
+        generate: bool = True,
     ) -> dict[str, Any]:
-        """Trigger read-only idea generation and return created + active ideas."""
+        """Persist optional auto_interval_hours and trigger read-only idea generation when requested."""
         db_path = self._resolve_idea_db_path()
-        eff_runner = (
-            self.runner
-            if self.runner is not None
-            else getattr(self.build_worker, "runner", None)
-        )
-        raw_root = getattr(self._self_improver, "repo_root", None)
-        repo_root = Path(raw_root).resolve() if raw_root is not None else None
-        eff_model = None
-        if self.model_resolver is not None and hasattr(self.model_resolver, "resolve_model"):
-            try:
-                eff_model = self.model_resolver.resolve_model("INTERVIEW")
-            except (RuntimeError, ValueError, OSError):
-                eff_model = None
+        if auto_interval_hours is not None:
+            idea_engine.set_auto_interval_hours(auto_interval_hours, db_path=db_path)
 
-        created = idea_engine.generate_new_ideas(
-            source="manual",
-            count=count,
-            db_path=db_path,
-            runner=eff_runner,
-            git_runner=eff_runner,
-            repo_root=repo_root,
-            model=eff_model,
-        )
+        created: list[dict[str, Any]] = []
+        if generate:
+            eff_runner = (
+                self.runner
+                if self.runner is not None
+                else getattr(self.build_worker, "runner", None)
+            )
+            raw_root = getattr(self._self_improver, "repo_root", None)
+            repo_root = Path(raw_root).resolve() if raw_root is not None else None
+            eff_model = None
+            if self.model_resolver is not None and hasattr(self.model_resolver, "resolve_model"):
+                try:
+                    eff_model = self.model_resolver.resolve_model("INTERVIEW")
+                except (RuntimeError, ValueError, OSError):
+                    eff_model = None
+
+            created = idea_engine.generate_new_ideas(
+                source="manual",
+                count=count,
+                db_path=db_path,
+                runner=eff_runner,
+                git_runner=eff_runner,
+                repo_root=repo_root,
+                model=eff_model,
+            )
+
         ideas = idea_engine.list_ideas(db_path=db_path)
         interval_hours = idea_engine.get_auto_interval_hours(db_path=db_path)
         return _scrub_value(
@@ -13987,10 +14002,32 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/ideas/generate":
             def _post_ideas_generate() -> dict[str, Any]:
                 body = self._read_json_body()
+                has_interval = (
+                    "auto_interval_hours" in body and body["auto_interval_hours"] is not None
+                )
+                raw_interval = body["auto_interval_hours"] if has_interval else None
+
+                has_generate = "generate" in body and body["generate"] is not None
+                if has_generate:
+                    if not isinstance(body["generate"], bool):
+                        raise TypeError("El campo 'generate' debe ser booleano.")
+                    should_generate = bool(body["generate"])
+                elif has_interval and "count" not in body:
+                    should_generate = False
+                else:
+                    should_generate = True
+
                 raw_count = body.get("count", idea_engine.DEFAULT_IDEATION_COUNT)
                 if isinstance(raw_count, bool) or not isinstance(raw_count, int):
                     raise TypeError("El campo 'count' debe ser un entero positivo.")
-                return ctrl.generate_improvement_ideas(count=raw_count)
+                if raw_count <= 0:
+                    raise ValueError("El campo 'count' debe ser un entero positivo.")
+
+                return ctrl.generate_improvement_ideas(
+                    count=raw_count,
+                    auto_interval_hours=raw_interval,
+                    generate=should_generate,
+                )
 
             self._send_controller_json(_post_ideas_generate)
             return

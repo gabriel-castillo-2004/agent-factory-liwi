@@ -7708,6 +7708,221 @@ def test_dashboard_radar_ideas_responsive_and_endpoints(tmp_path: Path) -> None:
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_ideas_api_generate_frequency_and_404_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/api/ideas endpoints use telemetry SQLite DB, support auto_interval_hours on /generate, and return 404 on missing IDs."""
+    from agent_factory import idea_engine
+
+    telemetry_db = tmp_path / "telemetry.db"
+    monkeypatch.setenv("AGENT_FACTORY_TELEMETRY_DB", str(telemetry_db))
+
+    store = SqliteEventStore(str(tmp_path / "events.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+
+    generate_calls: list[dict[str, Any]] = []
+    enqueued_calls: list[dict[str, Any]] = []
+
+    def _fake_generate_new_ideas(
+        *,
+        source: str = "manual",
+        count: int = 3,
+        db_path: Path | str | None = None,
+        **_kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        generate_calls.append({"source": source, "count": count, "db_path": Path(db_path) if db_path else None})
+        idx = len(generate_calls)
+        return idea_engine.save_ideas(
+            [
+                {
+                    "title": f"💡 Mejora Radar #{idx}",
+                    "category": "UX",
+                    "impact": "Alto",
+                    "simple_description": f"Descripción simple #{idx}",
+                    "technical_prompt": f"Prompt técnico TDD #{idx}",
+                }
+            ],
+            source=source,
+            db_path=db_path,
+            max_items=count,
+        )
+
+    class _FakeStagingManager:
+        def enqueue_improvement(
+            self,
+            *,
+            title: str,
+            prompt: str,
+            metadata: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            enqueued_calls.append({"title": title, "prompt": prompt, "metadata": metadata or {}})
+            return {
+                "pending_count": 0,
+                "commits": [],
+                "is_building": True,
+                "queue_size": len(enqueued_calls),
+                "last_error": None,
+                "current_task": title,
+                "initialized": True,
+            }
+
+        def get_staging_status(self) -> dict[str, Any]:
+            return {
+                "pending_count": 0,
+                "commits": [],
+                "is_building": bool(enqueued_calls),
+                "queue_size": len(enqueued_calls),
+                "last_error": None,
+                "current_task": enqueued_calls[-1]["title"] if enqueued_calls else None,
+                "initialized": True,
+            }
+
+        def shutdown(self, timeout: float = 5.0) -> None:
+            _ = timeout
+
+    monkeypatch.setattr(idea_engine, "generate_new_ideas", _fake_generate_new_ideas)
+
+    # Seed one pre-existing idea directly in telemetry_db to prove GET /api/ideas reads it
+    seeded = idea_engine.save_ideas(
+        [
+            {
+                "title": "🛡️ Validar entradas en API",
+                "category": "Seguridad",
+                "impact": "Alto",
+                "simple_description": "Asegura validación estricta en endpoints.",
+                "technical_prompt": "Valida IDs numéricos en dashboard.py con pruebas dirigidas.",
+            }
+        ],
+        source="auto",
+        db_path=telemetry_db,
+    )
+    seeded_id = seeded[0]["id"]
+
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        staging_manager=_FakeStagingManager(),  # type: ignore[arg-type]
+    )
+    try:
+        # 1. GET /api/ideas returns seeded idea from telemetry_db and default auto_interval_hours=0.0
+        code, initial = _http_json(f"{base_url}/api/ideas")
+        assert code == 200
+        assert initial["auto_interval_hours"] == 0.0
+        assert [it["id"] for it in initial["ideas"]] == [seeded_id]
+        assert initial["ideas"][0]["title"] == "🛡️ Validar entradas en API"
+
+        # 2. POST /api/ideas/generate with only auto_interval_hours saves frequency without invoking generator
+        freq_code, freq_data = _http_json(
+            f"{base_url}/api/ideas/generate",
+            method="POST",
+            body={"auto_interval_hours": 72},
+        )
+        assert freq_code == 200
+        assert freq_data["ok"] is True
+        assert freq_data["auto_interval_hours"] == 72.0
+        assert freq_data["created_count"] == 0
+        assert freq_data["created"] == []
+        assert [it["id"] for it in freq_data["ideas"]] == [seeded_id]
+        assert len(generate_calls) == 0
+        assert idea_engine.get_auto_interval_hours(db_path=telemetry_db) == 72.0
+
+        # Invalid auto_interval_hours rejected with 400 and does not invoke generator
+        bad_freq_code, _ = _http_json(
+            f"{base_url}/api/ideas/generate",
+            method="POST",
+            body={"auto_interval_hours": -12},
+        )
+        assert bad_freq_code == 400
+        assert len(generate_calls) == 0
+
+        # 3. POST /api/ideas/generate with auto_interval_hours + count updates frequency AND generates
+        gen_code, gen_data = _http_json(
+            f"{base_url}/api/ideas/generate",
+            method="POST",
+            body={"auto_interval_hours": 24, "count": 2},
+        )
+        assert gen_code == 200
+        assert gen_data["ok"] is True
+        assert gen_data["auto_interval_hours"] == 24.0
+        assert gen_data["created_count"] == 1
+        assert len(gen_data["ideas"]) == 2
+        assert len(generate_calls) == 1
+        assert generate_calls[0]["db_path"] == telemetry_db.resolve()
+        assert idea_engine.get_auto_interval_hours(db_path=telemetry_db) == 24.0
+        generated_id = gen_data["created"][0]["id"]
+
+        # 4. POST /api/ideas/<id>/implement enqueues technical_prompt and marks 'encolada'; 404 for unknown ID
+        imp_code, imp_data = _http_json(
+            f"{base_url}/api/ideas/{generated_id}/implement",
+            method="POST",
+        )
+        assert imp_code == 200
+        assert imp_data["ok"] is True
+        assert imp_data["idea"]["status"] == "encolada"
+        assert len(enqueued_calls) == 1
+        assert enqueued_calls[0]["prompt"] == "Prompt técnico TDD #1"
+        assert idea_engine.get_idea(generated_id, db_path=telemetry_db)["status"] == "encolada"
+
+        missing_imp_code, _ = _http_json(f"{base_url}/api/ideas/999999/implement", method="POST")
+        assert missing_imp_code == 404
+
+        # 5. POST /api/ideas/<id>/dismiss marks 'descartada'; 404 for unknown ID; 400 for invalid ID
+        dis_code, dis_data = _http_json(
+            f"{base_url}/api/ideas/{seeded_id}/dismiss",
+            method="POST",
+        )
+        assert dis_code == 200
+        assert dis_data["ok"] is True
+        assert dis_data["idea"]["status"] == "descartada"
+        assert idea_engine.get_idea(seeded_id, db_path=telemetry_db)["status"] == "descartada"
+
+        missing_dis_code, _ = _http_json(f"{base_url}/api/ideas/999999/dismiss", method="POST")
+        assert missing_dis_code == 404
+
+        bad_dis_code, _ = _http_json(f"{base_url}/api/ideas/not-valid/dismiss", method="POST")
+        assert bad_dis_code == 400
+
+        # Final GET /api/ideas reflects persisted state and frequency
+        final_code, final_data = _http_json(f"{base_url}/api/ideas")
+        assert final_code == 200
+        assert final_data["auto_interval_hours"] == 24.0
+        assert [it["id"] for it in final_data["ideas"]] == [generated_id]
+        assert final_data["ideas"][0]["status"] == "encolada"
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+def test_dashboard_radar_idea_db_path_resolves_to_telemetry_db(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DashboardController resolves idea DB to data/telemetry.db in production and respects AGENT_FACTORY_TELEMETRY_DB."""
+    monkeypatch.delenv("AGENT_FACTORY_TELEMETRY_DB", raising=False)
+
+    # When store DB is in a temp directory, ideas DB stays isolated in <tmp>/telemetry.db
+    store = SqliteEventStore(str(tmp_path / "agent_factory.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    try:
+        ctrl = DashboardController(orchestrator=orch)
+        assert ctrl._resolve_idea_db_path() == (tmp_path / "telemetry.db").resolve()
+
+        # When AGENT_FACTORY_TELEMETRY_DB is set, it takes precedence
+        override_db = tmp_path / "custom_telemetry.db"
+        monkeypatch.setenv("AGENT_FACTORY_TELEMETRY_DB", str(override_db))
+        assert ctrl._resolve_idea_db_path() == override_db.resolve()
+    finally:
+        store.close()
+
+
+
 
 
 
