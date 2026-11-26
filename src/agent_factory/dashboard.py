@@ -3819,6 +3819,38 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       color: var(--ok);
       font-weight: 600;
     }
+    .copy-msg-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--muted);
+      font-family: inherit;
+      font-size: 0.74rem;
+      font-weight: 500;
+      line-height: 1.2;
+      white-space: nowrap;
+      flex-shrink: 0;
+      cursor: pointer;
+      transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+    }
+    .copy-msg-btn:hover {
+      background: var(--surface-alt);
+      color: var(--text);
+      border-color: var(--accent);
+    }
+    .copy-msg-btn:active {
+      transform: translateY(1px);
+    }
+    .copy-msg-btn.is-copied {
+      color: var(--ok);
+      border-color: var(--ok);
+      background: var(--ok-bg);
+    }
     @media (max-width: 1279px) {
       .detail-work-split.preview-open {
         display: block;
@@ -3940,6 +3972,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         white-space: nowrap;
         flex-shrink: 0;
         min-height: 38px;
+      }
+      #factory-chat-stream .copy-msg-btn,
+      .copy-msg-btn {
+        min-height: 36px;
+        padding: 6px 10px;
+        font-size: 0.78rem;
+        touch-action: manipulation;
+        max-width: 100%;
+      }
+      #factory-chat-stream .factory-msg-head,
+      #factory-chat-stream .factory-proposal-head,
+      #factory-chat-stream .factory-pre-bar {
+        max-width: 100%;
+        min-width: 0;
+        flex-wrap: wrap;
       }
     }
     @media (max-width: 600px) {
@@ -4683,12 +4730,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       overflow-wrap: anywhere;
       word-break: break-word;
     }
+    .factory-msg-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 6px;
+      min-width: 0;
+    }
     .factory-msg-role {
       font-size: 0.78rem;
       font-weight: 600;
       color: var(--muted);
       margin-bottom: 6px;
       letter-spacing: 0.01em;
+    }
+    .factory-msg-head .factory-msg-role {
+      margin-bottom: 0;
     }
     .factory-msg-body p {
       margin: 0 0 10px;
@@ -4705,6 +4763,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       overflow-x: auto;
       max-width: 100%;
     }
+    #factory-chat-stream .md-code-head {
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .factory-pre-wrap {
+      margin: 8px 0;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      background: var(--surface-alt);
+      max-width: 100%;
+    }
+    .factory-pre-bar {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      padding: 4px 8px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+    }
+    .factory-pre-wrap pre {
+      margin: 0;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+    }
     .factory-proposal-card {
       margin-top: 14px;
       padding: 14px 16px;
@@ -4715,10 +4800,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       flex-direction: column;
       gap: 10px;
     }
+    .factory-proposal-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-width: 0;
+    }
     .factory-proposal-title {
       font-size: 0.92rem;
       font-weight: 600;
       color: var(--text);
+      min-width: 0;
     }
     .factory-proposal-card .doctor-prompt-pre {
       margin: 0;
@@ -10936,6 +11029,154 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         });
       }
 
+      async function copyTextToClipboard(text) {
+        const value = String(text == null ? '' : text);
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          try {
+            await navigator.clipboard.writeText(value);
+            return true;
+          } catch (_) {
+            // Fallback to execCommand('copy') when Clipboard API is unavailable or rejected (HTTP/Tailscale/mobile)
+          }
+        }
+        const ta = document.createElement('textarea');
+        ta.value = value;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.top = '-9999px';
+        ta.style.left = '-9999px';
+        ta.style.opacity = '0';
+        ta.style.pointerEvents = 'none';
+        document.body.appendChild(ta);
+        try {
+          if (typeof ta.focus === 'function') {
+            try { ta.focus({ preventScroll: true }); } catch (_) { ta.focus(); }
+          }
+          ta.select();
+          if (typeof ta.setSelectionRange === 'function') {
+            ta.setSelectionRange(0, value.length);
+          }
+          return Boolean(document.execCommand('copy'));
+        } catch (_) {
+          return false;
+        } finally {
+          if (ta.parentNode) ta.parentNode.removeChild(ta);
+        }
+      }
+
+      function extractCleanCopyText(node) {
+        if (!node) return '';
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('.copy-msg-btn, .md-copy-btn, button, .factory-proposal-actions, .md-code-head, .factory-pre-bar').forEach((el) => {
+          el.remove();
+        });
+        return String(clone.textContent || '').trim();
+      }
+
+      function createCopyButton(getTextFn, ariaLabel) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'copy-msg-btn';
+        btn.setAttribute('aria-label', ariaLabel || 'Copiar contenido');
+        btn.textContent = '📋 Copiar';
+        let resetTimer = null;
+        btn.addEventListener('click', async (ev) => {
+          ev.stopPropagation();
+          const cleanText = typeof getTextFn === 'function' ? String(getTextFn() || '').trim() : '';
+          if (!cleanText) return;
+          await copyTextToClipboard(cleanText);
+          if (resetTimer) {
+            clearTimeout(resetTimer);
+            resetTimer = null;
+          }
+          btn.textContent = '✓ Copiado';
+          btn.classList.add('is-copied');
+          resetTimer = setTimeout(() => {
+            btn.textContent = '📋 Copiar';
+            btn.classList.remove('is-copied');
+            resetTimer = null;
+          }, 1500);
+        });
+        return btn;
+      }
+
+      function attachFactoryCopyButtons(rootEl, assistantRawTexts) {
+        if (!rootEl) return;
+        const rawList = Array.isArray(assistantRawTexts) ? assistantRawTexts : [];
+
+        // 1. Copy button on each assistant (Liwi) message
+        rootEl.querySelectorAll('.factory-msg-assistant').forEach((msgEl) => {
+          if (msgEl.id === 'factory-thinking-bubble') return;
+          const headEl = msgEl.querySelector('.factory-msg-head');
+          if (!headEl || headEl.querySelector('.copy-msg-btn')) return;
+          const bodyEl = msgEl.querySelector('.factory-msg-body');
+          const rawIdxAttr = msgEl.getAttribute('data-assistant-idx');
+          const rawIdx = rawIdxAttr !== null ? Number(rawIdxAttr) : -1;
+          const rawText = rawIdx >= 0 && typeof rawList[rawIdx] === 'string' ? rawList[rawIdx].trim() : '';
+          const msgCopyBtn = createCopyButton(
+            () => rawText || extractCleanCopyText(bodyEl),
+            'Copiar mensaje de Liwi'
+          );
+          headEl.appendChild(msgCopyBtn);
+        });
+
+        // 2. Copy button on each proposal box
+        rootEl.querySelectorAll('.factory-proposal-card').forEach((cardEl) => {
+          const preEl = cardEl.querySelector('.doctor-prompt-pre');
+          if (preEl) preEl.setAttribute('data-copy-attached', '1');
+          const headEl = cardEl.querySelector('.factory-proposal-head');
+          if (!headEl || headEl.querySelector('.copy-msg-btn') || !preEl) return;
+          const propCopyBtn = createCopyButton(
+            () => extractCleanCopyText(preEl),
+            'Copiar propuesta'
+          );
+          headEl.appendChild(propCopyBtn);
+        });
+
+        // 3. Upgrade markdown code block copy buttons inside #factory-chat-stream (zero duplicates)
+        rootEl.querySelectorAll('.md-code-wrap').forEach((wrapEl) => {
+          const preEl = wrapEl.querySelector('pre');
+          if (preEl) preEl.setAttribute('data-copy-attached', '1');
+          const headEl = wrapEl.querySelector('.md-code-head');
+          if (!headEl || headEl.querySelector('.copy-msg-btn')) return;
+          const legacyBtn = headEl.querySelector('button.md-copy-btn[data-md-code-idx]');
+          const idx = legacyBtn ? Number(legacyBtn.getAttribute('data-md-code-idx')) : -1;
+          const entry = idx >= 0 ? allFactoryCodeBlocks[idx] : null;
+          const codeCopyBtn = createCopyButton(
+            () => (entry && typeof entry.raw === 'string' ? entry.raw : extractCleanCopyText(preEl)),
+            'Copiar bloque de código'
+          );
+          if (legacyBtn) {
+            legacyBtn.replaceWith(codeCopyBtn);
+          } else {
+            headEl.appendChild(codeCopyBtn);
+          }
+        });
+
+        // 4. Any standalone <pre> inside #factory-chat-stream not already wrapped
+        rootEl.querySelectorAll('pre').forEach((preEl) => {
+          if (
+            preEl.getAttribute('data-copy-attached') === '1' ||
+            preEl.closest('.md-code-wrap') ||
+            preEl.closest('.factory-proposal-card') ||
+            preEl.closest('.factory-pre-wrap')
+          ) {
+            return;
+          }
+          preEl.setAttribute('data-copy-attached', '1');
+          const wrapEl = document.createElement('div');
+          wrapEl.className = 'factory-pre-wrap';
+          const barEl = document.createElement('div');
+          barEl.className = 'factory-pre-bar';
+          barEl.appendChild(createCopyButton(() => extractCleanCopyText(preEl), 'Copiar bloque'));
+          if (preEl.parentNode) {
+            preEl.parentNode.insertBefore(wrapEl, preEl);
+            wrapEl.appendChild(barEl);
+            wrapEl.appendChild(preEl);
+          }
+        });
+      }
+
       function renderMessages(msgs) {
         const list = Array.isArray(msgs) ? msgs : [];
         if (!list.length) {
@@ -10944,6 +11185,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           return;
         }
         allFactoryCodeBlocks = [];
+        const assistantRawTexts = [];
         const isLocked = !!(applyInFlight || activeStatus.running);
         streamEl.innerHTML = list.map((m) => {
           const isUser = m.role === 'user';
@@ -10957,35 +11199,37 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const isApplied = m.status === 'applied';
             const applyLabel = isApplied ? '✓ Mejora aplicada' : '✨ Aplicar mejora a Liwi';
             propHtml = '<div class="factory-proposal-card">' +
-              '<div class="factory-proposal-title">Propuesta: ' + escapeHtml(String(m.proposal_title || 'Auto-mejora')) + '</div>' +
+              '<div class="factory-proposal-head">' +
+                '<div class="factory-proposal-title">Propuesta: ' + escapeHtml(String(m.proposal_title || 'Auto-mejora')) + '</div>' +
+              '</div>' +
               '<pre class="doctor-prompt-pre">' + escapeHtml(String(m.proposal_prompt)) + '</pre>' +
               '<div class="factory-proposal-actions">' +
                 '<button type="button" class="btn btn-primary btn-sm" data-apply-factory-proposal="1" data-applied="' + (isApplied ? '1' : '0') + '" data-msg-id="' + escapeHtml(String(m.id || '')) + '" data-prop-title="' + escapeHtml(String(m.proposal_title || '')) + '"' + ((isApplied || isLocked) ? ' disabled' : '') + '>' + applyLabel + '</button>' +
               '</div>' +
             '</div>';
           }
-          const roleHtml = isUser ? '' : '<div class="factory-msg-role">Liwi</div>';
+          let assistantIdxAttr = '';
+          if (!isUser) {
+            const aIdx = assistantRawTexts.length;
+            assistantRawTexts.push(String(m.content || ''));
+            assistantIdxAttr = ' data-assistant-idx="' + aIdx + '"';
+          }
+          const roleHtml = isUser ? '' : '<div class="factory-msg-head"><div class="factory-msg-role">Liwi</div></div>';
           const parsed = renderSafeMarkdown(String(m.content || ''));
           const baseOffset = allFactoryCodeBlocks.length;
           parsed.codeBlocks.forEach((cb) => allFactoryCodeBlocks.push(cb));
           const bodyHtml = parsed.html.replace(/data-md-code-idx="(\\d+)"/g, (_mt, n) =>
             'data-md-code-idx="' + (Number(n) + baseOffset) + '"'
           );
-          return '<div class="' + cls + '">' +
+          return '<div class="' + cls + '"' + assistantIdxAttr + '>' +
             roleHtml +
             '<div class="factory-msg-body">' + bodyHtml + '</div>' +
             thumbs +
             propHtml +
           '</div>';
         }).join('');
+        attachFactoryCopyButtons(streamEl, assistantRawTexts);
         streamEl.scrollTop = streamEl.scrollHeight;
-        streamEl.querySelectorAll('button.md-copy-btn[data-md-code-idx]').forEach((copyBtn) => {
-          copyBtn.addEventListener('click', () => {
-            const idx = Number(copyBtn.getAttribute('data-md-code-idx'));
-            const entry = allFactoryCodeBlocks[idx];
-            if (entry) copyToClipboard(entry.raw, '✓ Bloque de código copiado.');
-          });
-        });
         streamEl.querySelectorAll('button[data-apply-factory-proposal]').forEach((btn) => {
           btn.addEventListener('click', async () => {
             if (applyInFlight || activeStatus.running) return;

@@ -6267,3 +6267,62 @@ def test_dashboard_mobile_responsive_header_and_project_selector() -> None:
     assert ".controls { display: flex; align-items: center; gap: 10px; }" in css
     desktop_switcher = _extract_css_block(css, ".mobile-switcher-row {")
     assert "display: none;" in desktop_switcher
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_factory_chat_includes_copy_button_and_clipboard_fallback(
+    tmp_path: Path,
+) -> None:
+    """Dashboard HTML includes discreet .copy-msg-btn styles (desktop + mobile), Copiar/Copiado labels, and clipboard + execCommand fallback for #factory-chat-stream."""
+    store = SqliteEventStore(str(tmp_path / "factory_chat_copy.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as resp:
+            assert resp.status == 200
+            html = resp.read().decode("utf-8")
+
+        # Zero external CDNs and existing Liwi chat container intact
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+        assert 'id="factory-chat-stream"' in html
+
+        # 1. CSS rules for .copy-msg-btn on desktop and touch-friendly @media (max-width: 768px)
+        style_start = html.index("<style>") + len("<style>")
+        style_end = html.index("</style>", style_start)
+        css = html[style_start:style_end]
+
+        assert ".copy-msg-btn" in css
+        desktop_copy_rule = _extract_css_block(css, ".copy-msg-btn {")
+        assert desktop_copy_rule, "Expected desktop .copy-msg-btn CSS rule"
+        assert "cursor: pointer;" in desktop_copy_rule
+
+        media_768 = _extract_css_block(css, "@media (max-width: 768px)")
+        assert media_768, "Expected @media (max-width: 768px) block"
+        assert ".copy-msg-btn" in media_768
+        assert "touch-action: manipulation;" in media_768
+        assert "min-height: 36px;" in media_768 or "min-height: 34px;" in media_768 or "min-height: 32px;" in media_768
+
+        # 2. JS helpers inside factory chat modal: labels, clipboard API + execCommand fallback, and clean extraction
+        init_js_start = html.index("(function initFactoryImproverModal()")
+        init_js_end = html.index("setInterval(updateLiveTimers", init_js_start)
+        init_js = html[init_js_start:init_js_end]
+
+        assert "copy-msg-btn" in init_js
+        assert "Copiar" in init_js
+        assert "Copiado" in init_js
+        assert "navigator.clipboard.writeText" in init_js
+        assert "execCommand('copy')" in init_js or 'execCommand("copy")' in init_js
+        assert "function copyTextToClipboard(" in init_js
+        assert "function createCopyButton(" in init_js
+        assert "1500" in init_js
+        assert "setSelectionRange" in init_js
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
