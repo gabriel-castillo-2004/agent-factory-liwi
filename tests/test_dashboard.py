@@ -7356,3 +7356,48 @@ def test_dashboard_staging_banner_mobile_responsive_css_inside_media_768(tmp_pat
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_staging_chat_stays_non_blocking_and_promote_polling_is_guarded(
+    tmp_path: Path,
+) -> None:
+    """While staging builds in background, Liwi chat remains non-blocking, tracks queued proposals across refreshes, and guards promote reload probes."""
+    store = SqliteEventStore(str(tmp_path / "staging_non_blocking.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as resp:
+            assert resp.status == 200
+            html = resp.read().decode("utf-8")
+
+        script_js = html[html.index("<script>") :]
+
+        # Chat blocking checks must be gated by isBlockingApplyActive() so staging never locks chat
+        assert "function isBlockingApplyActive()" in script_js
+        assert "activeStatus.running && !window.__liwiStagingActive" in script_js
+        assert "if (consultInFlight || isBlockingApplyActive()) return;" in script_js
+        assert "if (!isBlockingApplyActive()) {" in script_js
+        assert "const isLocked = isBlockingApplyActive();" in script_js
+
+        # Reload race guard: staging banner clears legacy blocking overlay/controls when active
+        assert "window.clearFactoryBlockingForStaging" in script_js
+
+        # Double-click and mid-refresh protection for queued proposals
+        assert "locallyQueuedProposalIds" in script_js
+        assert "b.getAttribute('data-enqueuing') === '1'" in script_js
+
+        # Promote reload polling prevents overlapping concurrent probes
+        promote_fn_start = script_js.index("function startPromoteReloadPolling(")
+        promote_fn_end = script_js.index("btn.addEventListener('click'", promote_fn_start)
+        promote_fn_body = script_js[promote_fn_start:promote_fn_end]
+        assert "probeInFlight" in promote_fn_body
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+

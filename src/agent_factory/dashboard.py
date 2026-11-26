@@ -11610,6 +11610,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       let lastServerRunning = false;
       let lastActiveStep = 0;
       let allFactoryCodeBlocks = [];
+      const locallyQueuedProposalIds = new Set();
       let activeStatus = {
         running: false,
         step: 0,
@@ -11621,6 +11622,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         last_outcome: '',
         syncedAtMs: Date.now(),
       };
+
+      function isBlockingApplyActive() {
+        return !!(applyInFlight || (activeStatus.running && !window.__liwiStagingActive));
+      }
 
       function formatMmSs(totalSecs) {
         const secs = Math.max(0, Math.floor(Number(totalSecs) || 0));
@@ -11644,13 +11649,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (locked) {
             b.disabled = true;
           } else {
-            b.disabled = b.getAttribute('data-applied') === '1';
+            b.disabled = b.getAttribute('data-applied') === '1' || b.getAttribute('data-enqueuing') === '1';
           }
         });
       }
 
       function updateLiveClockAndHeader() {
-        const isRunning = !!(activeStatus.running || applyInFlight);
+        const isRunning = isBlockingApplyActive();
         const mmss = formatMmSs(currentElapsedSeconds());
         if (isRunning) {
           const stepNum = Math.max(1, Number(activeStatus.step) || 1);
@@ -11736,6 +11741,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         setTimeout(() => { window.location.reload(); }, 650);
       }
 
+      function clearFactoryBlockingForStaging() {
+        if (applyInFlight) return;
+        stopStatusPolling();
+        stopClockTicker();
+        if (fsOverlay) fsOverlay.style.display = 'none';
+        if (buildBanner) buildBanner.style.display = 'none';
+        if (progressCard) progressCard.style.display = 'none';
+        setFactoryControlsLocked(false);
+        updateLiveClockAndHeader();
+      }
+      window.clearFactoryBlockingForStaging = clearFactoryBlockingForStaging;
+
       function applyStatusSnapshot(st) {
         const s = st && typeof st === 'object' ? st : {};
         const wasRunning = lastServerRunning;
@@ -11755,13 +11772,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         lastServerRunning = isRunning;
 
         if (window.__liwiStagingActive && !applyInFlight) {
-          stopStatusPolling();
-          stopClockTicker();
-          if (fsOverlay) fsOverlay.style.display = 'none';
-          if (buildBanner) buildBanner.style.display = 'none';
-          if (progressCard) progressCard.style.display = 'none';
-          setFactoryControlsLocked(false);
-          updateLiveClockAndHeader();
+          clearFactoryBlockingForStaging();
           if (typeof window.refreshSelfImproveStaging === 'function') {
             window.refreshSelfImproveStaging();
           }
@@ -12100,7 +12111,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
         allFactoryCodeBlocks = [];
         const assistantRawTexts = [];
-        const isLocked = !!(applyInFlight || activeStatus.running);
+        const isLocked = isBlockingApplyActive();
         streamEl.innerHTML = list.map((m) => {
           const isUser = m.role === 'user';
           const cls = isUser ? 'factory-msg factory-msg-user' : 'factory-msg factory-msg-assistant';
@@ -12110,16 +12121,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             : '';
           let propHtml = '';
           if (!isUser && m.proposal_prompt) {
+            const msgIdStr = String(m.id || '');
             const isApplied = m.status === 'applied';
-            const applyLabel = isApplied ? '✓ Mejora aplicada' : '✨ Aplicar mejora a Liwi';
+            const isQueuedLocal = !isApplied && msgIdStr !== '' && locallyQueuedProposalIds.has(msgIdStr);
+            const isDisabledProp = isApplied || isQueuedLocal || isLocked;
+            const applyLabel = isApplied
+              ? '✓ Mejora aplicada'
+              : (isQueuedLocal ? '✓ Encolada en staging' : '✨ Aplicar mejora a Liwi');
+            const queuedNoticeHtml = isQueuedLocal
+              ? '<div class="factory-staging-notice" role="status">✓ Mejora encolada en segundo plano (staging)</div>'
+              : '';
             propHtml = '<div class="factory-proposal-card">' +
               '<div class="factory-proposal-head">' +
                 '<div class="factory-proposal-title">Propuesta: ' + escapeHtml(String(m.proposal_title || 'Auto-mejora')) + '</div>' +
               '</div>' +
               '<pre class="doctor-prompt-pre">' + escapeHtml(String(m.proposal_prompt)) + '</pre>' +
               '<div class="factory-proposal-actions">' +
-                '<button type="button" class="btn btn-primary btn-sm" data-apply-factory-proposal="1" data-applied="' + (isApplied ? '1' : '0') + '" data-msg-id="' + escapeHtml(String(m.id || '')) + '" data-prop-title="' + escapeHtml(String(m.proposal_title || '')) + '"' + ((isApplied || isLocked) ? ' disabled' : '') + '>' + applyLabel + '</button>' +
+                '<button type="button" class="btn btn-primary btn-sm" data-apply-factory-proposal="1" data-applied="' + ((isApplied || isQueuedLocal) ? '1' : '0') + '" data-msg-id="' + escapeHtml(msgIdStr) + '" data-prop-title="' + escapeHtml(String(m.proposal_title || '')) + '"' + (isDisabledProp ? ' disabled' : '') + '>' + applyLabel + '</button>' +
               '</div>' +
+              queuedNoticeHtml +
             '</div>';
           }
           let assistantIdxAttr = '';
@@ -12184,6 +12204,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               btn.removeAttribute('aria-busy');
               if (res && res.queued) {
                 window.__liwiStagingActive = true;
+                const queuedMid = btn.getAttribute('data-msg-id') || '';
+                if (queuedMid) locallyQueuedProposalIds.add(queuedMid);
                 btn.setAttribute('data-applied', '1');
                 btn.disabled = true;
                 btn.textContent = '✓ Encolada en staging';
@@ -12264,7 +12286,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         autoResizeFactoryInput();
         refreshHistory();
         pollFactoryStatus();
-        if (inputEl && !applyInFlight && !activeStatus.running) inputEl.focus();
+        if (inputEl && !isBlockingApplyActive()) inputEl.focus();
       };
 
       openBtn.addEventListener('click', () => window.openFactoryImproveModal(''));
@@ -12276,7 +12298,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
       if (buildBanner) {
         const reopenBuildOverlayOrModal = () => {
-          if (activeStatus.running || applyInFlight) {
+          if (isBlockingApplyActive()) {
             buildOverlayMinimized = false;
             if (fsOverlay) fsOverlay.style.display = 'flex';
           } else {
@@ -12334,7 +12356,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (formEl) {
         formEl.addEventListener('submit', async (ev) => {
           ev.preventDefault();
-          if (consultInFlight || applyInFlight || activeStatus.running) return;
+          if (consultInFlight || isBlockingApplyActive()) return;
           const rawInputVal = inputEl ? inputEl.value : '';
           const msgTxt = rawInputVal.trim();
           if (!msgTxt && !pendingImages.length) {
@@ -12401,7 +12423,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             if (statusEl) statusEl.textContent = 'Error consultando: ' + err.message;
           } finally {
             consultInFlight = false;
-            if (!applyInFlight && !activeStatus.running) {
+            if (!isBlockingApplyActive()) {
               sendBtn.disabled = false;
             }
             sendBtn.textContent = '↑';
@@ -12481,6 +12503,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           initialized: initialized,
         };
         window.__liwiStagingActive = Boolean(initialized || hasWorkInProgress || effectivePending > 0);
+        if (window.__liwiStagingActive && typeof window.clearFactoryBlockingForStaging === 'function') {
+          window.clearFactoryBlockingForStaging();
+        }
 
         if (!hasWorkInProgress && effectivePending === 0 && !promoteInFlight) {
           wrap.style.display = 'none';
@@ -12598,12 +12623,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           return;
         }
         let sawDrop = false;
+        let probeInFlight = false;
         const pollStartedAt = Date.now();
         promoteReloadTimer = setInterval(async () => {
+          if (probeInFlight) return;
+          probeInFlight = true;
           try {
             const resp = await fetch('/api/self-improve/staging', { cache: 'no-store' });
             if (resp.ok) {
-              if (sawDrop || (Date.now() - pollStartedAt) >= 1500) {
+              const st = await resp.json().catch(() => null);
+              const elapsedMs = Date.now() - pollStartedAt;
+              const freshAfterRestart = Boolean(
+                st && !st.initialized && Number(st.pending_count || 0) === 0 && elapsedMs >= 1500
+              );
+              if (sawDrop || freshAfterRestart || elapsedMs >= 4000) {
                 stopPromoteReloadTimer();
                 stopPromoteClock();
                 if (promoteStatusTextEl) promoteStatusTextEl.textContent = '✓ ¡Liwi actualizado! Recargando...';
@@ -12614,6 +12647,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             }
           } catch (_) {
             sawDrop = true;
+          } finally {
+            probeInFlight = false;
           }
         }, 1000);
       }
