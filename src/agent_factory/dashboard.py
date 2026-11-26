@@ -12228,6 +12228,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 }
                 return;
               }
+              if (res && res.ok === false) {
+                throw new Error(res.error || res.message || 'No se pudo aplicar la mejora.');
+              }
               if (res && Array.isArray(res.messages)) {
                 renderMessages(res.messages);
               }
@@ -12628,8 +12631,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         promoteReloadTimer = setInterval(async () => {
           if (probeInFlight) return;
           probeInFlight = true;
+          const probeController = typeof AbortController === 'function' ? new AbortController() : null;
+          const probeAbortTimer = probeController ? setTimeout(() => probeController.abort(), 2500) : null;
           try {
-            const resp = await fetch('/api/self-improve/staging', { cache: 'no-store' });
+            const fetchOpts = { cache: 'no-store' };
+            if (probeController) fetchOpts.signal = probeController.signal;
+            const resp = await fetch('/api/self-improve/staging', fetchOpts);
             if (resp.ok) {
               const st = await resp.json().catch(() => null);
               const elapsedMs = Date.now() - pollStartedAt;
@@ -12648,6 +12655,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           } catch (_) {
             sawDrop = true;
           } finally {
+            if (probeAbortTimer) clearTimeout(probeAbortTimer);
             probeInFlight = false;
           }
         }, 1000);

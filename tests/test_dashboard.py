@@ -7400,4 +7400,41 @@ def test_dashboard_staging_chat_stays_non_blocking_and_promote_polling_is_guarde
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_staging_apply_handles_ok_false_and_promote_probe_uses_timeout(
+    tmp_path: Path,
+) -> None:
+    """Apply flow treats ok=false responses as errors restoring the button, and promote reload probes bound hung sockets with AbortController."""
+    store = SqliteEventStore(str(tmp_path / "staging_resilience.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as resp:
+            assert resp.status == 200
+            html = resp.read().decode("utf-8")
+
+        script_js = html[html.index("<script>") :]
+
+        apply_start = script_js.index("apiFetch('/api/factory/assistant/apply'")
+        apply_end = script_js.index("async function refreshHistory()", apply_start)
+        apply_body = script_js[apply_start:apply_end]
+        assert "if (res && res.ok === false)" in apply_body
+
+        promote_start = script_js.index("function startPromoteReloadPolling(")
+        promote_end = script_js.index("btn.addEventListener('click'", promote_start)
+        promote_body = script_js[promote_start:promote_end]
+        assert "AbortController" in promote_body
+        assert ".abort()" in promote_body
+        assert "clearTimeout(" in promote_body
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+
 
