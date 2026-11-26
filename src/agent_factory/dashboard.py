@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from agent_factory import telemetry
 from agent_factory.adapters.github_vcs_adapter import VcsError
 from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.builder import BuildWorker
@@ -12184,6 +12185,24 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/projects":
             self._send_json(200, {"projects": ctrl.list_projects()})
+            return
+
+        if path == "/api/telemetry/summary":
+            qs = urllib.parse.parse_qs(parsed_url.query, keep_blank_values=True)
+            if "limit" in qs:
+                raw_limit = str(qs["limit"][-1]).strip()
+                try:
+                    limit_val = int(raw_limit)
+                except ValueError:
+                    self._send_json(400, {"error": "Parámetro 'limit' inválido; debe ser un entero."})
+                    return
+                bounded_limit = max(
+                    telemetry.MIN_SUMMARY_LIMIT,
+                    min(limit_val, telemetry.MAX_SUMMARY_LIMIT),
+                )
+                self._send_json(200, telemetry.get_telemetry_summary(limit=bounded_limit))
+                return
+            self._send_json(200, telemetry.get_telemetry_summary())
             return
 
         if path == "/api/settings/lan-mode":
