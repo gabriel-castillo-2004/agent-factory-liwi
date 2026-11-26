@@ -263,3 +263,79 @@ def test_get_staging_manager_singleton_per_repo(temp_git_repo: Path) -> None:
         assert m1 is m2
     finally:
         m1.shutdown()
+
+
+def test_promote_rebases_diverged_main_before_ff_merge_and_syncs_empty_worktree(
+    temp_git_repo: Path,
+) -> None:
+    """When main advances before or after a staging build, empty staging syncs to main HEAD before building, promote() rebases diverged non-conflicting commits and fast-forwards cleanly, and real conflicts abort rebase cleanly."""
+    restart_calls: list[str] = []
+    manager = StagingManager(
+        repo_root=temp_git_repo,
+        executor=_commit_file_executor,
+        on_restart=lambda: restart_calls.append("restarted"),
+    )
+    try:
+        # 1. Create worktree at initial commit, then advance main while staging has 0 pending commits
+        wt = manager.ensure_worktree()
+        (temp_git_repo / "base_ahead.txt").write_text("from-main-first\n", encoding="utf-8")
+        assert _git(temp_git_repo, "add", "base_ahead.txt").returncode == 0
+        assert _git(temp_git_repo, "commit", "-m", "chore: advance main before build").returncode == 0
+        main_ahead_sha = _git(temp_git_repo, "rev-parse", "main").stdout.strip()
+
+        # Enqueuing a new build when staging queue/commits are empty resets .liwi-staging to main HEAD first
+        seen_base_in_build: list[bool] = []
+
+        def _check_base_and_commit(worktree: Path, task: dict[str, Any]) -> None:
+            seen_base_in_build.append((worktree / "base_ahead.txt").is_file())
+            _commit_file_executor(worktree, task)
+
+        manager._executor = _check_base_and_commit
+        manager.enqueue_improvement(
+            title="feat: feature built on latest main",
+            prompt="Add feat_latest.txt",
+            metadata={"filename": "feat_latest.txt", "content": "ok\n"},
+        )
+        assert manager.wait_until_idle(timeout=15.0) is True
+        assert seen_base_in_build == [True]
+        assert main_ahead_sha in _git(wt, "log", "--format=%H", "-n", "5").stdout
+
+        # 2. Diverge main AFTER staging already has a ready commit (disjoint file -> clean rebase)
+        (temp_git_repo / "main_diverged_after.txt").write_text("main-update\n", encoding="utf-8")
+        assert _git(temp_git_repo, "add", "main_diverged_after.txt").returncode == 0
+        assert _git(temp_git_repo, "commit", "-m", "chore: diverge main after staging build").returncode == 0
+
+        res = manager.promote(trigger_restart=True)
+        assert res["promoted"] is True
+        assert res["merged_commits"] == 1
+        assert restart_calls == ["restarted"]
+        assert (temp_git_repo / "feat_latest.txt").read_text(encoding="utf-8") == "ok\n"
+        assert (temp_git_repo / "main_diverged_after.txt").read_text(encoding="utf-8") == "main-update\n"
+        assert manager.get_staging_status()["pending_count"] == 0
+
+        main_sha = _git(temp_git_repo, "rev-parse", "main").stdout.strip()
+        staging_sha = _git(temp_git_repo, "rev-parse", "liwi-staging").stdout.strip()
+        wt_sha = _git(wt, "rev-parse", "HEAD").stdout.strip()
+        assert main_sha == staging_sha == wt_sha
+
+        # 3. Real conflict in promote() aborts rebase cleanly without leaving worktree stuck mid-rebase
+        manager.enqueue_improvement(
+            title="feat: edit shared README",
+            prompt="Update README on staging",
+            metadata={"filename": "README.md", "content": "STAGING CONFLICT CONTENT\n"},
+        )
+        assert manager.wait_until_idle(timeout=15.0) is True
+
+        (temp_git_repo / "README.md").write_text("MAIN CONFLICT CONTENT\n", encoding="utf-8")
+        assert _git(temp_git_repo, "add", "README.md").returncode == 0
+        assert _git(temp_git_repo, "commit", "-m", "chore: conflicting README edit on main").returncode == 0
+
+        with pytest.raises(RuntimeError, match="rebase|conflicto|fast-forward"):
+            manager.promote(trigger_restart=False)
+
+        assert not (wt / ".git").is_dir()  # worktree .git is file; check rebase state via git status
+        assert _git(wt, "status", "--porcelain").stdout.strip() == ""
+        assert (wt / "README.md").read_text(encoding="utf-8") == "STAGING CONFLICT CONTENT\n"
+        assert _git(wt, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "liwi-staging"
+    finally:
+        manager.shutdown()

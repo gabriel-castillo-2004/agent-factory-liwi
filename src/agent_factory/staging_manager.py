@@ -223,6 +223,31 @@ class StagingManager:
         self._run_git(["reset", "--hard", "HEAD"], cwd=self.worktree_path)
         self._run_git(["clean", "-fd"], cwd=self.worktree_path)
 
+    def _git_identity_prefix(self, cwd: Path) -> list[str]:
+        name_chk = self._run_git(["config", "--get", "user.name"], cwd=cwd)
+        email_chk = self._run_git(["config", "--get", "user.email"], cwd=cwd)
+        if (
+            name_chk.returncode == 0
+            and name_chk.stdout.strip()
+            and email_chk.returncode == 0
+            and email_chk.stdout.strip()
+        ):
+            return []
+        return ["-c", "user.name=AgentFactory", "-c", "user.email=agent@factory.local"]
+
+    def _sync_empty_staging_to_base(self, worktree_path: Path) -> None:
+        """Reset .liwi-staging to main HEAD before building when staging has zero pending commits."""
+        if self._list_pending_commits():
+            return
+        base_head_res = self._run_git(["rev-parse", self.base_branch], cwd=self.repo_root)
+        target_ref = (
+            base_head_res.stdout.strip()
+            if base_head_res.returncode == 0 and base_head_res.stdout.strip()
+            else self.base_branch
+        )
+        self._run_git(["reset", "--hard", target_ref], cwd=worktree_path)
+        self._run_git(["clean", "-fd"], cwd=worktree_path)
+
     def _commit_parallel_changes(
         self,
         worktree_path: Path,
@@ -248,18 +273,7 @@ class StagingManager:
 
         diff_res = self._run_git(["diff", "--cached", "--quiet"], cwd=worktree_path)
         if diff_res.returncode != 0:
-            name_chk = self._run_git(["config", "--get", "user.name"], cwd=worktree_path)
-            email_chk = self._run_git(["config", "--get", "user.email"], cwd=worktree_path)
-            commit_prefix = (
-                []
-                if (
-                    name_chk.returncode == 0
-                    and name_chk.stdout.strip()
-                    and email_chk.returncode == 0
-                    and email_chk.stdout.strip()
-                )
-                else ["-c", "user.name=AgentFactory", "-c", "user.email=agent@factory.local"]
-            )
+            commit_prefix = self._git_identity_prefix(worktree_path)
             slug = re.sub(r"[\r\n\"`]+", " ", plan.title).strip() or "apply parallel improvement"
             msg = commit_message.strip() if isinstance(commit_message, str) and commit_message.strip() else f"chore(self-improve): {slug}"
             commit_res = self._run_git(
@@ -361,6 +375,7 @@ class StagingManager:
 
         try:
             worktree_path = self.ensure_worktree()
+            self._sync_empty_staging_to_base(worktree_path)
             return self._run_parallel_plan_in_worktree(
                 worktree_path,
                 plan,
@@ -456,6 +471,7 @@ class StagingManager:
 
             try:
                 worktree_path = self.ensure_worktree()
+                self._sync_empty_staging_to_base(worktree_path)
                 if self._executor is not None:
                     self._executor(worktree_path, task)
                 else:
@@ -563,8 +579,25 @@ class StagingManager:
                 "current_task": self._current_task,
             }
 
-    def promote_staging_to_main(self, trigger_restart: bool = True) -> dict[str, Any]:
-        """Fast-forward merge liwi-staging into main, sync worktree, and optionally trigger restart."""
+    def promote(
+        self,
+        trigger_restart: bool = True,
+        *,
+        rebase_on_diverge: bool = True,
+    ) -> dict[str, Any]:
+        """Promote liwi-staging commits to main, rebasing diverged commits cleanly before ff-only merge."""
+        return self.promote_staging_to_main(
+            trigger_restart=trigger_restart,
+            rebase_on_diverge=rebase_on_diverge,
+        )
+
+    def promote_staging_to_main(
+        self,
+        trigger_restart: bool = True,
+        *,
+        rebase_on_diverge: bool = False,
+    ) -> dict[str, Any]:
+        """Fast-forward merge liwi-staging into main (rebasing if requested on diverge), sync worktree, and optionally restart."""
         with self._cond:
             if self._is_building or len(self._queue) > 0:
                 raise RuntimeError(
@@ -597,6 +630,42 @@ class StagingManager:
                 ["merge", "--ff-only", self.staging_branch],
                 cwd=self.repo_root,
             )
+            if merge_res.returncode != 0 and rebase_on_diverge:
+                ancestor_chk = self._run_git(
+                    ["merge-base", "--is-ancestor", self.base_branch, self.staging_branch],
+                    cwd=self.repo_root,
+                )
+                if ancestor_chk.returncode != 0:
+                    worktree_path = self.ensure_worktree()
+                    self._cleanup_worktree()
+                    rebase_prefix = self._git_identity_prefix(worktree_path)
+                    rebase_res = self._run_git(
+                        [*rebase_prefix, "rebase", self.base_branch],
+                        cwd=worktree_path,
+                    )
+                    if rebase_res.returncode != 0:
+                        self._run_git(["rebase", "--abort"], cwd=worktree_path)
+                        detail = redact_secrets(
+                            (rebase_res.stderr or rebase_res.stdout or "git rebase failed").strip()
+                        )
+                        err_msg = (
+                            f"Conflicto real al hacer rebase de '{self.staging_branch}' "
+                            f"sobre '{self.base_branch}' (rebase abortado): {detail}"
+                        )
+                        with self._lock:
+                            self._last_error = err_msg
+                        raise RuntimeError(err_msg)
+
+                    commits = self._list_pending_commits()
+                    if not commits:
+                        with self._lock:
+                            self._last_error = None
+                        return result
+                    merge_res = self._run_git(
+                        ["merge", "--ff-only", self.staging_branch],
+                        cwd=self.repo_root,
+                    )
+
             if merge_res.returncode != 0:
                 detail = redact_secrets(
                     (merge_res.stderr or merge_res.stdout or "git merge --ff-only failed").strip()

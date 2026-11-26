@@ -2209,7 +2209,11 @@ class DashboardController:
         in_pytest = "PYTEST_CURRENT_TEST" in os.environ
         effective_restart = (not in_pytest) if trigger_restart is None else bool(trigger_restart)
         try:
-            res = mgr.promote_staging_to_main(trigger_restart=effective_restart)
+            res = (
+                mgr.promote(trigger_restart=effective_restart)
+                if hasattr(mgr, "promote")
+                else mgr.promote_staging_to_main(trigger_restart=effective_restart)
+            )
         except RuntimeError as exc:
             err_text = redact_secrets(str(exc), extra_secrets=self.secrets_to_redact)
             lowered = err_text.lower()
