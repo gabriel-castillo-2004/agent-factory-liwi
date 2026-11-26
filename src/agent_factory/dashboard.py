@@ -3849,6 +3849,95 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         margin-bottom: 0;
       }
     }
+    @media (max-width: 768px) {
+      html,
+      body {
+        max-width: 100%;
+        overflow-x: hidden;
+        box-sizing: border-box;
+      }
+      header,
+      .layout,
+      #sidebar-panel {
+        max-width: 100%;
+        min-width: 0;
+        box-sizing: border-box;
+      }
+      header {
+        width: 100%;
+        padding: 10px 12px;
+        gap: 8px;
+      }
+      header .brand {
+        width: 100%;
+        min-width: 0;
+        max-width: 100%;
+      }
+      header .controls {
+        display: flex;
+        flex-wrap: nowrap;
+        align-items: center;
+        gap: 8px;
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: thin;
+        padding-bottom: 2px;
+      }
+      header .controls .segmented-control,
+      header .controls .themes-menu-wrap,
+      header .controls .settings-menu-wrap {
+        flex-shrink: 0;
+        display: inline-flex;
+        align-items: center;
+      }
+      header .controls .btn,
+      header .controls .seg-btn,
+      #view-mode-simple,
+      #view-mode-dev,
+      #themes-menu-btn,
+      #improve-factory-btn,
+      #settings-menu-btn {
+        white-space: nowrap;
+        flex-shrink: 0;
+        min-height: 38px;
+      }
+      header .themes-popover,
+      header .settings-popover {
+        position: fixed;
+        top: 108px;
+        right: 12px;
+        left: auto;
+        max-width: calc(100vw - 24px);
+        z-index: 80;
+      }
+      .mobile-switcher-row {
+        display: flex;
+        flex-wrap: nowrap;
+        align-items: center;
+        gap: 8px;
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+      }
+      .mobile-switcher-row .mobile-switcher-btn,
+      .mobile-switcher-row #mobile-project-switcher,
+      .mobile-switcher-row select {
+        flex: 1;
+        min-width: 0;
+        min-height: 38px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      #mobile-new-project-shortcut {
+        white-space: nowrap;
+        flex-shrink: 0;
+        min-height: 38px;
+      }
+    }
     @media (max-width: 600px) {
       .layout {
         padding-bottom: 92px;

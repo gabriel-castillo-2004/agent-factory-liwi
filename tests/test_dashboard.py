@@ -6055,3 +6055,132 @@ def test_dashboard_liwi_fullscreen_overlay_optimistic_chat_markdown_newlines_and
     md_head = DASHBOARD_HTML[md_start:md_end]
     assert "replace(" in md_head
     assert "split(" in md_head
+
+
+def _extract_css_block(css: str, header_prefix: str) -> str:
+    """Return the brace-balanced inner body of the first CSS block matching header_prefix."""
+    start = css.find(header_prefix)
+    if start == -1:
+        return ""
+    open_brace = css.find("{", start)
+    if open_brace == -1:
+        return ""
+    depth = 0
+    for idx in range(open_brace, len(css)):
+        ch = css[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return css[open_brace + 1 : idx]
+    return ""
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_mobile_responsive_step1_header_and_project_selector(tmp_path: Path) -> None:
+    """Step 1 mobile CSS lives inside @media (max-width: 768px) for anti-overflow, scrollable header buttons, and single-line project selector + Nuevo without altering desktop or CDNs."""
+    store = SqliteEventStore(str(tmp_path / "mobile_step1.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as resp:
+            assert resp.status == 200
+            html = resp.read().decode("utf-8")
+
+        # 1. Zero external CDNs and all existing header + project-selector IDs preserved
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+        required_ids = [
+            "server-health-dot",
+            "server-health-label",
+            "status-note",
+            "view-mode-segmented",
+            "view-mode-simple",
+            "view-mode-dev",
+            "tech-mode-toggle",
+            "themes-menu-btn",
+            "themes-popover",
+            "improve-factory-btn",
+            "settings-menu-btn",
+            "settings-popover",
+            "sidebar-panel",
+            "mobile-project-switcher",
+            "mobile-new-project-shortcut",
+            "toggle-import-project-btn",
+            "toggle-new-project-btn",
+        ]
+        for dom_id in required_ids:
+            assert f'id="{dom_id}"' in html, f"Missing existing HTML id: {dom_id}"
+
+        # 2. Extract <style> and the @media (max-width: 768px) block
+        style_start = html.index("<style>") + len("<style>")
+        style_end = html.index("</style>", style_start)
+        css = html[style_start:style_end]
+
+        media_768 = _extract_css_block(css, "@media (max-width: 768px)")
+        assert media_768, "Expected @media (max-width: 768px) block in dashboard CSS"
+
+        # 3. Anti-overflow base rules inside @media (max-width: 768px)
+        assert "overflow-x: hidden;" in media_768
+        assert "max-width: 100%;" in media_768
+        assert "box-sizing: border-box;" in media_768
+
+        # 4. Top header scrollable controls bar and non-wrapping 38px buttons
+        controls_rule = _extract_css_block(media_768, "header .controls")
+        assert controls_rule, "Expected header .controls rule inside @media (max-width: 768px)"
+        assert "display: flex;" in controls_rule
+        assert "flex-wrap: nowrap;" in controls_rule
+        assert "overflow-x: auto;" in controls_rule
+        assert "-webkit-overflow-scrolling: touch;" in controls_rule
+        assert "max-width: 100%;" in controls_rule
+
+        for header_btn_sel in (
+            "#view-mode-simple",
+            "#view-mode-dev",
+            "#themes-menu-btn",
+            "#improve-factory-btn",
+            "#settings-menu-btn",
+        ):
+            assert header_btn_sel in media_768
+        header_btns_rule = _extract_css_block(media_768, "header .controls .btn")
+        assert header_btns_rule, "Expected header button rules inside @media (max-width: 768px)"
+        assert "white-space: nowrap;" in header_btns_rule
+        assert "flex-shrink: 0;" in header_btns_rule
+        assert "min-height: 38px;" in header_btns_rule
+
+        # 5. Project selector row + selector control + '+ Nuevo' button
+        switcher_row_rule = _extract_css_block(media_768, ".mobile-switcher-row {")
+        assert switcher_row_rule, "Expected .mobile-switcher-row rule inside @media (max-width: 768px)"
+        assert "display: flex;" in switcher_row_rule
+        assert "flex-wrap: nowrap;" in switcher_row_rule
+        assert "align-items: center;" in switcher_row_rule
+        assert "width: 100%;" in switcher_row_rule
+        assert "min-width: 0;" in switcher_row_rule
+
+        selector_rule = _extract_css_block(media_768, ".mobile-switcher-row .mobile-switcher-btn")
+        assert selector_rule, "Expected project selector rule inside @media (max-width: 768px)"
+        assert ".mobile-switcher-row #mobile-project-switcher" in media_768
+        assert ".mobile-switcher-row select" in media_768
+        assert "flex: 1;" in selector_rule
+        assert "min-width: 0;" in selector_rule
+        assert "min-height: 38px;" in selector_rule
+
+        new_btn_rule = _extract_css_block(media_768, "#mobile-new-project-shortcut")
+        assert new_btn_rule, "Expected #mobile-new-project-shortcut rule inside @media (max-width: 768px)"
+        assert "white-space: nowrap;" in new_btn_rule
+        assert "flex-shrink: 0;" in new_btn_rule
+        assert "min-height: 38px;" in new_btn_rule
+
+        # 6. Desktop rules outside @media remain untouched
+        assert ".controls { display: flex; align-items: center; gap: 10px; }" in css
+        desktop_switcher = _extract_css_block(css, ".mobile-switcher-row {")
+        assert "display: none;" in desktop_switcher
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
