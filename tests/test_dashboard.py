@@ -7436,5 +7436,278 @@ def test_dashboard_staging_apply_handles_ok_false_and_promote_probe_uses_timeout
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_renders_radar_de_auto_mejoras_ui(tmp_path: Path) -> None:
+    """Dashboard HTML renders the '💡 Radar de Auto-Mejoras' UI inside the Liwi modal with zero external CDNs."""
+    store = SqliteEventStore(str(tmp_path / "radar_ui.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as resp:
+            assert resp.status == 200
+            html = resp.read().decode("utf-8")
+
+        # Zero external CDNs
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+
+        # Existing Liwi modal IDs remain intact
+        for existing_id in (
+            "factory-improve-modal",
+            "factory-improve-title",
+            "factory-memory-toggle",
+            "factory-memory-panel",
+            "close-factory-improve-btn",
+            "factory-chat-stream",
+            "factory-chat-form",
+            "factory-chat-input",
+            "factory-chat-send-btn",
+        ):
+            assert f'id="{existing_id}"' in html, f"Missing existing ID: {existing_id}"
+
+        # Radar section strictly inside Liwi modal (#factory-improve-modal)
+        modal_start = html.index('<div id="factory-improve-modal"')
+        modal_end = html.index('<div id="factory-fullscreen-build-overlay"', modal_start)
+        modal_html = html[modal_start:modal_end]
+
+        assert "💡 Radar de Auto-Mejoras" in modal_html
+        for radar_id in (
+            "liwi-radar-section",
+            "liwi-radar-title",
+            "liwi-radar-frequency",
+            "liwi-radar-generate-btn",
+            "liwi-radar-live-status",
+            "liwi-radar-spinner",
+            "liwi-radar-status-text",
+            "liwi-radar-clock",
+            "liwi-radar-grid",
+            "liwi-radar-empty",
+        ):
+            assert f'id="{radar_id}"' in modal_html, f"Missing radar ID in Liwi modal: {radar_id}"
+
+        assert "💡 Generar ideas" in modal_html
+        assert ">Manual<" in modal_html
+        assert ">Cada 24h<" in modal_html
+        assert ">Cada 3 días<" in modal_html
+
+        # Inline JS wires /api/ideas, card expansion, live timers, implement/dismiss actions, and XSS escaping
+        script_js = html[html.index("<script>") :]
+        assert "/api/ideas" in script_js
+        assert "/api/ideas/generate" in script_js
+        assert "/api/ideas/settings" in script_js
+        assert "/implement" in script_js
+        assert "/dismiss" in script_js
+        assert "simple_description" in script_js
+        assert "✨ Implementar" in script_js
+        assert "Descartar" in script_js
+        assert "stopPropagation()" in script_js
+        assert "setInterval(" in script_js
+        assert "escapeHtml(" in script_js
+        assert "auto_interval_hours" in script_js
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_radar_ideas_responsive_and_endpoints(tmp_path: Path) -> None:
+    """Radar CSS uses 2 columns on desktop and 1 column inside @media (max-width: 768px), and /api/ideas endpoints work end-to-end."""
+    db_path = tmp_path / "radar_endpoints.db"
+    store = SqliteEventStore(str(db_path))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+
+    enqueued_calls: list[dict[str, Any]] = []
+
+    class _StubStagingManager:
+        def enqueue_improvement(
+            self,
+            *,
+            title: str,
+            prompt: str,
+            metadata: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            enqueued_calls.append({"title": title, "prompt": prompt, "metadata": metadata or {}})
+            return {
+                "pending_count": 0,
+                "commits": [],
+                "is_building": True,
+                "queue_size": len(enqueued_calls),
+                "last_error": None,
+                "current_task": title,
+                "initialized": True,
+            }
+
+        def get_staging_status(self) -> dict[str, Any]:
+            return {
+                "pending_count": 0,
+                "commits": [],
+                "is_building": bool(enqueued_calls),
+                "queue_size": len(enqueued_calls),
+                "last_error": None,
+                "current_task": enqueued_calls[-1]["title"] if enqueued_calls else None,
+                "initialized": True,
+            }
+
+        def shutdown(self, timeout: float = 5.0) -> None:
+            _ = timeout
+
+    generated_payload = json.dumps(
+        {
+            "ideas": [
+                {
+                    "title": "⚡ Caché de estado en dashboard",
+                    "category": "Rendimiento",
+                    "impact": "Alto",
+                    "simple_description": "Reduce lecturas repetidas en disco para acelerar la carga.",
+                    "technical_prompt": "Agrega caché corta en dashboard.py y verifica con pytest -q --no-cov tests/test_dashboard.py.",
+                },
+                {
+                    "title": "🎨 Atajos de teclado en modal",
+                    "category": "UX",
+                    "impact": "Medio",
+                    "simple_description": "Permite cerrar y navegar tarjetas del radar con teclado.",
+                    "technical_prompt": "Agrega soporte de Escape en dashboard.py y verifica con pytest -q --no-cov tests/test_dashboard.py.",
+                },
+            ]
+        }
+    )
+    fake_runner = FakeRunner(
+        results=[
+            # 1) git log in build_ideation_context
+            CommandResult(exit_code=0, stdout="abc1234 feat(radar): add idea engine\n"),
+            # 2) agy read-only ideation output
+            CommandResult(exit_code=0, stdout=generated_payload),
+        ]
+    )
+
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        runner=fake_runner,
+        staging_manager=_StubStagingManager(),  # type: ignore[arg-type]
+    )
+    try:
+        # 1. Responsive CSS check: 2 columns desktop, 1 column strictly inside @media (max-width: 768px)
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as resp:
+            assert resp.status == 200
+            html = resp.read().decode("utf-8")
+
+        style_start = html.index("<style>") + len("<style>")
+        style_end = html.index("</style>", style_start)
+        css = html[style_start:style_end]
+
+        desktop_grid = _extract_css_block(css, ".liwi-radar-grid {")
+        assert desktop_grid, "Expected desktop .liwi-radar-grid rule"
+        assert "display: grid;" in desktop_grid
+        assert "repeat(2, minmax(0, 1fr))" in desktop_grid
+
+        desktop_details = _extract_css_block(css, ".liwi-radar-card-details {")
+        assert desktop_details, "Expected collapsed .liwi-radar-card-details rule"
+        assert "display: none;" in desktop_details
+
+        media_768 = _extract_css_block(css, "@media (max-width: 768px)")
+        assert media_768, "Expected @media (max-width: 768px) block"
+        mobile_grid = _extract_css_block(media_768, ".liwi-radar-grid {")
+        assert mobile_grid, "Expected .liwi-radar-grid override inside @media (max-width: 768px)"
+        assert "grid-template-columns: 1fr;" in mobile_grid
+        assert ".liwi-radar-head" in media_768
+        assert ".liwi-radar-controls" in media_768
+
+        # 2. GET /api/ideas initially empty with default auto_interval_hours=0.0
+        code, initial = _http_json(f"{base_url}/api/ideas")
+        assert code == 200
+        assert initial["ideas"] == []
+        assert initial["auto_interval_hours"] == 0.0
+
+        # 3. POST /api/ideas/settings persists frequency and rejects invalid input
+        s_code, s_data = _http_json(
+            f"{base_url}/api/ideas/settings",
+            method="POST",
+            body={"auto_interval_hours": 24},
+        )
+        assert s_code == 200
+        assert s_data["ok"] is True
+        assert s_data["auto_interval_hours"] == 24.0
+
+        bad_s_code, _ = _http_json(
+            f"{base_url}/api/ideas/settings",
+            method="POST",
+            body={"auto_interval_hours": -5},
+        )
+        assert bad_s_code == 400
+
+        code_after_setting, list_after_setting = _http_json(f"{base_url}/api/ideas")
+        assert code_after_setting == 200
+        assert list_after_setting["auto_interval_hours"] == 24.0
+
+        # 4. POST /api/ideas/generate creates and returns ideas
+        g_code, g_data = _http_json(
+            f"{base_url}/api/ideas/generate",
+            method="POST",
+            body={"count": 2},
+        )
+        assert g_code == 200
+        assert g_data["ok"] is True
+        assert g_data["created_count"] == 2
+        assert len(g_data["ideas"]) == 2
+        by_title = {item["title"]: item for item in g_data["ideas"]}
+        first_idea = by_title["⚡ Caché de estado en dashboard"]
+        second_idea = by_title["🎨 Atajos de teclado en modal"]
+        assert first_idea["impact"] == "Alto"
+        assert first_idea["status"] == "nueva"
+        assert first_idea["simple_description"] == "Reduce lecturas repetidas en disco para acelerar la carga."
+
+        # 5. POST /api/ideas/<id>/implement enqueues into staging and marks status='encolada'
+        imp_code, imp_data = _http_json(
+            f"{base_url}/api/ideas/{first_idea['id']}/implement",
+            method="POST",
+        )
+        assert imp_code == 200
+        assert imp_data["ok"] is True
+        assert imp_data["idea"]["status"] == "encolada"
+        assert len(enqueued_calls) == 1
+        assert enqueued_calls[0]["title"] == "⚡ Caché de estado en dashboard"
+        assert "Agrega caché corta en dashboard.py" in enqueued_calls[0]["prompt"]
+
+        # Duplicate implement returns 409; invalid ID returns 400; missing ID returns 404
+        dup_code, _ = _http_json(
+            f"{base_url}/api/ideas/{first_idea['id']}/implement",
+            method="POST",
+        )
+        assert dup_code == 409
+        bad_id_code, _ = _http_json(f"{base_url}/api/ideas/not-an-int/implement", method="POST")
+        assert bad_id_code == 400
+        missing_code, _ = _http_json(f"{base_url}/api/ideas/99999/implement", method="POST")
+        assert missing_code == 404
+
+        # 6. POST /api/ideas/<id>/dismiss marks 'descartada' and removes from default GET /api/ideas
+        dis_code, dis_data = _http_json(
+            f"{base_url}/api/ideas/{second_idea['id']}/dismiss",
+            method="POST",
+        )
+        assert dis_code == 200
+        assert dis_data["ok"] is True
+        assert dis_data["idea"]["status"] == "descartada"
+
+        code_final, final_list = _http_json(f"{base_url}/api/ideas")
+        assert code_final == 200
+        assert [item["id"] for item in final_list["ideas"]] == [first_idea["id"]]
+        assert final_list["ideas"][0]["status"] == "encolada"
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+
 
 
