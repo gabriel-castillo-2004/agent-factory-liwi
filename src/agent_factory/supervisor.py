@@ -16,7 +16,7 @@ from typing import Any
 
 RESTART_EXIT_CODE: int = 42
 DEFAULT_RESTART_DELAY_SECONDS: float = 1.5
-DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS: float = 12.0
+DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS: float = 25.0
 DEFAULT_HEALTHCHECK_URL: str = "http://127.0.0.1:8000/api/autonomous/status"
 
 logger = logging.getLogger(__name__)
