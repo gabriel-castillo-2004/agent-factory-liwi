@@ -2589,21 +2589,45 @@ class DashboardController:
         with self._lock:
             if self._active_projects or self._active_ops:
                 return True
-        for proj in self.list_projects():
-            if str(proj.get("state") or "").upper() in {"BUILDING", "RECOVERING"}:
+        for pid in self.orchestrator.store.list_project_ids():
+            try:
+                validate_project_id(pid)
+                if not self.orchestrator.store.get_events(pid):
+                    continue
+                status = self.orchestrator.get_status(
+                    pid,
+                    notify_publisher=False,
+                    notify_notifier=False,
+                )
+            except (ValueError, IllegalTransition):
+                continue
+            raw_state = getattr(status.state, "value", status.state)
+            if str(raw_state or "").upper() in {"BUILDING", "RECOVERING"}:
                 return True
         return False
 
     def _has_running_local_apps(self) -> bool:
-        for proj in self.list_projects():
-            pid = str(proj.get("project_id") or "").strip()
-            if not pid:
+        runner = self.local_runner
+        if (
+            isinstance(runner, LocalAppRunner)
+            and type(runner).get_status is LocalAppRunner.get_status
+            and "get_status" not in runner.__dict__
+        ):
+            with runner._lock:
+                runner._prune_dead_locked()
+                return any(
+                    entry.process.poll() is None
+                    for entry in runner._processes.values()
+                )
+        for pid in self.orchestrator.store.list_project_ids():
+            pid_clean = str(pid or "").strip()
+            if not pid_clean:
                 continue
             try:
-                if self.local_runner.get_status(pid).running:
+                if runner.get_status(pid_clean).running:
                     return True
             except Exception as exc:  # noqa: BLE001
-                logger.debug("local_runner.get_status skipped for %s: %s", pid, exc)
+                logger.debug("local_runner.get_status skipped for %s: %s", pid_clean, exc)
         return False
 
     def _get_autonomous_engine(self) -> idea_engine.AutonomousEngine:
@@ -2629,8 +2653,48 @@ class DashboardController:
 
     def get_autonomous_status(self) -> dict[str, Any]:
         """Return live 24/7 autonomous status, quota meter telemetry, and recent autonomous history."""
-        engine = self._get_autonomous_engine()
-        return _scrub_value(engine.get_status_snapshot(), self.secrets_to_redact)
+        try:
+            engine = self._get_autonomous_engine()
+            return _scrub_value(engine.get_status_snapshot(), self.secrets_to_redact)
+        except Exception as exc:  # noqa: BLE001
+            clean_err = redact_secrets(
+                str(exc) or exc.__class__.__name__,
+                extra_secrets=self.secrets_to_redact,
+            )
+            logger.warning("Autonomous status degraded fallback: %s", clean_err)
+            est_turns = max(
+                0,
+                idea_engine.DEFAULT_ESTIMATED_WINDOW_CAPACITY
+                // max(1, idea_engine.DEFAULT_AVG_TURN_TOKENS),
+            )
+            return _scrub_value(
+                {
+                    "autonomous_enabled": False,
+                    "cooldown_minutes": idea_engine.DEFAULT_AUTONOMOUS_COOLDOWN_MINUTES,
+                    "consecutive_failures": 0,
+                    "state": "apagado",
+                    "current_task": None,
+                    "is_running": False,
+                    "busy_reason": None,
+                    "pause_reason": None,
+                    "last_error": {"message": clean_err},
+                    "last_cycle_result": None,
+                    "degraded": True,
+                    "quota": {
+                        "window_tokens_used": 0,
+                        "estimated_window_capacity": idea_engine.DEFAULT_ESTIMATED_WINDOW_CAPACITY,
+                        "quota_remaining_pct": 100,
+                        "reserve_threshold_pct": idea_engine.DEFAULT_RESERVE_THRESHOLD_PCT,
+                        "turns_used": 0,
+                        "turns_remaining_est": est_turns,
+                        "is_paused": False,
+                        "reserve_reached": False,
+                        "resume_hhmm": None,
+                    },
+                    "history": [],
+                },
+                self.secrets_to_redact,
+            )
 
     def toggle_autonomous_mode(
         self,
@@ -15266,10 +15330,12 @@ class DashboardHTTPServer(http.server.ThreadingHTTPServer):
                 f"DashboardHTTPServer must bind exclusively to {LOOPBACK_HOST}, got '{host}'"
             )
         self.controller = controller
+        self._closing = threading.Event()
         super().__init__((host, port), _DashboardRequestHandler)
 
     def server_close(self) -> None:
         """Ensure locally launched apps, staging worker, and autonomous engine stop cleanly on shutdown."""
+        self._closing.set()
         try:
             self.controller.local_runner.stop_all()
         finally:
@@ -16267,13 +16333,6 @@ def start_dashboard_server(
         visual_qa_runner=visual_qa_runner,
         secrets_to_redact=secrets_to_redact,
     )
-    if "PYTEST_CURRENT_TEST" not in os.environ:
-        try:
-            auto_st = idea_engine.get_autonomous_state(db_path=controller._resolve_idea_db_path())
-            if auto_st["autonomous_enabled"]:
-                controller._get_autonomous_engine().start()
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Autonomous engine auto-start skipped: %s", exc)
     server = DashboardHTTPServer((host, port), controller)
     actual_port = int(server.server_address[1])
     thread = threading.Thread(
@@ -16282,4 +16341,20 @@ def start_dashboard_server(
         daemon=True,
     )
     thread.start()
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        def _auto_start_autonomous() -> None:
+            try:
+                auto_st = idea_engine.get_autonomous_state(
+                    db_path=controller._resolve_idea_db_path()
+                )
+                if auto_st["autonomous_enabled"] and not server._closing.is_set():
+                    controller._get_autonomous_engine().start()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Autonomous engine auto-start skipped: %s", exc)
+
+        threading.Thread(
+            target=_auto_start_autonomous,
+            name="agent-factory-autonomous-autostart",
+            daemon=True,
+        ).start()
     return server, thread, f"http://{host}:{actual_port}"

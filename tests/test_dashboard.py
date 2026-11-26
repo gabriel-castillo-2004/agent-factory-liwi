@@ -8423,6 +8423,119 @@ def test_dashboard_triage_client_error_tickets_and_banner_ui(
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_autonomous_status_watchdog_nonblocking_and_fault_tolerant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /api/autonomous/status stays fast (no git publish or workspace scans), non-blocking at boot, and 200 OK on DB errors."""
+    import sqlite3
+    import time
+
+    from agent_factory import idea_engine, runtime_runner
+
+    monkeypatch.setenv("AGENT_FACTORY_TELEMETRY_DB", str(tmp_path / "telemetry_watchdog.db"))
+    store = SqliteEventStore(db_path=tmp_path / "dash_watchdog.db")
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_watchdog")
+    pid = "watchdog-proj"
+    ws_dir = ws_mgr.create_workspace(pid)
+    (ws_dir / "index.html").write_text("<html><body><h1>Watchdog</h1></body></html>\n", encoding="utf-8")
+
+    publish_calls: list[str] = []
+
+    class _SpyPublisher:
+        def publish(self, status: Any) -> None:
+            publish_calls.append(str(status.project_id))
+
+    orch = Orchestrator(
+        store=store,
+        llm=FakeLLM(),
+        publisher=_SpyPublisher(),  # type: ignore[arg-type]
+        workspace_manager=ws_mgr,
+    )
+    now = datetime(2026, 6, 1, 10, 0, tzinfo=UTC)
+    store.append(
+        create_event(
+            pid,
+            EventType.PROJECT_CREATED,
+            {"name": "Watchdog Proj", "objective": "Fast healthcheck", "state": "INTERVIEW"},
+            at=now,
+        )
+    )
+
+    detect_calls: list[Path] = []
+    orig_detect = runtime_runner.detect_workspace_app
+
+    def _spy_detect(path: Path) -> Any:
+        detect_calls.append(path)
+        return orig_detect(path)
+
+    monkeypatch.setattr(runtime_runner, "detect_workspace_app", _spy_detect)
+
+    # 1. Non-blocking cold boot: even if autonomous auto-start blocks on SQLite, HTTP server binds immediately.
+    autostart_gate = threading.Event()
+    autostart_entered = threading.Event()
+    real_get_auto_state = idea_engine.get_autonomous_state
+
+    def _slow_first_autostart(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        if not autostart_entered.is_set():
+            autostart_entered.set()
+            autostart_gate.wait(timeout=3.0)
+        return real_get_auto_state(*args, **kwargs)
+
+    monkeypatch.setattr(idea_engine, "get_autonomous_state", _slow_first_autostart)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    t0 = time.monotonic()
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        workspace_manager=ws_mgr,
+        secrets_to_redact=("SUPER_SECRET_BOOT_999",),
+    )
+    boot_elapsed = time.monotonic() - t0
+    try:
+        assert boot_elapsed < 1.0, f"start_dashboard_server blocked {boot_elapsed:.2f}s on autonomous autostart"
+
+        # Restore normal get_autonomous_state for the HTTP probe while autostart thread is still waiting
+        monkeypatch.setattr(idea_engine, "get_autonomous_state", real_get_auto_state)
+
+        # 2. GET /api/autonomous/status must NOT trigger publisher.publish() or detect_workspace_app() scans
+        code, payload = _http_json(f"{base_url}/api/autonomous/status", timeout=2.0)
+        assert code == 200
+        assert payload["state"] == "apagado"
+        assert "quota" in payload
+        assert publish_calls == []
+        assert detect_calls == []
+
+        # 3. Transient SQLite lock inside get_status_snapshot must degrade to 200 OK (never drop connection / 500)
+        eng = server.controller._get_autonomous_engine()
+        monkeypatch.setattr(
+            eng,
+            "get_status_snapshot",
+            lambda **_kw: (_ for _ in ()).throw(
+                sqlite3.OperationalError("database is locked SUPER_SECRET_BOOT_999")
+            ),
+        )
+        deg_code, deg_payload = _http_json(f"{base_url}/api/autonomous/status", timeout=2.0)
+        assert deg_code == 200
+        assert deg_payload["degraded"] is True
+        assert deg_payload["state"] == "apagado"
+        assert deg_payload["history"] == []
+        assert "quota" in deg_payload
+        assert "SUPER_SECRET_BOOT_999" not in json.dumps(deg_payload)
+    finally:
+        autostart_gate.set()
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+
 
 
 
