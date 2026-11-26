@@ -5571,9 +5571,6 @@ def test_dashboard_auto_recovers_orphaned_delivered_ops_manual_recover_and_unifi
         store.close()
 
 
-
-
-
 def test_dashboard_expires_stale_in_memory_active_ops_over_600s(tmp_path: Path) -> None:
     """Expire stale in-memory active_ops entries (>600s) without requiring a restart."""
     from agent_factory.dashboard import DashboardController
@@ -6787,5 +6784,431 @@ def test_dashboard_mobile_responsive_step2a_cards_doctor_tabs_overflow_and_antiz
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_self_improve_staging_lazy_init_executes_zero_git_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Instantiating DashboardController/DashboardHTTPServer and querying staging/promote lazily executes zero git commands."""
+    import subprocess
 
+    git_calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def _forbid_git(cmd: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(cmd, (list, tuple)) and cmd and str(cmd[0]).lower().endswith("git"):
+            git_calls.append([str(c) for c in cmd])
+            raise AssertionError(f"Unexpected git execution during lazy dashboard init: {cmd}")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", _forbid_git)
+
+    store = SqliteEventStore(str(tmp_path / "staging_lazy.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    ctrl = DashboardController(orchestrator=orch)
+    assert ctrl._staging_manager is None
+
+    http_srv = DashboardHTTPServer(("127.0.0.1", 0), ctrl)
+    http_srv.server_close()
+    assert ctrl._staging_manager is None
+    assert git_calls == []
+
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        assert server.controller._staging_manager is None
+
+        status_code, staging_payload = _http_json(f"{base_url}/api/self-improve/staging")
+        assert status_code == 200
+        assert staging_payload["pending_count"] == 0
+        assert staging_payload["commits"] == []
+        assert staging_payload["is_building"] is False
+        assert staging_payload["queue_size"] == 0
+        assert staging_payload["last_error"] is None
+        assert staging_payload["current_task"] is None
+        assert staging_payload["initialized"] is False
+        assert server.controller._staging_manager is None
+
+        promote_code, promote_payload = _http_json(
+            f"{base_url}/api/self-improve/promote",
+            method="POST",
+            body={},
+        )
+        assert promote_code == 200
+        assert promote_payload["ok"] is True
+        assert promote_payload["promoted"] is False
+        assert promote_payload["merged_commits"] == 0
+        assert promote_payload["commits"] == []
+        assert promote_payload["restart_scheduled"] is False
+        assert server.controller._staging_manager is None
+        assert git_calls == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_self_improve_apply_enqueues_in_staging_and_delegates_to_controller_self_improver(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /api/factory/assistant/apply enqueues background staging work without restarting main and resolves controller.self_improver dynamically."""
+    from agent_factory.staging_manager import StagingManager
+
+    class _FakeStagingManager:
+        def __init__(self) -> None:
+            self.enqueued: list[dict[str, Any]] = []
+            self.shutdown_called = False
+
+        def enqueue_improvement(
+            self,
+            title: str,
+            prompt: str,
+            metadata: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            self.enqueued.append(
+                {
+                    "title": title,
+                    "prompt": prompt,
+                    "metadata": dict(metadata) if metadata is not None else {},
+                }
+            )
+            return {
+                "pending_count": 0,
+                "commits": [],
+                "is_building": True,
+                "queue_size": len(self.enqueued),
+                "last_error": None,
+                "current_task": title,
+            }
+
+        def get_staging_status(self) -> dict[str, Any]:
+            return {
+                "pending_count": 0,
+                "commits": [],
+                "is_building": bool(self.enqueued),
+                "queue_size": len(self.enqueued),
+                "last_error": None,
+                "current_task": self.enqueued[-1]["title"] if self.enqueued else None,
+            }
+
+        def shutdown(self, timeout: float = 5.0) -> None:
+            del timeout
+            self.shutdown_called = True
+
+    store = SqliteEventStore(str(tmp_path / "staging_apply.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    fake_staging = _FakeStagingManager()
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        staging_manager=fake_staging,  # type: ignore[arg-type]
+        secrets_to_redact=("SECRET_STAGE_APPLY_99",),
+    )
+    try:
+        code, payload = _http_json(
+            f"{base_url}/api/factory/assistant/apply",
+            method="POST",
+            body={
+                "proposal_title": "Mejora staging SECRET_STAGE_APPLY_99",
+                "proposal_prompt": "Implementa mejora en segundo plano",
+                "message_id": "fmsg-101",
+            },
+        )
+        assert code == 200
+        assert payload["ok"] is True
+        assert payload["queued"] is True
+        assert payload["applied"] is False
+        assert payload["rolled_back"] is False
+        assert payload["restart_scheduled"] is False
+        assert "SECRET_STAGE_APPLY_99" not in json.dumps(payload)
+        assert payload["staging"]["queue_size"] == 1
+        assert len(fake_staging.enqueued) == 1
+        assert fake_staging.enqueued[0]["prompt"] == "Implementa mejora en segundo plano"
+        assert fake_staging.enqueued[0]["metadata"]["message_id"] == "fmsg-101"
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+
+    assert fake_staging.shutdown_called is True
+
+    # Part B: Dynamic resolution of controller.self_improver at worker execution time (no git / no agy.EXE)
+    class _SpySelfImprover:
+        def __init__(self, *, should_fail: bool = False) -> None:
+            self.should_fail = should_fail
+            self.calls: list[dict[str, Any]] = []
+            self.repo_root = tmp_path / "fake_repo"
+
+        def apply_proposal(
+            self,
+            proposal_prompt: str,
+            *,
+            proposal_title: str = "",
+            message_id: str | None = None,
+            github_token: str = "",
+        ) -> dict[str, Any]:
+            self.calls.append(
+                {
+                    "proposal_prompt": proposal_prompt,
+                    "proposal_title": proposal_title,
+                    "message_id": message_id,
+                    "github_token": github_token,
+                }
+            )
+            if self.should_fail:
+                return {"ok": False, "error": "fallo controlado en staging"}
+            return {"ok": True, "applied": True, "restart_scheduled": False}
+
+    worktree_dir = (tmp_path / "fake_repo" / ".liwi-staging").resolve()
+    worktree_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(StagingManager, "ensure_worktree", lambda self: worktree_dir)
+    monkeypatch.setattr(StagingManager, "_list_pending_commits", lambda self: [])
+    monkeypatch.setattr(StagingManager, "_cleanup_worktree", lambda self: None)
+
+    ctrl = DashboardController(orchestrator=orch)
+    stale_double = _SpySelfImprover()
+    active_double = _SpySelfImprover()
+    failing_double = _SpySelfImprover(should_fail=True)
+    ctrl.self_improver = stale_double  # type: ignore[assignment]
+    # Trigger lazy manager creation first, then swap self_improver to prove dynamic resolution
+    mgr = ctrl._get_staging_manager()
+    ctrl.self_improver = active_double  # type: ignore[assignment]
+    try:
+        res_ok = ctrl.apply_factory_assistant_proposal(
+            "Mejora dinámica 1",
+            proposal_title="Dinámica 1",
+            message_id="fmsg-202",
+        )
+        assert res_ok["ok"] is True
+        assert res_ok["queued"] is True
+        assert res_ok["restart_scheduled"] is False
+        assert mgr.wait_until_idle(timeout=5.0) is True
+        assert stale_double.calls == []
+        assert active_double.calls == [
+            {
+                "proposal_prompt": "Mejora dinámica 1",
+                "proposal_title": "Dinámica 1",
+                "message_id": "fmsg-202",
+                "github_token": "",
+            }
+        ]
+        assert mgr.get_staging_status()["last_error"] is None
+
+        # Swap again to failing double and verify error is captured cleanly in staging status
+        ctrl.self_improver = failing_double  # type: ignore[assignment]
+        ctrl.apply_factory_assistant_proposal("Rompe staging", proposal_title="Fallo 1")
+        assert mgr.wait_until_idle(timeout=5.0) is True
+        assert len(failing_double.calls) == 1
+        st_after_err = ctrl.get_self_improve_staging_status()
+        assert st_after_err["last_error"] == "fallo controlado en staging"
+    finally:
+        ctrl.shutdown_staging(timeout=2.0)
+        store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_self_improve_staging_get_endpoint_returns_status_without_mutating_git(
+    tmp_path: Path,
+) -> None:
+    """GET /api/self-improve/staging returns worker state, pending commits, and redacted last_error without mutating Git."""
+
+    class _ReadOnlyStagingSpy:
+        def __init__(self) -> None:
+            self.status_calls = 0
+            self.mutated = False
+
+        def ensure_worktree(self) -> Path:
+            self.mutated = True
+            raise AssertionError("ensure_worktree must not be called by GET /api/self-improve/staging")
+
+        def get_staging_status(self) -> dict[str, Any]:
+            self.status_calls += 1
+            return {
+                "pending_count": 2,
+                "commits": [
+                    {"hash": "abc1234", "title": "feat: mejora uno"},
+                    {"hash": "def5678", "title": "feat: mejora dos"},
+                ],
+                "is_building": True,
+                "queue_size": 1,
+                "last_error": "error previo con SECRET_STG_TOKEN",
+                "current_task": "feat: mejora tres",
+            }
+
+        def shutdown(self, timeout: float = 5.0) -> None:
+            del timeout
+
+    store = SqliteEventStore(str(tmp_path / "staging_status.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    spy = _ReadOnlyStagingSpy()
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        staging_manager=spy,  # type: ignore[arg-type]
+        secrets_to_redact=("SECRET_STG_TOKEN",),
+    )
+    try:
+        code, payload = _http_json(f"{base_url}/api/self-improve/staging")
+        assert code == 200
+        assert spy.status_calls == 1
+        assert spy.mutated is False
+        assert payload["pending_count"] == 2
+        assert payload["commits"] == [
+            {"hash": "abc1234", "title": "feat: mejora uno"},
+            {"hash": "def5678", "title": "feat: mejora dos"},
+        ]
+        assert payload["is_building"] is True
+        assert payload["queue_size"] == 1
+        assert payload["current_task"] == "feat: mejora tres"
+        assert payload["initialized"] is True
+        assert "SECRET_STG_TOKEN" not in str(payload["last_error"])
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_self_improve_promote_endpoint_handles_success_empty_busy_and_error(
+    tmp_path: Path,
+) -> None:
+    """POST /api/self-improve/promote delegates to staging_manager and cleanly handles empty, busy (409), error (400), and success without restarting pytest."""
+    from agent_factory.self_improver import FactorySelfImprover
+
+    class _ControllableStagingManager:
+        def __init__(self) -> None:
+            self.mode = "empty"
+            self.promote_calls: list[bool] = []
+            self.on_restart_calls = 0
+
+        def promote_staging_to_main(self, trigger_restart: bool = True) -> dict[str, Any]:
+            self.promote_calls.append(bool(trigger_restart))
+            if self.mode == "empty":
+                return {"promoted": False, "merged_commits": 0, "commits": []}
+            if self.mode == "busy":
+                raise RuntimeError(
+                    "No se puede promover staging a main mientras hay mejoras en construcción o en cola."
+                )
+            if self.mode == "error":
+                raise RuntimeError("Falló el merge fast-forward de 'liwi-staging' en 'main': conflict")
+            if trigger_restart:
+                self.on_restart_calls += 1
+            return {
+                "promoted": True,
+                "merged_commits": 2,
+                "commits": [
+                    {"hash": "111aaaa", "title": "feat: alpha"},
+                    {"hash": "222bbbb", "title": "feat: beta"},
+                ],
+            }
+
+        def shutdown(self, timeout: float = 5.0) -> None:
+            del timeout
+
+    store = SqliteEventStore(str(tmp_path / "staging_promote.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    fake_mgr = _ControllableStagingManager()
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        staging_manager=fake_mgr,  # type: ignore[arg-type]
+    )
+    try:
+        # 1. Empty staging (no pending commits)
+        fake_mgr.mode = "empty"
+        c_empty, r_empty = _http_json(
+            f"{base_url}/api/self-improve/promote",
+            method="POST",
+            body={},
+        )
+        assert c_empty == 200
+        assert r_empty["ok"] is True
+        assert r_empty["promoted"] is False
+        assert r_empty["merged_commits"] == 0
+        assert r_empty["commits"] == []
+        assert r_empty["restart_scheduled"] is False
+        assert fake_mgr.on_restart_calls == 0
+
+        # 2. Busy queue / worker building -> 409 Conflict
+        fake_mgr.mode = "busy"
+        c_busy, r_busy = _http_json(
+            f"{base_url}/api/self-improve/promote",
+            method="POST",
+            body={},
+        )
+        assert c_busy == 409
+        assert "construcción" in r_busy["error"] or "cola" in r_busy["error"]
+        assert fake_mgr.on_restart_calls == 0
+
+        # 3. Git merge / branch error -> 400 Bad Request
+        fake_mgr.mode = "error"
+        c_err, r_err = _http_json(
+            f"{base_url}/api/self-improve/promote",
+            method="POST",
+            body={},
+        )
+        assert c_err == 400
+        assert "fast-forward" in r_err["error"]
+        assert fake_mgr.on_restart_calls == 0
+
+        # 4. Success under pytest defaults trigger_restart=False so pytest never restarts
+        fake_mgr.mode = "success"
+        c_ok, r_ok = _http_json(
+            f"{base_url}/api/self-improve/promote",
+            method="POST",
+            body={},
+        )
+        assert c_ok == 200
+        assert r_ok["ok"] is True
+        assert r_ok["promoted"] is True
+        assert r_ok["merged_commits"] == 2
+        assert len(r_ok["commits"]) == 2
+        assert r_ok["restart_scheduled"] is False
+        assert fake_mgr.promote_calls[-1] is False
+        assert fake_mgr.on_restart_calls == 0
+
+        # 5. Controller's _trigger_staging_restart guards os._exit under pytest and supports test restart_fn
+        restart_event = threading.Event()
+        restart_codes: list[int] = []
+
+        def _capture_exit(code: int) -> None:
+            restart_codes.append(code)
+            restart_event.set()
+
+        # Default os._exit must be a safe no-op under pytest
+        safe_improver = FactorySelfImprover(sqlite_store=store, repo_root=tmp_path)
+        server.controller.self_improver = safe_improver
+        server.controller._trigger_staging_restart()
+
+        # Injected non-os._exit restart_fn schedules exit code 42
+        spy_improver = FactorySelfImprover(
+            sqlite_store=store,
+            repo_root=tmp_path,
+            restart_fn=_capture_exit,
+            restart_delay_seconds=0.01,
+        )
+        server.controller.self_improver = spy_improver
+        server.controller._trigger_staging_restart()
+        assert restart_event.wait(timeout=2.0) is True
+        assert restart_codes == [42]
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
 

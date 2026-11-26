@@ -9,6 +9,7 @@ import email.policy
 import http.server
 import json
 import logging
+import os
 import threading
 import urllib.parse
 import uuid
@@ -39,6 +40,7 @@ from agent_factory.runtime_runner import LocalAppError, LocalAppRunner
 from agent_factory.scaffold import TemplateScaffold
 from agent_factory.secrets import redact_secrets
 from agent_factory.self_improver import FactorySelfImprover
+from agent_factory.staging_manager import StagingManager
 from agent_factory.telegram_bot import TelegramBotService, _slugify
 from agent_factory.workspace import (
     LOGO_MIME_BY_EXT,
@@ -91,6 +93,7 @@ class DashboardController:
         vcs: Any | None = None,
         runner: Runner | None = None,
         self_improver: FactorySelfImprover | None = None,
+        staging_manager: StagingManager | None = None,
         secrets_to_redact: Sequence[str] = (),
     ) -> None:
         self.orchestrator = orchestrator
@@ -160,6 +163,10 @@ class DashboardController:
         self._op_seq = 0
         self._threads: list[threading.Thread] = []
         self._self_improver: FactorySelfImprover | None = self_improver
+        self._staging_manager: StagingManager | None = staging_manager
+        self._legacy_direct_self_improver: bool = (
+            isinstance(self_improver, FactorySelfImprover) and staging_manager is None
+        )
 
     def _get_live_status_info(self, running: bool) -> dict[str, Any]:
         """Return live active model, stage, activity summary/detail, test progress, and timer."""
@@ -2007,10 +2014,23 @@ class DashboardController:
 
         return {"ok": True, "deleted": project_id}
 
+    @property
+    def self_improver(self) -> FactorySelfImprover | None:
+        """Return the currently configured self-improver instance without eager creation."""
+        return self._self_improver
+
+    @self_improver.setter
+    def self_improver(self, value: FactorySelfImprover | None) -> None:
+        with self._lock:
+            self._self_improver = value
+
     def _effective_self_improver(self) -> FactorySelfImprover:
         with self._lock:
             if self._self_improver is not None:
-                if self._self_improver.pre_exit_hook is None:
+                if (
+                    hasattr(self._self_improver, "pre_exit_hook")
+                    and self._self_improver.pre_exit_hook is None
+                ):
                     self._self_improver.pre_exit_hook = lambda: self.local_runner.stop_all()
                 return self._self_improver
             store = self.orchestrator.store
@@ -2035,6 +2055,194 @@ class DashboardController:
                 pre_exit_hook=lambda: self.local_runner.stop_all(),
             )
             return self._self_improver
+
+    def _get_staging_manager(self) -> StagingManager:
+        """Lazily create and return the controller-scoped StagingManager without mutating Git."""
+        with self._lock:
+            if self._staging_manager is None:
+                raw_root = getattr(self._self_improver, "repo_root", None)
+                repo_root = (
+                    Path(raw_root).resolve()
+                    if raw_root is not None
+                    else Path(__file__).resolve().parents[2]
+                )
+                self._staging_manager = StagingManager(
+                    repo_root=repo_root,
+                    executor=self._execute_staging_task,
+                    on_restart=self._trigger_staging_restart,
+                )
+            return self._staging_manager
+
+    def shutdown_staging(self, timeout: float = 5.0) -> None:
+        """Cleanly stop the staging worker if a StagingManager has been initialized."""
+        with self._lock:
+            mgr = self._staging_manager
+        if mgr is not None and callable(getattr(mgr, "shutdown", None)):
+            mgr.shutdown(timeout=timeout)
+
+    def _execute_staging_task(self, worktree_path: Path, task: dict[str, Any]) -> Any:
+        """Execute a queued self-improvement inside .liwi-staging delegating dynamically to self.self_improver."""
+        improver = self.self_improver
+        if improver is None:
+            improver = self._effective_self_improver()
+
+        prompt = str(task.get("prompt") or "")
+        title = str(task.get("title") or "Auto-mejora Liwi")
+        meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+        message_id = str(meta["message_id"]) if meta.get("message_id") else None
+
+        is_real_unmodified = (
+            type(improver) is FactorySelfImprover and "apply_proposal" not in improver.__dict__
+        )
+        if not is_real_unmodified:
+            res = improver.apply_proposal(
+                prompt,
+                proposal_title=title,
+                message_id=message_id,
+                github_token="",
+            )
+        else:
+            store = self.orchestrator.store
+            sqlite_store = store if hasattr(store, "_conn") and hasattr(store, "_lock") else None
+            staging_improver = FactorySelfImprover(
+                sqlite_store=sqlite_store,
+                repo_root=worktree_path,
+                uploads_dir=improver.uploads_dir,
+                runner=improver.runner,
+                clock=improver.clock,
+                agy_command=improver.agy_command,
+                model=improver.model,
+                secrets_to_redact=improver.secrets_to_redact,
+                apply_timeout_seconds=improver.apply_timeout_seconds,
+                verify_timeout_seconds=improver.verify_timeout_seconds,
+                restart_fn=lambda _code: None,
+                restart_delay_seconds=0.0,
+                pre_exit_hook=None,
+            )
+            if getattr(staging_improver.memory_store, "_owns_conn", False):
+                staging_improver.memory_store._conn.close()
+            staging_improver.memory_store = improver.memory_store
+            staging_improver._status = improver._status
+            staging_improver._status_lock = improver._status_lock
+            res = staging_improver.apply_proposal(
+                prompt,
+                proposal_title=title,
+                message_id=message_id,
+                github_token="",
+            )
+
+        if isinstance(res, Mapping) and not res.get("ok"):
+            err = str(res.get("error") or "La auto-mejora falló en el worktree de staging.")
+            raise RuntimeError(redact_secrets(err, extra_secrets=self.secrets_to_redact))
+        return res
+
+    def _trigger_staging_restart(self) -> None:
+        """Trigger supervised process restart (exit 42) after real promotion, never calling os._exit under pytest."""
+        in_pytest = "PYTEST_CURRENT_TEST" in os.environ
+        improver = self.self_improver
+        if improver is not None:
+            restart_fn = getattr(improver, "restart_fn", None)
+            if in_pytest and restart_fn is os._exit:
+                return
+            schedule_fn = getattr(improver, "_schedule_process_restart", None)
+            if callable(schedule_fn):
+                schedule_fn()
+                return
+        if in_pytest:
+            return
+        self._effective_self_improver()._schedule_process_restart()
+
+    def _should_use_staging(self, use_staging: bool | None = None) -> bool:
+        if use_staging is not None:
+            return bool(use_staging)
+        if self._staging_manager is not None:
+            return True
+        return not self._legacy_direct_self_improver
+
+    def get_self_improve_staging_status(self) -> dict[str, Any]:
+        """Return staging queue/worker status and pending commits without mutating Git or initializing lazily."""
+        with self._lock:
+            mgr = self._staging_manager
+        if mgr is None:
+            return {
+                "pending_count": 0,
+                "commits": [],
+                "is_building": False,
+                "queue_size": 0,
+                "last_error": None,
+                "current_task": None,
+                "initialized": False,
+            }
+        status = mgr.get_staging_status()
+        if isinstance(status, dict):
+            payload = dict(status)
+            payload.setdefault("initialized", True)
+            return _scrub_value(payload, self.secrets_to_redact)
+        return {
+            "pending_count": 0,
+            "commits": [],
+            "is_building": False,
+            "queue_size": 0,
+            "last_error": None,
+            "current_task": None,
+            "initialized": True,
+        }
+
+    def promote_self_improve_staging(
+        self,
+        *,
+        trigger_restart: bool | None = None,
+    ) -> dict[str, Any]:
+        """Promote accumulated liwi-staging commits to main and restart only on real success outside pytest."""
+        with self._lock:
+            mgr = self._staging_manager
+        if mgr is None:
+            return {
+                "ok": True,
+                "promoted": False,
+                "merged_commits": 0,
+                "commits": [],
+                "restart_scheduled": False,
+                "message": "No hay mejoras pendientes en staging para promover.",
+            }
+
+        in_pytest = "PYTEST_CURRENT_TEST" in os.environ
+        effective_restart = (not in_pytest) if trigger_restart is None else bool(trigger_restart)
+        try:
+            res = mgr.promote_staging_to_main(trigger_restart=effective_restart)
+        except RuntimeError as exc:
+            err_text = redact_secrets(str(exc), extra_secrets=self.secrets_to_redact)
+            lowered = err_text.lower()
+            if any(
+                token in lowered
+                for token in ("construcción", "cola", "en ejecución", "building", "promoting")
+            ):
+                raise ProjectConflictError(err_text) from exc
+            raise ValueError(err_text) from exc
+
+        promoted = bool(res.get("promoted"))
+        merged_commits = int(res.get("merged_commits") or 0)
+        commits = list(res.get("commits") or [])
+        restart_scheduled = bool(promoted and effective_restart)
+        if promoted:
+            msg = (
+                f"Se promovieron {merged_commits} mejora(s) a main. Reiniciando Liwi..."
+                if restart_scheduled
+                else f"Se promovieron {merged_commits} mejora(s) a main."
+            )
+        else:
+            msg = "No hay mejoras pendientes en staging para promover."
+        return _scrub_value(
+            {
+                "ok": True,
+                "promoted": promoted,
+                "merged_commits": merged_commits,
+                "commits": commits,
+                "restart_scheduled": restart_scheduled,
+                "message": msg,
+            },
+            self.secrets_to_redact,
+        )
 
     def get_factory_assistant_history(self) -> dict[str, Any]:
         """Return Liwi self-improvement chat history and persistent memory rules."""
@@ -2082,13 +2290,54 @@ class DashboardController:
         *,
         proposal_title: str = "",
         message_id: str | None = None,
+        use_staging: bool | None = None,
     ) -> dict[str, Any]:
-        """Execute proposal on Liwi with git savepoint, ruff+pytest gate, rollback or exit 42."""
+        """Enqueue a Liwi improvement in background staging (or run legacy direct apply when injected)."""
+        clean_prompt = str(proposal_prompt or "").strip()
+        if not clean_prompt:
+            raise ValueError("El campo 'proposal_prompt' es obligatorio.")
+        clean_title = (
+            redact_secrets(
+                str(proposal_title or "Auto-mejora Liwi").strip(),
+                extra_secrets=self.secrets_to_redact,
+            )[:100]
+            or "Auto-mejora Liwi"
+        )
+
+        if self._should_use_staging(use_staging):
+            mgr = self._get_staging_manager()
+            metadata: dict[str, Any] = {}
+            if message_id:
+                metadata["message_id"] = str(message_id)
+            try:
+                staging_status = mgr.enqueue_improvement(
+                    title=clean_title,
+                    prompt=clean_prompt,
+                    metadata=metadata,
+                )
+            except RuntimeError as exc:
+                raise ProjectConflictError(
+                    redact_secrets(str(exc), extra_secrets=self.secrets_to_redact)
+                ) from exc
+            return _scrub_value(
+                {
+                    "ok": True,
+                    "queued": True,
+                    "applied": False,
+                    "rolled_back": False,
+                    "restart_scheduled": False,
+                    "title": clean_title,
+                    "message": f"Mejora '{clean_title}' encolada en staging en segundo plano.",
+                    "staging": staging_status,
+                },
+                self.secrets_to_redact,
+            )
+
         gh_tok = str(getattr(self.vcs, "github_token", "") or "")
         try:
             res = self._effective_self_improver().apply_proposal(
-                proposal_prompt,
-                proposal_title=proposal_title,
+                clean_prompt,
+                proposal_title=clean_title,
                 message_id=message_id,
                 github_token=gh_tok,
             )
@@ -11958,11 +12207,14 @@ class DashboardHTTPServer(http.server.ThreadingHTTPServer):
         super().__init__((host, port), _DashboardRequestHandler)
 
     def server_close(self) -> None:
-        """Ensure any locally launched apps stop cleanly when HTTP server shuts down."""
+        """Ensure locally launched apps and any staging worker stop cleanly on shutdown."""
         try:
             self.controller.local_runner.stop_all()
         finally:
-            super().server_close()
+            try:
+                self.controller.shutdown_staging(timeout=2.0)
+            finally:
+                super().server_close()
 
 
 class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -12217,6 +12469,10 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, ctrl.get_factory_assistant_status())
             return
 
+        if path == "/api/self-improve/staging":
+            self._send_json(200, ctrl.get_self_improve_staging_status())
+            return
+
         if path == "/api/factory/assistant/versions":
             qs = urllib.parse.parse_qs(parsed_url.query, keep_blank_values=True)
             if "limit" in qs:
@@ -12350,15 +12606,32 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
                     raw_prompt = body.get("prompt")
                 if not isinstance(raw_prompt, str) or not raw_prompt.strip():
                     raise ValueError("El campo 'proposal_prompt' es obligatorio.")
-                raw_title = body.get("proposal_title", "")
+                raw_title = body.get("proposal_title")
+                if raw_title is None:
+                    raw_title = body.get("title", "")
                 raw_mid = body.get("message_id")
+                raw_use_staging = body.get("use_staging")
+                if raw_use_staging is not None and not isinstance(raw_use_staging, bool):
+                    raise TypeError("El campo 'use_staging' debe ser booleano.")
                 return ctrl.apply_factory_assistant_proposal(
                     raw_prompt,
                     proposal_title=str(raw_title or ""),
                     message_id=str(raw_mid) if raw_mid is not None else None,
+                    use_staging=raw_use_staging,
                 )
 
             self._send_controller_json(_post_factory_apply)
+            return
+
+        if path == "/api/self-improve/promote":
+            def _post_self_improve_promote() -> dict[str, Any]:
+                body = self._read_json_body()
+                raw_restart = body.get("trigger_restart")
+                if raw_restart is not None and not isinstance(raw_restart, bool):
+                    raise TypeError("El campo 'trigger_restart' debe ser booleano.")
+                return ctrl.promote_self_improve_staging(trigger_restart=raw_restart)
+
+            self._send_controller_json(_post_self_improve_promote)
             return
 
         chat_pid, chat_entry_id, chat_subact = self._parse_project_chat_entry_route()
@@ -12549,6 +12822,7 @@ def start_dashboard_server(
     vcs: Any | None = None,
     runner: Runner | None = None,
     self_improver: FactorySelfImprover | None = None,
+    staging_manager: StagingManager | None = None,
     secrets_to_redact: Sequence[str] = (),
 ) -> tuple[DashboardHTTPServer, threading.Thread, str]:
     """Create and start DashboardHTTPServer on 127.0.0.1:<port> in a daemon thread."""
@@ -12565,6 +12839,7 @@ def start_dashboard_server(
         vcs=vcs,
         runner=runner,
         self_improver=self_improver,
+        staging_manager=staging_manager,
         secrets_to_redact=secrets_to_redact,
     )
     server = DashboardHTTPServer((LOOPBACK_HOST, port), controller)
