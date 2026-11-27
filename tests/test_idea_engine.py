@@ -1610,4 +1610,520 @@ def test_generate_project_ideas_injects_history_commits_filters_and_completes_qu
     ]
 
 
+def test_idea_execution_tracking_backward_compatible_defaults_and_heartbeat_helpers(
+    tmp_path: Path,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    db_path = tmp_path / "telemetry.db"
+    saved = idea_engine.save_ideas(
+        [_sample_idea(title="💓 Seguimiento de Latido")],
+        source="manual",
+        db_path=db_path,
+    )
+    idea_id = saved[0]["id"]
+
+    # Backward-compatible default fields for newly saved ideas
+    assert saved[0]["started_at"] is None
+    assert saved[0]["last_heartbeat_at"] is None
+    assert saved[0]["current_step"] == ""
+    assert saved[0]["retry_count"] == 0
+    assert saved[0]["failure_reason"] is None
+
+    t0 = datetime(2026, 11, 26, 12, 0, 0, tzinfo=UTC)
+    started = idea_engine.start_idea_execution(
+        idea_id,
+        current_step="Preparando entorno",
+        db_path=db_path,
+        now=t0,
+    )
+    assert started["status"] == "implementando"
+    assert started["started_at"] == "2026-11-26T12:00:00+00:00"
+    assert started["last_heartbeat_at"] == "2026-11-26T12:00:00+00:00"
+    assert started["current_step"] == "Preparando entorno"
+    assert started["retry_count"] == 0
+
+    t1 = t0 + timedelta(seconds=45)
+    beat = idea_engine.record_idea_heartbeat(
+        idea_id,
+        current_step="Ejecutando pruebas dirigidas",
+        db_path=db_path,
+        now=t1,
+    )
+    assert beat["status"] == "implementando"
+    assert beat["started_at"] == "2026-11-26T12:00:00+00:00"
+    assert beat["last_heartbeat_at"] == "2026-11-26T12:00:45+00:00"
+    assert beat["current_step"] == "Ejecutando pruebas dirigidas"
+    assert beat["retry_count"] == 0
+
+
+def test_reconcile_idea_queue_enforces_single_implementing_idea_keeping_most_recent_valid(
+    tmp_path: Path,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    db_path = tmp_path / "telemetry.db"
+    saved = idea_engine.save_ideas(
+        [
+            _sample_idea(title="🔧 Idea Activa Antigua"),
+            _sample_idea(title="🚀 Idea Activa Reciente"),
+            _sample_idea(title="🧊 Idea Activa Estancada"),
+        ],
+        source="manual",
+        db_path=db_path,
+    )
+    id_old, id_recent, id_stale = saved[0]["id"], saved[1]["id"], saved[2]["id"]
+    now = datetime(2026, 11, 26, 14, 0, 0, tzinfo=UTC)
+
+    idea_engine.start_idea_execution(
+        id_old,
+        current_step="Paso antiguo",
+        db_path=db_path,
+        now=now - timedelta(seconds=120),
+    )
+    idea_engine.start_idea_execution(
+        id_recent,
+        current_step="Editando código",
+        db_path=db_path,
+        now=now - timedelta(seconds=40),
+    )
+    idea_engine.record_idea_heartbeat(
+        id_recent,
+        current_step="Verificando pruebas",
+        db_path=db_path,
+        now=now - timedelta(seconds=15),
+    )
+    idea_engine.start_idea_execution(
+        id_stale,
+        current_step="Colgada hace tiempo",
+        db_path=db_path,
+        now=now - timedelta(seconds=420),
+    )
+
+    diag = idea_engine.reconcile_idea_queue(
+        stale_seconds=360,
+        db_path=db_path,
+        worker_alive=True,
+        quota_paused=False,
+        now=now,
+    )
+
+    assert diag["worker_alive"] is True
+    assert diag["pause_reason"] == "ok"
+    assert diag["active_idea"] == {
+        "id": id_recent,
+        "title": "🚀 Idea Activa Reciente",
+        "elapsed_seconds": 40.0,
+        "current_step": "Verificando pruebas",
+        "started_at": "2026-11-26T13:59:20+00:00",
+        "last_heartbeat_at": "2026-11-26T13:59:45+00:00",
+        "retry_count": 0,
+    }
+    assert diag["counts"]["implementing"] == 1
+    assert diag["counts"]["queued"] == 2
+    assert diag["counts"]["failed"] == 0
+    assert diag["counts"]["requeued"] == 2
+    assert diag["counts"]["reconciled"] == 2
+
+    assert idea_engine.get_idea(id_recent, db_path=db_path)["status"] == "implementando"  # type: ignore[index]
+    old_after = idea_engine.get_idea(id_old, db_path=db_path)
+    stale_after = idea_engine.get_idea(id_stale, db_path=db_path)
+    assert old_after is not None and old_after["status"] == "encolada"
+    assert stale_after is not None and stale_after["status"] == "encolada"
+    assert stale_after["retry_count"] == 1
+
+
+def test_reconcile_idea_queue_stale_and_dead_worker_retries_up_to_two_then_marks_failed(
+    tmp_path: Path,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    db_path = tmp_path / "telemetry.db"
+    saved = idea_engine.save_ideas(
+        [_sample_idea(title="🩹 Idea Recuperable Con Reintentos")],
+        source="manual",
+        db_path=db_path,
+    )
+    idea_id = saved[0]["id"]
+    base = datetime(2026, 11, 26, 15, 0, 0, tzinfo=UTC)
+
+    # Attempt 1: stale heartbeat (> 360s) with worker_alive=True -> retry_count=1, back to queued
+    idea_engine.start_idea_execution(
+        idea_id,
+        current_step="Editando",
+        db_path=db_path,
+        now=base,
+    )
+    diag1 = idea_engine.reconcile_idea_queue(
+        stale_seconds=360,
+        db_path=db_path,
+        worker_alive=True,
+        quota_paused=False,
+        now=base + timedelta(seconds=361),
+    )
+    assert diag1["active_idea"] is None
+    assert diag1["counts"]["implementing"] == 0
+    assert diag1["counts"]["queued"] == 1
+    assert diag1["counts"]["requeued"] == 1
+    assert diag1["counts"]["marked_failed"] == 0
+    after1 = idea_engine.get_idea(idea_id, db_path=db_path)
+    assert after1 is not None
+    assert after1["status"] == "encolada"
+    assert after1["retry_count"] == 1
+    assert after1["last_heartbeat_at"] is None
+
+    # Attempt 2: worker died (worker_alive=False) even with recent heartbeat -> retry_count=2, back to queued
+    t2 = base + timedelta(minutes=10)
+    idea_engine.start_idea_execution(
+        idea_id,
+        current_step="Verificando",
+        db_path=db_path,
+        now=t2,
+    )
+    diag2 = idea_engine.reconcile_idea_queue(
+        stale_seconds=360,
+        db_path=db_path,
+        worker_alive=False,
+        quota_paused=False,
+        now=t2 + timedelta(seconds=10),
+    )
+    assert diag2["worker_alive"] is False
+    assert diag2["pause_reason"] == "no_worker"
+    assert diag2["active_idea"] is None
+    assert diag2["counts"]["queued"] == 1
+    assert diag2["counts"]["requeued"] == 1
+    assert diag2["counts"]["marked_failed"] == 0
+    after2 = idea_engine.get_idea(idea_id, db_path=db_path)
+    assert after2 is not None
+    assert after2["status"] == "encolada"
+    assert after2["retry_count"] == 2
+
+    # Attempt 3: exceeds 2 retries -> transitions cleanly to 'failed' with explicit reason
+    t3 = base + timedelta(minutes=20)
+    idea_engine.start_idea_execution(
+        idea_id,
+        current_step="Reintentando",
+        db_path=db_path,
+        now=t3,
+    )
+    diag3 = idea_engine.reconcile_idea_queue(
+        stale_seconds=360,
+        db_path=db_path,
+        worker_alive=False,
+        quota_paused=False,
+        now=t3 + timedelta(seconds=5),
+    )
+    assert diag3["worker_alive"] is False
+    assert diag3["pause_reason"] == "empty"
+    assert diag3["active_idea"] is None
+    assert diag3["counts"]["queued"] == 0
+    assert diag3["counts"]["implementing"] == 0
+    assert diag3["counts"]["failed"] == 1
+    assert diag3["counts"]["marked_failed"] == 1
+    after3 = idea_engine.get_idea(idea_id, db_path=db_path)
+    assert after3 is not None
+    assert after3["status"] == "failed"
+    assert after3["retry_count"] == 3
+    assert isinstance(after3["failure_reason"], str) and len(after3["failure_reason"]) > 10
+
+
+def test_reconcile_idea_queue_diagnostics_covers_all_four_pause_reasons(tmp_path: Path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    db_path = tmp_path / "telemetry.db"
+    now = datetime(2026, 11, 26, 16, 0, 0, tzinfo=UTC)
+
+    # 1. "empty" when queue has no queued or implementing ideas
+    diag_empty = idea_engine.reconcile_idea_queue(
+        stale_seconds=360,
+        db_path=db_path,
+        worker_alive=False,
+        quota_paused=False,
+        now=now,
+    )
+    assert diag_empty["worker_alive"] is False
+    assert diag_empty["pause_reason"] == "empty"
+    assert diag_empty["active_idea"] is None
+    assert diag_empty["counts"]["queued"] == 0
+    assert diag_empty["counts"]["implementing"] == 0
+
+    # 2. "no_worker" when queued ideas exist and worker is not alive
+    saved = idea_engine.save_ideas([_sample_idea(title="📥 Idea En Cola")], db_path=db_path)
+    idea_id = saved[0]["id"]
+    idea_engine.update_idea_status(idea_id, "queued", db_path=db_path)
+
+    diag_no_worker = idea_engine.reconcile_idea_queue(
+        stale_seconds=360,
+        db_path=db_path,
+        worker_alive=False,
+        quota_paused=False,
+        now=now,
+    )
+    assert diag_no_worker["worker_alive"] is False
+    assert diag_no_worker["pause_reason"] == "no_worker"
+    assert diag_no_worker["active_idea"] is None
+    assert diag_no_worker["counts"]["queued"] == 1
+
+    # 3. "quota_pause" detected automatically from persisted 429 pause in SQLite
+    idea_engine.record_agy_429_pause(
+        "RESOURCE_EXHAUSTED HTTP 429 Resets in 15m0s",
+        db_path=db_path,
+        now=now,
+    )
+    diag_quota = idea_engine.reconcile_idea_queue(
+        stale_seconds=360,
+        db_path=db_path,
+        worker_alive=False,
+        now=now + timedelta(seconds=30),
+    )
+    assert diag_quota["pause_reason"] == "quota_pause"
+    assert diag_quota["quota_paused"] is True
+
+    # 4. "ok" when quota pause cleared, worker is alive, and active idea has fresh heartbeat
+    idea_engine.set_quota_config(clear_pause=True, db_path=db_path)
+    idea_engine.start_idea_execution(
+        idea_id,
+        current_step="Ejecutando agy",
+        db_path=db_path,
+        now=now,
+    )
+    diag_ok = idea_engine.reconcile_idea_queue(
+        stale_seconds=360,
+        db_path=db_path,
+        worker_alive=True,
+        now=now + timedelta(seconds=25),
+    )
+    assert diag_ok["worker_alive"] is True
+    assert diag_ok["quota_paused"] is False
+    assert diag_ok["pause_reason"] == "ok"
+    assert diag_ok["active_idea"] is not None
+    assert diag_ok["active_idea"]["id"] == idea_id
+    assert diag_ok["active_idea"]["elapsed_seconds"] == 25.0
+    assert diag_ok["active_idea"]["current_step"] == "Ejecutando agy"
+    assert diag_ok["counts"]["implementing"] == 1
+
+
+def test_self_improver_auto_queue_limit_max_three_and_resume_drains_without_autonomous_on(
+    tmp_path: Path,
+) -> None:
+    from datetime import UTC, datetime
+
+    from agent_factory import self_improver
+
+    db_path = tmp_path / "telemetry.db"
+    now = datetime(2026, 11, 26, 18, 0, 0, tzinfo=UTC)
+
+    # Seed 5 pending ideas and keep 24/7 autonomous generator OFF
+    saved = idea_engine.save_ideas(
+        [
+            _sample_idea(title="⚡ Mejora Cola 1", impact="Alto"),
+            _sample_idea(title="🛡️ Mejora Cola 2", impact="Alto"),
+            _sample_idea(title="📊 Mejora Cola 3", impact="Medio"),
+            _sample_idea(title="🧹 Mejora Cola 4", impact="Medio"),
+            _sample_idea(title="🔔 Mejora Cola 5", impact="Medio"),
+        ],
+        source="auto",
+        db_path=db_path,
+    )
+    assert len(saved) == 5
+    assert idea_engine.get_autonomous_state(db_path=db_path)["autonomous_enabled"] is False
+
+    # Auto-enqueue must cap queued ideas strictly at 3
+    gen_calls: list[int] = []
+
+    def _spy_generator(needed: int) -> list[dict[str, str]]:
+        gen_calls.append(needed)
+        return [_sample_idea(title=f"🤖 Generada Extra {i}") for i in range(needed)]
+
+    first = self_improver.auto_enqueue_ideas(
+        db_path=db_path,
+        generator=_spy_generator,
+        now=now,
+    )
+    assert first["ok"] is True
+    assert first["skipped"] is False
+    assert first["max_queued"] == 3
+    assert first["queued_count"] == 3
+    assert len(first["enqueued"]) == 3
+    assert gen_calls == []
+    assert idea_engine.count_ideas_by_status(db_path=db_path)["queued"] == 3
+
+    # Calling again while 3 ideas are queued must skip and NEVER invoke generator
+    second = self_improver.auto_enqueue_ideas(
+        db_path=db_path,
+        generator=_spy_generator,
+        now=now,
+    )
+    assert second["ok"] is True
+    assert second["skipped"] is True
+    assert second["reason"] == "queue_limit_reached"
+    assert second["queued_count"] == 3
+    assert gen_calls == []
+
+    # Simulate an orphaned implementing idea (server restart) while 24/7 generator is OFF
+    orphan_id = first["enqueued"][0]["id"]
+    idea_engine.start_idea_execution(
+        orphan_id,
+        current_step="Interrumpida por reinicio",
+        db_path=db_path,
+        now=now,
+    )
+
+    # Active 429 quota pause must block resume_idea_queue from starting the worker
+    idea_engine.record_agy_429_pause(
+        "RESOURCE_EXHAUSTED HTTP 429 Resets in 20m0s",
+        db_path=db_path,
+        now=now,
+    )
+    assert self_improver.is_quota_429_paused(db_path=db_path, now=now) is True
+
+    executed_ids: list[int] = []
+    seen_heartbeats: list[str] = []
+
+    def _fake_executor(idea: dict[str, Any]) -> dict[str, Any]:
+        executed_ids.append(int(idea["id"]))
+        beat = idea_engine.record_idea_heartbeat(
+            int(idea["id"]),
+            current_step="Ejecutando prueba determinista",
+            db_path=db_path,
+        )
+        seen_heartbeats.append(str(beat["current_step"]))
+        return {"ok": True, "applied": True}
+
+    try:
+        blocked = self_improver.resume_idea_queue(
+            db_path=db_path,
+            executor=_fake_executor,
+            now=now,
+            poll_interval_seconds=0.02,
+        )
+        assert blocked["ok"] is True
+        assert blocked["resumed"] is False
+        assert blocked["worker_started"] is False
+        assert blocked["pause_reason"] == "quota_pause"
+        assert executed_ids == []
+        # Orphaned idea was still cleanly reconciled back to queued
+        assert idea_engine.get_idea(orphan_id, db_path=db_path)["status"] == "encolada"  # type: ignore[index]
+
+        # Clear 429 pause -> resume_idea_queue starts worker immediately even with autonomous_enabled=False
+        idea_engine.set_quota_config(clear_pause=True, db_path=db_path)
+        resumed = self_improver.resume_idea_queue(
+            db_path=db_path,
+            executor=_fake_executor,
+            now=now,
+            poll_interval_seconds=0.02,
+        )
+        assert resumed["ok"] is True
+        assert resumed["resumed"] is True
+        assert resumed["worker_started"] is True
+        assert resumed["worker_alive"] is True
+        assert resumed["pause_reason"] == "ok"
+
+        worker = self_improver.get_idea_queue_worker()
+        assert worker is not None
+        assert worker.wait_until_idle(timeout=5.0) is True
+        assert len(executed_ids) == 3
+        assert orphan_id in executed_ids
+        assert seen_heartbeats == ["Ejecutando prueba determinista"] * 3
+        assert idea_engine.count_ideas_by_status(db_path=db_path)["queued"] == 0
+        assert idea_engine.count_ideas_by_status(db_path=db_path)["implemented"] == 3
+    finally:
+        self_improver.stop_idea_queue_worker(timeout=2.0)
+
+    assert self_improver.is_idea_worker_alive() is False
+
+
+def test_self_improver_apply_proposal_updates_idea_heartbeat_and_current_step(
+    tmp_path: Path,
+) -> None:
+    import subprocess
+    from datetime import UTC, datetime, timedelta
+
+    from agent_factory.adapters.subprocess_runner import SubprocessRunner
+    from agent_factory.self_improver import FactorySelfImprover
+
+    repo_root = tmp_path / "repo_hb"
+    repo_root.mkdir(parents=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "TestFactory"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.email", "factory@local"], cwd=repo_root, check=True)
+    (repo_root / "src" / "agent_factory").mkdir(parents=True)
+    (repo_root / "tests").mkdir(parents=True)
+    (repo_root / "src" / "agent_factory" / "sample.py").write_text("X = 1\n", encoding="utf-8")
+    (repo_root / "tests" / "test_sample.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "chore: init"], cwd=repo_root, check=True, capture_output=True)
+
+    db_path = tmp_path / "telemetry.db"
+    saved = idea_engine.save_ideas([_sample_idea(title="💓 Latido en Apply")], db_path=db_path)
+    idea_id = saved[0]["id"]
+
+    class _AdvancingClock:
+        def __init__(self) -> None:
+            self.current = datetime(2026, 11, 26, 19, 0, 0, tzinfo=UTC)
+
+        def now(self) -> datetime:
+            self.current = self.current + timedelta(seconds=5)
+            return self.current
+
+        def sleep(self, seconds: float) -> None:
+            del seconds
+
+    real_runner = SubprocessRunner(default_timeout_seconds=15.0)
+    observed_steps: list[tuple[str, str | None]] = []
+
+    class _HeartbeatSpyRunner(SubprocessRunner):
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            exe = Path(command[0]).stem.lower()
+            if exe == "agy":
+                cur = idea_engine.get_idea(idea_id, db_path=db_path)
+                assert cur is not None
+                observed_steps.append((cur["current_step"], cur["last_heartbeat_at"]))
+                (repo_root / "src" / "agent_factory" / "sample.py").write_text("X = 2\n", encoding="utf-8")
+                return CommandResult(exit_code=0, stdout="ok")
+            if exe == "ruff":
+                cur = idea_engine.get_idea(idea_id, db_path=db_path)
+                assert cur is not None
+                observed_steps.append((cur["current_step"], cur["last_heartbeat_at"]))
+                return CommandResult(exit_code=0, stdout="All checks passed!")
+            if exe == "pytest":
+                cur = idea_engine.get_idea(idea_id, db_path=db_path)
+                assert cur is not None
+                observed_steps.append((cur["current_step"], cur["last_heartbeat_at"]))
+                return CommandResult(exit_code=0, stdout="1 passed")
+            return real_runner.run(command, cwd, timeout_seconds=timeout_seconds, env=env)
+
+    improver = FactorySelfImprover(
+        db_path=tmp_path / "factory.db",
+        telemetry_db_path=db_path,
+        repo_root=repo_root,
+        uploads_dir=tmp_path / "uploads",
+        runner=_HeartbeatSpyRunner(),
+        clock=_AdvancingClock(),
+        restart_fn=lambda _code: None,
+        restart_delay_seconds=0.0,
+    )
+    res = improver.apply_proposal(
+        "Actualiza sample.py a X = 2",
+        proposal_title="💓 Latido en Apply",
+        idea_id=idea_id,
+    )
+    assert res["ok"] is True
+    assert len(observed_steps) == 3
+    # Distinct progressive steps and advancing heartbeat timestamps across agy -> ruff -> pytest
+    assert observed_steps[0][0] != ""
+    assert observed_steps[1][0] != observed_steps[0][0]
+    assert observed_steps[2][0] != observed_steps[1][0]
+    assert observed_steps[0][1] is not None
+    assert observed_steps[1][1] is not None and observed_steps[1][1] > observed_steps[0][1]
+    assert observed_steps[2][1] is not None and observed_steps[2][1] > observed_steps[1][1]
+
+
+
 

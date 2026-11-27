@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_IDEA_DB_PATH: Path = DEFAULT_TELEMETRY_DB_PATH
 IDEA_VALID_STATUSES: frozenset[str] = frozenset(
-    {"nueva", "encolada", "implementando", "aplicada", "descartada"}
+    {"nueva", "encolada", "implementando", "aplicada", "descartada", "failed"}
 )
 IDEA_FILTER_STATUSES: tuple[str, ...] = (
     "pending",
@@ -48,6 +48,7 @@ IDEA_FILTER_STATUSES: tuple[str, ...] = (
     "implementing",
     "implemented",
     "dismissed",
+    "failed",
 )
 IDEA_VALID_FILTERS: frozenset[str] = frozenset((*IDEA_FILTER_STATUSES, "all"))
 _DEFAULT_ACTIVE_IDEA_STATUSES: tuple[str, ...] = ("nueva", "encolada", "implementando")
@@ -57,6 +58,7 @@ _CANONICAL_TO_DB_STATUS: dict[str, str] = {
     "implementing": "implementando",
     "implemented": "aplicada",
     "dismissed": "descartada",
+    "failed": "failed",
 }
 _DB_TO_CANONICAL_STATUS: dict[str, str] = {
     db_val: canonical for canonical, db_val in _CANONICAL_TO_DB_STATUS.items()
@@ -66,7 +68,13 @@ _STATUS_ALIAS_TO_DB: dict[str, str] = {
     **{db_val: db_val for db_val in _DB_TO_CANONICAL_STATUS},
     "applied": "aplicada",
     "implementada": "aplicada",
+    "fallida": "failed",
 }
+DEFAULT_IDEA_STALE_SECONDS: int = 360
+MAX_IDEA_RETRIES: int = 2
+MAX_AUTO_QUEUED_IDEAS: int = 3
+_RUNTIME_STATUS_LOCK = threading.Lock()
+_RUNTIME_STATUS_PROVIDER: Callable[[], Mapping[str, Any]] | None = None
 _UNSET: Any = object()
 IDEA_VALID_SOURCES: frozenset[str] = frozenset({"manual", "auto", "visual_qa"})
 IDEA_VALID_IMPACTS: frozenset[str] = frozenset({"Alto", "Medio"})
@@ -147,6 +155,14 @@ _IDEA_SELECT_COLS = (
     "id, created_at, title, category, impact, simple_description, "
     "technical_prompt, status, source"
 )
+_IDEA_JOIN_SELECT_SQL = (
+    "SELECT i.id, i.created_at, i.title, i.category, i.impact, "
+    "i.simple_description, i.technical_prompt, i.status, i.source, "
+    "e.started_at, e.last_heartbeat_at, e.current_step, "
+    "COALESCE(e.retry_count, 0) AS retry_count, e.failure_reason "
+    "FROM improvement_ideas AS i "
+    "LEFT JOIN idea_execution_state AS e ON e.idea_id = i.id"
+)
 _AUTONOMOUS_HISTORY_SELECT_COLS = (
     "id, applied_at, idea_id, title, simple_description, commit_hash, status"
 )
@@ -173,9 +189,21 @@ CREATE TABLE IF NOT EXISTS improvement_ideas (
     simple_description TEXT NOT NULL,
     technical_prompt TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'nueva'
-        CHECK(status IN ('nueva', 'encolada', 'implementando', 'aplicada', 'descartada')),
+        CHECK(status IN ('nueva', 'encolada', 'implementando', 'aplicada', 'descartada', 'failed')),
     source TEXT NOT NULL DEFAULT 'manual'
         CHECK(source IN ('manual', 'auto', 'visual_qa'))
+);
+"""
+
+_CREATE_IDEA_EXECUTION_STATE_SQL = """
+CREATE TABLE IF NOT EXISTS idea_execution_state (
+    idea_id INTEGER PRIMARY KEY,
+    started_at TEXT,
+    last_heartbeat_at TEXT,
+    current_step TEXT NOT NULL DEFAULT '',
+    retry_count INTEGER NOT NULL DEFAULT 0 CHECK(retry_count >= 0),
+    failure_reason TEXT,
+    updated_at TEXT NOT NULL
 );
 """
 
@@ -208,6 +236,7 @@ def _ensure_idea_schema(conn: sqlite3.Connection) -> None:
         "visual_qa" not in existing_sql
         or "implementando" not in existing_sql
         or "aplicada" not in existing_sql
+        or "'failed'" not in existing_sql
     ):
         conn.execute("ALTER TABLE improvement_ideas RENAME TO _improvement_ideas_legacy;")
         conn.execute(_CREATE_IMPROVEMENT_IDEAS_SQL)
@@ -224,6 +253,7 @@ def _ensure_idea_schema(conn: sqlite3.Connection) -> None:
             """
         )
         conn.execute("DROP TABLE _improvement_ideas_legacy;")
+    conn.execute(_CREATE_IDEA_EXECUTION_STATE_SQL)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS idea_radar_settings (
@@ -443,7 +473,10 @@ def _accumulate_status_counts(rows: Sequence[sqlite3.Row]) -> dict[str, int]:
         total += cnt
         canonical = _DB_TO_CANONICAL_STATUS.get(raw_status)
         if canonical is not None:
-            counts[canonical] += cnt
+            if canonical in counts:
+                counts[canonical] += cnt
+            elif cnt > 0:
+                counts[canonical] = cnt
     counts["all"] = total
     return counts
 
@@ -706,6 +739,12 @@ def normalize_impact(raw_impact: Any) -> str:
 
 
 def _row_to_idea(row: sqlite3.Row) -> dict[str, Any]:
+    keys = set(row.keys())
+    raw_started = row["started_at"] if "started_at" in keys else None
+    raw_hb = row["last_heartbeat_at"] if "last_heartbeat_at" in keys else None
+    raw_step = row["current_step"] if "current_step" in keys else ""
+    raw_retry = row["retry_count"] if "retry_count" in keys else 0
+    raw_failure = row["failure_reason"] if "failure_reason" in keys else None
     return {
         "id": int(row["id"]),
         "created_at": str(row["created_at"]),
@@ -716,6 +755,11 @@ def _row_to_idea(row: sqlite3.Row) -> dict[str, Any]:
         "technical_prompt": str(row["technical_prompt"]),
         "status": str(row["status"]),
         "source": str(row["source"]),
+        "started_at": str(raw_started) if raw_started else None,
+        "last_heartbeat_at": str(raw_hb) if raw_hb else None,
+        "current_step": str(raw_step or ""),
+        "retry_count": max(0, int(raw_retry or 0)),
+        "failure_reason": str(raw_failure) if raw_failure else None,
     }
 
 
@@ -837,12 +881,12 @@ def list_ideas(
             where_sql = ""
             if status_tuple is not None:
                 placeholders = ", ".join("?" for _ in status_tuple)
-                where_sql = f"WHERE status IN ({placeholders})"
+                where_sql = f"WHERE i.status IN ({placeholders})"
                 params.extend(status_tuple)
             params.append(bounded_limit)
             rows = conn.execute(
-                f"SELECT {_IDEA_SELECT_COLS} FROM improvement_ideas "
-                f"{where_sql} ORDER BY created_at DESC, id DESC LIMIT ?;",
+                f"{_IDEA_JOIN_SELECT_SQL} "
+                f"{where_sql} ORDER BY i.created_at DESC, i.id DESC LIMIT ?;",
                 tuple(params),
             ).fetchall()
             items = [_row_to_idea(row) for row in rows]
@@ -881,7 +925,7 @@ def update_idea_status(
         if cursor.rowcount <= 0:
             raise KeyError(f"Idea {valid_id} no encontrada.")
         row = conn.execute(
-            f"SELECT {_IDEA_SELECT_COLS} FROM improvement_ideas WHERE id = ?;",
+            f"{_IDEA_JOIN_SELECT_SQL} WHERE i.id = ?;",
             (valid_id,),
         ).fetchone()
         assert row is not None
@@ -917,7 +961,7 @@ def get_idea(
     try:
         conn = _open_connection(db_path)
         row = conn.execute(
-            f"SELECT {_IDEA_SELECT_COLS} FROM improvement_ideas WHERE id = ?;",
+            f"{_IDEA_JOIN_SELECT_SQL} WHERE i.id = ?;",
             (valid_id,),
         ).fetchone()
         return _row_to_idea(row) if row is not None else None
@@ -1010,7 +1054,7 @@ def save_ideas(
             )
             inserted_id = cursor.lastrowid
             row = conn.execute(
-                f"SELECT {_IDEA_SELECT_COLS} FROM improvement_ideas WHERE id = ?;",
+                f"{_IDEA_JOIN_SELECT_SQL} WHERE i.id = ?;",
                 (inserted_id,),
             ).fetchone()
             if row is not None:
@@ -1057,7 +1101,7 @@ def dismiss_idea(
             return None
         conn.commit()
         row = conn.execute(
-            f"SELECT {_IDEA_SELECT_COLS} FROM improvement_ideas WHERE id = ?;",
+            f"{_IDEA_JOIN_SELECT_SQL} WHERE i.id = ?;",
             (valid_id,),
         ).fetchone()
         return _row_to_idea(row) if row is not None else None
@@ -1100,7 +1144,7 @@ def implement_idea(
         )
         conn.commit()
         row = conn.execute(
-            f"SELECT {_IDEA_SELECT_COLS} FROM improvement_ideas WHERE id = ?;",
+            f"{_IDEA_JOIN_SELECT_SQL} WHERE i.id = ?;",
             (idea["id"],),
         ).fetchone()
         updated = _row_to_idea(row) if row is not None else {**idea, "status": "encolada"}
@@ -1175,12 +1219,12 @@ def _run_port_command(
 
 
 def _list_all_historical_ideas(db_path: Path | str | None = None) -> list[dict[str, Any]]:
-    """Return all improvement_ideas records across every status (pending/queued/implementing/implemented/dismissed)."""
+    """Return all improvement_ideas records across every status (pending/queued/implementing/implemented/dismissed/failed)."""
     conn: sqlite3.Connection | None = None
     try:
         conn = _open_connection(db_path)
         rows = conn.execute(
-            f"SELECT {_IDEA_SELECT_COLS} FROM improvement_ideas ORDER BY id DESC;"
+            f"{_IDEA_JOIN_SELECT_SQL} ORDER BY i.id DESC;"
         ).fetchall()
         return [_row_to_idea(row) for row in rows]
     finally:
@@ -1783,6 +1827,8 @@ class AutoIdeaScheduler:
             return []
         if not self._safe_check_idle(self._is_staging_idle, "staging"):
             return []
+        if count_ideas_by_status(db_path=self.db_path).get("queued", 0) >= MAX_AUTO_QUEUED_IDEAS:
+            return []
 
         created = self._invoke_generator()
         with self._lock:
@@ -2234,17 +2280,544 @@ def select_next_autonomous_idea(
         conn = _open_connection(db_path)
         row = conn.execute(
             f"""
-            SELECT {_IDEA_SELECT_COLS}
-            FROM improvement_ideas
-            WHERE status = 'nueva'
+            {_IDEA_JOIN_SELECT_SQL}
+            WHERE i.status = 'nueva'
             ORDER BY
-                CASE WHEN impact = 'Alto' THEN 0 ELSE 1 END ASC,
-                created_at ASC,
-                id ASC
+                CASE WHEN i.impact = 'Alto' THEN 0 ELSE 1 END ASC,
+                i.created_at ASC,
+                i.id ASC
             LIMIT 1;
             """
         ).fetchone()
         return _row_to_idea(row) if row is not None else None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def select_next_queued_idea(
+    db_path: Path | str | None = None,
+) -> dict[str, Any] | None:
+    """Return the highest-priority queued ('encolada') idea ready for sequential execution, or None."""
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        row = conn.execute(
+            f"""
+            {_IDEA_JOIN_SELECT_SQL}
+            WHERE i.status = 'encolada'
+            ORDER BY
+                CASE WHEN i.impact = 'Alto' THEN 0 ELSE 1 END ASC,
+                i.created_at ASC,
+                i.id ASC
+            LIMIT 1;
+            """
+        ).fetchone()
+        return _row_to_idea(row) if row is not None else None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _normalize_utc_now(now: datetime | Callable[[], datetime] | None = None) -> datetime:
+    ref = now() if callable(now) else (now if now is not None else datetime.now(UTC))
+    if ref.tzinfo is None:
+        return ref.replace(tzinfo=UTC)
+    return ref
+
+
+def register_runtime_status_provider(
+    provider: Callable[[], Mapping[str, Any]] | None,
+) -> None:
+    """Register an optional runtime worker/quota provider without creating circular imports."""
+    global _RUNTIME_STATUS_PROVIDER
+    with _RUNTIME_STATUS_LOCK:
+        _RUNTIME_STATUS_PROVIDER = provider
+
+
+def _resolve_runtime_worker_and_quota(
+    *,
+    db_path: Path | str | None,
+    worker_alive: bool | Callable[[], bool] | None,
+    quota_paused: bool | Callable[[], bool] | None,
+    ref_now: datetime,
+) -> tuple[bool, bool]:
+    resolved_worker: bool | None = (
+        bool(worker_alive())
+        if callable(worker_alive)
+        else (bool(worker_alive) if worker_alive is not None else None)
+    )
+    resolved_quota: bool | None = (
+        bool(quota_paused())
+        if callable(quota_paused)
+        else (bool(quota_paused) if quota_paused is not None else None)
+    )
+
+    if resolved_worker is None or resolved_quota is None:
+        provider_payload: Mapping[str, Any] | None = None
+        with _RUNTIME_STATUS_LOCK:
+            provider = _RUNTIME_STATUS_PROVIDER
+        if provider is not None:
+            try:
+                raw = provider()
+                if isinstance(raw, Mapping):
+                    provider_payload = raw
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Runtime status provider failed: %s", exc)
+        if provider_payload is None:
+            try:
+                from agent_factory.self_improver import get_idea_worker_runtime_status
+
+                provider_payload = get_idea_worker_runtime_status(db_path=db_path, now=ref_now)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Lazy self_improver runtime status skipped: %s", exc)
+        if isinstance(provider_payload, Mapping):
+            if resolved_worker is None and "worker_alive" in provider_payload:
+                resolved_worker = bool(provider_payload["worker_alive"])
+            if resolved_quota is None and "quota_paused" in provider_payload:
+                resolved_quota = bool(provider_payload["quota_paused"])
+
+    if resolved_worker is None:
+        resolved_worker = False
+    if resolved_quota is None:
+        try:
+            resolved_quota = bool(get_quota_status(db_path=db_path, now=ref_now).get("is_paused"))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Fallback quota_paused check failed: %s", exc)
+            resolved_quota = False
+
+    return resolved_worker, resolved_quota
+
+
+def start_idea_execution(
+    idea_id: int,
+    *,
+    current_step: str = "Iniciando implementación",
+    db_path: Path | str | None = None,
+    now: datetime | Callable[[], datetime] | None = None,
+) -> dict[str, Any]:
+    """Mark an idea as 'implementando' and initialize started_at, last_heartbeat_at, and current_step."""
+    valid_id = _validate_idea_id(idea_id)
+    if valid_id is None:
+        raise ValueError(f"idea_id inválido: {idea_id!r}")
+    ref_now = _normalize_utc_now(now)
+    now_iso = ref_now.isoformat()
+    clean_step = redact_secrets(str(current_step or "").strip())[:240]
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        cur = conn.execute(
+            "UPDATE improvement_ideas SET status = 'implementando' WHERE id = ?;",
+            (valid_id,),
+        )
+        if cur.rowcount <= 0:
+            raise KeyError(f"Idea {valid_id} no encontrada.")
+        conn.execute(
+            """
+            INSERT INTO idea_execution_state (
+                idea_id, started_at, last_heartbeat_at, current_step,
+                retry_count, failure_reason, updated_at
+            ) VALUES (?, ?, ?, ?, 0, NULL, ?)
+            ON CONFLICT(idea_id) DO UPDATE SET
+                started_at = excluded.started_at,
+                last_heartbeat_at = excluded.last_heartbeat_at,
+                current_step = excluded.current_step,
+                failure_reason = NULL,
+                updated_at = excluded.updated_at;
+            """,
+            (valid_id, now_iso, now_iso, clean_step, now_iso),
+        )
+        conn.commit()
+        row = conn.execute(
+            f"{_IDEA_JOIN_SELECT_SQL} WHERE i.id = ?;",
+            (valid_id,),
+        ).fetchone()
+        assert row is not None
+        return _row_to_idea(row)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def record_idea_heartbeat(
+    idea_id: int,
+    *,
+    current_step: str | None = None,
+    db_path: Path | str | None = None,
+    now: datetime | Callable[[], datetime] | None = None,
+) -> dict[str, Any]:
+    """Refresh last_heartbeat_at (and optional current_step) for an idea in execution."""
+    valid_id = _validate_idea_id(idea_id)
+    if valid_id is None:
+        raise ValueError(f"idea_id inválido: {idea_id!r}")
+    ref_now = _normalize_utc_now(now)
+    now_iso = ref_now.isoformat()
+    clean_step = (
+        redact_secrets(str(current_step).strip())[:240]
+        if current_step is not None
+        else None
+    )
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        exists = conn.execute(
+            "SELECT id FROM improvement_ideas WHERE id = ?;",
+            (valid_id,),
+        ).fetchone()
+        if exists is None:
+            raise KeyError(f"Idea {valid_id} no encontrada.")
+        if clean_step is not None:
+            conn.execute(
+                """
+                INSERT INTO idea_execution_state (
+                    idea_id, started_at, last_heartbeat_at, current_step,
+                    retry_count, failure_reason, updated_at
+                ) VALUES (?, ?, ?, ?, 0, NULL, ?)
+                ON CONFLICT(idea_id) DO UPDATE SET
+                    started_at = COALESCE(idea_execution_state.started_at, excluded.started_at),
+                    last_heartbeat_at = excluded.last_heartbeat_at,
+                    current_step = excluded.current_step,
+                    updated_at = excluded.updated_at;
+                """,
+                (valid_id, now_iso, now_iso, clean_step, now_iso),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO idea_execution_state (
+                    idea_id, started_at, last_heartbeat_at, current_step,
+                    retry_count, failure_reason, updated_at
+                ) VALUES (?, ?, ?, '', 0, NULL, ?)
+                ON CONFLICT(idea_id) DO UPDATE SET
+                    started_at = COALESCE(idea_execution_state.started_at, excluded.started_at),
+                    last_heartbeat_at = excluded.last_heartbeat_at,
+                    updated_at = excluded.updated_at;
+                """,
+                (valid_id, now_iso, now_iso, now_iso),
+            )
+        conn.commit()
+        row = conn.execute(
+            f"{_IDEA_JOIN_SELECT_SQL} WHERE i.id = ?;",
+            (valid_id,),
+        ).fetchone()
+        assert row is not None
+        return _row_to_idea(row)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+update_idea_heartbeat = record_idea_heartbeat
+
+
+def finish_idea_execution(
+    idea_id: int,
+    *,
+    status: str = "implemented",
+    current_step: str = "",
+    failure_reason: str | None = None,
+    increment_retry: bool = False,
+    clear_heartbeat: bool = True,
+    db_path: Path | str | None = None,
+    now: datetime | Callable[[], datetime] | None = None,
+) -> dict[str, Any]:
+    """Transition an executing idea to its target status and update execution metadata cleanly."""
+    valid_id = _validate_idea_id(idea_id)
+    if valid_id is None:
+        raise ValueError(f"idea_id inválido: {idea_id!r}")
+    db_status = _validate_status(status)
+    ref_now = _normalize_utc_now(now)
+    now_iso = ref_now.isoformat()
+    clean_step = redact_secrets(str(current_step or "").strip())[:240]
+    clean_reason = (
+        redact_secrets(str(failure_reason).strip())[:500]
+        if failure_reason is not None and str(failure_reason).strip()
+        else None
+    )
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        cur = conn.execute(
+            "UPDATE improvement_ideas SET status = ? WHERE id = ?;",
+            (db_status, valid_id),
+        )
+        if cur.rowcount <= 0:
+            raise KeyError(f"Idea {valid_id} no encontrada.")
+        existing_exec = conn.execute(
+            "SELECT retry_count, started_at, last_heartbeat_at FROM idea_execution_state WHERE idea_id = ?;",
+            (valid_id,),
+        ).fetchone()
+        prev_retry = int(existing_exec["retry_count"]) if existing_exec is not None else 0
+        next_retry = prev_retry + 1 if increment_retry else prev_retry
+        next_started = None if clear_heartbeat else (
+            existing_exec["started_at"] if existing_exec is not None else None
+        )
+        next_hb = None if clear_heartbeat else (
+            existing_exec["last_heartbeat_at"] if existing_exec is not None else now_iso
+        )
+        conn.execute(
+            """
+            INSERT INTO idea_execution_state (
+                idea_id, started_at, last_heartbeat_at, current_step,
+                retry_count, failure_reason, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(idea_id) DO UPDATE SET
+                started_at = excluded.started_at,
+                last_heartbeat_at = excluded.last_heartbeat_at,
+                current_step = excluded.current_step,
+                retry_count = excluded.retry_count,
+                failure_reason = excluded.failure_reason,
+                updated_at = excluded.updated_at;
+            """,
+            (valid_id, next_started, next_hb, clean_step, next_retry, clean_reason, now_iso),
+        )
+        conn.commit()
+        row = conn.execute(
+            f"{_IDEA_JOIN_SELECT_SQL} WHERE i.id = ?;",
+            (valid_id,),
+        ).fetchone()
+        assert row is not None
+        return _row_to_idea(row)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def reconcile_idea_queue(
+    stale_seconds: int = DEFAULT_IDEA_STALE_SECONDS,
+    *,
+    db_path: Path | str | None = None,
+    worker_alive: bool | Callable[[], bool] | None = None,
+    quota_paused: bool | Callable[[], bool] | None = None,
+    now: datetime | Callable[[], datetime] | None = None,
+    max_retries: int = MAX_IDEA_RETRIES,
+) -> dict[str, Any]:
+    """Reconcile improvement_ideas execution states, enforce max 1 active idea, and return queue diagnostics."""
+    if isinstance(stale_seconds, bool) or not isinstance(stale_seconds, (int, float)):
+        raise TypeError("stale_seconds debe ser un número >= 0.")
+    eff_stale_seconds = float(stale_seconds)
+    if math.isnan(eff_stale_seconds) or math.isinf(eff_stale_seconds) or eff_stale_seconds < 0.0:
+        raise ValueError("stale_seconds debe ser un número finito >= 0.")
+
+    if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
+        raise ValueError("max_retries debe ser un entero >= 0.")
+
+    ref_now = _normalize_utc_now(now)
+    now_iso = ref_now.isoformat()
+    eff_worker_alive, eff_quota_paused = _resolve_runtime_worker_and_quota(
+        db_path=db_path,
+        worker_alive=worker_alive,
+        quota_paused=quota_paused,
+        ref_now=ref_now,
+    )
+
+    requeued_ids: list[int] = []
+    failed_ids: list[int] = []
+    reconciled_actions: list[dict[str, Any]] = []
+    active_idea: dict[str, Any] | None = None
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        impl_rows = conn.execute(
+            f"{_IDEA_JOIN_SELECT_SQL} WHERE i.status = 'implementando' ORDER BY i.id ASC;"
+        ).fetchall()
+        implementing = [_row_to_idea(row) for row in impl_rows]
+
+        valid_candidates: list[tuple[datetime, datetime, int, dict[str, Any]]] = []
+        stale_map: dict[int, bool] = {}
+
+        for item in implementing:
+            idea_id = int(item["id"])
+            hb_dt = _parse_iso_datetime(item["last_heartbeat_at"])
+            started_dt = _parse_iso_datetime(item["started_at"])
+            is_stale = hb_dt is None or (ref_now - hb_dt).total_seconds() > eff_stale_seconds
+            stale_map[idea_id] = is_stale
+            if eff_worker_alive and not is_stale and hb_dt is not None:
+                valid_candidates.append((hb_dt, started_dt or hb_dt, idea_id, item))
+
+        keeper: dict[str, Any] | None = None
+        if valid_candidates:
+            valid_candidates.sort(key=lambda entry: (entry[0], entry[1], entry[2]), reverse=True)
+            keeper = valid_candidates[0][3]
+
+        keeper_id = int(keeper["id"]) if keeper is not None else None
+
+        for item in implementing:
+            idea_id = int(item["id"])
+            if keeper_id is not None and idea_id == keeper_id:
+                continue
+
+            current_retry = int(item["retry_count"] or 0)
+            is_stale = stale_map.get(idea_id, True)
+            is_concurrent_dup = eff_worker_alive and not is_stale and keeper_id is not None
+
+            if is_concurrent_dup:
+                conn.execute(
+                    "UPDATE improvement_ideas SET status = 'encolada' WHERE id = ?;",
+                    (idea_id,),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO idea_execution_state (
+                        idea_id, started_at, last_heartbeat_at, current_step,
+                        retry_count, failure_reason, updated_at
+                    ) VALUES (?, NULL, NULL, '', ?, NULL, ?)
+                    ON CONFLICT(idea_id) DO UPDATE SET
+                        started_at = NULL,
+                        last_heartbeat_at = NULL,
+                        current_step = '',
+                        retry_count = excluded.retry_count,
+                        failure_reason = NULL,
+                        updated_at = excluded.updated_at;
+                    """,
+                    (idea_id, current_retry, now_iso),
+                )
+                requeued_ids.append(idea_id)
+                reconciled_actions.append(
+                    {
+                        "idea_id": idea_id,
+                        "title": item["title"],
+                        "action": "requeued",
+                        "reason": "duplicate_implementing",
+                        "retry_count": current_retry,
+                    }
+                )
+                continue
+
+            next_retry = current_retry + 1
+            cause_detail = (
+                "worker inactivo"
+                if not eff_worker_alive
+                else f"latido expirado (> {int(eff_stale_seconds)}s)"
+            )
+            if next_retry > max_retries:
+                failure_msg = (
+                    f"Superó el máximo de {max_retries} reintentos tras quedar sin progreso "
+                    f"({cause_detail})."
+                )
+                conn.execute(
+                    "UPDATE improvement_ideas SET status = 'failed' WHERE id = ?;",
+                    (idea_id,),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO idea_execution_state (
+                        idea_id, started_at, last_heartbeat_at, current_step,
+                        retry_count, failure_reason, updated_at
+                    ) VALUES (?, NULL, NULL, '', ?, ?, ?)
+                    ON CONFLICT(idea_id) DO UPDATE SET
+                        started_at = NULL,
+                        last_heartbeat_at = NULL,
+                        current_step = '',
+                        retry_count = excluded.retry_count,
+                        failure_reason = excluded.failure_reason,
+                        updated_at = excluded.updated_at;
+                    """,
+                    (idea_id, next_retry, failure_msg, now_iso),
+                )
+                failed_ids.append(idea_id)
+                reconciled_actions.append(
+                    {
+                        "idea_id": idea_id,
+                        "title": item["title"],
+                        "action": "failed",
+                        "reason": failure_msg,
+                        "retry_count": next_retry,
+                    }
+                )
+            else:
+                conn.execute(
+                    "UPDATE improvement_ideas SET status = 'encolada' WHERE id = ?;",
+                    (idea_id,),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO idea_execution_state (
+                        idea_id, started_at, last_heartbeat_at, current_step,
+                        retry_count, failure_reason, updated_at
+                    ) VALUES (?, NULL, NULL, '', ?, NULL, ?)
+                    ON CONFLICT(idea_id) DO UPDATE SET
+                        started_at = NULL,
+                        last_heartbeat_at = NULL,
+                        current_step = '',
+                        retry_count = excluded.retry_count,
+                        failure_reason = NULL,
+                        updated_at = excluded.updated_at;
+                    """,
+                    (idea_id, next_retry, now_iso),
+                )
+                requeued_ids.append(idea_id)
+                reconciled_actions.append(
+                    {
+                        "idea_id": idea_id,
+                        "title": item["title"],
+                        "action": "requeued",
+                        "reason": cause_detail,
+                        "retry_count": next_retry,
+                    }
+                )
+
+        if reconciled_actions:
+            conn.commit()
+
+        raw_counts = _query_idea_status_counts(conn)
+        if keeper is not None:
+            ref_start = (
+                _parse_iso_datetime(keeper["started_at"])
+                or _parse_iso_datetime(keeper["last_heartbeat_at"])
+                or ref_now
+            )
+            elapsed_seconds = round(max(0.0, (ref_now - ref_start).total_seconds()), 2)
+            active_idea = {
+                "id": int(keeper["id"]),
+                "title": str(keeper["title"]),
+                "elapsed_seconds": elapsed_seconds,
+                "current_step": str(keeper["current_step"] or ""),
+                "started_at": keeper["started_at"],
+                "last_heartbeat_at": keeper["last_heartbeat_at"],
+                "retry_count": int(keeper["retry_count"] or 0),
+            }
+
+        counts: dict[str, int] = {
+            "pending": int(raw_counts.get("pending", 0)),
+            "queued": int(raw_counts.get("queued", 0)),
+            "implementing": int(raw_counts.get("implementing", 0)),
+            "implemented": int(raw_counts.get("implemented", 0)),
+            "dismissed": int(raw_counts.get("dismissed", 0)),
+            "failed": int(raw_counts.get("failed", 0)),
+            "all": int(raw_counts.get("all", 0)),
+            "requeued": len(requeued_ids),
+            "marked_failed": len(failed_ids),
+            "reconciled": len(reconciled_actions),
+        }
+
+        if eff_quota_paused:
+            pause_reason = "quota_pause"
+        elif active_idea is not None:
+            pause_reason = "ok"
+        elif counts["queued"] > 0:
+            pause_reason = "ok" if eff_worker_alive else "no_worker"
+        else:
+            pause_reason = "empty"
+
+        return {
+            "worker_alive": eff_worker_alive,
+            "quota_paused": eff_quota_paused,
+            "pause_reason": pause_reason,
+            "active_idea": active_idea,
+            "counts": counts,
+            "reconciled": {
+                "requeued_ids": requeued_ids,
+                "failed_ids": failed_ids,
+                "actions": reconciled_actions,
+            },
+            "reconciled_count": len(reconciled_actions),
+            "stale_seconds": eff_stale_seconds,
+        }
     finally:
         if conn is not None:
             conn.close()
@@ -3020,6 +3593,17 @@ class AutonomousEngine:
 
             work_item = self._select_next_work_item()
             if work_item is None:
+                queued_now = int(count_ideas_by_status(db_path=self.db_path).get("queued", 0))
+                if queued_now >= MAX_AUTO_QUEUED_IDEAS:
+                    return self._set_last_cycle_result(
+                        {
+                            "status": "queue_full",
+                            "executed": False,
+                            "promoted": False,
+                            "queued_count": queued_now,
+                            "max_queued": MAX_AUTO_QUEUED_IDEAS,
+                        }
+                    )
                 # Generate fresh backlog ideas automatically if permitted and quota is healthy
                 if self._idea_generator is not None:
                     try:

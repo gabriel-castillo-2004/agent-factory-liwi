@@ -50,7 +50,15 @@ DEFAULT_SELF_IMPROVE_TIMEOUT_SECONDS: float = DEFAULT_SELF_IMPROVE_APPLY_TIMEOUT
 DEFAULT_RESTART_DELAY_SECONDS: float = 1.0
 MAX_UPLOAD_IMAGE_BYTES: int = 5 * 1024 * 1024
 MAX_UPLOAD_IMAGES_PER_MESSAGE: int = 4
+MAX_AUTO_QUEUED_IDEAS: int = 3
+DEFAULT_IDEA_STALE_SECONDS: int = 360
+MAX_IDEA_RETRIES: int = 2
 _MAX_INLINE_PROMPT_CHARS: int = 6000
+_QUEUE_WORKER_LOCK = threading.RLock()
+_QUEUE_WORKER: IdeaQueueWorker | None = None
+_ACTIVE_APPLY_COUNT: int = 0
+_ACTIVE_IDEA_ID: int | None = None
+_ACTIVE_CURRENT_STEP: str = ""
 _SAFE_RULE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _SAFE_UPLOAD_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
 _SELF_IMPROVE_PREFIX_RE = re.compile(r"^chore\(self-improve\)\s*:\s*", flags=re.IGNORECASE)
@@ -466,6 +474,8 @@ class FactorySelfImprover:
         self.pre_exit_hook = pre_exit_hook
         self._apply_lock = threading.Lock()
         self._status_lock = threading.Lock()
+        self._active_idea_id: int | None = None
+        self._idea_queue_worker: IdeaQueueWorker | None = None
         self._status: dict[str, Any] = {
             "running": False,
             "step": 0,
@@ -603,6 +613,89 @@ class FactorySelfImprover:
                 "elapsed_seconds": elapsed,
                 "last_outcome": str(self._status.get("last_outcome") or ""),
             }
+
+    def is_worker_alive(self) -> bool:
+        """Return True if this improver is actively applying a change or its sequential queue worker is alive."""
+        with self._status_lock:
+            if bool(self._status.get("running")):
+                return True
+        worker = self._idea_queue_worker
+        return bool(worker is not None and worker.is_alive)
+
+    def is_quota_paused(self, *, now: datetime | None = None) -> bool:
+        """Return True when an active 429 quota pause is persisted for this improver's telemetry DB."""
+        return is_quota_429_paused(db_path=self._resolve_telemetry_db_path(), now=now)
+
+    def get_worker_diagnostics(self, *, now: datetime | None = None) -> dict[str, Any]:
+        """Expose live worker_alive and 429 quota_paused status for queue reconciliation."""
+        return {
+            "worker_alive": self.is_worker_alive(),
+            "quota_paused": self.is_quota_paused(now=now),
+            "active_idea_id": self._active_idea_id,
+            "current_step": str(self.get_status().get("stage") or ""),
+        }
+
+    def _touch_idea_heartbeat(
+        self,
+        idea_id: int | None,
+        current_step: str,
+        *,
+        db_path: Path | str | None = None,
+    ) -> None:
+        global _ACTIVE_CURRENT_STEP
+        with _QUEUE_WORKER_LOCK:
+            _ACTIVE_CURRENT_STEP = str(current_step or "").strip()[:240]
+        if idea_id is None:
+            return
+        try:
+            from agent_factory.idea_engine import record_idea_heartbeat
+
+            target_db = db_path if db_path is not None else self._resolve_telemetry_db_path()
+            record_idea_heartbeat(
+                idea_id,
+                current_step=current_step,
+                db_path=target_db,
+                now=self.clock.now(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).debug("Idea heartbeat update skipped: %s", exc)
+
+    def auto_enqueue_ideas(
+        self,
+        *,
+        max_queued: int = MAX_AUTO_QUEUED_IDEAS,
+        generator: Callable[..., Sequence[Mapping[str, Any]]] | None = None,
+        now: datetime | None = None,
+        source: str = "auto",
+    ) -> dict[str, Any]:
+        """Auto-enqueue pending or freshly generated ideas while strictly capping queued count at max_queued (3)."""
+        return auto_enqueue_ideas(
+            db_path=self._resolve_telemetry_db_path(),
+            max_queued=max_queued,
+            generator=generator,
+            now=now if now is not None else self.clock.now(),
+            source=source,
+        )
+
+    def resume_idea_queue(
+        self,
+        *,
+        stale_seconds: int = DEFAULT_IDEA_STALE_SECONDS,
+        executor: Callable[[dict[str, Any]], Any] | None = None,
+        now: datetime | None = None,
+        quota_paused: bool | None = None,
+        poll_interval_seconds: float = 0.5,
+    ) -> dict[str, Any]:
+        """Reconcile the idea queue and start/wake the sequential queue drainer immediately."""
+        return resume_idea_queue(
+            db_path=self._resolve_telemetry_db_path(),
+            stale_seconds=stale_seconds,
+            executor=executor,
+            improver=self,
+            now=now,
+            quota_paused=quota_paused,
+            poll_interval_seconds=poll_interval_seconds,
+        )
 
     def get_evolution_history(self, limit: int = 30) -> dict[str, Any]:
         """Return Git evolutionary version history (v1.N) from main (or HEAD fallback) with secrets redacted."""
@@ -1153,6 +1246,7 @@ class FactorySelfImprover:
         clean_title: str,
         started_at: datetime,
         explicit_tests: Sequence[str] | None = None,
+        idea_id: int | None = None,
     ) -> tuple[bool, str]:
         """Run ruff check src tests followed by targeted (or full fallback) pytest."""
         self._set_apply_status(
@@ -1165,6 +1259,7 @@ class FactorySelfImprover:
             started_at=started_at,
         )
         telemetry_db = self._resolve_telemetry_db_path()
+        self._touch_idea_heartbeat(idea_id, "Verificando calidad (ruff)", db_path=telemetry_db)
         ruff_cmd = [*self._resolve_venv_tool("ruff"), "check", "src", "tests"]
         ruff_t0 = time.monotonic()
         ruff_res = self.runner.run(
@@ -1265,6 +1360,11 @@ class FactorySelfImprover:
                 title=clean_title,
                 started_at=started_at,
             )
+        self._touch_idea_heartbeat(
+            idea_id,
+            "Ejecutando pruebas automatizadas",
+            db_path=telemetry_db,
+        )
         pytest_cmd = [*self._resolve_venv_tool("pytest"), *pytest_args]
         pytest_t0 = time.monotonic()
         pytest_res = self.runner.run(
@@ -1346,8 +1446,11 @@ class FactorySelfImprover:
         github_token: str = "",
         preserve_on_quota_429: bool = False,
         explicit_tests: Sequence[str] | None = None,
+        idea_id: int | None = None,
     ) -> dict[str, Any]:
         """Tag HEAD, run agy (900s), gate with ruff + pytest (900s), rollback on failure, commit+push+exit 42 on pass."""
+        global _ACTIVE_APPLY_COUNT, _ACTIVE_IDEA_ID, _ACTIVE_CURRENT_STEP
+
         clean_prompt = str(proposal_prompt or "").strip()
         if not clean_prompt:
             raise ValueError("El campo 'proposal_prompt' es obligatorio.")
@@ -1360,6 +1463,12 @@ class FactorySelfImprover:
         started_at = self.clock.now()
         telemetry_db = self._resolve_telemetry_db_path()
         outcome = "error"
+        self._active_idea_id = idea_id
+        with _QUEUE_WORKER_LOCK:
+            _ACTIVE_APPLY_COUNT += 1
+            if idea_id is not None:
+                _ACTIVE_IDEA_ID = idea_id
+            _ACTIVE_CURRENT_STEP = "Editando código de Liwi con IA"
         self._set_apply_status(
             running=True,
             step=1,
@@ -1370,6 +1479,18 @@ class FactorySelfImprover:
             started_at=started_at,
             last_outcome="",
         )
+        if idea_id is not None:
+            try:
+                from agent_factory.idea_engine import start_idea_execution
+
+                start_idea_execution(
+                    idea_id,
+                    current_step="Preparando entorno y guardando punto de control",
+                    db_path=telemetry_db,
+                    now=started_at,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger(__name__).debug("start_idea_execution skipped: %s", exc)
         record_safe_event(
             component="self_improver",
             stage="apply_start",
@@ -1392,6 +1513,11 @@ class FactorySelfImprover:
             baseline = self._snapshot_forbidden_state()
 
             # 2. Execute agy inside factory repo with explicit forbidden-file guardrails & targeted tests only
+            self._touch_idea_heartbeat(
+                idea_id,
+                "Editando código de Liwi con IA",
+                db_path=telemetry_db,
+            )
             apply_prompt = (
                 "Implementa la siguiente mejora en Agent Factory usando TDD.\n"
                 "REGLA ESTRICTA DE SEGURIDAD: PROHIBIDO leer o modificar .env, MASTER_PROMPT.md, "
@@ -1426,6 +1552,7 @@ class FactorySelfImprover:
                     clean_title=clean_title,
                     started_at=started_at,
                     explicit_tests=explicit_tests,
+                    idea_id=idea_id,
                 )
                 if not verify_ok:
                     self._set_apply_status(
@@ -1436,6 +1563,11 @@ class FactorySelfImprover:
                         detail="Ejecutando 1 ronda de auto-reparación con agy sobre el error exacto...",
                         title=clean_title,
                         started_at=started_at,
+                    )
+                    self._touch_idea_heartbeat(
+                        idea_id,
+                        "Auto-reparando fallo detectado",
+                        db_path=telemetry_db,
                     )
                     compact_verify_err = compact_pytest_failure_output(verify_err, max_chars=2500)
                     failed_nodes = extract_failed_pytest_nodes(verify_err)
@@ -1484,6 +1616,7 @@ class FactorySelfImprover:
                             clean_title=clean_title,
                             started_at=started_at,
                             explicit_tests=explicit_tests,
+                            idea_id=idea_id,
                         )
                         if not verify_ok2:
                             failure_reason = verify_err2
@@ -1574,6 +1707,11 @@ class FactorySelfImprover:
                 detail="Creando commit en main y recargando Liwi automáticamente...",
                 title=clean_title,
                 started_at=started_at,
+            )
+            self._touch_idea_heartbeat(
+                idea_id,
+                "Guardando commit y finalizando",
+                db_path=telemetry_db,
             )
             add_res = self.runner.run(
                 ["git", "add", "-A", "--", "src", "tests"],
@@ -1686,6 +1824,12 @@ class FactorySelfImprover:
             )
             raise
         finally:
+            self._active_idea_id = None
+            with _QUEUE_WORKER_LOCK:
+                _ACTIVE_APPLY_COUNT = max(0, _ACTIVE_APPLY_COUNT - 1)
+                if _ACTIVE_APPLY_COUNT == 0:
+                    _ACTIVE_IDEA_ID = None
+                    _ACTIVE_CURRENT_STEP = ""
             self._set_apply_status(
                 running=False,
                 step=0,
@@ -1697,3 +1841,574 @@ class FactorySelfImprover:
                 last_outcome=outcome,
             )
             self._apply_lock.release()
+
+
+def is_quota_429_paused(
+    *,
+    db_path: Path | str | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """Return True if an active 429 quota pause is persisted in SQLite quota_state."""
+    try:
+        from agent_factory.idea_engine import get_quota_status
+
+        status = get_quota_status(db_path=db_path, now=now)
+        return bool(status.get("is_paused", False))
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).debug("is_quota_429_paused fallback False: %s", exc)
+        return False
+
+
+def is_idea_worker_alive(
+    *,
+    improver: FactorySelfImprover | None = None,
+    staging_manager: Any | None = None,
+) -> bool:
+    """Return True when the sequential idea queue worker or an active self-improvement apply is alive."""
+    with _QUEUE_WORKER_LOCK:
+        if _QUEUE_WORKER is not None and _QUEUE_WORKER.is_alive:
+            return True
+        if _ACTIVE_APPLY_COUNT > 0:
+            return True
+    if improver is not None and improver.is_worker_alive():
+        return True
+    if staging_manager is not None:
+        worker_thread = getattr(staging_manager, "_worker", None)
+        if isinstance(worker_thread, threading.Thread) and worker_thread.is_alive():
+            return True
+    return False
+
+
+def get_idea_worker_runtime_status(
+    *,
+    db_path: Path | str | None = None,
+    now: datetime | None = None,
+    improver: FactorySelfImprover | None = None,
+    staging_manager: Any | None = None,
+) -> dict[str, Any]:
+    """Return live worker_alive and 429 quota_paused diagnostics without circular imports."""
+    with _QUEUE_WORKER_LOCK:
+        worker = _QUEUE_WORKER
+        active_id = worker.active_idea_id if (worker is not None and worker.active_idea_id is not None) else _ACTIVE_IDEA_ID
+        step = worker.current_step if (worker is not None and worker.current_step) else _ACTIVE_CURRENT_STEP
+    return {
+        "worker_alive": is_idea_worker_alive(improver=improver, staging_manager=staging_manager),
+        "quota_paused": is_quota_429_paused(db_path=db_path, now=now),
+        "active_idea_id": active_id,
+        "current_step": step,
+    }
+
+
+class IdeaQueueWorker:
+    """Sequential daemon worker that drains 'queued' improvement ideas independently of the 24/7 generator."""
+
+    def __init__(
+        self,
+        *,
+        db_path: Path | str | None = None,
+        executor: Callable[[dict[str, Any]], Any] | None = None,
+        improver: FactorySelfImprover | None = None,
+        stale_seconds: int = DEFAULT_IDEA_STALE_SECONDS,
+        max_retries: int = MAX_IDEA_RETRIES,
+        poll_interval_seconds: float = 0.5,
+        clock: Clock | None = None,
+    ) -> None:
+        self.db_path = db_path
+        self._executor = executor
+        self._improver = improver
+        self.stale_seconds = int(stale_seconds)
+        self.max_retries = max(0, int(max_retries))
+        self.poll_interval_seconds = max(0.01, float(poll_interval_seconds))
+        self.clock: Clock = clock if clock is not None else _WallClock()
+
+        self._lock = threading.RLock()
+        self._cond = threading.Condition(self._lock)
+        self._stop_event = threading.Event()
+        self._wakeup_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._busy: bool = False
+        self._active_idea_id: int | None = None
+        self._current_step: str = ""
+        self._last_result: dict[str, Any] | None = None
+
+    @property
+    def is_alive(self) -> bool:
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def active_idea_id(self) -> int | None:
+        with self._lock:
+            return self._active_idea_id
+
+    @property
+    def current_step(self) -> str:
+        with self._lock:
+            return self._current_step
+
+    def _set_active_step(self, idea_id: int | None, step: str) -> None:
+        with self._lock:
+            self._active_idea_id = idea_id
+            self._current_step = str(step or "")
+
+    def _default_execute_idea(self, idea: dict[str, Any]) -> dict[str, Any]:
+        target_improver = self._improver
+        if target_improver is None:
+            target_improver = FactorySelfImprover(
+                telemetry_db_path=self.db_path,
+                clock=self.clock,
+                restart_fn=lambda _code: None,
+                restart_delay_seconds=0.0,
+            )
+        return target_improver.apply_proposal(
+            str(idea.get("technical_prompt") or ""),
+            proposal_title=str(idea.get("title") or "Auto-mejora"),
+            preserve_on_quota_429=True,
+            idea_id=int(idea["id"]),
+        )
+
+    def drain_once(self) -> dict[str, Any]:
+        """Execute at most one queued idea sequentially, updating heartbeat and handling 429/retries."""
+        from agent_factory.error_triage import is_quota_429_error
+        from agent_factory.idea_engine import (
+            finish_idea_execution,
+            record_agy_429_pause,
+            record_idea_heartbeat,
+            select_next_queued_idea,
+            start_idea_execution,
+        )
+
+        ref_now = self.clock.now()
+        if is_quota_429_paused(db_path=self.db_path, now=ref_now):
+            return {"status": "quota_pause", "processed": False}
+
+        idea = select_next_queued_idea(db_path=self.db_path)
+        if idea is None:
+            return {"status": "empty", "processed": False}
+
+        idea_id = int(idea["id"])
+        with self._cond:
+            self._busy = True
+            self._active_idea_id = idea_id
+            self._current_step = "Iniciando ejecución en cola"
+            self._cond.notify_all()
+
+        try:
+            start_idea_execution(
+                idea_id,
+                current_step="Iniciando ejecución en cola",
+                db_path=self.db_path,
+                now=ref_now,
+            )
+            exec_fn = self._executor if self._executor is not None else self._default_execute_idea
+            raw_res = exec_fn(idea)
+
+            if isinstance(raw_res, Mapping):
+                if raw_res.get("quota_429") or (
+                    not raw_res.get("ok", True)
+                    and is_quota_429_error(
+                        str(raw_res.get("technical_detail") or raw_res.get("error") or "")
+                    )
+                ):
+                    err_text = str(
+                        raw_res.get("technical_detail")
+                        or raw_res.get("error")
+                        or "RESOURCE_EXHAUSTED 429"
+                    )
+                    if not is_quota_429_paused(db_path=self.db_path, now=self.clock.now()):
+                        record_agy_429_pause(err_text, db_path=self.db_path, now=self.clock.now())
+                    finish_idea_execution(
+                        idea_id,
+                        status="queued",
+                        current_step="Pausada por cuota 429",
+                        increment_retry=False,
+                        clear_heartbeat=True,
+                        db_path=self.db_path,
+                        now=self.clock.now(),
+                    )
+                    return {"status": "quota_pause", "processed": True, "idea_id": idea_id}
+                ok = bool(raw_res.get("ok", raw_res.get("applied", True)))
+                err_detail = str(raw_res.get("error") or "Error ejecutando idea en cola.")
+            elif isinstance(raw_res, bool):
+                ok = raw_res
+                err_detail = "Error ejecutando idea en cola."
+            else:
+                ok = True
+                err_detail = ""
+
+            if ok:
+                record_idea_heartbeat(
+                    idea_id,
+                    current_step="Finalizando implementación",
+                    db_path=self.db_path,
+                    now=self.clock.now(),
+                )
+                finish_idea_execution(
+                    idea_id,
+                    status="implemented",
+                    current_step="Completada",
+                    failure_reason=None,
+                    increment_retry=False,
+                    clear_heartbeat=True,
+                    db_path=self.db_path,
+                    now=self.clock.now(),
+                )
+                return {"status": "implemented", "processed": True, "idea_id": idea_id}
+
+            next_retry = int(idea.get("retry_count") or 0) + 1
+            if next_retry > self.max_retries:
+                finish_idea_execution(
+                    idea_id,
+                    status="failed",
+                    current_step="",
+                    failure_reason=redact_secrets(err_detail),
+                    increment_retry=True,
+                    clear_heartbeat=True,
+                    db_path=self.db_path,
+                    now=self.clock.now(),
+                )
+                return {"status": "failed", "processed": True, "idea_id": idea_id}
+
+            finish_idea_execution(
+                idea_id,
+                status="queued",
+                current_step="",
+                failure_reason=None,
+                increment_retry=True,
+                clear_heartbeat=True,
+                db_path=self.db_path,
+                now=self.clock.now(),
+            )
+            return {"status": "requeued", "processed": True, "idea_id": idea_id}
+        except Exception as exc:  # noqa: BLE001
+            err_msg = redact_secrets(str(exc) or type(exc).__name__)
+            if is_quota_429_error(err_msg):
+                if not is_quota_429_paused(db_path=self.db_path, now=self.clock.now()):
+                    record_agy_429_pause(err_msg, db_path=self.db_path, now=self.clock.now())
+                finish_idea_execution(
+                    idea_id,
+                    status="queued",
+                    current_step="Pausada por cuota 429",
+                    increment_retry=False,
+                    clear_heartbeat=True,
+                    db_path=self.db_path,
+                    now=self.clock.now(),
+                )
+                return {"status": "quota_pause", "processed": True, "idea_id": idea_id}
+            next_retry = int(idea.get("retry_count") or 0) + 1
+            target_status = "failed" if next_retry > self.max_retries else "queued"
+            finish_idea_execution(
+                idea_id,
+                status=target_status,
+                current_step="",
+                failure_reason=err_msg if target_status == "failed" else None,
+                increment_retry=True,
+                clear_heartbeat=True,
+                db_path=self.db_path,
+                now=self.clock.now(),
+            )
+            return {"status": target_status, "processed": True, "idea_id": idea_id, "error": err_msg}
+        finally:
+            with self._cond:
+                self._busy = False
+                self._active_idea_id = None
+                self._current_step = ""
+                self._cond.notify_all()
+
+    def _worker_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                result = self.drain_once()
+                with self._cond:
+                    self._last_result = result
+                    self._cond.notify_all()
+                if result.get("processed") and result.get("status") not in {"quota_pause", "empty"}:
+                    continue
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "IdeaQueueWorker cycle error: %s",
+                    redact_secrets(str(exc)),
+                )
+            if self._stop_event.is_set():
+                break
+            self._wakeup_event.clear()
+            self._wakeup_event.wait(timeout=self.poll_interval_seconds)
+
+    def start(self) -> IdeaQueueWorker:
+        """Start the sequential queue worker thread idempotently."""
+        with self._cond:
+            if self._thread is not None and self._thread.is_alive():
+                self._wakeup_event.set()
+                return self
+            self._stop_event.clear()
+            self._wakeup_event.set()
+            self._thread = threading.Thread(
+                target=self._worker_loop,
+                name="liwi-idea-queue-worker",
+                daemon=True,
+            )
+            self._thread.start()
+            self._cond.notify_all()
+        return self
+
+    def wake(self) -> None:
+        """Wake the worker immediately (starting it if not alive and not stopped)."""
+        with self._cond:
+            if self._stop_event.is_set():
+                return
+            if self._thread is None or not self._thread.is_alive():
+                self.start()
+                return
+            self._wakeup_event.set()
+            self._cond.notify_all()
+
+    def wait_until_idle(self, timeout: float = 10.0) -> bool:
+        """Wait until the worker is not busy and either no queued/implementing ideas remain or quota is paused."""
+        from agent_factory.idea_engine import count_ideas_by_status
+
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            with self._cond:
+                busy = self._busy
+            if not busy:
+                if is_quota_429_paused(db_path=self.db_path, now=self.clock.now()):
+                    with self._cond:
+                        if not self._busy:
+                            return True
+                else:
+                    counts = count_ideas_by_status(db_path=self.db_path)
+                    queued_left = int(counts.get("queued", 0))
+                    impl_left = int(counts.get("implementing", 0))
+                    if queued_left == 0 and impl_left == 0:
+                        with self._cond:
+                            if not self._busy:
+                                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            with self._cond:
+                self._cond.wait(timeout=min(0.05, remaining))
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Signal the sequential queue worker thread to stop and join cleanly."""
+        with self._cond:
+            self._stop_event.set()
+            self._wakeup_event.set()
+            thread = self._thread
+            self._cond.notify_all()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(0.0, float(timeout)))
+        with self._cond:
+            if self._thread is not None and not self._thread.is_alive():
+                self._thread = None
+
+
+def get_idea_queue_worker() -> IdeaQueueWorker | None:
+    """Return the active module-level IdeaQueueWorker instance, if initialized."""
+    with _QUEUE_WORKER_LOCK:
+        return _QUEUE_WORKER
+
+
+def stop_idea_queue_worker(timeout: float = 5.0) -> None:
+    """Stop and clear the module-level IdeaQueueWorker cleanly."""
+    global _QUEUE_WORKER
+    with _QUEUE_WORKER_LOCK:
+        worker = _QUEUE_WORKER
+        _QUEUE_WORKER = None
+    if worker is not None:
+        worker.stop(timeout=timeout)
+
+
+def auto_enqueue_ideas(
+    *,
+    db_path: Path | str | None = None,
+    max_queued: int = MAX_AUTO_QUEUED_IDEAS,
+    generator: Callable[..., Sequence[Mapping[str, Any]]] | None = None,
+    now: datetime | None = None,
+    source: str = "auto",
+) -> dict[str, Any]:
+    """Automatically enqueue pending or newly generated ideas, strictly capping queued count at max_queued (default 3)."""
+    from agent_factory.idea_engine import (
+        count_ideas_by_status,
+        save_ideas,
+        select_next_autonomous_idea,
+        update_idea_status,
+    )
+
+    if isinstance(max_queued, bool) or not isinstance(max_queued, int) or max_queued <= 0:
+        raise ValueError("max_queued debe ser un entero positivo.")
+
+    if is_quota_429_paused(db_path=db_path, now=now):
+        current_queued = int(count_ideas_by_status(db_path=db_path).get("queued", 0))
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "quota_pause",
+            "queued_count": current_queued,
+            "max_queued": max_queued,
+            "enqueued": [],
+            "generated_count": 0,
+        }
+
+    current_queued = int(count_ideas_by_status(db_path=db_path).get("queued", 0))
+    available_slots = max(0, max_queued - current_queued)
+    if available_slots <= 0:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "queue_limit_reached",
+            "queued_count": current_queued,
+            "max_queued": max_queued,
+            "enqueued": [],
+            "generated_count": 0,
+        }
+
+    enqueued: list[dict[str, Any]] = []
+    while len(enqueued) < available_slots:
+        next_pending = select_next_autonomous_idea(db_path=db_path)
+        if next_pending is None:
+            break
+        updated = update_idea_status(int(next_pending["id"]), "queued", db_path=db_path)
+        enqueued.append(updated)
+
+    generated_count = 0
+    remaining_slots = available_slots - len(enqueued)
+    if remaining_slots > 0 and generator is not None:
+        try:
+            raw_generated = generator(remaining_slots)
+        except TypeError:
+            raw_generated = generator()
+        raw_list = list(raw_generated) if raw_generated is not None else []
+        unsaved = [item for item in raw_list if isinstance(item, Mapping) and "id" not in item]
+        if unsaved:
+            saved_new = save_ideas(
+                unsaved,
+                source=source,
+                db_path=db_path,
+                max_items=remaining_slots,
+            )
+            generated_count = len(saved_new)
+        else:
+            generated_count = len(raw_list)
+
+        while len(enqueued) < available_slots:
+            next_pending = select_next_autonomous_idea(db_path=db_path)
+            if next_pending is None:
+                break
+            updated = update_idea_status(int(next_pending["id"]), "queued", db_path=db_path)
+            enqueued.append(updated)
+
+    final_queued = int(count_ideas_by_status(db_path=db_path).get("queued", 0))
+    return {
+        "ok": True,
+        "skipped": False,
+        "reason": "ok",
+        "queued_count": final_queued,
+        "max_queued": max_queued,
+        "enqueued": enqueued,
+        "generated_count": generated_count,
+    }
+
+
+def resume_idea_queue(
+    *,
+    db_path: Path | str | None = None,
+    stale_seconds: int = DEFAULT_IDEA_STALE_SECONDS,
+    worker: IdeaQueueWorker | None = None,
+    executor: Callable[[dict[str, Any]], Any] | None = None,
+    improver: FactorySelfImprover | None = None,
+    now: datetime | None = None,
+    quota_paused: bool | None = None,
+    poll_interval_seconds: float = 0.5,
+) -> dict[str, Any]:
+    """Reconcile the idea queue and immediately start/wake the sequential worker to drain queued ideas (independent of 24/7 toggle, respecting only 429 quota pause)."""
+    global _QUEUE_WORKER
+    from agent_factory.idea_engine import reconcile_idea_queue
+
+    eff_quota_paused = (
+        bool(quota_paused)
+        if quota_paused is not None
+        else is_quota_429_paused(db_path=db_path, now=now)
+    )
+    current_worker_alive = (
+        worker.is_alive
+        if worker is not None
+        else is_idea_worker_alive(improver=improver)
+    )
+
+    reconciliation = reconcile_idea_queue(
+        stale_seconds=stale_seconds,
+        db_path=db_path,
+        worker_alive=current_worker_alive,
+        quota_paused=eff_quota_paused,
+        now=now,
+    )
+
+    if eff_quota_paused:
+        return {
+            "ok": True,
+            "resumed": False,
+            "worker_started": False,
+            "worker_alive": current_worker_alive,
+            "pause_reason": "quota_pause",
+            "reconciliation": reconciliation,
+            "counts": reconciliation["counts"],
+        }
+
+    queued_count = int(reconciliation["counts"].get("queued", 0))
+    has_active = reconciliation["active_idea"] is not None
+    if queued_count <= 0 and not has_active:
+        return {
+            "ok": True,
+            "resumed": False,
+            "worker_started": False,
+            "worker_alive": current_worker_alive,
+            "pause_reason": "empty",
+            "reconciliation": reconciliation,
+            "counts": reconciliation["counts"],
+        }
+
+    old_worker_to_stop: IdeaQueueWorker | None = None
+    if worker is not None:
+        target_worker = worker
+    else:
+        with _QUEUE_WORKER_LOCK:
+            existing = _QUEUE_WORKER
+            same_db = existing is not None and str(existing.db_path) == str(db_path)
+            same_exec = existing is not None and (executor is None or existing._executor is executor)
+            if existing is not None and same_db and same_exec:
+                target_worker = existing
+            else:
+                old_worker_to_stop = existing
+                target_worker = IdeaQueueWorker(
+                    db_path=db_path,
+                    executor=executor,
+                    improver=improver,
+                    stale_seconds=stale_seconds,
+                    poll_interval_seconds=poll_interval_seconds,
+                )
+                _QUEUE_WORKER = target_worker
+        if old_worker_to_stop is not None:
+            old_worker_to_stop.stop(timeout=2.0)
+
+    if improver is not None:
+        improver._idea_queue_worker = target_worker
+
+    was_alive = target_worker.is_alive
+    if was_alive:
+        target_worker.wake()
+        worker_started = False
+    else:
+        target_worker.start()
+        worker_started = True
+
+    live_now = target_worker.is_alive
+    return {
+        "ok": True,
+        "resumed": True,
+        "worker_started": worker_started,
+        "worker_alive": live_now,
+        "pause_reason": "ok" if live_now else "no_worker",
+        "reconciliation": reconciliation,
+        "counts": reconciliation["counts"],
+    }
