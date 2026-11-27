@@ -3251,6 +3251,7 @@ def drain_queued_ideas(
                 "impact": idea["impact"],
                 "source": idea["source"],
                 "drain_queue": True,
+                **({"db_path": str(db_path)} if db_path is not None else {}),
             },
         )
         enqueued_ids.append(iid)

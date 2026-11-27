@@ -246,6 +246,7 @@ class StagingManager:
         self._shutdown_requested: bool = False
         self._last_error: str | None = None
         self._current_task: str | None = None
+        self._current_idea_id: int | None = None
 
     def _run_git(
         self,
@@ -1108,13 +1109,35 @@ class StagingManager:
                 if self._shutdown_requested:
                     self._is_building = False
                     self._current_task = None
+                    self._current_idea_id = None
                     self._cond.notify_all()
                     return
 
                 assert task is not None
+                task_meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+                raw_idea_id = task_meta.get("idea_id")
+                cur_idea_id = (
+                    int(raw_idea_id)
+                    if isinstance(raw_idea_id, int) and not isinstance(raw_idea_id, bool) and raw_idea_id > 0
+                    else None
+                )
+                task_db_path = task_meta.get("db_path")
                 self._is_building = True
                 self._current_task = str(task["title"])
+                self._current_idea_id = cur_idea_id
                 self._cond.notify_all()
+
+            if cur_idea_id is not None:
+                try:
+                    from agent_factory.idea_engine import start_idea_execution
+
+                    start_idea_execution(
+                        cur_idea_id,
+                        current_step="Preparando .liwi-staging",
+                        db_path=task_db_path,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
             worktree_path: Path | None = None
             try:
@@ -1139,6 +1162,7 @@ class StagingManager:
                 with self._cond:
                     self._is_building = False
                     self._current_task = None
+                    self._current_idea_id = None
                     self._cond.notify_all()
 
     def enqueue_improvement(
@@ -1223,6 +1247,14 @@ class StagingManager:
         commits = self._list_pending_commits()
         with self._lock:
             paused = self._paused_tasks[0] if self._paused_tasks else None
+            queued_idea_ids = [
+                int(t["metadata"]["idea_id"])
+                for t in self._queue
+                if isinstance(t, dict)
+                and isinstance(t.get("metadata"), dict)
+                and isinstance(t["metadata"].get("idea_id"), int)
+                and not isinstance(t["metadata"].get("idea_id"), bool)
+            ]
             return {
                 "pending_count": len(commits),
                 "commits": commits,
@@ -1233,7 +1265,11 @@ class StagingManager:
                 "quota_paused_message": paused["friendly_error"] if paused else None,
                 "last_error": self._last_error,
                 "current_task": self._current_task,
+                "current_idea_id": self._current_idea_id,
+                "queued_idea_ids": queued_idea_ids,
             }
+
+    get_status = get_staging_status
 
     def promote(
         self,

@@ -9310,6 +9310,16 @@ def test_drain_queue_endpoint_and_autonomous_history_merge(tmp_path: Path) -> No
         assert i_code == 200
         titles = [it["title"] for it in i_data["ideas"]]
         assert "Historial Previo Sin Idea" in titles
+        assert "staging_queue" in i_data
+        assert i_data["staging_queue"]["active"] is True
+        assert i_data["staging_queue"]["pending_count"] == 3
+
+        st_code, st_data = _http_json(f"{base_url}/api/autonomous/status")
+        assert st_code == 200
+        assert st_data["staging_queue"]["active"] is True
+        assert "⚙️ Procesando cola" in DASHBOARD_HTML
+        assert "🔄 En staging" in DASHBOARD_HTML
+        assert "⏳ Cola en ejecución en staging..." in DASHBOARD_HTML
     finally:
         server.shutdown()
         server.server_close()

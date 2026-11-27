@@ -2498,6 +2498,46 @@ class DashboardController:
             return (db_parent / "telemetry.db").resolve()
         return None
 
+    def _build_staging_queue_payload(self) -> dict[str, Any]:
+        """Return normalized live StagingManager queue state for modal synchronization."""
+        try:
+            mgr = self._get_staging_manager()
+            st = mgr.get_status() if hasattr(mgr, "get_status") else mgr.get_staging_status()
+        except Exception:  # noqa: BLE001
+            st = {}
+        if not isinstance(st, Mapping):
+            st = {}
+        is_building = bool(st.get("is_building"))
+        queue_size = int(st.get("queue_size") or 0)
+        cur_title = str(st.get("current_task") or "").strip()
+        cur_idea_id = st.get("current_idea_id")
+        if not (isinstance(cur_idea_id, int) and not isinstance(cur_idea_id, bool)):
+            cur_idea_id = None
+        raw_queued_ids = st.get("queued_idea_ids")
+        queued_idea_ids = (
+            [int(x) for x in raw_queued_ids if isinstance(x, int) and not isinstance(x, bool)]
+            if isinstance(raw_queued_ids, Sequence) and not isinstance(raw_queued_ids, (str, bytes))
+            else []
+        )
+        step = str(st.get("current_step") or "").strip()
+        if not step and self._self_improver is not None:
+            try:
+                imp_st = self._self_improver.get_status()
+                if isinstance(imp_st, Mapping) and imp_st.get("running"):
+                    step = str(imp_st.get("stage") or "").strip()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("self_improver status skipped: %s", exc)
+        if not step and is_building:
+            step = "Construyendo en .liwi-staging"
+        return {
+            "active": bool(is_building or queue_size > 0),
+            "current_title": cur_title,
+            "current_idea_id": cur_idea_id,
+            "queued_idea_ids": queued_idea_ids,
+            "pending_count": queue_size + (1 if is_building else 0),
+            "step": step,
+        }
+
     def list_improvement_ideas(self, *, status: str | None = None) -> dict[str, Any]:
         """Return improvement ideas (optionally filtered by status), status counts, and auto-generation interval."""
         db_path = self._resolve_idea_db_path()
@@ -2555,6 +2595,7 @@ class DashboardController:
                 "counts": result["counts"],
                 "status": result["status"],
                 "auto_interval_hours": interval_hours,
+                "staging_queue": self._build_staging_queue_payload(),
             },
             self.secrets_to_redact,
         )
@@ -2823,9 +2864,12 @@ class DashboardController:
 
     def get_autonomous_status(self) -> dict[str, Any]:
         """Return live 24/7 autonomous status, quota meter telemetry, and recent autonomous history."""
+        staging_queue = self._build_staging_queue_payload()
         try:
             engine = self._get_autonomous_engine()
-            return _scrub_value(engine.get_status_snapshot(), self.secrets_to_redact)
+            snap = engine.get_status_snapshot()
+            snap["staging_queue"] = staging_queue
+            return _scrub_value(snap, self.secrets_to_redact)
         except Exception as exc:  # noqa: BLE001
             clean_err = redact_secrets(
                 str(exc) or exc.__class__.__name__,
@@ -2850,6 +2894,7 @@ class DashboardController:
                     "last_error": {"message": clean_err},
                     "last_cycle_result": None,
                     "degraded": True,
+                    "staging_queue": staging_queue,
                     "quota": {
                         "window_tokens_used": 0,
                         "estimated_window_capacity": idea_engine.DEFAULT_ESTIMATED_WINDOW_CAPACITY,
@@ -14881,14 +14926,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const activeIdea = Array.isArray(currentImplementing) && currentImplementing.length
           ? currentImplementing[0]
           : null;
-        if (!activeIdea) {
+        const sq = (window.__liwiStagingQueue && typeof window.__liwiStagingQueue === 'object')
+          ? window.__liwiStagingQueue
+          : null;
+        const sqActive = Boolean(sq && sq.active);
+        if (!activeIdea && !sqActive) {
+          window.__liwiStagingStartedIso = null;
           heroEl.style.display = 'none';
           return;
         }
         heroEl.style.display = 'flex';
-        if (heroTitleEl) heroTitleEl.textContent = String(activeIdea.title || 'Mejora en curso...');
-        if (heroStepEl) heroStepEl.textContent = String(activeIdea.current_step || 'Analizando');
-        const startedIso = String(activeIdea.started_at || activeIdea.created_at || '');
+        if (activeIdea) {
+          if (heroTitleEl) heroTitleEl.textContent = String(activeIdea.title || 'Mejora en curso...');
+          if (heroStepEl) heroStepEl.textContent = String(activeIdea.current_step || (sq && sq.step) || 'Analizando');
+        } else {
+          if (!window.__liwiStagingStartedIso) {
+            window.__liwiStagingStartedIso = new Date().toISOString();
+          }
+          if (heroTitleEl) heroTitleEl.textContent = String((sq && sq.current_title) || 'Procesando cola en .liwi-staging...');
+          if (heroStepEl) heroStepEl.textContent = String((sq && sq.step) || 'Construyendo en .liwi-staging');
+        }
+        const startedIso = activeIdea
+          ? String(activeIdea.started_at || activeIdea.created_at || '')
+          : String(window.__liwiStagingStartedIso || '');
         if (heroTimerEl) {
           heroTimerEl.textContent = formatMmSsSince(startedIso);
           heroTickTimer = setInterval(() => {
@@ -15003,11 +15063,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         gridEl.classList.toggle('is-lane-list', activeFilter === 'queued' || activeFilter === 'implemented');
 
+        const sqState = (window.__liwiStagingQueue && typeof window.__liwiStagingQueue === 'object')
+          ? window.__liwiStagingQueue
+          : {};
+        const sqIsActive = Boolean(sqState.active);
         if (drainBarEl) {
           const showDrain = activeFilter === 'queued' && list.length > 0;
           drainBarEl.style.display = showDrain ? 'flex' : 'none';
           if (drainBtn && showDrain) {
-            drainBtn.textContent = '▶️ Procesar toda la cola (' + list.length + ')';
+            drainBtn.disabled = sqIsActive;
+            drainBtn.textContent = sqIsActive
+              ? '⏳ Cola en ejecución en staging...'
+              : ('▶️ Procesar toda la cola (' + list.length + ')');
           }
         }
 
@@ -15049,6 +15116,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const retryBadge = retryNum > 0
               ? ('<span class="liwi-retry-badge">⚠️ Reintento ' + retryNum + ' · Auto-investigada</span>')
               : '';
+            const queuedIdsArr = Array.isArray(sqState.queued_idea_ids) ? sqState.queued_idea_ids : [];
+            const inStaging = sqIsActive && (
+              idNum === Number(sqState.current_idea_id) ||
+              queuedIdsArr.indexOf(idNum) >= 0
+            );
+            const stagingBadge = inStaging
+              ? '<span class="liwi-radar-status-pill is-implementing">🔄 En staging</span>'
+              : '';
             return (
               '<article class="liwi-radar-card" data-radar-card-id="' + escapeHtml(idStr) + '">' +
                 '<div class="liwi-radar-card-head">' +
@@ -15056,6 +15131,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                   '<div class="liwi-radar-card-main">' +
                     '<div class="liwi-radar-card-title">' + escapeHtml(title) + '</div>' +
                     '<div class="liwi-radar-card-meta">' +
+                      stagingBadge +
                       (enqueuedLabel ? ('<span class="liwi-radar-impact">Encolada: ' + escapeHtml(enqueuedLabel) + '</span>') : '') +
                       (waitLabel ? ('<span class="liwi-radar-impact is-medium">' + escapeHtml(waitLabel) + '</span>') : '') +
                       retryBadge +
@@ -15064,7 +15140,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                   '</div>' +
                 '</div>' +
                 '<div class="liwi-radar-card-actions">' +
-                  '<button type="button" class="btn btn-primary btn-sm" data-radar-run-now="' + escapeHtml(idStr) + '"' + (isBusy ? ' disabled' : '') + '>▶️ Ejecutar ya</button>' +
+                  '<button type="button" class="btn btn-primary btn-sm" data-radar-run-now="' + escapeHtml(idStr) + '"' + ((isBusy || inStaging) ? ' disabled' : '') + '>▶️ Ejecutar ya</button>' +
                   '<button type="button" class="btn btn-sm" data-radar-remove="' + escapeHtml(idStr) + '"' + (isBusy ? ' disabled' : '') + '>Quitar</button>' +
                 '</div>' +
                 '<div class="liwi-radar-card-feedback" data-radar-feedback="' + escapeHtml(idStr) + '" style="display:none"></div>' +
@@ -15342,6 +15418,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             });
           }
           currentIdeas = loadedIdeas;
+          const latestSq = primaryRes.staging_queue || implRes.staging_queue || null;
+          if (latestSq && typeof latestSq === 'object') {
+            window.__liwiStagingQueue = latestSq;
+          }
           const latestCounts = primaryRes.counts || implRes.counts || null;
           if (latestCounts) {
             currentCounts = normalizeCounts(latestCounts);
@@ -15572,6 +15652,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         if (!st || typeof st !== 'object') return;
         lastAutoStatus = st;
         window.__liwiAutonomousHistory = Array.isArray(st.history) ? st.history : [];
+        if (st.staging_queue && typeof st.staging_queue === 'object') {
+          window.__liwiStagingQueue = st.staging_queue;
+        }
         const enabled = Boolean(st.autonomous_enabled);
         const liveState = String(st.state || (enabled ? 'activo' : 'apagado'));
         const curTask = String(st.current_task || '').trim();
@@ -15583,9 +15666,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const resumeHhmm = quota.resume_hhmm ? String(quota.resume_hhmm) : '';
         const pilotStatePill = document.getElementById('liwi-pilot-state-pill');
 
+        const sqActiveHeader = Boolean(window.__liwiStagingQueue && window.__liwiStagingQueue.active);
         if (pilotStatePill) {
           pilotStatePill.classList.remove('is-building', 'is-investigating', 'is-paused', 'is-on');
-          if (!enabled) {
+          if (!enabled && sqActiveHeader) {
+            pilotStatePill.textContent = '⚙️ Procesando cola';
+            pilotStatePill.classList.add('is-building');
+          } else if (!enabled) {
             pilotStatePill.textContent = 'Apagado';
           } else if (liveState === 'construyendo') {
             pilotStatePill.textContent = 'Construyendo';
