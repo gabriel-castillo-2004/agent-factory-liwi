@@ -9233,4 +9233,91 @@ def test_centro_automejora_three_lanes_and_queue_endpoints(tmp_path: Path) -> No
         store.close()
 
 
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_drain_queue_endpoint_and_autonomous_history_merge(tmp_path: Path) -> None:
+    from agent_factory import idea_engine
+    from agent_factory.dashboard import DASHBOARD_HTML, start_dashboard_server
+    from agent_factory.orchestrator import Orchestrator
+
+    assert 'id="liwi-drain-queue-btn"' in DASHBOARD_HTML
+    assert "Procesar toda la cola" in DASHBOARD_HTML
+
+    store = SqliteEventStore(str(tmp_path / "factory.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    telemetry_db = tmp_path / "telemetry.db"
+    idea_engine.set_autonomous_config(autonomous_enabled=False, db_path=telemetry_db)
+    created = idea_engine.save_ideas(
+        [
+            {
+                "title": "Cola Uno",
+                "category": "UX",
+                "impact": "Medio",
+                "simple_description": "Primera mejora en cola.",
+                "technical_prompt": "Prompt 1",
+                "source": "manual",
+            },
+            {
+                "title": "Cola Dos",
+                "category": "Rendimiento",
+                "impact": "Alto",
+                "simple_description": "Segunda mejora en cola.",
+                "technical_prompt": "Prompt 2",
+                "source": "manual",
+            },
+        ],
+        db_path=telemetry_db,
+    )
+    for item in created:
+        idea_engine.update_idea_status(int(item["id"]), "encolada", db_path=telemetry_db)
+
+    idea_engine.record_autonomous_application(
+        title="Historial Previo Sin Idea",
+        commit_hash="abc123456789",
+        simple_description="Mejora aplicada previamente.",
+        idea_id=None,
+        db_path=telemetry_db,
+    )
+
+    enqueued_calls: list[dict[str, object]] = []
+
+    class _FakeStaging:
+        def __init__(self) -> None:
+            self._queue: list[dict[str, object]] = []
+
+        def enqueue_improvement(self, title: str, prompt: str, metadata: dict | None = None) -> dict:
+            enqueued_calls.append({"title": title, "prompt": prompt, "metadata": metadata or {}})
+            return {"is_building": True, "queue_size": len(enqueued_calls)}
+
+        def get_staging_status(self) -> dict:
+            return {"is_building": bool(enqueued_calls), "queue_size": len(enqueued_calls)}
+
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        staging_manager=_FakeStaging(),  # type: ignore[arg-type]
+    )
+    server.controller._resolve_idea_db_path = lambda: telemetry_db  # type: ignore[method-assign]
+    try:
+        d_code, d_data = _http_json(f"{base_url}/api/ideas/drain-queue", method="POST")
+        assert d_code == 200
+        assert d_data["ok"] is True
+        assert d_data["enqueued_count"] == 2
+        assert len(enqueued_calls) == 2
+        assert idea_engine.get_autonomous_state(db_path=telemetry_db)["autonomous_enabled"] is False
+
+        i_code, i_data = _http_json(f"{base_url}/api/ideas?status=implemented")
+        assert i_code == 200
+        titles = [it["title"] for it in i_data["ideas"]]
+        assert "Historial Previo Sin Idea" in titles
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+
 

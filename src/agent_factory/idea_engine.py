@@ -3127,26 +3127,30 @@ def reconcile_and_investigate_queue(
                 if conn_u is not None:
                     conn_u.close()
 
-        summary_lines = [
-            f"- Idea #{a['idea_id']} ({a['title']}): {a['action']} ({a['reason']})"
-            for a in reconciled_actions
-        ]
-        err_text = (
-            "Atasco detectado en la cola de auto-mejoras (.liwi-staging):\n"
-            + "\n".join(summary_lines)
-            + f"\nLocks limpiados: {locks_removed or 'ninguno'}"
+        should_create_ticket = bool(auto_st.get("autonomous_enabled")) and not bool(
+            base_report["quota_paused"]
         )
-        try:
-            from agent_factory.error_triage import build_actionable_fix_ticket
-
-            ticket = build_actionable_fix_ticket(
-                "queue_watchdog",
-                err_text,
-                context=diagnostic_snapshot,
-                db_path=db_path,
+        if should_create_ticket:
+            summary_lines = [
+                f"- Idea #{a['idea_id']} ({a['title']}): {a['action']} ({a['reason']})"
+                for a in reconciled_actions
+            ]
+            err_text = (
+                "Atasco detectado en la cola de auto-mejoras (.liwi-staging):\n"
+                + "\n".join(summary_lines)
+                + f"\nLocks limpiados: {locks_removed or 'ninguno'}"
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("queue_watchdog ticket creation skipped: %s", exc)
+            try:
+                from agent_factory.error_triage import build_actionable_fix_ticket
+
+                ticket = build_actionable_fix_ticket(
+                    "queue_watchdog",
+                    err_text,
+                    context=diagnostic_snapshot,
+                    db_path=db_path,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("queue_watchdog ticket creation skipped: %s", exc)
 
         if staging_manager is not None and requeued_ids:
             try:
@@ -3167,6 +3171,97 @@ def reconcile_and_investigate_queue(
         "failed_ids": failed_ids,
         "actions": reconciled_actions,
         **base_report,
+    }
+
+
+def drain_queued_ideas(
+    *,
+    staging_manager: Any | None = None,
+    db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Enqueue all 'encolada' ideas sequentially into .liwi-staging without enabling auto-ideation."""
+    quota = get_quota_status(db_path=db_path)
+    if quota.get("is_paused"):
+        return {
+            "ok": False,
+            "paused_quota": True,
+            "enqueued_count": 0,
+            "queued_ids": [],
+            "quota": quota,
+            "error": (
+                f"Sin cuota hasta las {quota.get('resume_hhmm') or 'pronto'}; "
+                "la cola se procesará al reanudarse."
+            ),
+        }
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        rows = conn.execute(
+            f"{_IDEA_JOIN_SELECT_SQL} WHERE i.status = 'encolada' "
+            "ORDER BY COALESCE(i.queued_at, i.created_at) ASC, i.id ASC;"
+        ).fetchall()
+        queued_ideas = [_row_to_idea(row) for row in rows]
+        counts = _query_idea_status_counts(conn)
+    finally:
+        if conn is not None:
+            conn.close()
+
+    if not queued_ideas:
+        return {
+            "ok": True,
+            "paused_quota": False,
+            "enqueued_count": 0,
+            "queued_ids": [],
+            "counts": counts,
+        }
+
+    if staging_manager is None:
+        return {
+            "ok": True,
+            "paused_quota": False,
+            "enqueued_count": 0,
+            "queued_ids": [int(i["id"]) for i in queued_ideas],
+            "counts": counts,
+        }
+
+    existing_ids: set[int] = set()
+    raw_queue = getattr(staging_manager, "_queue", None)
+    if isinstance(raw_queue, list):
+        for t in raw_queue:
+            if isinstance(t, Mapping) and isinstance(t.get("metadata"), Mapping):
+                tid = t["metadata"].get("idea_id")
+                if isinstance(tid, int):
+                    existing_ids.add(tid)
+
+    enqueued_ids: list[int] = []
+    last_staging_status: dict[str, Any] | None = None
+    for idea in queued_ideas:
+        if get_quota_status(db_path=db_path).get("is_paused"):
+            break
+        iid = int(idea["id"])
+        if iid in existing_ids:
+            continue
+        last_staging_status = staging_manager.enqueue_improvement(
+            title=idea["title"],
+            prompt=idea["technical_prompt"],
+            metadata={
+                "idea_id": iid,
+                "category": idea["category"],
+                "impact": idea["impact"],
+                "source": idea["source"],
+                "drain_queue": True,
+            },
+        )
+        enqueued_ids.append(iid)
+
+    return {
+        "ok": True,
+        "paused_quota": False,
+        "enqueued_count": len(enqueued_ids),
+        "queued_ids": enqueued_ids,
+        "counts": counts,
+        "staging_status": last_staging_status or staging_manager.get_staging_status(),
     }
 
 

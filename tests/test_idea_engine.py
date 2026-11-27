@@ -2214,6 +2214,65 @@ def test_blackbox_columns_and_reconcile_and_investigate_queue(tmp_path: Path) ->
     assert "reintent" in str(after3["failure_reason"]).lower() or "atasc" in str(after3["failure_reason"]).lower()
 
 
+def test_reconcile_and_investigate_queue_skips_tickets_when_autonomous_disabled(tmp_path: Path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    db_path = tmp_path / "telemetry.db"
+    t0 = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
+    idea_engine.set_autonomous_config(autonomous_enabled=False, db_path=db_path)
+
+    saved = idea_engine.save_ideas(
+        [
+            {
+                "title": "Queued While Off",
+                "category": "UX",
+                "impact": "Medio",
+                "simple_description": "Debe esperar sin generar falsas alarmas.",
+                "technical_prompt": "Ajuste menor",
+                "source": "manual",
+            },
+            {
+                "title": "Orphan Implementing",
+                "category": "Estabilidad",
+                "impact": "Alto",
+                "simple_description": "Huérfana tras cierre abrupto.",
+                "technical_prompt": "Recuperar",
+                "source": "manual",
+            },
+        ],
+        db_path=db_path,
+    )
+    queued_id = int(saved[0]["id"])
+    orphan_id = int(saved[1]["id"])
+    idea_engine.update_idea_status(queued_id, "encolada", db_path=db_path)
+
+    # 1. Queued idea waiting > 900s while autonomous_enabled=False -> no stall, no ticket
+    rep_wait = idea_engine.reconcile_and_investigate_queue(
+        stale_exec_seconds=300,
+        stale_wait_seconds=900,
+        db_path=db_path,
+        repo_root=tmp_path,
+        worker_alive=False,
+        now=t0 + timedelta(seconds=2000),
+    )
+    assert rep_wait["stale_wait_ids"] == []
+    assert rep_wait["ticket"] is None
+
+    # 2. Orphan implementing cleaned silently without creating a triage ticket
+    idea_engine.start_idea_execution(orphan_id, current_step="Editando", db_path=db_path, now=t0)
+    rep_orphan = idea_engine.reconcile_and_investigate_queue(
+        stale_exec_seconds=300,
+        stale_wait_seconds=900,
+        db_path=db_path,
+        repo_root=tmp_path,
+        worker_alive=False,
+        now=t0 + timedelta(seconds=500),
+    )
+    assert orphan_id in rep_orphan["requeued_ids"]
+    assert rep_orphan["ticket"] is None
+
+
+
 
 
 

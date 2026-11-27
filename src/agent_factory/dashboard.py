@@ -2507,10 +2507,51 @@ class DashboardController:
             db_path=db_path,
         )
         assert isinstance(result, dict)
+        ideas_list = list(result["ideas"])
+        norm_status = str(status or "").strip().lower()
+        if norm_status in {"", "all", "implemented", "aplicada"}:
+            hist = idea_engine.list_autonomous_history(db_path=db_path)
+            existing_ids = {
+                int(it["id"])
+                for it in ideas_list
+                if isinstance(it.get("id"), int) and int(it["id"]) > 0
+            }
+            existing_shas = {
+                str(it.get("commit_sha") or "").strip()[:7]
+                for it in ideas_list
+                if str(it.get("commit_sha") or "").strip()
+            }
+            for entry in hist:
+                if str(entry.get("status") or "") == "revertida":
+                    continue
+                eid = entry.get("idea_id")
+                if isinstance(eid, int) and eid in existing_ids:
+                    continue
+                chash = str(entry.get("commit_hash") or "").strip()
+                if chash and chash[:7] in existing_shas:
+                    continue
+                ideas_list.append(
+                    {
+                        "id": -int(entry["id"]),
+                        "history_entry_id": int(entry["id"]),
+                        "created_at": entry.get("applied_at") or "",
+                        "completed_at": entry.get("applied_at") or "",
+                        "duration_seconds": None,
+                        "commit_sha": chash,
+                        "title": entry.get("title") or "Mejora autónoma",
+                        "category": "Automejora",
+                        "impact": "Medio",
+                        "simple_description": entry.get("simple_description") or "",
+                        "technical_prompt": "",
+                        "status": "aplicada",
+                        "source": "autonomous_history",
+                        "retry_count": 0,
+                    }
+                )
         interval_hours = idea_engine.get_auto_interval_hours(db_path=db_path)
         return _scrub_value(
             {
-                "ideas": result["ideas"],
+                "ideas": ideas_list,
                 "counts": result["counts"],
                 "status": result["status"],
                 "auto_interval_hours": interval_hours,
@@ -2688,6 +2729,16 @@ class DashboardController:
             },
             self.secrets_to_redact,
         )
+
+    def drain_idea_queue(self) -> dict[str, Any]:
+        """Start sequential execution of all queued ideas in .liwi-staging without auto-ideation."""
+        db_path = self._resolve_idea_db_path()
+        mgr = self._get_staging_manager()
+        res = idea_engine.drain_queued_ideas(
+            staging_manager=mgr,
+            db_path=db_path,
+        )
+        return _scrub_value(res, self.secrets_to_redact)
 
     def dismiss_improvement_idea(self, idea_id: int) -> dict[str, Any]:
         """Mark an improvement idea as 'descartada'."""
@@ -6909,6 +6960,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       font-size: 0.78rem;
       color: var(--muted);
     }
+    .liwi-queue-drain-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding: 8px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
+    }
     .liwi-radar-grid.is-lane-list {
       grid-template-columns: 1fr;
       gap: 10px;
@@ -7920,6 +7982,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <button id="liwi-radar-filter-pending" class="liwi-radar-filter-btn active" type="button" role="tab" aria-selected="true" data-radar-filter="pending"><span>✨ Nuevas</span><span class="liwi-radar-filter-count" data-radar-filter-count="pending">0</span></button>
               <button id="liwi-radar-filter-in-progress" class="liwi-radar-filter-btn" type="button" role="tab" aria-selected="false" data-radar-filter="queued"><span>⏳ En cola</span><span class="liwi-radar-filter-count" data-radar-filter-count="queued">0</span></button>
               <button id="liwi-radar-filter-implemented" class="liwi-radar-filter-btn" type="button" role="tab" aria-selected="false" data-radar-filter="implemented"><span>✅ Implementadas</span><span class="liwi-radar-filter-count" data-radar-filter-count="implemented">0</span></button>
+            </div>
+            <div id="liwi-queue-drain-bar" class="liwi-queue-drain-bar" style="display:none">
+              <span class="muted" style="font-size:0.78rem;">Ejecuta todas las ideas en espera una por una en .liwi-staging</span>
+              <button id="liwi-drain-queue-btn" class="btn btn-primary btn-sm" type="button">▶️ Procesar toda la cola (0)</button>
             </div>
             <div id="liwi-radar-empty" class="liwi-radar-empty" style="display:none">Sin ideas pendientes por ahora. Pulsa «💡 Generar ideas» para descubrir mejoras.</div>
             <div id="liwi-radar-grid" class="liwi-radar-grid" aria-live="polite"></div>
@@ -14672,6 +14738,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const heroStepEl = document.getElementById('liwi-hero-active-step');
       const heroTimerEl = document.getElementById('liwi-hero-active-timer');
       const reconcileBtn = document.getElementById('liwi-queue-reconcile-btn');
+      const drainBarEl = document.getElementById('liwi-queue-drain-bar');
+      const drainBtn = document.getElementById('liwi-drain-queue-btn');
       if (!sectionEl || !gridEl) return;
 
       let currentIdeas = [];
@@ -14934,6 +15002,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         renderHeroActiveCard();
 
         gridEl.classList.toggle('is-lane-list', activeFilter === 'queued' || activeFilter === 'implemented');
+
+        if (drainBarEl) {
+          const showDrain = activeFilter === 'queued' && list.length > 0;
+          drainBarEl.style.display = showDrain ? 'flex' : 'none';
+          if (drainBtn && showDrain) {
+            drainBtn.textContent = '▶️ Procesar toda la cola (' + list.length + ')';
+          }
+        }
 
         if (!list.length) {
           expandedIdeaId = null;
@@ -15284,6 +15360,44 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             { error: true }
           );
         }
+      }
+
+      if (drainBtn) {
+        drainBtn.addEventListener('click', async () => {
+          if (drainBtn.disabled) return;
+          drainBtn.disabled = true;
+          const orig = drainBtn.textContent;
+          drainBtn.textContent = '⏳ Encolando lote...';
+          try {
+            const res = await apiFetch('/api/ideas/drain-queue', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: '{}',
+            });
+            if (res && res.paused_quota) {
+              setRadarLiveStatus(res.error || '⏳ Cuota en pausa; la cola se procesará al reanudarse.', { error: true });
+            } else {
+              window.__liwiStagingActive = true;
+              const snap = (res && (res.staging_status || res.staging)) || null;
+              if (snap && typeof window.applySelfImproveStagingSnapshot === 'function') {
+                window.applySelfImproveStagingSnapshot(snap);
+              }
+              const n = Number((res && res.enqueued_count) || 0);
+              setRadarLiveStatus(
+                n > 0
+                  ? ('▶️ Procesando toda la cola (' + n + ' ideas) en .liwi-staging...')
+                  : '✓ La cola ya está siendo procesada en .liwi-staging.',
+                { ok: true, autoHideMs: 4500 }
+              );
+            }
+            await loadIdeas();
+          } catch (err) {
+            setRadarLiveStatus('Error procesando cola: ' + (err && err.message ? err.message : ''), { error: true });
+          } finally {
+            drainBtn.disabled = false;
+            if (drainBtn.textContent === '⏳ Encolando lote...') drainBtn.textContent = orig;
+          }
+        });
       }
 
       if (reconcileBtn) {
@@ -16777,6 +16891,11 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/ideas/queue-reconcile":
             self._drain_body()
             self._send_controller_json(ctrl.reconcile_idea_queue_now)
+            return
+
+        if path == "/api/ideas/drain-queue":
+            self._drain_body()
+            self._send_controller_json(ctrl.drain_idea_queue)
             return
 
         if path == "/api/ideas/visual-audit":
