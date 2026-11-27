@@ -8,6 +8,7 @@ import math
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -158,8 +159,15 @@ _IDEA_SELECT_COLS = (
 _IDEA_JOIN_SELECT_SQL = (
     "SELECT i.id, i.created_at, i.title, i.category, i.impact, "
     "i.simple_description, i.technical_prompt, i.status, i.source, "
-    "e.started_at, e.last_heartbeat_at, e.current_step, "
-    "COALESCE(e.retry_count, 0) AS retry_count, e.failure_reason "
+    "i.queued_at, "
+    "COALESCE(NULLIF(i.started_at, ''), e.started_at) AS started_at, "
+    "i.completed_at, "
+    "i.duration_seconds, "
+    "COALESCE(NULLIF(i.last_heartbeat_at, ''), e.last_heartbeat_at) AS last_heartbeat_at, "
+    "COALESCE(NULLIF(i.current_step, ''), e.current_step, '') AS current_step, "
+    "MAX(COALESCE(i.retry_count, 0), COALESCE(e.retry_count, 0)) AS retry_count, "
+    "i.diagnostic_snapshot, "
+    "e.failure_reason "
     "FROM improvement_ideas AS i "
     "LEFT JOIN idea_execution_state AS e ON e.idea_id = i.id"
 )
@@ -254,6 +262,23 @@ def _ensure_idea_schema(conn: sqlite3.Connection) -> None:
         )
         conn.execute("DROP TABLE _improvement_ideas_legacy;")
     conn.execute(_CREATE_IDEA_EXECUTION_STATE_SQL)
+    existing_idea_cols = {
+        str(r["name"])
+        for r in conn.execute("PRAGMA table_info(improvement_ideas);").fetchall()
+    }
+    idea_col_migrations = (
+        ("queued_at", "TEXT"),
+        ("started_at", "TEXT"),
+        ("completed_at", "TEXT"),
+        ("duration_seconds", "REAL"),
+        ("current_step", "TEXT NOT NULL DEFAULT ''"),
+        ("last_heartbeat_at", "TEXT"),
+        ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("diagnostic_snapshot", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for col_name, col_def in idea_col_migrations:
+        if col_name not in existing_idea_cols:
+            conn.execute(f"ALTER TABLE improvement_ideas ADD COLUMN {col_name} {col_def};")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS idea_radar_settings (
@@ -740,10 +765,14 @@ def normalize_impact(raw_impact: Any) -> str:
 
 def _row_to_idea(row: sqlite3.Row) -> dict[str, Any]:
     keys = set(row.keys())
+    raw_queued = row["queued_at"] if "queued_at" in keys else None
     raw_started = row["started_at"] if "started_at" in keys else None
+    raw_completed = row["completed_at"] if "completed_at" in keys else None
+    raw_duration = row["duration_seconds"] if "duration_seconds" in keys else None
     raw_hb = row["last_heartbeat_at"] if "last_heartbeat_at" in keys else None
     raw_step = row["current_step"] if "current_step" in keys else ""
     raw_retry = row["retry_count"] if "retry_count" in keys else 0
+    raw_diag = row["diagnostic_snapshot"] if "diagnostic_snapshot" in keys else ""
     raw_failure = row["failure_reason"] if "failure_reason" in keys else None
     return {
         "id": int(row["id"]),
@@ -755,10 +784,14 @@ def _row_to_idea(row: sqlite3.Row) -> dict[str, Any]:
         "technical_prompt": str(row["technical_prompt"]),
         "status": str(row["status"]),
         "source": str(row["source"]),
+        "queued_at": str(raw_queued) if raw_queued else None,
         "started_at": str(raw_started) if raw_started else None,
+        "completed_at": str(raw_completed) if raw_completed else None,
+        "duration_seconds": float(raw_duration) if raw_duration is not None else None,
         "last_heartbeat_at": str(raw_hb) if raw_hb else None,
         "current_step": str(raw_step or ""),
         "retry_count": max(0, int(raw_retry or 0)),
+        "diagnostic_snapshot": str(raw_diag or ""),
         "failure_reason": str(raw_failure) if raw_failure else None,
     }
 
@@ -1138,9 +1171,11 @@ def implement_idea(
     conn: sqlite3.Connection | None = None
     try:
         conn = _open_connection(db_path)
+        now_iso = datetime.now(UTC).isoformat()
         conn.execute(
-            "UPDATE improvement_ideas SET status = 'encolada' WHERE id = ?;",
-            (idea["id"],),
+            "UPDATE improvement_ideas SET status = 'encolada', "
+            "queued_at = COALESCE(queued_at, ?) WHERE id = ?;",
+            (now_iso, idea["id"]),
         )
         conn.commit()
         row = conn.execute(
@@ -2408,8 +2443,10 @@ def start_idea_execution(
     try:
         conn = _open_connection(db_path)
         cur = conn.execute(
-            "UPDATE improvement_ideas SET status = 'implementando' WHERE id = ?;",
-            (valid_id,),
+            "UPDATE improvement_ideas "
+            "SET status = 'implementando', started_at = ?, last_heartbeat_at = ?, current_step = ? "
+            "WHERE id = ?;",
+            (now_iso, now_iso, clean_step, valid_id),
         )
         if cur.rowcount <= 0:
             raise KeyError(f"Idea {valid_id} no encontrada.")
@@ -2470,6 +2507,12 @@ def record_idea_heartbeat(
             raise KeyError(f"Idea {valid_id} no encontrada.")
         if clean_step is not None:
             conn.execute(
+                "UPDATE improvement_ideas "
+                "SET started_at = COALESCE(started_at, ?), last_heartbeat_at = ?, current_step = ? "
+                "WHERE id = ?;",
+                (now_iso, now_iso, clean_step, valid_id),
+            )
+            conn.execute(
                 """
                 INSERT INTO idea_execution_state (
                     idea_id, started_at, last_heartbeat_at, current_step,
@@ -2484,6 +2527,12 @@ def record_idea_heartbeat(
                 (valid_id, now_iso, now_iso, clean_step, now_iso),
             )
         else:
+            conn.execute(
+                "UPDATE improvement_ideas "
+                "SET started_at = COALESCE(started_at, ?), last_heartbeat_at = ? "
+                "WHERE id = ?;",
+                (now_iso, now_iso, valid_id),
+            )
             conn.execute(
                 """
                 INSERT INTO idea_execution_state (
@@ -2540,11 +2589,11 @@ def finish_idea_execution(
     conn: sqlite3.Connection | None = None
     try:
         conn = _open_connection(db_path)
-        cur = conn.execute(
-            "UPDATE improvement_ideas SET status = ? WHERE id = ?;",
-            (db_status, valid_id),
-        )
-        if cur.rowcount <= 0:
+        existing_row = conn.execute(
+            "SELECT queued_at, started_at FROM improvement_ideas WHERE id = ?;",
+            (valid_id,),
+        ).fetchone()
+        if existing_row is None:
             raise KeyError(f"Idea {valid_id} no encontrada.")
         existing_exec = conn.execute(
             "SELECT retry_count, started_at, last_heartbeat_at FROM idea_execution_state WHERE idea_id = ?;",
@@ -2553,10 +2602,36 @@ def finish_idea_execution(
         prev_retry = int(existing_exec["retry_count"]) if existing_exec is not None else 0
         next_retry = prev_retry + 1 if increment_retry else prev_retry
         next_started = None if clear_heartbeat else (
-            existing_exec["started_at"] if existing_exec is not None else None
+            existing_exec["started_at"] if existing_exec is not None else existing_row["started_at"]
         )
         next_hb = None if clear_heartbeat else (
             existing_exec["last_heartbeat_at"] if existing_exec is not None else now_iso
+        )
+        is_terminal = db_status in {"aplicada", "failed"}
+        completed_val: str | None = now_iso if is_terminal else None
+        duration_val: float | None = None
+        if is_terminal:
+            ref_start_dt = (
+                _parse_iso_datetime(
+                    (existing_exec["started_at"] if existing_exec is not None else None)
+                    or existing_row["started_at"]
+                    or existing_row["queued_at"]
+                )
+            )
+            if ref_start_dt is not None:
+                duration_val = round(max(0.0, (ref_now - ref_start_dt).total_seconds()), 2)
+        conn.execute(
+            """
+            UPDATE improvement_ideas
+            SET status = ?,
+                completed_at = COALESCE(?, completed_at),
+                duration_seconds = COALESCE(?, duration_seconds),
+                current_step = ?,
+                last_heartbeat_at = ?,
+                retry_count = ?
+            WHERE id = ?;
+            """,
+            (db_status, completed_val, duration_val, clean_step, next_hb, next_retry, valid_id),
         )
         conn.execute(
             """
@@ -2699,9 +2774,28 @@ def reconcile_idea_queue(
                     f"Superó el máximo de {max_retries} reintentos tras quedar sin progreso "
                     f"({cause_detail})."
                 )
+                ref_start_dt = (
+                    _parse_iso_datetime(item.get("started_at"))
+                    or _parse_iso_datetime(item.get("queued_at"))
+                )
+                dur_val = (
+                    round(max(0.0, (ref_now - ref_start_dt).total_seconds()), 2)
+                    if ref_start_dt is not None
+                    else None
+                )
                 conn.execute(
-                    "UPDATE improvement_ideas SET status = 'failed' WHERE id = ?;",
-                    (idea_id,),
+                    """
+                    UPDATE improvement_ideas
+                    SET status = 'failed',
+                        completed_at = COALESCE(completed_at, ?),
+                        duration_seconds = COALESCE(duration_seconds, ?),
+                        started_at = NULL,
+                        last_heartbeat_at = NULL,
+                        current_step = '',
+                        retry_count = ?
+                    WHERE id = ?;
+                    """,
+                    (now_iso, dur_val, next_retry, idea_id),
                 )
                 conn.execute(
                     """
@@ -2731,8 +2825,16 @@ def reconcile_idea_queue(
                 )
             else:
                 conn.execute(
-                    "UPDATE improvement_ideas SET status = 'encolada' WHERE id = ?;",
-                    (idea_id,),
+                    """
+                    UPDATE improvement_ideas
+                    SET status = 'encolada',
+                        started_at = NULL,
+                        last_heartbeat_at = NULL,
+                        current_step = '',
+                        retry_count = ?
+                    WHERE id = ?;
+                    """,
+                    (next_retry, idea_id),
                 )
                 conn.execute(
                     """
@@ -2821,6 +2923,251 @@ def reconcile_idea_queue(
     finally:
         if conn is not None:
             conn.close()
+
+
+def _collect_queue_diagnostic_snapshot(
+    *,
+    repo_root: Path | None = None,
+    db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Capture a black-box diagnostic snapshot of autonomous state, quota, threads, and .liwi-staging git."""
+    eff_root = Path(repo_root).resolve() if repo_root is not None else _default_repo_root()
+    staging_dir = eff_root / ".liwi-staging"
+    lock_paths = [
+        staging_dir / ".git" / "index.lock",
+        eff_root / ".git" / "worktrees" / ".liwi-staging" / "index.lock",
+        eff_root / ".git" / "worktrees" / "liwi-staging" / "index.lock",
+    ]
+    found_locks = [str(p) for p in lock_paths if p.exists()]
+
+    git_status = ""
+    git_log = ""
+    if staging_dir.is_dir():
+        try:
+            st_proc = subprocess.run(
+                ["git", "-C", str(staging_dir), "status", "--short"],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+            git_status = redact_secrets((st_proc.stdout or "").strip())[:1000]
+            log_proc = subprocess.run(
+                ["git", "-C", str(staging_dir), "log", "-n", "5", "--oneline"],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+            git_log = redact_secrets((log_proc.stdout or "").strip())[:1000]
+        except (OSError, subprocess.SubprocessError) as exc:
+            git_status = f"(error inspeccionando git: {exc})"
+
+    return {
+        "captured_at": datetime.now(UTC).isoformat(),
+        "autonomous_state": get_autonomous_state(db_path=db_path),
+        "quota_status": get_quota_status(db_path=db_path),
+        "active_threads": [t.name for t in threading.enumerate() if t.is_alive()],
+        "git_index_locks": found_locks,
+        "staging_git_status": git_status,
+        "staging_recent_commits": git_log,
+    }
+
+
+def _cleanup_orphan_staging_locks(repo_root: Path | None = None) -> list[str]:
+    eff_root = Path(repo_root).resolve() if repo_root is not None else _default_repo_root()
+    candidates = (
+        eff_root / ".liwi-staging" / ".git" / "index.lock",
+        eff_root / ".git" / "worktrees" / ".liwi-staging" / "index.lock",
+        eff_root / ".git" / "worktrees" / "liwi-staging" / "index.lock",
+    )
+    removed: list[str] = []
+    for lock_path in candidates:
+        if lock_path.is_file():
+            try:
+                lock_path.unlink()
+                removed.append(str(lock_path))
+            except OSError:
+                pass
+    return removed
+
+
+def reconcile_and_investigate_queue(
+    stale_exec_seconds: int = 300,
+    stale_wait_seconds: int = 900,
+    *,
+    db_path: Path | str | None = None,
+    repo_root: Path | str | None = None,
+    worker_alive: bool | Callable[[], bool] | None = None,
+    quota_paused: bool | Callable[[], bool] | None = None,
+    staging_manager: Any | None = None,
+    now: datetime | Callable[[], datetime] | None = None,
+) -> dict[str, Any]:
+    """Detect stalled implementing/queued ideas, capture black-box snapshot, log triage ticket, and recover."""
+    ref_now = _normalize_utc_now(now)
+    now_iso = ref_now.isoformat()
+    eff_root = Path(repo_root).resolve() if repo_root is not None else _default_repo_root()
+
+    base_report = reconcile_idea_queue(
+        stale_seconds=stale_exec_seconds,
+        db_path=db_path,
+        worker_alive=worker_alive,
+        quota_paused=quota_paused,
+        now=ref_now,
+        max_retries=2,
+    )
+    reconciled_actions = list(base_report["reconciled"]["actions"])
+    requeued_ids = list(base_report["reconciled"]["requeued_ids"])
+    failed_ids = list(base_report["reconciled"]["failed_ids"])
+
+    # Check if Automejora is ON (without quota_pause), worker is inactive, and first queued idea waited > stale_wait_seconds
+    stale_wait_ids: list[int] = []
+    auto_st = get_autonomous_state(db_path=db_path)
+    if (
+        auto_st.get("autonomous_enabled")
+        and not base_report["quota_paused"]
+        and not base_report["worker_alive"]
+    ):
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = _open_connection(db_path)
+            first_queued = conn.execute(
+                f"{_IDEA_JOIN_SELECT_SQL} WHERE i.status = 'encolada' "
+                "ORDER BY COALESCE(i.queued_at, i.created_at) ASC, i.id ASC LIMIT 1;"
+            ).fetchone()
+            if first_queued is not None:
+                q_item = _row_to_idea(first_queued)
+                wait_ref = _parse_iso_datetime(q_item["queued_at"]) or _parse_iso_datetime(q_item["created_at"])
+                if wait_ref is not None and (ref_now - wait_ref).total_seconds() > float(stale_wait_seconds):
+                    qid = int(q_item["id"])
+                    next_retry = int(q_item["retry_count"] or 0) + 1
+                    stale_wait_ids.append(qid)
+                    if next_retry > 2:
+                        fail_msg = (
+                            f"Superó 2 reintentos tras permanecer más de {int(stale_wait_seconds)}s "
+                            "en cola sin avance del worker."
+                        )
+                        finish_idea_execution(
+                            qid,
+                            status="failed",
+                            failure_reason=fail_msg,
+                            increment_retry=True,
+                            clear_heartbeat=True,
+                            db_path=db_path,
+                            now=ref_now,
+                        )
+                        failed_ids.append(qid)
+                        reconciled_actions.append(
+                            {
+                                "idea_id": qid,
+                                "title": q_item["title"],
+                                "action": "failed",
+                                "reason": fail_msg,
+                                "retry_count": next_retry,
+                            }
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE improvement_ideas SET queued_at = ?, retry_count = ? WHERE id = ?;",
+                            (now_iso, next_retry, qid),
+                        )
+                        conn.execute(
+                            """
+                            INSERT INTO idea_execution_state (
+                                idea_id, started_at, last_heartbeat_at, current_step,
+                                retry_count, failure_reason, updated_at
+                            ) VALUES (?, NULL, NULL, '', ?, NULL, ?)
+                            ON CONFLICT(idea_id) DO UPDATE SET
+                                retry_count = excluded.retry_count,
+                                updated_at = excluded.updated_at;
+                            """,
+                            (qid, next_retry, now_iso),
+                        )
+                        conn.commit()
+                        requeued_ids.append(qid)
+                        reconciled_actions.append(
+                            {
+                                "idea_id": qid,
+                                "title": q_item["title"],
+                                "action": "requeued_stale_wait",
+                                "reason": f"espera > {int(stale_wait_seconds)}s en cola",
+                                "retry_count": next_retry,
+                            }
+                        )
+        finally:
+            if conn is not None:
+                conn.close()
+
+    stall_detected = bool(reconciled_actions)
+    diagnostic_snapshot: dict[str, Any] | None = None
+    ticket: dict[str, Any] | None = None
+    locks_removed: list[str] = []
+
+    if stall_detected:
+        diagnostic_snapshot = _collect_queue_diagnostic_snapshot(
+            repo_root=eff_root,
+            db_path=db_path,
+        )
+        locks_removed = _cleanup_orphan_staging_locks(eff_root)
+        diagnostic_snapshot["locks_removed"] = locks_removed
+        snap_json = redact_secrets(json.dumps(diagnostic_snapshot, ensure_ascii=False, default=str))[:4000]
+
+        affected_ids = sorted({int(a["idea_id"]) for a in reconciled_actions if "idea_id" in a})
+        if affected_ids:
+            conn_u: sqlite3.Connection | None = None
+            try:
+                conn_u = _open_connection(db_path)
+                for aid in affected_ids:
+                    conn_u.execute(
+                        "UPDATE improvement_ideas SET diagnostic_snapshot = ? WHERE id = ?;",
+                        (snap_json, aid),
+                    )
+                conn_u.commit()
+            finally:
+                if conn_u is not None:
+                    conn_u.close()
+
+        summary_lines = [
+            f"- Idea #{a['idea_id']} ({a['title']}): {a['action']} ({a['reason']})"
+            for a in reconciled_actions
+        ]
+        err_text = (
+            "Atasco detectado en la cola de auto-mejoras (.liwi-staging):\n"
+            + "\n".join(summary_lines)
+            + f"\nLocks limpiados: {locks_removed or 'ninguno'}"
+        )
+        try:
+            from agent_factory.error_triage import build_actionable_fix_ticket
+
+            ticket = build_actionable_fix_ticket(
+                "queue_watchdog",
+                err_text,
+                context=diagnostic_snapshot,
+                db_path=db_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("queue_watchdog ticket creation skipped: %s", exc)
+
+        if staging_manager is not None and requeued_ids:
+            try:
+                if hasattr(staging_manager, "wake_worker"):
+                    staging_manager.wake_worker()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("staging_manager wake skipped: %s", exc)
+
+    return {
+        "ok": True,
+        "investigated": stall_detected,
+        "stall_detected": stall_detected,
+        "diagnostic_snapshot": diagnostic_snapshot,
+        "locks_removed": locks_removed,
+        "ticket": ticket,
+        "stale_wait_ids": stale_wait_ids,
+        "requeued_ids": requeued_ids,
+        "failed_ids": failed_ids,
+        "actions": reconciled_actions,
+        **base_report,
+    }
 
 
 def _interpret_action_result(result: Any, default_error: str) -> tuple[bool, str]:
@@ -3504,22 +3851,17 @@ class AutonomousEngine:
                 commit_hash = res.stdout.strip()
         return {"ok": bool(commit_hash), "promoted": True, "commit_hash": commit_hash}
 
-    def _mark_work_item_applied(self, work_item: dict[str, Any]) -> None:
+    def _mark_work_item_applied(self, work_item: dict[str, Any], *, commit_hash: str | None = None) -> None:
         if work_item.get("source") == "idea_engine":
             idea_id = _validate_idea_id(work_item.get("idea_id"))
             if idea_id is not None:
-                conn: sqlite3.Connection | None = None
-                try:
-                    conn = _open_connection(self.db_path)
-                    conn.execute(
-                        "UPDATE improvement_ideas SET status = 'encolada' "
-                        "WHERE id = ? AND status = 'nueva';",
-                        (idea_id,),
-                    )
-                    conn.commit()
-                finally:
-                    if conn is not None:
-                        conn.close()
+                finish_idea_execution(
+                    idea_id,
+                    status="implemented",
+                    current_step="Integrando",
+                    commit_sha=commit_hash,
+                    db_path=self.db_path,
+                )
         elif work_item.get("source") == "error_triage":
             triage_id = _validate_idea_id(work_item.get("triage_id"))
             if triage_id is not None:
@@ -3647,6 +3989,17 @@ class AutonomousEngine:
                 )
 
             # Build and verify inside isolated .liwi-staging worktree
+            cycle_idea_id = (
+                _validate_idea_id(work_item.get("idea_id"))
+                if work_item.get("source") == "idea_engine"
+                else None
+            )
+            if cycle_idea_id is not None:
+                start_idea_execution(
+                    cycle_idea_id,
+                    current_step="Analizando",
+                    db_path=self.db_path,
+                )
             with self._lock:
                 self._building_task_title = work_item["title"]
             try:
@@ -3668,6 +4021,13 @@ class AutonomousEngine:
 
             if not exec_ok:
                 if is_quota_429_error(exec_err):
+                    if cycle_idea_id is not None:
+                        finish_idea_execution(
+                            cycle_idea_id,
+                            status="queued",
+                            current_step="",
+                            db_path=self.db_path,
+                        )
                     err_info = format_agent_error(exec_err)
                     current_quota = get_quota_status(db_path=self.db_path)
                     if not current_quota["is_paused"]:
@@ -3687,6 +4047,14 @@ class AutonomousEngine:
                             "work_item": work_item,
                         }
                     )
+                if cycle_idea_id is not None:
+                    finish_idea_execution(
+                        cycle_idea_id,
+                        status="failed",
+                        current_step="",
+                        failure_reason=exec_err,
+                        db_path=self.db_path,
+                    )
                 err_info = format_agent_error(exec_err)
                 with self._lock:
                     self._last_error_details = err_info
@@ -3695,6 +4063,13 @@ class AutonomousEngine:
             # Brake 2: immediate shutoff during build parks result in .liwi-staging without promoting
             mid_state = get_autonomous_state(db_path=self.db_path)
             if not mid_state["autonomous_enabled"] or self._stop_event.is_set():
+                if cycle_idea_id is not None:
+                    finish_idea_execution(
+                        cycle_idea_id,
+                        status="queued",
+                        current_step="",
+                        db_path=self.db_path,
+                    )
                 return self._set_last_cycle_result(
                     {
                         "status": "parked_in_staging",
@@ -3730,7 +4105,7 @@ class AutonomousEngine:
                 db_path=self.db_path,
             )
             set_autonomous_config(consecutive_failures=0, db_path=self.db_path)
-            self._mark_work_item_applied(work_item)
+            self._mark_work_item_applied(work_item, commit_hash=commit_hash)
             with self._lock:
                 self._last_error_details = None
 
@@ -3746,9 +4121,22 @@ class AutonomousEngine:
             )
 
     def _worker_loop(self) -> None:
+        last_watchdog_mono = 0.0
         while not self._stop_event.is_set():
             with self._lock:
                 seen_gen = self._config_generation
+
+            now_mono = time.monotonic()
+            if now_mono - last_watchdog_mono >= 30.0:
+                last_watchdog_mono = now_mono
+                try:
+                    reconcile_and_investigate_queue(
+                        db_path=self.db_path,
+                        repo_root=self.repo_root,
+                        staging_manager=self._staging_manager,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Autonomous queue watchdog error: %s", redact_secrets(str(exc)))
 
             state = get_autonomous_state(db_path=self.db_path)
             if not state["autonomous_enabled"]:
@@ -3758,7 +4146,7 @@ class AutonomousEngine:
                     if self._config_generation != seen_gen:
                         continue
                     self._wakeup_event.clear()
-                self._wakeup_event.wait(timeout=self._idle_poll_seconds)
+                self._wakeup_event.wait(timeout=min(self._idle_poll_seconds, 30.0))
                 continue
 
             try:
@@ -3777,13 +4165,29 @@ class AutonomousEngine:
                 0.001,
                 float(post_state["cooldown_minutes"]) * self._cooldown_unit_seconds,
             )
-            with self._lock:
-                if self._stop_event.is_set():
+            deadline_mono = time.monotonic() + wait_seconds
+            while not self._stop_event.is_set():
+                remaining = deadline_mono - time.monotonic()
+                if remaining <= 0:
                     break
-                if self._config_generation != seen_gen:
-                    continue
-                self._wakeup_event.clear()
-            self._wakeup_event.wait(timeout=wait_seconds)
+                with self._lock:
+                    if self._config_generation != seen_gen:
+                        break
+                    self._wakeup_event.clear()
+                self._wakeup_event.wait(timeout=min(remaining, 30.0))
+                if time.monotonic() - last_watchdog_mono >= 30.0 and not self._stop_event.is_set():
+                    last_watchdog_mono = time.monotonic()
+                    try:
+                        reconcile_and_investigate_queue(
+                            db_path=self.db_path,
+                            repo_root=self.repo_root,
+                            staging_manager=self._staging_manager,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("Autonomous queue watchdog error: %s", redact_secrets(str(exc)))
+                with self._lock:
+                    if self._config_generation != seen_gen:
+                        break
 
     def start(self) -> AutonomousEngine:
         """Start the 24/7 autonomous daemon thread idempotently."""

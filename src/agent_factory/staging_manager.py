@@ -994,12 +994,15 @@ class StagingManager:
                 improver_kwargs[key] = meta[key]
 
         improver = FactorySelfImprover(**improver_kwargs)
+        raw_idea_id = meta.get("idea_id")
+        idea_id = int(raw_idea_id) if isinstance(raw_idea_id, int) and raw_idea_id > 0 else None
         result = improver.apply_proposal(
             str(task["prompt"]),
             proposal_title=str(task["title"]),
             message_id=str(meta["message_id"]) if meta.get("message_id") else None,
             github_token="",
             preserve_on_quota_429=True,
+            idea_id=idea_id,
         )
         if not result.get("ok"):
             if result.get("quota_429") or is_quota_429_error(

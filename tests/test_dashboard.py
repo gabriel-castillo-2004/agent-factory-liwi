@@ -7501,7 +7501,7 @@ def test_dashboard_renders_radar_de_auto_mejoras_ui(tmp_path: Path) -> None:
         assert "/implement" in script_js
         assert "/dismiss" in script_js
         assert "simple_description" in script_js
-        assert "✨ Implementar" in script_js
+        assert "+ Encolar" in script_js
         assert "Descartar" in script_js
         assert "stopPropagation()" in script_js
         assert "setInterval(" in script_js
@@ -8929,13 +8929,12 @@ def test_dashboard_radar_filters_run_now_and_exclusive_accordion_ui(tmp_path: Pa
         radar_end = html.index("</section>", radar_start) + len("</section>")
         radar_html = html[radar_start:radar_end]
 
-        # 4 filter buttons with counters inside #liwi-radar-section, with 'pending' selected by default
+        # 3-lane filter buttons with counters inside #liwi-radar-section, with 'pending' selected by default
         assert 'id="liwi-radar-filters"' in radar_html
         for filter_key, label in (
-            ("pending", "⏳ Sin implementar"),
-            ("in_progress", "⚙️ En cola / En curso"),
+            ("pending", "✨ Nuevas"),
+            ("queued", "⏳ En cola"),
             ("implemented", "✅ Implementadas"),
-            ("dismissed", "🚫 Descartadas"),
         ):
             assert f'data-radar-filter="{filter_key}"' in radar_html
             assert label in radar_html
@@ -8946,7 +8945,7 @@ def test_dashboard_radar_filters_run_now_and_exclusive_accordion_ui(tmp_path: Pa
         assert "active" in pending_btn_tag
         assert 'aria-selected="true"' in pending_btn_tag
 
-        for other_key in ("in_progress", "implemented", "dismissed"):
+        for other_key in ("queued", "implemented"):
             other_start = radar_html.index(f'data-radar-filter="{other_key}"')
             other_tag = radar_html[radar_html.rfind("<button", 0, other_start) : radar_html.index(">", other_start) + 1]
             assert 'aria-selected="false"' in other_tag
@@ -8970,26 +8969,23 @@ def test_dashboard_radar_filters_run_now_and_exclusive_accordion_ui(tmp_path: Pa
         radar_js_end = script_js.index("(function initAutonomousAndProjectIdeas()", radar_js_start)
         radar_js = script_js[radar_js_start:radar_js_end]
 
-        # 1) 4-filter state (pending default), backend counts sync (queued + implementing), active filter preserved
+        # 1) 3-lane filter state (pending default), backend counts sync, active filter preserved
         assert "let activeFilter = 'pending';" in radar_js
         assert "counts.queued" in radar_js
-        assert "counts.implementing" in radar_js
         assert "counts.pending" in radar_js
         assert "counts.implemented" in radar_js
-        assert "counts.dismissed" in radar_js
+        assert "counts.failed" in radar_js
         assert "/api/ideas?status=" in radar_js
 
-        # 2) Queued cards replace disabled '✓ Encolada en staging' button with '▶️ Ejecutar ahora' (/run-now) + 'Descartar'
+        # 2) Queued cards expose '▶️ Ejecutar ya' (/run-now) + 'Quitar' (/remove)
         assert "✓ Encolada en staging" not in radar_js
-        assert "▶️ Ejecutar ahora" in radar_js
+        assert "▶️ Ejecutar ya" in radar_js
         assert "data-radar-run-now" in radar_js
         assert "/run-now" in radar_js
-        assert "data-run-clock" in radar_js
+        assert "data-radar-remove" in radar_js
+        assert "/remove" in radar_js
         assert "actionInFlightIds" in radar_js
-        assert "aria-busy" in radar_js
-        assert "btn-spinner" in radar_js
-        assert "clearInterval(runTimer)" in radar_js
-        assert "Error al ejecutar ahora:" in radar_js
+        assert "Error al ejecutar:" in radar_js
 
         # 3) Exclusive accordion inside #liwi-radar-section (single expanded card at a time)
         assert "expandedIdeaIds" not in radar_js
@@ -9167,5 +9163,74 @@ def test_dashboard_radar_ideas_run_now_endpoint_and_status_counts(
         if thread.is_alive():
             thread.join(timeout=2.0)
         store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_centro_automejora_three_lanes_and_queue_endpoints(tmp_path: Path) -> None:
+    from agent_factory import idea_engine
+    from agent_factory.dashboard import DASHBOARD_HTML, start_dashboard_server
+    from agent_factory.orchestrator import Orchestrator
+
+    # 1. 3-lane Centro de Auto-Mejora UI markers & applyTechMode polling isolation
+    for marker in (
+        "Centro de Auto-Mejora",
+        'id="liwi-hero-active-card"',
+        'id="liwi-queue-reconcile-btn"',
+        'id="liwi-pilot-state-pill"',
+        "✨ Nuevas",
+        "⏳ En cola",
+        "✅ Implementadas",
+    ):
+        assert marker in DASHBOARD_HTML
+    tech_fn_start = DASHBOARD_HTML.index("function applyTechMode(")
+    tech_fn_block = DASHBOARD_HTML[tech_fn_start : tech_fn_start + 900]
+    assert "setInterval" not in tech_fn_block
+    assert "clearInterval" not in tech_fn_block
+
+    # 2. /api/ideas/<id>/remove and /api/ideas/queue-reconcile endpoints
+    store = SqliteEventStore(str(tmp_path / "factory.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    telemetry_db = tmp_path / "telemetry.db"
+    created = idea_engine.save_ideas(
+        [
+            {
+                "title": "Mejora de cola",
+                "category": "UX",
+                "impact": "Medio",
+                "simple_description": "Prueba de quitar de cola y reconciliar.",
+                "technical_prompt": "Ajuste menor",
+                "source": "manual",
+            }
+        ],
+        db_path=telemetry_db,
+    )
+    idea_id = int(created[0]["id"])
+    idea_engine.update_idea_status(idea_id, "encolada", db_path=telemetry_db)
+
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+    )
+    server.controller._resolve_idea_db_path = lambda: telemetry_db  # type: ignore[method-assign]
+    try:
+        rm_code, rm_data = _http_json(f"{base_url}/api/ideas/{idea_id}/remove", method="POST")
+        assert rm_code == 200
+        assert rm_data["ok"] is True
+        assert rm_data["idea"]["status"] == "nueva"
+        assert rm_data["idea"]["queued_at"] is None
+
+        rec_code, rec_data = _http_json(f"{base_url}/api/ideas/queue-reconcile", method="POST")
+        assert rec_code == 200
+        assert rec_data["ok"] is True
+        assert "report" in rec_data
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
 
 

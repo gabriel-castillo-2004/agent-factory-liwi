@@ -1920,6 +1920,19 @@ class FactorySelfImprover:
                 raw_failure = self._redact(failure_reason)
                 if preserve_on_quota_429 and is_quota_429_error(raw_failure):
                     outcome = "paused_quota"
+                    if idea_id is not None:
+                        try:
+                            from agent_factory.idea_engine import finish_idea_execution
+
+                            finish_idea_execution(
+                                idea_id,
+                                status="queued",
+                                current_step="",
+                                db_path=telemetry_db,
+                                now=self.clock.now(),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logging.getLogger(__name__).debug("finish_idea_execution (429) skipped: %s", exc)
                     err_info = format_agent_error(raw_failure)
                     duration_ms = max(0.0, (self.clock.now() - started_at).total_seconds() * 1000.0)
                     record_safe_event(
@@ -1953,6 +1966,20 @@ class FactorySelfImprover:
                 outcome = "rolled_back"
                 self._rollback_savepoint(clean_env)
                 redacted_failure = raw_failure
+                if idea_id is not None:
+                    try:
+                        from agent_factory.idea_engine import finish_idea_execution
+
+                        finish_idea_execution(
+                            idea_id,
+                            status="failed",
+                            current_step="",
+                            failure_reason=redacted_failure,
+                            db_path=telemetry_db,
+                            now=self.clock.now(),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logging.getLogger(__name__).debug("finish_idea_execution (rolled_back) skipped: %s", exc)
                 duration_ms = max(0.0, (self.clock.now() - started_at).total_seconds() * 1000.0)
                 record_safe_incident(
                     stage="apply_proposal",
@@ -2077,6 +2104,20 @@ class FactorySelfImprover:
                 status="applied",
             )
             outcome = "applied"
+            if idea_id is not None:
+                try:
+                    from agent_factory.idea_engine import finish_idea_execution
+
+                    finish_idea_execution(
+                        idea_id,
+                        status="implemented",
+                        current_step="Integrando",
+                        commit_sha=commit_sha,
+                        db_path=telemetry_db,
+                        now=self.clock.now(),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logging.getLogger(__name__).debug("finish_idea_execution (applied) skipped: %s", exc)
             duration_ms = max(0.0, (self.clock.now() - started_at).total_seconds() * 1000.0)
             record_safe_event(
                 component="self_improver",
@@ -2100,6 +2141,20 @@ class FactorySelfImprover:
         except Exception as exc:
             duration_ms = max(0.0, (self.clock.now() - started_at).total_seconds() * 1000.0)
             redacted_err = self._redact(str(exc) or type(exc).__name__)
+            if idea_id is not None:
+                try:
+                    from agent_factory.idea_engine import finish_idea_execution
+
+                    finish_idea_execution(
+                        idea_id,
+                        status="failed",
+                        current_step="",
+                        failure_reason=redacted_err,
+                        db_path=telemetry_db,
+                        now=self.clock.now(),
+                    )
+                except Exception as fin_exc:  # noqa: BLE001
+                    logging.getLogger(__name__).debug("finish_idea_execution (error) skipped: %s", fin_exc)
             record_safe_incident(
                 stage="apply_proposal",
                 raw_error=redacted_err,

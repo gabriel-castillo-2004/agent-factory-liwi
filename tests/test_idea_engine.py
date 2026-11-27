@@ -118,6 +118,14 @@ def test_init_idea_db_creates_schema_and_check_constraints_idempotently(tmp_path
             "technical_prompt",
             "status",
             "source",
+            "queued_at",
+            "started_at",
+            "completed_at",
+            "duration_seconds",
+            "current_step",
+            "last_heartbeat_at",
+            "retry_count",
+            "diagnostic_snapshot",
         ]
 
         settings_cols = [
@@ -2123,6 +2131,88 @@ def test_self_improver_apply_proposal_updates_idea_heartbeat_and_current_step(
     assert observed_steps[0][1] is not None
     assert observed_steps[1][1] is not None and observed_steps[1][1] > observed_steps[0][1]
     assert observed_steps[2][1] is not None and observed_steps[2][1] > observed_steps[1][1]
+
+
+def test_blackbox_columns_and_reconcile_and_investigate_queue(tmp_path: Path) -> None:
+    import sqlite3
+    from datetime import UTC, datetime, timedelta
+
+    db_path = tmp_path / "telemetry.db"
+    t0 = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
+    created = idea_engine.save_ideas(
+        [
+            {
+                "title": "Watchdog Test Idea",
+                "category": "Estabilidad",
+                "impact": "Alto",
+                "simple_description": "Verifica recuperación de atascos en cola.",
+                "technical_prompt": "Corrige el bloqueo de cola.",
+                "source": "manual",
+            }
+        ],
+        db_path=db_path,
+    )
+    idea_id = int(created[0]["id"])
+
+    conn = sqlite3.connect(db_path)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(improvement_ideas);").fetchall()}
+    conn.close()
+    for expected_col in (
+        "queued_at",
+        "started_at",
+        "completed_at",
+        "duration_seconds",
+        "current_step",
+        "last_heartbeat_at",
+        "retry_count",
+        "diagnostic_snapshot",
+    ):
+        assert expected_col in cols
+
+    # Simulate stale implementing idea (> 300s without heartbeat)
+    idea_engine.start_idea_execution(idea_id, current_step="Editando", db_path=db_path, now=t0)
+    report1 = idea_engine.reconcile_and_investigate_queue(
+        stale_exec_seconds=300,
+        stale_wait_seconds=900,
+        db_path=db_path,
+        repo_root=tmp_path,
+        now=t0 + timedelta(seconds=400),
+    )
+    assert report1["investigated"] is True
+    assert len(report1["actions"]) >= 1
+    after1 = idea_engine.get_idea(idea_id, db_path=db_path)
+    assert after1 is not None
+    assert after1["status"] == "encolada"
+    assert after1["retry_count"] == 1
+    assert after1["diagnostic_snapshot"] != ""
+
+    # Repeat stale failures until retry_count > 2 -> failed
+    idea_engine.start_idea_execution(
+        idea_id, current_step="Probando", db_path=db_path, now=t0 + timedelta(seconds=500)
+    )
+    idea_engine.reconcile_and_investigate_queue(
+        stale_exec_seconds=300,
+        stale_wait_seconds=900,
+        db_path=db_path,
+        repo_root=tmp_path,
+        now=t0 + timedelta(seconds=900),
+    )
+    idea_engine.start_idea_execution(
+        idea_id, current_step="Integrando", db_path=db_path, now=t0 + timedelta(seconds=1000)
+    )
+    idea_engine.reconcile_and_investigate_queue(
+        stale_exec_seconds=300,
+        stale_wait_seconds=900,
+        db_path=db_path,
+        repo_root=tmp_path,
+        now=t0 + timedelta(seconds=1400),
+    )
+    after3 = idea_engine.get_idea(idea_id, db_path=db_path)
+    assert after3 is not None
+    assert after3["status"] == "failed"
+    assert after3["completed_at"] is not None
+    assert "reintent" in str(after3["failure_reason"]).lower() or "atasc" in str(after3["failure_reason"]).lower()
+
 
 
 
