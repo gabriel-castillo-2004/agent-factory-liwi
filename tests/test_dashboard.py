@@ -8884,3 +8884,288 @@ def test_dashboard_ideas_and_project_ideas_status_filters_and_counts(
             thread.join(timeout=2.0)
         store.close()
 
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_radar_filters_run_now_and_exclusive_accordion_ui(tmp_path: Path) -> None:
+    """Radar exposes 4 status filters with counters (pending default), replaces queued disabled button with run-now + dismiss, enforces exclusive accordion, preserves all IDs, and uses zero external CDNs."""
+    store = SqliteEventStore(str(tmp_path / "radar_step1_ui.db"))
+    orch = Orchestrator(store=store, llm=FakeLLM())
+    server, thread, base_url = start_dashboard_server(orchestrator=orch, port=0)
+    try:
+        with urllib.request.urlopen(f"{base_url}/", timeout=5.0) as resp:
+            assert resp.status == 200
+            html = resp.read().decode("utf-8")
+
+        # Zero external CDNs
+        assert "cdn." not in html.lower()
+        assert "https://" not in html.lower()
+
+        # Existing HTML IDs preserved intact (including #liwi-radar-section and untouched #tab-ideas / #tab-ideas-btn)
+        for preserved_id in (
+            "liwi-radar-section",
+            "liwi-radar-title",
+            "liwi-radar-frequency",
+            "liwi-radar-generate-btn",
+            "liwi-radar-live-status",
+            "liwi-radar-spinner",
+            "liwi-radar-status-text",
+            "liwi-radar-clock",
+            "liwi-radar-grid",
+            "liwi-radar-empty",
+            "liwi-subtab-ideas-btn",
+            "liwi-subtab-history-btn",
+            "liwi-pilot-settings-btn",
+            "liwi-pilot-settings-panel",
+            "liwi-autonomous-history-panel",
+            "liwi-visual-audit-btn",
+            "tab-ideas",
+            "tab-ideas-btn",
+        ):
+            assert f'id="{preserved_id}"' in html, f"Missing preserved ID: {preserved_id}"
+
+        # Extract #liwi-radar-section HTML
+        radar_start = html.index('<section id="liwi-radar-section"')
+        radar_end = html.index("</section>", radar_start) + len("</section>")
+        radar_html = html[radar_start:radar_end]
+
+        # 4 filter buttons with counters inside #liwi-radar-section, with 'pending' selected by default
+        assert 'id="liwi-radar-filters"' in radar_html
+        for filter_key, label in (
+            ("pending", "⏳ Sin implementar"),
+            ("in_progress", "⚙️ En cola / En curso"),
+            ("implemented", "✅ Implementadas"),
+            ("dismissed", "🚫 Descartadas"),
+        ):
+            assert f'data-radar-filter="{filter_key}"' in radar_html
+            assert label in radar_html
+            assert f'data-radar-filter-count="{filter_key}"' in radar_html
+
+        pending_btn_start = radar_html.index('data-radar-filter="pending"')
+        pending_btn_tag = radar_html[radar_html.rfind("<button", 0, pending_btn_start) : radar_html.index(">", pending_btn_start) + 1]
+        assert "active" in pending_btn_tag
+        assert 'aria-selected="true"' in pending_btn_tag
+
+        for other_key in ("in_progress", "implemented", "dismissed"):
+            other_start = radar_html.index(f'data-radar-filter="{other_key}"')
+            other_tag = radar_html[radar_html.rfind("<button", 0, other_start) : radar_html.index(">", other_start) + 1]
+            assert 'aria-selected="false"' in other_tag
+
+        # Responsive CSS rules: mobile adjustments strictly inside @media (max-width: 768px)
+        style_start = html.index("<style>") + len("<style>")
+        style_end = html.index("</style>", style_start)
+        css = html[style_start:style_end]
+        media_768 = _extract_css_block(css, "@media (max-width: 768px)")
+        assert ".liwi-radar-filters" in css
+        assert ".liwi-radar-filter-btn" in css
+        assert ".liwi-radar-filters" in media_768
+        assert ".liwi-radar-filter-btn" in media_768
+        desktop_css = css.replace(media_768, "")
+        desktop_grid = _extract_css_block(desktop_css, ".liwi-radar-grid {")
+        assert "repeat(2, minmax(0, 1fr))" in desktop_grid
+
+        # Inspect initLiwiIdeaRadar JS logic
+        script_js = html[html.index("<script>") :]
+        radar_js_start = script_js.index("(function initLiwiIdeaRadar()")
+        radar_js_end = script_js.index("(function initAutonomousAndProjectIdeas()", radar_js_start)
+        radar_js = script_js[radar_js_start:radar_js_end]
+
+        # 1) 4-filter state (pending default), backend counts sync (queued + implementing), active filter preserved
+        assert "let activeFilter = 'pending';" in radar_js
+        assert "counts.queued" in radar_js
+        assert "counts.implementing" in radar_js
+        assert "counts.pending" in radar_js
+        assert "counts.implemented" in radar_js
+        assert "counts.dismissed" in radar_js
+        assert "/api/ideas?status=" in radar_js
+
+        # 2) Queued cards replace disabled '✓ Encolada en staging' button with '▶️ Ejecutar ahora' (/run-now) + 'Descartar'
+        assert "✓ Encolada en staging" not in radar_js
+        assert "▶️ Ejecutar ahora" in radar_js
+        assert "data-radar-run-now" in radar_js
+        assert "/run-now" in radar_js
+        assert "data-run-clock" in radar_js
+        assert "actionInFlightIds" in radar_js
+        assert "aria-busy" in radar_js
+        assert "btn-spinner" in radar_js
+        assert "clearInterval(runTimer)" in radar_js
+        assert "Error al ejecutar ahora:" in radar_js
+
+        # 3) Exclusive accordion inside #liwi-radar-section (single expanded card at a time)
+        assert "expandedIdeaIds" not in radar_js
+        assert "let expandedIdeaId = null;" in radar_js
+        assert "gridEl.querySelectorAll('.liwi-radar-card').forEach((otherEl)" in radar_js
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_radar_ideas_run_now_endpoint_and_status_counts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /api/ideas/<id>/run-now enqueues queued idea immediately, updates status to implementando and counts, and guards invalid/conflicting states."""
+    from agent_factory import idea_engine
+
+    telemetry_db = tmp_path / "telemetry_run_now.db"
+    monkeypatch.setenv("AGENT_FACTORY_TELEMETRY_DB", str(telemetry_db))
+
+    store = SqliteEventStore(db_path=tmp_path / "dash_run_now.db")
+    orch = Orchestrator(store=store, llm=FakeLLM())
+
+    enqueued_calls: list[dict[str, Any]] = []
+
+    class _StubStagingManager:
+        def enqueue_improvement(
+            self,
+            *,
+            title: str,
+            prompt: str,
+            metadata: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            enqueued_calls.append({"title": title, "prompt": prompt, "metadata": metadata or {}})
+            return {
+                "pending_count": 0,
+                "commits": [],
+                "is_building": True,
+                "queue_size": len(enqueued_calls),
+                "last_error": None,
+                "current_task": title,
+                "initialized": True,
+            }
+
+        def get_staging_status(self) -> dict[str, Any]:
+            return {
+                "pending_count": 0,
+                "commits": [],
+                "is_building": bool(enqueued_calls),
+                "queue_size": len(enqueued_calls),
+                "last_error": None,
+                "current_task": enqueued_calls[-1]["title"] if enqueued_calls else None,
+                "initialized": True,
+            }
+
+        def shutdown(self, timeout: float = 5.0) -> None:
+            _ = timeout
+
+    saved = idea_engine.save_ideas(
+        [
+            {
+                "title": "💡 Pending Idea",
+                "category": "UX",
+                "impact": "Alto",
+                "simple_description": "Pending",
+                "technical_prompt": "Prompt pending",
+            },
+            {
+                "title": "📥 Queued Idea One",
+                "category": "Rendimiento",
+                "impact": "Alto",
+                "simple_description": "Queued one",
+                "technical_prompt": "Prompt queued one",
+            },
+            {
+                "title": "📥 Queued Idea Two",
+                "category": "UX",
+                "impact": "Medio",
+                "simple_description": "Queued two",
+                "technical_prompt": "Prompt queued two",
+            },
+            {
+                "title": "✅ Implemented Idea",
+                "category": "Calidad",
+                "impact": "Medio",
+                "simple_description": "Implemented",
+                "technical_prompt": "Prompt implemented",
+            },
+            {
+                "title": "🚫 Dismissed Idea",
+                "category": "Seguridad",
+                "impact": "Medio",
+                "simple_description": "Dismissed",
+                "technical_prompt": "Prompt dismissed",
+            },
+        ],
+        source="manual",
+        db_path=telemetry_db,
+    )
+    by_title = {item["title"]: item["id"] for item in saved}
+    queued_one_id = by_title["📥 Queued Idea One"]
+    queued_two_id = by_title["📥 Queued Idea Two"]
+    implemented_id = by_title["✅ Implemented Idea"]
+    dismissed_id = by_title["🚫 Dismissed Idea"]
+
+    idea_engine.update_idea_status(queued_one_id, "queued", db_path=telemetry_db)
+    idea_engine.update_idea_status(queued_two_id, "queued", db_path=telemetry_db)
+    idea_engine.update_idea_status(implemented_id, "implemented", db_path=telemetry_db)
+    idea_engine.dismiss_idea(dismissed_id, db_path=telemetry_db)
+
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        staging_manager=_StubStagingManager(),  # type: ignore[arg-type]
+    )
+    try:
+        # 1. Run-now on queued idea -> 200, enqueued with run_now=True, status='implementando', counts updated
+        code, data = _http_json(f"{base_url}/api/ideas/{queued_one_id}/run-now", method="POST")
+        assert code == 200
+        assert data["ok"] is True
+        assert data["idea"]["id"] == queued_one_id
+        assert data["idea"]["status"] == "implementando"
+        assert data["counts"] == {
+            "pending": 1,
+            "queued": 1,
+            "implementing": 1,
+            "implemented": 1,
+            "dismissed": 1,
+            "all": 5,
+        }
+        assert len(enqueued_calls) == 1
+        assert enqueued_calls[0]["title"] == "📥 Queued Idea One"
+        assert enqueued_calls[0]["prompt"] == "Prompt queued one"
+        assert enqueued_calls[0]["metadata"]["idea_id"] == queued_one_id
+        assert enqueued_calls[0]["metadata"]["run_now"] is True
+
+        # 2. Conflict / Not Found / Bad Request guards
+        dup_code, _ = _http_json(f"{base_url}/api/ideas/{queued_one_id}/run-now", method="POST")
+        assert dup_code == 409
+        impl_code, _ = _http_json(f"{base_url}/api/ideas/{implemented_id}/run-now", method="POST")
+        assert impl_code == 409
+        dis_code, _ = _http_json(f"{base_url}/api/ideas/{dismissed_id}/run-now", method="POST")
+        assert dis_code == 409
+        nf_code, _ = _http_json(f"{base_url}/api/ideas/999999/run-now", method="POST")
+        assert nf_code == 404
+        bad_code, _ = _http_json(f"{base_url}/api/ideas/not-an-int/run-now", method="POST")
+        assert bad_code == 400
+
+        # 3. Dismissing a queued idea updates counts cleanly (queued -> 0, dismissed -> 2)
+        d_code, d_data = _http_json(f"{base_url}/api/ideas/{queued_two_id}/dismiss", method="POST")
+        assert d_code == 200
+        assert d_data["idea"]["status"] == "descartada"
+
+        q_code, q_list = _http_json(f"{base_url}/api/ideas?status=queued")
+        assert q_code == 200
+        assert q_list["ideas"] == []
+        assert q_list["counts"] == {
+            "pending": 1,
+            "queued": 0,
+            "implementing": 1,
+            "implemented": 1,
+            "dismissed": 2,
+            "all": 5,
+        }
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
+

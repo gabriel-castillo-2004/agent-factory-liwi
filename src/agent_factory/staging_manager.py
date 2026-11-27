@@ -243,6 +243,8 @@ class StagingManager:
 
     def _sync_empty_staging_to_base(self, worktree_path: Path) -> None:
         """Reset .liwi-staging to main HEAD before building when staging has zero pending commits."""
+        if not worktree_path.is_dir() or not (worktree_path / ".git").exists():
+            return
         if self._list_pending_commits():
             return
         base_head_res = self._run_git(["rev-parse", self.base_branch], cwd=self.repo_root)
