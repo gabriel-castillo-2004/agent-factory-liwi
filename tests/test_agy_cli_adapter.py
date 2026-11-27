@@ -3,13 +3,17 @@
 import json
 import logging
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from agent_factory.adapters.agy_cli_adapter import AgyCliAdapter
+from agent_factory.adapters.agy_cli_adapter import (
+    AgyCliAdapter,
+    parse_quota_reset_seconds,
+)
 from agent_factory.adapters.fake_llm import FakeLLM
 from agent_factory.adapters.fake_runner import FakeRunner
 from agent_factory.adapters.fake_vcs import FakeVCS
@@ -1480,6 +1484,275 @@ def test_agy_cli_adapter_resolves_which_shim_and_wraps_missing_binary_error(
     )
     with pytest.raises(CodeAgentError):
         missing_adapter.update_tests(ws_dir, plan.acceptance_tests, "Add export feature")
+
+
+def test_parse_quota_reset_seconds_detects_markers_and_extracts_seconds_case_insensitively() -> None:
+    """parse_quota_reset_seconds extracts <N> from 'Resets in <N>s' only when quota marker is present."""
+    assert parse_quota_reset_seconds("Individual quota reached. Resets in 38s") == 38
+    assert parse_quota_reset_seconds("RESOURCE_EXHAUSTED: Resets in 12s.") == 12
+    assert parse_quota_reset_seconds("individual quota reached\nresets in 5s") == 5
+    assert parse_quota_reset_seconds("resource_exhausted - RESETS IN 65S") == 65
+    assert parse_quota_reset_seconds("Individual quota reached. Resets in 0s") == 0
+    assert parse_quota_reset_seconds("RESOURCE_EXHAUSTED: Resets in 120s") == 120
+
+    # Missing quota marker must return None even if 'Resets in <N>s' is present
+    assert parse_quota_reset_seconds("Operation timed out. Resets in 15s") is None
+    assert parse_quota_reset_seconds("Resets in 10s") is None
+
+    # Quota marker without valid seconds must return None
+    assert parse_quota_reset_seconds("Individual quota reached. Try again later.") is None
+    assert parse_quota_reset_seconds("RESOURCE_EXHAUSTED: no reset hint") is None
+    assert parse_quota_reset_seconds("Individual quota reached. Resets in 3m") is None
+    assert parse_quota_reset_seconds("RESOURCE_EXHAUSTED: Resets in 500ms") is None
+    assert parse_quota_reset_seconds("") is None
+
+
+def test_agy_cli_adapter_waits_and_retries_once_on_short_quota_reset(
+    tmp_path: Path,
+) -> None:
+    """When quota reset <= max_quota_wait_seconds, sleep_fn waits reset_seconds + 2 and retries once."""
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+    ws_dir = ws_mgr.create_workspace("proj-quota-retry-ok")
+    plan = _sample_static_web_plan()
+
+    # Verify default sleep_fn and max_quota_wait_seconds
+    default_adapter = AgyCliAdapter(workspace_manager=ws_mgr, runner=FakeRunner())
+    assert default_adapter.sleep_fn is time.sleep
+    assert default_adapter.max_quota_wait_seconds == 65
+
+    # Case 1: Individual quota reached with 18s (<= 65s) -> waits 20s and succeeds on retry
+    sleeps: list[float] = []
+    runner_ok = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=1,
+                stdout="",
+                stderr="Error: Individual quota reached. Resets in 18s",
+            ),
+            CommandResult(
+                exit_code=0,
+                stdout=json.dumps({"files_written": ["src/app.js"], "summary": "Recovered after wait"}),
+            ),
+        ]
+    )
+    adapter_ok = AgyCliAdapter(
+        workspace_manager=ws_mgr,
+        runner=runner_ok,
+        cli_command=("agy",),
+        sleep_fn=sleeps.append,
+    )
+    res_ok = adapter_ok.implement_or_fix(ws_dir, plan, attempt=1)
+    assert res_ok.files_written == ["src/app.js"]
+    assert res_ok.summary == "Recovered after wait"
+    assert sleeps == [20]
+    assert len(runner_ok.calls) == 2
+
+    # Case 2: Boundary value reset_seconds == max_quota_wait_seconds (65s) -> waits 67s and succeeds
+    sleeps_boundary: list[float] = []
+    runner_boundary = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=1,
+                stdout="",
+                stderr="RESOURCE_EXHAUSTED: quota window full. resets in 65s",
+            ),
+            CommandResult(
+                exit_code=0,
+                stdout=json.dumps({"files_written": ["src/app.js"], "summary": "Boundary retry ok"}),
+            ),
+        ]
+    )
+    adapter_boundary = AgyCliAdapter(
+        workspace_manager=ws_mgr,
+        runner=runner_boundary,
+        cli_command=("agy",),
+        sleep_fn=sleeps_boundary.append,
+        max_quota_wait_seconds=65,
+    )
+    res_boundary = adapter_boundary.implement_or_fix(ws_dir, plan, attempt=1)
+    assert res_boundary.summary == "Boundary retry ok"
+    assert sleeps_boundary == [67]
+    assert len(runner_boundary.calls) == 2
+
+    # Case 3: Retry also fails with quota -> at most 1 retry, sleeps once, preserves message
+    sleeps_twice: list[float] = []
+    runner_still_limited = FakeRunner(
+        results=[
+            CommandResult(
+                exit_code=1,
+                stdout="",
+                stderr="Individual quota reached. Resets in 10s",
+            ),
+            CommandResult(
+                exit_code=1,
+                stdout="",
+                stderr="Individual quota reached again on retry. Resets in 15s",
+            ),
+            CommandResult(
+                exit_code=0,
+                stdout=json.dumps({"files_written": ["src/app.js"], "summary": "Should not be reached"}),
+            ),
+        ]
+    )
+    adapter_once = AgyCliAdapter(
+        workspace_manager=ws_mgr,
+        runner=runner_still_limited,
+        cli_command=("agy",),
+        sleep_fn=sleeps_twice.append,
+    )
+    with pytest.raises(QuotaExhaustedError) as exc_info:
+        adapter_once.implement_or_fix(ws_dir, plan, attempt=1)
+    assert "Individual quota reached again on retry. Resets in 15s" in str(exc_info.value)
+    assert sleeps_twice == [12]
+    assert len(runner_still_limited.calls) == 2
+
+
+def test_agy_cli_adapter_fails_fast_when_quota_reset_exceeds_limit_or_lacks_seconds(
+    tmp_path: Path,
+) -> None:
+    """Fails fast without sleeping and preserves original error when reset > max_quota_wait_seconds or missing seconds."""
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+    ws_dir = ws_mgr.create_workspace("proj-quota-fail-fast")
+    plan = _sample_static_web_plan()
+
+    # Case 1: Reset seconds exceeds default 65s limit (66s) -> no sleep, single call, original message preserved
+    sleeps_over: list[float] = []
+    over_msg = "RESOURCE_EXHAUSTED: Individual quota reached. Resets in 66s"
+    runner_over = FakeRunner(
+        results=[
+            CommandResult(exit_code=1, stdout="", stderr=over_msg),
+        ]
+    )
+    adapter_over = AgyCliAdapter(
+        workspace_manager=ws_mgr,
+        runner=runner_over,
+        cli_command=("agy",),
+        sleep_fn=sleeps_over.append,
+    )
+    with pytest.raises(QuotaExhaustedError) as over_exc:
+        adapter_over.implement_or_fix(ws_dir, plan, attempt=1)
+    assert over_msg in str(over_exc.value)
+    assert sleeps_over == []
+    assert len(runner_over.calls) == 1
+
+    # Case 2: Reset seconds exceeds custom max_quota_wait_seconds=20 (25s) -> fails fast without sleeping
+    sleeps_custom: list[float] = []
+    custom_msg = "Individual quota reached. Resets in 25s"
+    runner_custom = FakeRunner(
+        results=[
+            CommandResult(exit_code=1, stdout="", stderr=custom_msg),
+        ]
+    )
+    adapter_custom = AgyCliAdapter(
+        workspace_manager=ws_mgr,
+        runner=runner_custom,
+        cli_command=("agy",),
+        sleep_fn=sleeps_custom.append,
+        max_quota_wait_seconds=20,
+    )
+    with pytest.raises(QuotaExhaustedError) as custom_exc:
+        adapter_custom.implement_or_fix(ws_dir, plan, attempt=1)
+    assert custom_msg in str(custom_exc.value)
+    assert sleeps_custom == []
+    assert len(runner_custom.calls) == 1
+
+    # Case 3: Individual quota reached without 'Resets in <N>s' -> fails fast without sleeping
+    sleeps_no_sec: list[float] = []
+    no_sec_msg = "Individual quota reached. Please upgrade or wait."
+    runner_no_sec = FakeRunner(
+        results=[
+            CommandResult(exit_code=1, stdout="", stderr=no_sec_msg),
+        ]
+    )
+    adapter_no_sec = AgyCliAdapter(
+        workspace_manager=ws_mgr,
+        runner=runner_no_sec,
+        cli_command=("agy",),
+        sleep_fn=sleeps_no_sec.append,
+    )
+    with pytest.raises(QuotaExhaustedError) as no_sec_exc:
+        adapter_no_sec.implement_or_fix(ws_dir, plan, attempt=1)
+    assert no_sec_msg in str(no_sec_exc.value)
+    assert sleeps_no_sec == []
+    assert len(runner_no_sec.calls) == 1
+
+    # Case 4: RESOURCE_EXHAUSTED without 'Resets in <N>s' -> fails fast without sleeping
+    sleeps_res_ex: list[float] = []
+    res_ex_msg = "RESOURCE_EXHAUSTED: daily quota depleted"
+    runner_res_ex = FakeRunner(
+        results=[
+            CommandResult(exit_code=1, stdout="", stderr=res_ex_msg),
+        ]
+    )
+    adapter_res_ex = AgyCliAdapter(
+        workspace_manager=ws_mgr,
+        runner=runner_res_ex,
+        cli_command=("agy",),
+        sleep_fn=sleeps_res_ex.append,
+    )
+    with pytest.raises(QuotaExhaustedError) as res_ex_exc:
+        adapter_res_ex.implement_or_fix(ws_dir, plan, attempt=1)
+    assert res_ex_msg in str(res_ex_exc.value)
+    assert sleeps_res_ex == []
+    assert len(runner_res_ex.calls) == 1
+
+
+def test_agy_cli_adapter_ignores_mode_auto_warning_when_exit_code_is_zero(
+    tmp_path: Path,
+) -> None:
+    """The warning 'warning: --mode auto is not available for this account' is not treated as an error on exit code 0."""
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "workspaces")
+    ws_dir = ws_mgr.create_workspace("proj-mode-auto-warn")
+    plan = _sample_static_web_plan()
+    warning_line = "warning: --mode auto is not available for this account"
+    sleeps: list[float] = []
+
+    runner = FakeRunner(
+        results=[
+            # 1. Warning in stderr with JSON in stdout
+            CommandResult(
+                exit_code=0,
+                stdout=json.dumps({"files_written": ["src/app.js"], "summary": "Completed cleanly"}),
+                stderr=f"{warning_line}\n",
+            ),
+            # 2. Warning prefixed in stdout before plain text summary
+            CommandResult(
+                exit_code=0,
+                stdout=f"{warning_line}\nUpdated counter module cleanly.",
+                stderr="",
+            ),
+            # 3. Warning in stderr during generate_tests
+            CommandResult(
+                exit_code=0,
+                stdout=json.dumps(
+                    {"files_written": ["tests/test_app.py"], "summary": "Tests created"}
+                ),
+                stderr=f"{warning_line}\n",
+            ),
+        ]
+    )
+    adapter = AgyCliAdapter(
+        workspace_manager=ws_mgr,
+        runner=runner,
+        cli_command=("agy",),
+        sleep_fn=sleeps.append,
+        retry_if_no_tests_written=False,
+    )
+
+    res_stderr_warn = adapter.implement_or_fix(ws_dir, plan, attempt=1)
+    assert res_stderr_warn.files_written == ["src/app.js"]
+    assert res_stderr_warn.summary == "Completed cleanly"
+
+    res_stdout_warn = adapter.implement_or_fix(ws_dir, plan, attempt=2)
+    assert res_stdout_warn.files_written == []
+    assert res_stdout_warn.summary == "Updated counter module cleanly."
+    assert warning_line not in res_stdout_warn.summary
+
+    res_gen_warn = adapter.generate_tests(ws_dir, plan.acceptance_tests)
+    assert res_gen_warn.files_written == ["tests/test_app.py"]
+    assert res_gen_warn.summary == "Tests created"
+    assert sleeps == []
+
 
 
 

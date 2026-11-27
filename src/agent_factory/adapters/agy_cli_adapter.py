@@ -4,7 +4,8 @@ import json
 import logging
 import os
 import re
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -112,6 +113,42 @@ _LANG_PREFIXES: frozenset[str] = frozenset(
 )
 _MAX_CLI_PROMPT_CHARS = 12000
 DEFAULT_AGY_CLI_TIMEOUT_SECONDS = 300.0
+DEFAULT_MAX_QUOTA_WAIT_SECONDS = 65
+_QUOTA_RESET_BUFFER_SECONDS = 2
+_QUOTA_RESET_MARKER_RE = re.compile(
+    r"(?:individual\s+quota\s+reached|resource_exhausted)",
+    re.IGNORECASE,
+)
+_QUOTA_RESET_SECONDS_RE = re.compile(
+    r"resets\s+in\s+(\d+)\s*s\b",
+    re.IGNORECASE,
+)
+_BENIGN_CLI_WARNING_RE = re.compile(
+    r"^\s*warning:\s*--mode\s+auto\s+is\s+not\s+available\s+for\s+this\s+account\.?\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_quota_reset_seconds(output: str) -> int | None:
+    """Detect AGY quota exhaustion markers and extract reset seconds from 'Resets in <N>s'."""
+    if not output:
+        return None
+    if not _QUOTA_RESET_MARKER_RE.search(output):
+        return None
+    match = _QUOTA_RESET_SECONDS_RE.search(output)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _strip_benign_cli_warnings(text: str) -> str:
+    """Remove known non-fatal AGY CLI warning lines from stdout when exit code is 0."""
+    if not text:
+        return ""
+    kept_lines = [
+        line for line in text.splitlines() if not _BENIGN_CLI_WARNING_RE.match(line)
+    ]
+    return "\n".join(kept_lines).strip()
 
 
 def _looks_like_file_path(token: str) -> bool:
@@ -367,6 +404,8 @@ class AgyCliAdapter(CodeAgent):
         model_resolver: ModelResolver | None = None,
         secrets: Sequence[str] = (),
         retry_if_no_tests_written: bool | None = None,
+        sleep_fn: Callable[[float], Any] = time.sleep,
+        max_quota_wait_seconds: int = DEFAULT_MAX_QUOTA_WAIT_SECONDS,
     ) -> None:
         self.workspace_manager = workspace_manager
         self.runner: Runner = (
@@ -380,6 +419,8 @@ class AgyCliAdapter(CodeAgent):
         self.default_retry_after_seconds = default_retry_after_seconds
         self.model = model
         self.secrets: tuple[str, ...] = tuple(secrets)
+        self.sleep_fn: Callable[[float], Any] = sleep_fn
+        self.max_quota_wait_seconds: int = max_quota_wait_seconds
         if retry_if_no_tests_written is None:
             self.retry_if_no_tests_written = self.runner.__class__.__name__ != "FakeRunner"
         else:
@@ -589,9 +630,11 @@ class AgyCliAdapter(CodeAgent):
         active_model = self.model_resolver.resolve_model_for_role(stage, self.model)
         tried_models: set[str] = set()
         max_attempts = 3
+        attempt_idx = 1
+        quota_wait_retries = 0
         res: CommandResult | None = None
 
-        for attempt_idx in range(1, max_attempts + 1):
+        while True:
             self.model_resolver.record_active_usage(active_model, stage)
             logger.info(
                 "AgyCliAdapter (%s) invoking stage %s with model %r (attempt %d/%d)",
@@ -635,10 +678,40 @@ class AgyCliAdapter(CodeAgent):
 
             combined_output = f"{res.stdout}\n{res.stderr}".strip()
             if res.exit_code == 0:
+                if res.stderr and any(
+                    _BENIGN_CLI_WARNING_RE.match(line) for line in res.stderr.splitlines()
+                ):
+                    logger.debug(
+                        "AgyCliAdapter (%s) ignoring non-fatal CLI warning on exit code 0",
+                        mode_arg,
+                    )
                 break
 
-            is_quota = is_quota_error(res.exit_code, combined_output)
+            reset_seconds = parse_quota_reset_seconds(combined_output)
+            is_quota = (
+                is_quota_error(res.exit_code, combined_output)
+                or reset_seconds is not None
+                or bool(_QUOTA_RESET_MARKER_RE.search(combined_output))
+            )
             is_model_err = is_model_selection_error(combined_output)
+
+            if (
+                is_quota
+                and reset_seconds is not None
+                and reset_seconds <= self.max_quota_wait_seconds
+                and quota_wait_retries < 1
+            ):
+                wait_seconds = reset_seconds + _QUOTA_RESET_BUFFER_SECONDS
+                logger.warning(
+                    "AgyCliAdapter (%s) hit short quota reset (%ds <= %ds); waiting %ds before retrying once",
+                    mode_arg,
+                    reset_seconds,
+                    self.max_quota_wait_seconds,
+                    wait_seconds,
+                )
+                self.sleep_fn(wait_seconds)
+                quota_wait_retries += 1
+                continue
 
             if (is_quota or is_model_err) and attempt_idx < max_attempts:
                 tried_models.add((active_model or "").lower())
@@ -661,17 +734,19 @@ class AgyCliAdapter(CodeAgent):
                         max_attempts,
                     )
                     active_model = candidate
+                    attempt_idx += 1
                     continue
 
             if is_quota:
                 retry_match = re.search(
                     r"retry_after[ =:]+([0-9.]+)", combined_output, re.IGNORECASE
                 )
-                retry_after = (
-                    float(retry_match.group(1))
-                    if retry_match
-                    else self.default_retry_after_seconds
-                )
+                if retry_match:
+                    retry_after = float(retry_match.group(1))
+                elif reset_seconds is not None:
+                    retry_after = float(reset_seconds)
+                else:
+                    retry_after = self.default_retry_after_seconds
                 raise QuotaExhaustedError(
                     message=redact_secrets(combined_output, extra_secrets=self.secrets)
                     or "CLI quota exhausted",
@@ -690,7 +765,7 @@ class AgyCliAdapter(CodeAgent):
         # Parse success output using shared fenced/inline JSON & summary cleaner
         files_written: list[str] = []
         summary = ""
-        output_text = res.stdout.strip()
+        output_text = _strip_benign_cli_warnings(res.stdout)
         if output_text:
             files_written, summary = _parse_cli_output(output_text)
 
@@ -704,7 +779,7 @@ class AgyCliAdapter(CodeAgent):
             summary=summary,
             model=resolved_model,
         )
-        return result, res.stdout
+        return result, output_text
 
     def _run_cli(
         self,
