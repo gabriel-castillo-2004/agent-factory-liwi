@@ -19,6 +19,7 @@ from agent_factory.orchestrator import Orchestrator
 from agent_factory.telemetry import (
     CANONICAL_COMPONENTS,
     classify_error,
+    classify_error_code,
     format_telemetry_context,
     get_telemetry_summary,
     init_telemetry_db,
@@ -973,3 +974,249 @@ def test_orchestrator_records_live_telemetry_and_never_breaks_on_telemetry_failu
         assert status_failed.state == ProjectState.FAILED
     finally:
         store.close()
+
+
+@pytest.mark.parametrize(
+    ("message", "current_code", "expected"),
+    [
+        # Quota exhausted patterns
+        (
+            "Error: Individual quota reached for model gemini-2.5-pro",
+            None,
+            "quota_exhausted",
+        ),
+        (
+            "google.genai.errors.ClientError: RESOURCE_EXHAUSTED: Quota exceeded",
+            "unknown",
+            "quota_exhausted",
+        ),
+        (
+            "HTTP 429 Too Many Requests from upstream provider",
+            "",
+            "quota_exhausted",
+        ),
+        (
+            "API returned status_code=429 while generating proposal",
+            "  UNKNOWN  ",
+            "quota_exhausted",
+        ),
+        # Pytest / test failure patterns
+        (
+            "Falló pytest -q --no-cov tests/test_telemetry.py:\n1 failed in 0.42s",
+            None,
+            "test_failure",
+        ),
+        (
+            "FAILED tests/test_dashboard.py::test_summary_endpoint - KeyError: 'total'",
+            "unknown",
+            "test_failure",
+        ),
+        (
+            "E       AssertionError: assert 'unknown' == 'quota_exhausted'",
+            "   ",
+            "test_failure",
+        ),
+        # Timeout patterns
+        (
+            "subprocess.TimeoutExpired: Command '['agy', '-p', 'prompt']' expired after 180s",
+            None,
+            "ag_cli_timeout",
+        ),
+        (
+            "Command timed out after 120 seconds waiting for response",
+            "unknown",
+            "ag_cli_timeout",
+        ),
+        (
+            "Worker aborted with ag_cli_timeout during code generation",
+            None,
+            "ag_cli_timeout",
+        ),
+        # Explicit non-unknown code is preserved even when message matches another pattern
+        (
+            "HTTP 429 RESOURCE_EXHAUSTED: Individual quota reached",
+            "custom_rate_limit",
+            "custom_rate_limit",
+        ),
+        (
+            "FAILED tests/test_telemetry.py::test_foo - AssertionError",
+            "  syntax_or_lint  ",
+            "syntax_or_lint",
+        ),
+        (
+            "Command timed out after 30s",
+            "git_timeout",
+            "git_timeout",
+        ),
+        # Fallback to unknown
+        ("Unexpected 502 Bad Gateway from upstream proxy", None, "unknown"),
+        ("Parser failed at line 1429 with unexpected token", None, "unknown"),
+        ("", None, "unknown"),
+        ("   \n\t  ", "unknown", "unknown"),
+        ("Unclassified runtime failure", "unknown", "unknown"),
+    ],
+)
+def test_classify_error_code_rules_and_explicit_preservation(
+    message: str,
+    current_code: str | None,
+    expected: str,
+) -> None:
+    """classify_error_code preserves explicit non-unknown codes and classifies quota, pytest, and timeout failures."""
+    assert classify_error_code(message, current_code=current_code) == expected
+
+
+def test_record_incident_and_event_apply_classify_error_code_and_preserve_legacy_rows(
+    tmp_path: Path,
+) -> None:
+    """Telemetry recording classifies empty/'unknown' codes via classify_error_code without breaking schema or legacy rows."""
+    db_path = tmp_path / "classify_code_telemetry.db"
+    init_telemetry_db(db_path=db_path)
+
+    # Seed a legacy row that was previously stored with error_signature='unknown'
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            """
+            INSERT INTO incidents (timestamp, project_id, stage, error_signature, raw_error, resolved)
+            VALUES (?, ?, ?, ?, ?, 0);
+            """,
+            ("2026-11-20T08:00:00+00:00", "proj-legacy", "legacy_stage", "unknown", "legacy failure"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Incidents with None, empty, or 'unknown' error_signature get auto-classified
+    record_incident(
+        stage="consult_message",
+        raw_error="429 RESOURCE_EXHAUSTED: Individual quota reached",
+        error_signature="unknown",
+        timestamp="2026-11-26T10:00:00+00:00",
+        db_path=db_path,
+    )
+    record_incident(
+        stage="apply_proposal",
+        raw_error="Falló pytest -q --no-cov tests/test_telemetry.py:\nFAILED tests/test_telemetry.py::test_x\nAssertionError",
+        error_signature="",
+        timestamp="2026-11-26T10:01:00+00:00",
+        db_path=db_path,
+    )
+    record_incident(
+        stage="apply_proposal",
+        raw_error="subprocess.TimeoutExpired: Command timed out after 180s",
+        error_signature=None,
+        timestamp="2026-11-26T10:02:00+00:00",
+        db_path=db_path,
+    )
+    # Explicit non-unknown code must be preserved
+    record_incident(
+        stage="apply_proposal",
+        raw_error="HTTP 429 RESOURCE_EXHAUSTED",
+        error_signature="explicit_custom_code",
+        timestamp="2026-11-26T10:03:00+00:00",
+        db_path=db_path,
+    )
+    # Unrecognized message falls back to 'unknown'
+    record_incident(
+        stage="apply_proposal",
+        raw_error="Unrecognized 502 upstream gateway error",
+        error_signature="unknown",
+        timestamp="2026-11-26T10:04:00+00:00",
+        db_path=db_path,
+    )
+
+    # Execution events with 'unknown' or None error_signature classify from error_text
+    record_execution_event(
+        component="self_improver",
+        stage="consult_finish",
+        command="consult_message",
+        duration_ms=500,
+        exit_code=1,
+        error_signature="unknown",
+        error_text="Individual quota reached for account",
+        timestamp="2026-11-26T10:05:00+00:00",
+        db_path=db_path,
+    )
+    record_execution_event(
+        component="self_improver",
+        stage="verify_pytest",
+        command="pytest -q --no-cov tests/test_telemetry.py",
+        duration_ms=1200,
+        exit_code=1,
+        error_text="FAILED tests/test_telemetry.py::test_demo - AssertionError: boom",
+        timestamp="2026-11-26T10:06:00+00:00",
+        db_path=db_path,
+    )
+    record_execution_event(
+        component="self_improver",
+        stage="apply_finish",
+        command="apply",
+        duration_ms=180000,
+        exit_code=1,
+        timed_out=True,
+        error_signature="unknown",
+        error_text="TimeoutExpired: process timed out after 180s",
+        timestamp="2026-11-26T10:07:00+00:00",
+        db_path=db_path,
+    )
+    record_execution_event(
+        component="self_improver",
+        stage="apply_finish",
+        command="apply",
+        duration_ms=300,
+        exit_code=1,
+        error_signature="preserved_event_code",
+        error_text="429 RESOURCE_EXHAUSTED",
+        timestamp="2026-11-26T10:08:00+00:00",
+        db_path=db_path,
+    )
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        inc_sigs = [
+            row["error_signature"]
+            for row in conn.execute("SELECT error_signature FROM incidents ORDER BY id ASC").fetchall()
+        ]
+        assert inc_sigs == [
+            "unknown",  # legacy row preserved untouched
+            "quota_exhausted",
+            "test_failure",
+            "ag_cli_timeout",
+            "explicit_custom_code",
+            "unknown",
+        ]
+
+        ev_sigs = [
+            row["error_signature"]
+            for row in conn.execute(
+                "SELECT error_signature FROM execution_events ORDER BY id ASC"
+            ).fetchall()
+        ]
+        assert ev_sigs == [
+            "quota_exhausted",
+            "test_failure",
+            "ag_cli_timeout",
+            "preserved_event_code",
+        ]
+    finally:
+        conn.close()
+
+    # Summary reads both legacy and newly classified records cleanly
+    summary = get_telemetry_summary(limit=10, db_path=db_path)
+    assert summary["totals"] == {
+        "execution_events": 4,
+        "incidents": 6,
+        "unresolved_incidents": 6,
+    }
+    recurring_by_sig = {
+        item["error_signature"]: item["count"] for item in summary["recurring_errors"]
+    }
+    assert recurring_by_sig == {
+        "quota_exhausted": 2,
+        "test_failure": 2,
+        "ag_cli_timeout": 2,
+        "unknown": 2,
+        "explicit_custom_code": 1,
+        "preserved_event_code": 1,
+    }

@@ -38,6 +38,8 @@ _KNOWN_SIGNATURES: frozenset[str] = frozenset(
         "ag_cli_timeout",
         "missing_module",
         "syntax_or_lint",
+        "quota_exhausted",
+        "test_failure",
         "unknown",
     }
 )
@@ -65,6 +67,18 @@ _SYNTAX_OR_LINT_RE = re.compile(
     r"(syntaxerror|indentationerror|taberror|invalid syntax|unexpected indent"
     r"|expected an indented block|unterminated string"
     r"|\bruff\b|\bflake8\b|\beslint\b|\bpylint\b|\blint(?:ing)?\s+errors?\b|\bsyntax_or_lint\b)",
+    re.IGNORECASE,
+)
+_QUOTA_EXHAUSTED_RE = re.compile(
+    r"(individual\s+quota\s+reached|resource_exhausted|(?<!\d)429(?!\d))",
+    re.IGNORECASE,
+)
+_TEST_FAILURE_RE = re.compile(
+    r"(fall[oó]\s+pytest|failed\s+tests[/\\]|assertionerror)",
+    re.IGNORECASE,
+)
+_AG_CLI_TIMEOUT_CODE_RE = re.compile(
+    r"(timeoutexpired|timed[\s_-]?out|\bag_cli_timeout\b)",
     re.IGNORECASE,
 )
 
@@ -218,6 +232,37 @@ def classify_error(text: str) -> str:
     return "unknown"
 
 
+def classify_error_code(message: str, current_code: str | None = None) -> str:
+    """Classify an error message when no specific code is set, preserving explicit non-unknown codes."""
+    if current_code is not None:
+        cleaned_code = str(current_code).strip()
+        if cleaned_code and cleaned_code.lower() != "unknown":
+            return cleaned_code
+
+    if not isinstance(message, str):
+        return "unknown"
+    stripped = message.strip()
+    if not stripped:
+        return "unknown"
+
+    if _QUOTA_EXHAUSTED_RE.search(stripped):
+        return "quota_exhausted"
+    if _TEST_FAILURE_RE.search(stripped):
+        return "test_failure"
+    if _AG_CLI_TIMEOUT_CODE_RE.search(stripped):
+        return "ag_cli_timeout"
+    return "unknown"
+
+
+def _resolve_error_signature(message: str, current_code: str | None = None) -> str:
+    """Resolve an error signature by preserving explicit codes and classifying unknown/empty ones."""
+    if current_code is not None:
+        cleaned_code = str(current_code).strip()
+        if cleaned_code and cleaned_code.lower() != "unknown":
+            return classify_error_code(message, current_code=cleaned_code)
+    return classify_error_code(message, current_code=classify_error(message))
+
+
 def record_execution_event(
     component: str,
     stage: str,
@@ -247,14 +292,21 @@ def record_execution_event(
         is_timeout = 1 if bool(timed_out) else 0
 
         eff_sig: str | None
-        if error_signature is not None and str(error_signature).strip():
-            eff_sig = str(error_signature).strip()
-        elif error_text is not None and str(error_text).strip():
-            eff_sig = classify_error(str(error_text))
+        raw_sig = str(error_signature).strip() if error_signature is not None else ""
+        raw_err = str(error_text).strip() if error_text is not None else ""
+        if raw_sig and raw_sig.lower() != "unknown":
+            eff_sig = classify_error_code(raw_err, current_code=raw_sig)
+        elif raw_err:
+            eff_sig = _resolve_error_signature(raw_err, current_code=raw_sig or None)
         elif is_timeout:
-            eff_sig = classify_error(f"{comp} {stg} {cmd or ''} timed out")
+            eff_sig = _resolve_error_signature(
+                f"{comp} {stg} {cmd or ''} timed out",
+                current_code=raw_sig or None,
+            )
+        elif raw_sig:
+            eff_sig = classify_error_code(cmd or "", current_code=raw_sig)
         elif code is not None and code != 0:
-            eff_sig = "unknown"
+            eff_sig = classify_error_code(cmd or "", current_code="unknown")
         else:
             eff_sig = None
 
@@ -306,11 +358,7 @@ def record_incident(
         )
         stg = str(stage).strip() or "unknown"
         raw = str(raw_error or "")
-        eff_sig = (
-            str(error_signature).strip()
-            if error_signature is not None and str(error_signature).strip()
-            else classify_error(raw)
-        )
+        eff_sig = _resolve_error_signature(raw, current_code=error_signature)
         is_resolved = 1 if bool(resolved) else 0
 
         conn = _open_connection(db_path)
