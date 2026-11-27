@@ -25,7 +25,11 @@ from agent_factory.adapters.subprocess_runner import SubprocessRunner, resolve_e
 from agent_factory.config import build_workspace_pytest_env
 from agent_factory.ports.clock import Clock
 from agent_factory.ports.runner import CommandTimeoutError, Runner
-from agent_factory.recovery_agent import _parse_json_dict_loose
+from agent_factory.recovery_agent import (
+    _parse_json_dict_loose,
+    compact_pytest_failure_output,
+    extract_failed_pytest_nodes,
+)
 from agent_factory.secrets import redact_secrets
 from agent_factory.supervisor import RESTART_EXIT_CODE
 from agent_factory.telemetry import (
@@ -1087,8 +1091,18 @@ class FactorySelfImprover:
                         env=ws_env,
                     )
                     if pre_res.exit_code != 0:
-                        tail = (pre_res.stdout or pre_res.stderr or "pytest failed").strip()[-1200:]
-                        return False, f"Falló pytest {' '.join(non_dash_tests)}:\n{self._redact(tail)}"
+                        raw_pre = (
+                            "\n".join(
+                                part for part in (pre_res.stdout, pre_res.stderr) if part and part.strip()
+                            ).strip()
+                            or "pytest failed"
+                        )
+                        pre_prefix = f"Falló pytest {' '.join(non_dash_tests)}:\n"
+                        pre_compact = compact_pytest_failure_output(
+                            self._redact(raw_pre),
+                            max_chars=max(200, 2500 - len(pre_prefix)),
+                        )
+                        return False, f"{pre_prefix}{pre_compact}"
                 pytest_args = [
                     "-q",
                     "--no-cov",
@@ -1119,8 +1133,18 @@ class FactorySelfImprover:
             env=ws_env,
         )
         if pytest_res.exit_code != 0:
-            tail = (pytest_res.stdout or pytest_res.stderr or "pytest failed").strip()[-1200:]
-            return False, f"Falló pytest {' '.join(pytest_args)}:\n{self._redact(tail)}"
+            raw_pytest = (
+                "\n".join(
+                    part for part in (pytest_res.stdout, pytest_res.stderr) if part and part.strip()
+                ).strip()
+                or "pytest failed"
+            )
+            pytest_prefix = f"Falló pytest {' '.join(pytest_args)}:\n"
+            pytest_compact = compact_pytest_failure_output(
+                self._redact(raw_pytest),
+                max_chars=max(200, 2500 - len(pytest_prefix)),
+            )
+            return False, f"{pytest_prefix}{pytest_compact}"
         return True, ""
 
     def _rollback_savepoint(self, env: Mapping[str, str]) -> None:
@@ -1251,13 +1275,26 @@ class FactorySelfImprover:
                         title=clean_title,
                         started_at=started_at,
                     )
+                    compact_verify_err = compact_pytest_failure_output(verify_err, max_chars=2500)
+                    failed_nodes = extract_failed_pytest_nodes(verify_err)
+                    failed_nodes_block = ""
+                    if failed_nodes:
+                        top_nodes = failed_nodes[:10]
+                        rerun_cmd = "pytest -q --no-cov " + " ".join(top_nodes)
+                        nodes_list = "\n".join(f"- {node}" for node in top_nodes)
+                        failed_nodes_block = (
+                            "Node IDs fallidos detectados (re-ejecuta primero estos tests antes de otros):\n"
+                            f"{nodes_list}\n"
+                            f"Comando sugerido: `{rerun_cmd}`\n\n"
+                        )
                     repair_prompt = (
                         "AUTO-REPARACIÓN OBLIGATORIA (1 ronda): La verificación falló tras tu edición.\n"
                         "REGLA ESTRICTA DE SEGURIDAD: PROHIBIDO leer o modificar .env, MASTER_PROMPT.md, "
                         "AGENTS.md, config/models.toml, data/ o workspaces/.\n"
                         "REGLA DE VELOCIDAD: Corrige únicamente los archivos afectados y verifica solo pruebas dirigidas.\n\n"
                         f"Propuesta original ({clean_title}):\n{clean_prompt}\n\n"
-                        f"Error exacto reportado:\n{verify_err}"
+                        f"{failed_nodes_block}"
+                        f"Error exacto reportado:\n{compact_verify_err}"
                     )
                     repair_ok, repair_out = self._run_agy(
                         prompt=repair_prompt,

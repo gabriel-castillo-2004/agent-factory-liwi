@@ -1103,4 +1103,94 @@ def test_factory_evolution_history_degrades_safely_without_git_and_falls_back_to
     assert res["versions"][0]["is_self_improve"] is True
 
 
+def test_factory_assistant_auto_repair_prompt_compacts_long_pytest_trace_and_suggests_failed_nodes(
+    tmp_path: Path,
+) -> None:
+    """AUTO-REPARACIÓN OBLIGATORIA compacts long pytest output and suggests re-running deduplicated failed node IDs first."""
+    repo_root = tmp_path / "repo_compact_repair"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "TestFactory"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.email", "factory@local"], cwd=repo_root, check=True)
+    (repo_root / "src" / "agent_factory").mkdir(parents=True, exist_ok=True)
+    (repo_root / "tests").mkdir(parents=True, exist_ok=True)
+    (repo_root / "src" / "agent_factory" / "self_improver.py").write_text("X = 1\n", encoding="utf-8")
+    (repo_root / "tests" / "test_self_improver.py").write_text("def test_si(): assert True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "chore: seed"], cwd=repo_root, check=True, capture_output=True)
+
+    real_runner = SubprocessRunner(default_timeout_seconds=15.0)
+    repair_prompts: list[str] = []
+    pytest_calls = [0]
+
+    long_pytest_fail = (
+        "\n".join(f"DEBUG SPAM_NOISE_{i}: filler output abcdefghijklmnopqrstuvwxyz" for i in range(180))
+        + "\n"
+        + "=================================== FAILURES ===================================\n"
+        + ">       assert actual == 'expected_compacted_trace'\n"
+        + "E       AssertionError: expected_compacted_trace\n"
+        + "tests/test_self_improver.py:77: AssertionError\n"
+        + "\n".join(f"DEBUG MID_SPAM_{i}: more filler 0123456789" for i in range(120))
+        + "\n"
+        + "=========================== short test summary info ============================\n"
+        + "FAILED tests/test_self_improver.py::test_case_a - AssertionError: expected_compacted_trace\n"
+        + "FAILED tests/test_self_improver.py::test_case_b - ValueError: bad\n"
+        + "FAILED tests/test_self_improver.py::test_case_a - AssertionError: duplicate\n"
+        + "2 failed, 10 passed in 3.50s\n"
+    )
+
+    class _CompactRepairRunner(SubprocessRunner):
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            exe_stem = Path(command[0]).stem.lower()
+            if exe_stem == "agy":
+                prompt = command[command.index("-p") + 1]
+                repair_prompts.append(prompt)
+                if len(repair_prompts) == 1:
+                    (repo_root / "src" / "agent_factory" / "self_improver.py").write_text("X = 'bad'\n", encoding="utf-8")
+                    return CommandResult(exit_code=0, stdout="initial")
+                (repo_root / "src" / "agent_factory" / "self_improver.py").write_text("X = 'good'\n", encoding="utf-8")
+                return CommandResult(exit_code=0, stdout="repaired")
+            if exe_stem == "ruff":
+                return CommandResult(exit_code=0, stdout="All checks passed!")
+            if exe_stem == "pytest":
+                pytest_calls[0] += 1
+                if pytest_calls[0] == 1:
+                    return CommandResult(exit_code=1, stdout=long_pytest_fail)
+                return CommandResult(exit_code=0, stdout="2 passed")
+            return real_runner.run(command, cwd, timeout_seconds=timeout_seconds, env=env)
+
+    store = SqliteEventStore(db_path=tmp_path / "compact_si.db")
+    try:
+        improver = FactorySelfImprover(
+            sqlite_store=store,
+            repo_root=repo_root,
+            uploads_dir=tmp_path / "uploads_cr",
+            runner=_CompactRepairRunner(),
+            restart_fn=lambda _code: None,
+            restart_delay_seconds=0.01,
+        )
+        res = improver.apply_proposal("Actualiza self_improver.py", proposal_title="Compact trace repair")
+        assert res["applied"] is True
+        assert len(repair_prompts) == 2
+        rep_prompt = repair_prompts[1]
+        assert "AUTO-REPARACIÓN OBLIGATORIA" in rep_prompt
+        assert (
+            "pytest -q --no-cov tests/test_self_improver.py::test_case_a tests/test_self_improver.py::test_case_b"
+            in rep_prompt
+        )
+        assert "AssertionError: expected_compacted_trace" in rep_prompt
+        assert "2 failed, 10 passed" in rep_prompt
+        assert "truncad" in rep_prompt.lower()
+        assert "SPAM_NOISE_120" not in rep_prompt
+        assert "MID_SPAM_60" not in rep_prompt
+    finally:
+        store.close()
+
+
 

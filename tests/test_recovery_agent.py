@@ -27,7 +27,12 @@ from agent_factory.domain.models import ApprovalEvent, Plan
 from agent_factory.domain.states import ProjectState
 from agent_factory.orchestrator import Orchestrator
 from agent_factory.ports.runner import CommandResult
-from agent_factory.recovery_agent import ErrorLessonStore, RecoveryAgent
+from agent_factory.recovery_agent import (
+    ErrorLessonStore,
+    RecoveryAgent,
+    compact_pytest_failure_output,
+    extract_failed_pytest_nodes,
+)
 from agent_factory.workspace import WorkspaceManager
 
 
@@ -643,5 +648,128 @@ def test_recovery_agent_matches_pip_install_playbook_on_module_not_found(
         )
         assert res_bad.recovered is False
         assert not any("pip" in c["command"] for c in bad_runner.calls)
+    finally:
+        store.close()
+
+
+def test_extract_failed_pytest_nodes_deduplicates_and_handles_empty_output() -> None:
+    """extract_failed_pytest_nodes returns unique ordered 'tests/...' node IDs and empty list for clean/empty output."""
+    assert extract_failed_pytest_nodes("") == []
+    assert extract_failed_pytest_nodes("   \n\t  ") == []
+    assert extract_failed_pytest_nodes("12 passed in 0.42s\n") == []
+
+    raw = (
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/test_alpha.py::test_one - AssertionError: boom\n"
+        "FAILED tests/test_beta.py::TestSuite::test_two[case-1] - ValueError: bad\n"
+        "FAILED tests/test_alpha.py::test_one - AssertionError: duplicate\n"
+        "  FAILED tests\\test_gamma.py::test_win\n"
+        "FAILED tests/test_delta.py - RuntimeError: import failed\n"
+        "FAILED other_dir/not_a_test.py::test_skip - AssertionError: ignored\n"
+    )
+    assert extract_failed_pytest_nodes(raw) == [
+        "tests/test_alpha.py::test_one",
+        "tests/test_beta.py::TestSuite::test_two[case-1]",
+        "tests/test_gamma.py::test_win",
+        "tests/test_delta.py",
+    ]
+
+
+def test_compact_pytest_failure_output_strict_max_chars_preserves_summary_assertions_and_handles_empty() -> None:
+    """compact_pytest_failure_output keeps failure summary and latest assertions/tracebacks within strict <= max_chars."""
+    assert compact_pytest_failure_output("") == ""
+    assert compact_pytest_failure_output("   \n\t ") == ""
+    assert compact_pytest_failure_output("FAILED tests/test_x.py::test_a", max_chars=0) == ""
+    assert compact_pytest_failure_output("FAILED tests/test_x.py::test_a", max_chars=-10) == ""
+
+    short_out = "FAILED tests/test_x.py::test_a - AssertionError: 1 != 2\n1 failed in 0.12s"
+    assert compact_pytest_failure_output(short_out, max_chars=2500) == short_out
+
+    leading_noise = "\n".join(f"PASSED tests/test_noise.py::test_ok_{i} [ 10%]" for i in range(80))
+    traceback_block = (
+        "=================================== FAILURES ===================================\n"
+        "__________________________________ test_total __________________________________\n"
+        "    def test_total():\n"
+        "        total = compute_total()\n"
+        ">       assert total == 42\n"
+        "E       AssertionError: assert 7 == 42\n"
+        "E        +  where 7 = compute_total()\n"
+        "tests/test_calc.py:42: AssertionError\n"
+    )
+    middle_noise = "\n".join(f"DEBUG NOISY_INTERMEDIATE_LINE_{i}: filler payload 0123456789" for i in range(180))
+    summary_block = (
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/test_calc.py::test_total - AssertionError: assert 7 == 42\n"
+        "========================= 1 failed, 90 passed in 4.10s ========================="
+    )
+    long_output = f"{leading_noise}\n{traceback_block}\n{middle_noise}\n{summary_block}"
+    assert len(long_output) > 5000
+
+    compacted = compact_pytest_failure_output(long_output, max_chars=700)
+    assert len(compacted) <= 700
+    assert "truncad" in compacted.lower()
+    assert "FAILED tests/test_calc.py::test_total" in compacted
+    assert "1 failed, 90 passed" in compacted
+    assert "AssertionError: assert 7 == 42" in compacted
+    assert ">       assert total == 42" in compacted
+    assert "NOISY_INTERMEDIATE_LINE_120" not in compacted
+
+    # Very tight budgets must still strictly respect <= max_chars
+    for tight_cap in (120, 40, 15, 3):
+        tight = compact_pytest_failure_output(long_output, max_chars=tight_cap)
+        assert len(tight) <= tight_cap
+
+    # Single huge line without newlines
+    single_line = "X" * 4000
+    compact_single = compact_pytest_failure_output(single_line, max_chars=250)
+    assert len(compact_single) <= 250
+    assert "truncad" in compact_single.lower()
+
+
+def test_recovery_agent_workspace_fix_prompt_compacts_pytest_output_and_suggests_failed_nodes(
+    tmp_path: Path,
+) -> None:
+    """RecoveryAgent compacts verbose pytest logs and suggests re-running deduplicated failed node IDs first."""
+    store = SqliteEventStore(db_path=tmp_path / "compact_ws.db")
+    try:
+        ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_compact")
+        ws_dir = ws_mgr.create_workspace("proj-compact-1")
+        fake_runner = FakeRunner(
+            results=[
+                CommandResult(exit_code=0, stdout=json.dumps({"files_written": ["app.py"], "summary": "Fixed edge"})),
+            ]
+        )
+        doctor = RecoveryAgent(
+            sqlite_store=store,
+            workspace_manager=ws_mgr,
+            runner=fake_runner,
+        )
+        noisy_logs = (
+            "\n".join(f"INFO NOISE_LOG_LINE_{i}: verbose setup output 1234567890" for i in range(160))
+            + "\n"
+            + ">       assert compute() == 'expected_ok'\n"
+            + "E       AssertionError: expected_ok\n"
+            + "tests/test_mod.py:18: AssertionError\n"
+            + "=========================== short test summary info ============================\n"
+            + "FAILED tests/test_mod.py::test_edge - AssertionError: expected_ok\n"
+            + "FAILED tests/test_mod.py::test_edge - AssertionError: expected_ok\n"
+            + "1 failed, 20 passed in 2.00s\n"
+        )
+        res = doctor.attempt_recovery(
+            project_id="proj-compact-1",
+            stage="VERIFYING",
+            error=RuntimeError("pytest failed with AssertionError: expected_ok"),
+            workspace_dir=ws_dir,
+            recent_logs=noisy_logs,
+            retry_fn=lambda: "green",
+        )
+        assert res.recovered is True
+        assert len(fake_runner.calls) == 1
+        cmd = fake_runner.calls[0]["command"]
+        prompt = cmd[cmd.index("-p") + 1]
+        assert "pytest -q --no-cov tests/test_mod.py::test_edge" in prompt
+        assert "AssertionError: expected_ok" in prompt
+        assert "truncad" in prompt.lower()
+        assert "NOISE_LOG_LINE_100" not in prompt
     finally:
         store.close()

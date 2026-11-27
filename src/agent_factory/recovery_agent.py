@@ -60,6 +60,19 @@ _WORKSPACE_EXTERNAL_ERROR_RE = re.compile(
     r"Git push failed|Merge failed|Smoke Test HTTP|pytest)",
     re.IGNORECASE,
 )
+_PYTEST_FAILED_NODE_RE = re.compile(r"(?:^|\s)FAILED\s+(tests[\\/][^\r\n]+)")
+_PYTEST_SUMMARY_LINE_RE = re.compile(
+    r"(?:short test summary info|^\s*(?:FAILED|ERROR)\s+tests[\\/]|"
+    r"^\s*=*\s*\d+\s+failed\b|\b\d+\s+failed,\s+\d+\s+passed\b)",
+    re.IGNORECASE,
+)
+_PYTEST_ASSERTION_LINE_RE = re.compile(
+    r"(?:^\s*[>E]\s+\S|^\s*Traceback\s+\(most recent call last\):|"
+    r"^\s*File\s+\"[^\"]+\",\s+line\s+\d+|AssertionError|Error:|Exception:|"
+    r"pytest\.raises|tests[\\/][^\s:]+:\d+:|\bassert\s+|"
+    r"^={3,}\s*FAILURES\s*={3,}$|^_{3,}\s*\S.*\S\s*_{3,}$)"
+)
+_COMPACT_TRUNCATION_MARKER = "[... salida intermedia truncada ...]"
 
 _SEEDED_ERROR_LESSONS: tuple[dict[str, Any], ...] = (
     {
@@ -463,6 +476,166 @@ def _extract_missing_package_name(error_text: str, payload_json: str) -> str | N
     return top_mod
 
 
+def extract_failed_pytest_nodes(output: str) -> list[str]:
+    """Extract unique pytest node IDs from 'FAILED tests/...' lines preserving first-seen order."""
+    if not output or not isinstance(output, str):
+        return []
+    nodes: list[str] = []
+    seen: set[str] = set()
+    for line in output.splitlines():
+        match = _PYTEST_FAILED_NODE_RE.search(line)
+        if not match:
+            continue
+        raw_node = match.group(1).strip()
+        if " - " in raw_node:
+            raw_node = raw_node.split(" - ", 1)[0].strip()
+        if not raw_node:
+            continue
+        if "::" in raw_node:
+            path_part, rest = raw_node.split("::", 1)
+            norm_path = path_part.replace("\\", "/")
+            node = f"{norm_path}::{rest}"
+        else:
+            node = raw_node.replace("\\", "/")
+        if node and node not in seen:
+            seen.add(node)
+            nodes.append(node)
+    return nodes
+
+
+def _take_lines_from_end(lines: Sequence[str], budget: int) -> str:
+    """Return as many trailing lines as fit within budget characters."""
+    if budget <= 0 or not lines:
+        return ""
+    picked: list[str] = []
+    used = 0
+    for line in reversed(lines):
+        extra = len(line) + (1 if picked else 0)
+        if used + extra <= budget:
+            picked.append(line)
+            used += extra
+        else:
+            if not picked:
+                picked.append(line[-budget:])
+            break
+    picked.reverse()
+    return "\n".join(picked)
+
+
+def _take_lines_from_start(lines: Sequence[str], budget: int) -> str:
+    """Return as many leading lines as fit within budget characters."""
+    if budget <= 0 or not lines:
+        return ""
+    picked: list[str] = []
+    used = 0
+    for line in lines:
+        extra = len(line) + (1 if picked else 0)
+        if used + extra <= budget:
+            picked.append(line)
+            used += extra
+        else:
+            if not picked:
+                picked.append(line[:budget])
+            break
+    return "\n".join(picked)
+
+
+def compact_pytest_failure_output(output: str, max_chars: int = 2500) -> str:
+    """Compact verbose pytest output to <= max_chars keeping failure summary and latest assertions/tracebacks."""
+    limit = int(max_chars)
+    if limit <= 0 or not output or not isinstance(output, str):
+        return ""
+    clean = output.strip()
+    if not clean:
+        return ""
+    if len(clean) <= limit:
+        return clean
+
+    marker = f"\n{_COMPACT_TRUNCATION_MARKER}\n"
+    if limit <= len(marker) + 4:
+        if limit <= 3:
+            return clean[-limit:]
+        return f"...{clean[-(limit - 3):]}"
+
+    lines = clean.splitlines()
+    if len(lines) <= 1:
+        avail = limit - len(marker)
+        head_len = avail // 3
+        tail_len = avail - head_len
+        return f"{clean[:head_len]}{marker}{clean[-tail_len:]}"
+
+    summary_indices: set[int] = set()
+    in_short_summary = False
+    for idx, line in enumerate(lines):
+        if "short test summary info" in line.lower():
+            in_short_summary = True
+        if in_short_summary or _PYTEST_SUMMARY_LINE_RE.search(line):
+            summary_indices.add(idx)
+
+    summary_lines = [lines[i] for i in sorted(summary_indices) if lines[i].strip()]
+    non_summary_indices = [i for i in range(len(lines)) if i not in summary_indices]
+
+    assertion_idx_set: set[int] = set()
+    for pos, orig_idx in enumerate(non_summary_indices):
+        line = lines[orig_idx]
+        if _PYTEST_ASSERTION_LINE_RE.search(line):
+            assertion_idx_set.add(orig_idx)
+            if line.lstrip().startswith((">", "Traceback")):
+                for back in (1, 2):
+                    if pos - back >= 0:
+                        prev_idx = non_summary_indices[pos - back]
+                        if lines[prev_idx].strip():
+                            assertion_idx_set.add(prev_idx)
+
+    assertion_lines = [lines[i] for i in sorted(assertion_idx_set)]
+    non_summary_lines = [lines[i] for i in non_summary_indices if lines[i].strip()]
+
+    avail = limit - len(marker)
+
+    if summary_lines:
+        summary_full = "\n".join(summary_lines)
+        if assertion_lines or non_summary_lines:
+            detail_source = assertion_lines if assertion_lines else non_summary_lines
+            summary_budget = min(len(summary_full), max(1, avail // 2))
+            summary_part = (
+                summary_full
+                if len(summary_full) <= summary_budget
+                else _take_lines_from_end(summary_lines, summary_budget)
+            )
+            detail_budget = avail - len(summary_part)
+            detail_part = _take_lines_from_end(detail_source, detail_budget)
+            if detail_part and summary_part:
+                result = f"{detail_part}{marker}{summary_part}"
+            elif summary_part:
+                result = f"{_COMPACT_TRUNCATION_MARKER}\n{summary_part}"
+            else:
+                result = f"{_COMPACT_TRUNCATION_MARKER}\n{detail_part}"
+        else:
+            head_budget = avail // 2
+            tail_budget = avail - head_budget
+            head_part = _take_lines_from_start(summary_lines, head_budget)
+            tail_part = _take_lines_from_end(summary_lines, tail_budget)
+            result = f"{head_part}{marker}{tail_part}"
+    else:
+        detail_source = assertion_lines if assertion_lines else non_summary_lines
+        tail_budget = max(1, (avail * 3) // 4)
+        tail_part = _take_lines_from_end(detail_source, tail_budget)
+        head_budget = avail - len(tail_part)
+        head_part = _take_lines_from_start(non_summary_lines, head_budget) if head_budget > 0 else ""
+        if head_part and tail_part and head_part != tail_part:
+            result = f"{head_part}{marker}{tail_part}"
+        else:
+            trimmed_tail = _take_lines_from_end(
+                detail_source,
+                max(1, limit - len(_COMPACT_TRUNCATION_MARKER) - 1),
+            )
+            result = f"{_COMPACT_TRUNCATION_MARKER}\n{trimmed_tail}"
+
+    if len(result) > limit:
+        result = result[-limit:]
+    return result
+
+
 def _parse_json_dict_loose(text: str) -> dict[str, Any] | None:
     """Extract first JSON object from stdout if CLI returned structured output."""
     clean = str(text or "").strip()
@@ -777,12 +950,31 @@ class RecoveryAgent:
         guidance: str = "",
         extra_secrets: Sequence[str],
     ) -> tuple[bool, str]:
-        bounded_logs = self._redact(recent_logs[-2500:], extra_secrets) if recent_logs else "(sin logs previos)"
+        redacted_err = self._redact(error_text, extra_secrets)
+        redacted_logs = self._redact(recent_logs, extra_secrets) if recent_logs else ""
+        bounded_err = compact_pytest_failure_output(redacted_err, max_chars=1500) or redacted_err[:1500]
+        bounded_logs = (
+            compact_pytest_failure_output(redacted_logs, max_chars=2500)
+            if redacted_logs
+            else "(sin logs previos)"
+        )
+        failed_nodes = extract_failed_pytest_nodes(f"{redacted_err}\n{redacted_logs}")
+        failed_nodes_block = ""
+        if failed_nodes:
+            top_nodes = failed_nodes[:10]
+            rerun_cmd = "pytest -q --no-cov " + " ".join(top_nodes)
+            nodes_lines = "\n".join(f"- {node}" for node in top_nodes)
+            failed_nodes_block = (
+                "\nNode IDs fallidos detectados (re-ejecuta primero estos tests):\n"
+                f"{nodes_lines}\n"
+                f"Comando sugerido: `{rerun_cmd}`\n"
+            )
         hint_block = f"\nLección previa de referencia: {guidance}\n" if guidance else ""
         prompt = (
             f"Agente Doctor (reparación segura limitada al workspace).\n"
             f"Etapa: {stage}\n"
-            f"Error detectado:\n{error_text[:1500]}\n"
+            f"Error detectado:\n{bounded_err}\n"
+            f"{failed_nodes_block}"
             f"{hint_block}"
             f"Logs recientes:\n{bounded_logs}\n\n"
             "Instrucciones: Investiga y corrige únicamente los archivos dentro de este workspace para resolver el fallo. "
