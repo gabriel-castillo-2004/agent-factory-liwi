@@ -78,6 +78,58 @@ def _handle_remove_readonly(func: Callable[..., Any], path: str, _exc: Any) -> N
     func(path)
 
 
+def _safe_resolve(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except OSError:
+        return Path(os.path.abspath(str(path)))
+
+
+def _norm_path(path: Path) -> str:
+    return os.path.normcase(str(_safe_resolve(path)))
+
+
+def _parse_worktree_porcelain(output: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if current is not None:
+                entries.append(current)
+                current = None
+            continue
+        if line.startswith("worktree "):
+            if current is not None:
+                entries.append(current)
+            current = {
+                "path": line[len("worktree ") :].strip(),
+                "head": "",
+                "branch": None,
+                "detached": False,
+                "bare": False,
+                "locked": False,
+                "prunable": False,
+            }
+        elif current is not None:
+            if line.startswith("HEAD "):
+                current["head"] = line[len("HEAD ") :].strip()
+            elif line.startswith("branch "):
+                ref = line.removeprefix("branch ").strip()
+                current["branch"] = ref.removeprefix("refs/heads/")
+            elif line == "detached":
+                current["detached"] = True
+            elif line == "bare":
+                current["bare"] = True
+            elif line == "locked" or line.startswith("locked "):
+                current["locked"] = True
+            elif line == "prunable" or line.startswith("prunable "):
+                current["prunable"] = True
+    if current is not None:
+        entries.append(current)
+    return entries
+
+
 class StagingManager:
     """Manages an isolated git worktree (.liwi-staging) for queued background self-improvements."""
 
@@ -228,6 +280,284 @@ class StagingManager:
             return
         self._run_git(["reset", "--hard", "HEAD"], cwd=self.worktree_path)
         self._run_git(["clean", "-fd"], cwd=self.worktree_path)
+
+    def _run_git_safe(
+        self,
+        args: list[str],
+        *,
+        errors: list[str],
+        cwd: Path | None = None,
+        timeout: float = _DEFAULT_GIT_TIMEOUT_SECONDS,
+        record_nonzero: bool = True,
+    ) -> subprocess.CompletedProcess[str] | None:
+        try:
+            res = self._run_git(args, cwd=cwd, timeout=timeout)
+        except (subprocess.SubprocessError, OSError) as exc:
+            errors.append(redact_secrets(f"git {' '.join(args)}: {exc}"))
+            return None
+        if record_nonzero and res.returncode != 0:
+            detail = (res.stderr or res.stdout or f"exit code {res.returncode}").strip()
+            errors.append(redact_secrets(f"git {' '.join(args)}: {detail}"))
+        return res
+
+    def _is_temp_staging_worktree_name(self, path: Path) -> bool:
+        name = path.name
+        if not name or name == self.worktree_name:
+            return False
+        prefixes = (
+            f"{self.worktree_name}-",
+            f"{self.worktree_name}_",
+            f"{self.worktree_name}.",
+            ".liwi-staging-",
+            ".liwi-staging_",
+            ".liwi-staging.",
+            "staging-tmp-",
+            ".staging-tmp-",
+        )
+        if any(name.startswith(prefix) for prefix in prefixes):
+            return True
+        return path.parent.name.startswith("af_wt_") and name.startswith("agent-")
+
+    def _is_temp_staging_branch(self, branch_name: str) -> bool:
+        clean = str(branch_name or "").strip()
+        if not clean or clean in {"main", "master", self.base_branch, self.staging_branch}:
+            return False
+        prefixes = (
+            f"{self.staging_branch}-",
+            f"{self.staging_branch}/",
+            f"{self.staging_branch}_",
+            "liwi-staging-",
+            "liwi-staging/",
+            "liwi-staging_",
+            "staging-tmp-",
+            "staging/tmp-",
+            "af-par-",
+        )
+        return any(clean.startswith(prefix) for prefix in prefixes)
+
+    def prune_stale_worktrees(self, max_age_seconds: int = 3600) -> dict[str, list[str]]:
+        """Safely prune orphaned/expired temporary staging worktrees and branches without touching main or active worktrees."""
+        pruned_worktrees: list[str] = []
+        pruned_branches: list[str] = []
+        skipped: list[str] = []
+        errors: list[str] = []
+        summary: dict[str, list[str]] = {
+            "pruned_worktrees": pruned_worktrees,
+            "pruned_branches": pruned_branches,
+            "skipped": skipped,
+            "errors": errors,
+        }
+
+        max_age = max(0.0, float(max_age_seconds))
+        now_ts = time.time()
+
+        with self._worktree_setup_lock:
+            with self._lock:
+                manager_busy = bool(self._is_building or self._is_promoting)
+
+            repo_root_norm = _norm_path(self.repo_root)
+            active_wt_norm = _norm_path(self.worktree_path)
+            protected_branches: set[str] = {
+                "main",
+                "master",
+                self.base_branch,
+                self.staging_branch,
+            }
+
+            head_res = self._run_git_safe(
+                ["rev-parse", "--abbrev-ref", "HEAD"],
+                errors=errors,
+                cwd=self.repo_root,
+                record_nonzero=False,
+            )
+            if head_res is not None and head_res.returncode == 0:
+                current_head = head_res.stdout.strip()
+                if current_head and current_head != "HEAD":
+                    protected_branches.add(current_head)
+
+            list_res = self._run_git_safe(
+                ["worktree", "list", "--porcelain"],
+                errors=errors,
+                cwd=self.repo_root,
+            )
+            worktree_list_ok = list_res is not None and list_res.returncode == 0
+            entries = (
+                _parse_worktree_porcelain(list_res.stdout)
+                if worktree_list_ok and list_res is not None
+                else []
+            )
+
+            prunable_entries: list[dict[str, Any]] = []
+            registered_paths_norm: set[str] = set()
+            for entry in entries:
+                wt_path = _safe_resolve(Path(entry["path"]))
+                wt_norm = _norm_path(wt_path)
+                registered_paths_norm.add(wt_norm)
+                if entry.get("prunable") and wt_norm not in {repo_root_norm, active_wt_norm}:
+                    prunable_entries.append(entry)
+
+            prune_res = self._run_git_safe(
+                ["worktree", "prune"],
+                errors=errors,
+                cwd=self.repo_root,
+            )
+            prune_succeeded = prune_res is not None and prune_res.returncode == 0
+            if prune_succeeded:
+                for entry in prunable_entries:
+                    pruned_worktrees.append(str(_safe_resolve(Path(entry["path"]))))
+
+            if not worktree_list_ok:
+                return summary
+
+            active_branches: set[str] = set(protected_branches)
+            if not prune_succeeded:
+                for entry in prunable_entries:
+                    branch = entry.get("branch")
+                    if branch:
+                        active_branches.add(str(branch))
+
+            for entry in entries:
+                wt_path = _safe_resolve(Path(entry["path"]))
+                wt_norm = _norm_path(wt_path)
+                wt_branch = str(entry["branch"]) if entry.get("branch") else None
+
+                if entry.get("prunable") and wt_norm not in {repo_root_norm, active_wt_norm}:
+                    continue
+
+                if (
+                    wt_norm == repo_root_norm
+                    or wt_norm == active_wt_norm
+                    or (wt_branch is not None and wt_branch in protected_branches)
+                    or bool(entry.get("locked"))
+                ):
+                    skipped.append(str(wt_path))
+                    if wt_branch:
+                        active_branches.add(wt_branch)
+                    continue
+
+                is_temp_wt = self._is_temp_staging_worktree_name(wt_path) or (
+                    wt_branch is not None and self._is_temp_staging_branch(wt_branch)
+                )
+                if not is_temp_wt or manager_busy:
+                    skipped.append(str(wt_path))
+                    if wt_branch:
+                        active_branches.add(wt_branch)
+                    continue
+
+                if wt_path.exists():
+                    try:
+                        mtime = wt_path.stat().st_mtime
+                    except OSError as exc:
+                        errors.append(redact_secrets(f"stat {wt_path}: {exc}"))
+                        if wt_branch:
+                            active_branches.add(wt_branch)
+                        continue
+                    if (now_ts - mtime) < max_age:
+                        skipped.append(str(wt_path))
+                        if wt_branch:
+                            active_branches.add(wt_branch)
+                        continue
+
+                rem_res = self._run_git_safe(
+                    ["worktree", "remove", "--force", str(wt_path)],
+                    errors=errors,
+                    cwd=self.repo_root,
+                )
+                if rem_res is not None and rem_res.returncode == 0:
+                    pruned_worktrees.append(str(wt_path))
+                elif wt_branch:
+                    active_branches.add(wt_branch)
+
+            if not manager_busy and self.repo_root.is_dir():
+                try:
+                    children = list(self.repo_root.iterdir())
+                except OSError as exc:
+                    errors.append(redact_secrets(f"iterdir {self.repo_root}: {exc}"))
+                    children = []
+
+                for child in children:
+                    if child.is_symlink() or not child.is_dir():
+                        continue
+                    child_resolved = _safe_resolve(child)
+                    child_norm = _norm_path(child_resolved)
+                    if child_norm in registered_paths_norm or child_norm in {
+                        repo_root_norm,
+                        active_wt_norm,
+                    }:
+                        continue
+                    if (
+                        not child_resolved.is_relative_to(self.repo_root)
+                        or child_resolved.parent != self.repo_root
+                    ):
+                        continue
+                    if not self._is_temp_staging_worktree_name(child_resolved):
+                        continue
+                    try:
+                        child_mtime = child_resolved.stat().st_mtime
+                    except OSError as exc:
+                        errors.append(redact_secrets(f"stat {child_resolved}: {exc}"))
+                        continue
+                    if (now_ts - child_mtime) < max_age:
+                        skipped.append(str(child_resolved))
+                        continue
+                    try:
+                        shutil.rmtree(child_resolved, onerror=_handle_remove_readonly)
+                        pruned_worktrees.append(str(child_resolved))
+                    except OSError as exc:
+                        errors.append(redact_secrets(f"rmtree {child_resolved}: {exc}"))
+
+            if not manager_busy:
+                refs_res = self._run_git_safe(
+                    [
+                        "for-each-ref",
+                        "--format=%(refname:short)\t%(committerdate:unix)",
+                        "refs/heads",
+                    ],
+                    errors=errors,
+                    cwd=self.repo_root,
+                )
+                if refs_res is not None and refs_res.returncode == 0 and refs_res.stdout:
+                    for raw_line in refs_res.stdout.splitlines():
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        parts = line.split("\t", 1)
+                        if len(parts) != 2:
+                            continue
+                        branch_name = parts[0].strip()
+                        ts_raw = parts[1].strip()
+                        if not branch_name:
+                            continue
+                        if branch_name in protected_branches:
+                            skipped.append(f"branch:{branch_name}")
+                            continue
+                        if not self._is_temp_staging_branch(branch_name):
+                            continue
+                        if branch_name in active_branches:
+                            skipped.append(f"branch:{branch_name}")
+                            continue
+                        try:
+                            branch_ts = float(ts_raw)
+                        except ValueError:
+                            skipped.append(f"branch:{branch_name}")
+                            continue
+                        if (now_ts - branch_ts) < max_age:
+                            skipped.append(f"branch:{branch_name}")
+                            continue
+                        try:
+                            validated_branch = _validate_branch_name(branch_name, "temporal")
+                        except ValueError:
+                            skipped.append(f"branch:{branch_name}")
+                            continue
+                        del_res = self._run_git_safe(
+                            ["branch", "-D", validated_branch],
+                            errors=errors,
+                            cwd=self.repo_root,
+                        )
+                        if del_res is not None and del_res.returncode == 0:
+                            pruned_branches.append(validated_branch)
+
+        return summary
 
     def _git_identity_prefix(self, cwd: Path) -> list[str]:
         name_chk = self._run_git(["config", "--get", "user.name"], cwd=cwd)

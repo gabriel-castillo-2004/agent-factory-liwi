@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -405,4 +408,357 @@ def test_staging_manager_429_preserves_dirty_worktree_wip_and_resumes_with_diff(
         assert "partial_feature.txt" in seen_prompts[1]
     finally:
         manager.shutdown()
+
+
+def test_prune_stale_worktrees_cleans_orphans_and_preserves_main_and_active(
+    temp_git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    """prune_stale_worktrees prunes expired orphan staging worktrees/branches while preserving main, active staging, and unrelated worktrees/branches."""
+    manager = StagingManager(repo_root=temp_git_repo)
+    old_ts = int(time.time()) - 7200
+    old_env = {
+        **os.environ,
+        "GIT_AUTHOR_DATE": f"{old_ts} +0000",
+        "GIT_COMMITTER_DATE": f"{old_ts} +0000",
+    }
+
+    def _git_old(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            env=old_env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+
+    try:
+        active_wt = manager.ensure_worktree()
+        main_sha_before = _git(temp_git_repo, "rev-parse", "main").stdout.strip()
+
+        # 1. Expired temporary staging worktree + expired temporary branch
+        stale_wt = temp_git_repo / ".liwi-staging-tmp-expired"
+        assert (
+            _git(
+                temp_git_repo,
+                "worktree",
+                "add",
+                "-b",
+                "liwi-staging-tmp-expired",
+                str(stale_wt),
+                "main",
+            ).returncode
+            == 0
+        )
+        (stale_wt / "stale.txt").write_text("stale\n", encoding="utf-8")
+        assert _git(stale_wt, "add", "stale.txt").returncode == 0
+        assert _git_old(stale_wt, "commit", "-m", "chore: old stale commit").returncode == 0
+        os.utime(stale_wt, (old_ts, old_ts))
+
+        # 2. Fresh temporary staging worktree (must NOT be pruned even if base commit is old)
+        fresh_wt = temp_git_repo / ".liwi-staging-tmp-fresh"
+        assert (
+            _git(
+                temp_git_repo,
+                "worktree",
+                "add",
+                "-b",
+                "liwi-staging-tmp-fresh",
+                str(fresh_wt),
+                "main",
+            ).returncode
+            == 0
+        )
+
+        # 3. Unrelated user worktree with old mtime (must NEVER be pruned)
+        unrelated_wt = tmp_path / "user_feature_wt"
+        assert (
+            _git(
+                temp_git_repo,
+                "worktree",
+                "add",
+                "-b",
+                "feat/user-feature",
+                str(unrelated_wt),
+                "main",
+            ).returncode
+            == 0
+        )
+        os.utime(unrelated_wt, (old_ts, old_ts))
+
+        # 4. Prunable worktree entry whose directory was already removed externally
+        ghost_wt = temp_git_repo / ".liwi-staging-ghost"
+        assert (
+            _git(
+                temp_git_repo,
+                "worktree",
+                "add",
+                "-b",
+                "liwi-staging-ghost",
+                str(ghost_wt),
+                "main",
+            ).returncode
+            == 0
+        )
+        (ghost_wt / "ghost.txt").write_text("ghost\n", encoding="utf-8")
+        assert _git(ghost_wt, "add", "ghost.txt").returncode == 0
+        assert _git_old(ghost_wt, "commit", "-m", "chore: ghost commit").returncode == 0
+        shutil.rmtree(ghost_wt)
+
+        # 5. Unregistered expired orphan directory inside repo_root
+        orphan_dir = temp_git_repo / ".liwi-staging-orphan-dir"
+        orphan_dir.mkdir()
+        (orphan_dir / "leftover.txt").write_text("leftover\n", encoding="utf-8")
+        os.utime(orphan_dir, (old_ts, old_ts))
+
+        # 6. Expired orphan temporary branch (no worktree) + fresh temporary branch + old unrelated branch
+        assert _git(temp_git_repo, "checkout", "-b", "liwi-staging-orphan-old", "main").returncode == 0
+        (temp_git_repo / "orphan_old.txt").write_text("old\n", encoding="utf-8")
+        assert _git(temp_git_repo, "add", "orphan_old.txt").returncode == 0
+        assert _git_old(temp_git_repo, "commit", "-m", "chore: orphan old branch").returncode == 0
+
+        assert _git(temp_git_repo, "checkout", "-b", "liwi-staging-fresh-branch", "main").returncode == 0
+        (temp_git_repo / "fresh_b.txt").write_text("fresh\n", encoding="utf-8")
+        assert _git(temp_git_repo, "add", "fresh_b.txt").returncode == 0
+        assert _git(temp_git_repo, "commit", "-m", "chore: fresh temp branch").returncode == 0
+
+        assert _git(temp_git_repo, "checkout", "-b", "feat/unrelated-old", "main").returncode == 0
+        (temp_git_repo / "unrelated.txt").write_text("keep\n", encoding="utf-8")
+        assert _git(temp_git_repo, "add", "unrelated.txt").returncode == 0
+        assert _git_old(temp_git_repo, "commit", "-m", "chore: keep user branch").returncode == 0
+
+        assert _git(temp_git_repo, "checkout", "main").returncode == 0
+
+        summary = manager.prune_stale_worktrees(max_age_seconds=3600)
+
+        assert set(summary.keys()) == {
+            "pruned_worktrees",
+            "pruned_branches",
+            "skipped",
+            "errors",
+        }
+        assert summary["errors"] == []
+
+        # Expired orphan worktrees and directories were removed
+        assert not stale_wt.exists()
+        assert not orphan_dir.exists()
+        assert str(stale_wt.resolve()) in summary["pruned_worktrees"]
+        assert str(orphan_dir.resolve()) in summary["pruned_worktrees"]
+        assert str(ghost_wt.resolve()) in summary["pruned_worktrees"]
+
+        # Expired orphan temporary branches were removed
+        assert "liwi-staging-tmp-expired" in summary["pruned_branches"]
+        assert "liwi-staging-ghost" in summary["pruned_branches"]
+        assert "liwi-staging-orphan-old" in summary["pruned_branches"]
+
+        # Main repo, main branch, active staging worktree & branch, fresh temp, and user items are intact
+        assert temp_git_repo.is_dir()
+        assert _git(temp_git_repo, "rev-parse", "main").stdout.strip() == main_sha_before
+        assert active_wt.is_dir()
+        assert fresh_wt.is_dir()
+        assert unrelated_wt.is_dir()
+
+        branches = set(
+            _git(temp_git_repo, "for-each-ref", "--format=%(refname:short)", "refs/heads")
+            .stdout.splitlines()
+        )
+        assert "main" in branches
+        assert "liwi-staging" in branches
+        assert "liwi-staging-tmp-fresh" in branches
+        assert "liwi-staging-fresh-branch" in branches
+        assert "feat/user-feature" in branches
+        assert "feat/unrelated-old" in branches
+        assert "liwi-staging-tmp-expired" not in branches
+        assert "liwi-staging-ghost" not in branches
+        assert "liwi-staging-orphan-old" not in branches
+
+        assert str(temp_git_repo.resolve()) in summary["skipped"]
+        assert str(active_wt.resolve()) in summary["skipped"]
+        assert str(fresh_wt.resolve()) in summary["skipped"]
+        assert str(unrelated_wt.resolve()) in summary["skipped"]
+        assert "branch:main" in summary["skipped"]
+        assert "branch:liwi-staging" in summary["skipped"]
+    finally:
+        manager.shutdown()
+
+
+def test_prune_stale_worktrees_never_deletes_main_locked_or_busy_worktrees_with_mocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With mocked git commands and max_age_seconds=0, main, active staging, locked worktrees, and busy runs are never removed."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    active_wt = repo / ".liwi-staging"
+    active_wt.mkdir()
+    locked_wt = repo / ".liwi-staging-tmp-locked"
+    locked_wt.mkdir()
+    old_ts = int(time.time()) - 10000
+    os.utime(active_wt, (old_ts, old_ts))
+    os.utime(locked_wt, (old_ts, old_ts))
+
+    manager = StagingManager(repo_root=repo)
+    called_args: list[list[str]] = []
+
+    porcelain_out = (
+        f"worktree {repo.resolve()}\n"
+        "HEAD 1111111\n"
+        "branch refs/heads/main\n\n"
+        f"worktree {active_wt.resolve()}\n"
+        "HEAD 2222222\n"
+        "branch refs/heads/liwi-staging\n\n"
+        f"worktree {locked_wt.resolve()}\n"
+        "HEAD 3333333\n"
+        "branch refs/heads/liwi-staging-tmp-locked\n"
+        "locked in progress\n"
+    )
+    refs_out = (
+        f"main\t{old_ts}\n"
+        f"liwi-staging\t{old_ts}\n"
+        f"liwi-staging-tmp-locked\t{old_ts}\n"
+        f"af-par-deadbeef-1\t{old_ts}\n"
+    )
+
+    def _fake_run_git(
+        args: list[str],
+        *,
+        cwd: Path | None = None,
+        timeout: float = 30.0,
+    ) -> subprocess.CompletedProcess[str]:
+        called_args.append(list(args))
+        if args[:2] == ["rev-parse", "--abbrev-ref"]:
+            return subprocess.CompletedProcess(args, 0, stdout="main\n", stderr="")
+        if args == ["worktree", "list", "--porcelain"]:
+            return subprocess.CompletedProcess(args, 0, stdout=porcelain_out, stderr="")
+        if args == ["worktree", "prune"]:
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if args[:1] == ["for-each-ref"]:
+            return subprocess.CompletedProcess(args, 0, stdout=refs_out, stderr="")
+        if args[:2] == ["branch", "-D"]:
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(manager, "_run_git", _fake_run_git)
+
+    try:
+        summary = manager.prune_stale_worktrees(max_age_seconds=0)
+        assert ["worktree", "prune"] in called_args
+        assert not any(cmd[:2] == ["worktree", "remove"] for cmd in called_args)
+        assert ["branch", "-D", "af-par-deadbeef-1"] in called_args
+        assert ["branch", "-D", "main"] not in called_args
+        assert ["branch", "-D", "liwi-staging"] not in called_args
+        assert ["branch", "-D", "liwi-staging-tmp-locked"] not in called_args
+        assert summary["pruned_worktrees"] == []
+        assert summary["pruned_branches"] == ["af-par-deadbeef-1"]
+        assert summary["errors"] == []
+
+        # When manager is actively building, even expired temp branches are skipped
+        called_args.clear()
+        with manager._lock:
+            manager._is_building = True
+        try:
+            busy_summary = manager.prune_stale_worktrees(max_age_seconds=0)
+        finally:
+            with manager._lock:
+                manager._is_building = False
+
+        assert ["worktree", "prune"] in called_args
+        assert not any(cmd[:2] == ["worktree", "remove"] for cmd in called_args)
+        assert not any(cmd[:2] == ["branch", "-D"] for cmd in called_args)
+        assert busy_summary["pruned_worktrees"] == []
+        assert busy_summary["pruned_branches"] == []
+        assert busy_summary["errors"] == []
+    finally:
+        manager.shutdown()
+
+
+def test_prune_stale_worktrees_handles_subprocess_errors_without_raising(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Subprocess timeouts, OS errors, and non-zero exits are captured in errors without breaking flow."""
+    repo = tmp_path / "repo_err"
+    repo.mkdir()
+    stale_wt = repo / ".liwi-staging-tmp-broken"
+    stale_wt.mkdir()
+    old_ts = int(time.time()) - 9000
+    os.utime(stale_wt, (old_ts, old_ts))
+
+    manager = StagingManager(repo_root=repo)
+
+    porcelain_out = (
+        f"worktree {repo.resolve()}\n"
+        "HEAD 1111111\n"
+        "branch refs/heads/main\n\n"
+        f"worktree {stale_wt.resolve()}\n"
+        "HEAD 2222222\n"
+        "branch refs/heads/liwi-staging-tmp-broken\n"
+    )
+    refs_out = (
+        f"main\t{old_ts}\n"
+        f"liwi-staging-tmp-broken\t{old_ts}\n"
+        f"liwi-staging-orphan-fail\t{old_ts}\n"
+        f"liwi-staging-orphan-ok\t{old_ts}\n"
+    )
+
+    def _flaky_run_git(
+        args: list[str],
+        *,
+        cwd: Path | None = None,
+        timeout: float = 30.0,
+    ) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ["rev-parse", "--abbrev-ref"]:
+            return subprocess.CompletedProcess(args, 0, stdout="main\n", stderr="")
+        if args == ["worktree", "list", "--porcelain"]:
+            return subprocess.CompletedProcess(args, 0, stdout=porcelain_out, stderr="")
+        if args == ["worktree", "prune"]:
+            raise subprocess.TimeoutExpired(cmd=["git", "worktree", "prune"], timeout=timeout)
+        if args[:2] == ["worktree", "remove"]:
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="fatal: cannot remove locked dir")
+        if args[:1] == ["for-each-ref"]:
+            return subprocess.CompletedProcess(args, 0, stdout=refs_out, stderr="")
+        if args == ["branch", "-D", "liwi-staging-orphan-fail"]:
+            raise OSError("permission denied executing git")
+        if args == ["branch", "-D", "liwi-staging-orphan-ok"]:
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(manager, "_run_git", _flaky_run_git)
+
+    try:
+        summary = manager.prune_stale_worktrees(max_age_seconds=3600)
+        assert summary["pruned_worktrees"] == []
+        # Branch whose worktree removal failed was NOT deleted; unrelated valid orphan branch WAS deleted
+        assert summary["pruned_branches"] == ["liwi-staging-orphan-ok"]
+        assert "branch:liwi-staging-tmp-broken" in summary["skipped"]
+        assert len(summary["errors"]) == 3
+        joined_errors = "\n".join(summary["errors"])
+        assert "worktree prune" in joined_errors
+        assert "cannot remove locked dir" in joined_errors
+        assert "permission denied executing git" in joined_errors
+
+        # If git worktree list fails, do not attempt branch deletions (cannot verify active worktrees)
+        def _failing_list_git(
+            args: list[str],
+            *,
+            cwd: Path | None = None,
+            timeout: float = 30.0,
+        ) -> subprocess.CompletedProcess[str]:
+            if args == ["worktree", "list", "--porcelain"]:
+                return subprocess.CompletedProcess(args, 128, stdout="", stderr="fatal: not a git repository")
+            if args[:2] == ["branch", "-D"]:
+                raise AssertionError("branch -D must not be called when worktree list fails")
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(manager, "_run_git", _failing_list_git)
+        fail_summary = manager.prune_stale_worktrees(max_age_seconds=0)
+        assert fail_summary["pruned_worktrees"] == []
+        assert fail_summary["pruned_branches"] == []
+        assert any("not a git repository" in e for e in fail_summary["errors"])
+    finally:
+        manager.shutdown()
+
 
