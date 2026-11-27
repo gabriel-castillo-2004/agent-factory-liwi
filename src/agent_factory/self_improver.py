@@ -480,7 +480,7 @@ class FactorySelfImprover:
     def _redact(self, text: str, extra_secrets: Sequence[str] = ()) -> str:
         return redact_secrets(text, extra_secrets=(*self.secrets_to_redact, *extra_secrets))
 
-    def _resolve_telemetry_db_path(self) -> Path | None:
+    def _resolve_telemetry_db_path(self) -> Path:
         """Resolve telemetry SQLite path respecting explicit override, env var, and test isolation."""
         if self._telemetry_db_path is not None:
             return self._telemetry_db_path
@@ -494,7 +494,7 @@ class FactorySelfImprover:
             if db_parent == repo_data_dir:
                 return (repo_data_dir / "telemetry.db").resolve()
             return (db_parent / "telemetry.db").resolve()
-        return None
+        return Path(":memory:")
 
     def _save_uploaded_images(self, images: Sequence[Mapping[str, Any]]) -> list[str]:
         if not images:
@@ -1164,16 +1164,37 @@ class FactorySelfImprover:
             title=clean_title,
             started_at=started_at,
         )
+        telemetry_db = self._resolve_telemetry_db_path()
         ruff_cmd = [*self._resolve_venv_tool("ruff"), "check", "src", "tests"]
+        ruff_t0 = time.monotonic()
         ruff_res = self.runner.run(
             ruff_cmd,
             cwd=self.repo_root,
             timeout_seconds=self.verify_timeout_seconds,
             env=ws_env,
         )
+        ruff_ms = max(0.0, (time.monotonic() - ruff_t0) * 1000.0)
         if ruff_res.exit_code != 0:
             tail = (ruff_res.stdout or ruff_res.stderr or "ruff check failed").strip()[-1200:]
-            return False, f"Falló ruff check src tests:\n{self._redact(tail)}"
+            redacted_tail = self._redact(tail)
+            record_safe_event(
+                component="self_improver",
+                stage="verify_ruff",
+                command="ruff check src tests",
+                duration_ms=ruff_ms,
+                exit_code=ruff_res.exit_code,
+                error_text=redacted_tail,
+                db_path=telemetry_db,
+            )
+            return False, f"Falló ruff check src tests:\n{redacted_tail}"
+        record_safe_event(
+            component="self_improver",
+            stage="verify_ruff",
+            command="ruff check src tests",
+            duration_ms=ruff_ms,
+            exit_code=0,
+            db_path=telemetry_db,
+        )
 
         explicit_targets = self._resolve_explicit_test_targets(explicit_tests)
         if explicit_targets:
@@ -1245,12 +1266,15 @@ class FactorySelfImprover:
                 started_at=started_at,
             )
         pytest_cmd = [*self._resolve_venv_tool("pytest"), *pytest_args]
+        pytest_t0 = time.monotonic()
         pytest_res = self.runner.run(
             pytest_cmd,
             cwd=self.repo_root,
             timeout_seconds=self.verify_timeout_seconds,
             env=ws_env,
         )
+        pytest_ms = max(0.0, (time.monotonic() - pytest_t0) * 1000.0)
+        pytest_cmd_label = f"pytest {' '.join(pytest_args)}"
         if pytest_res.exit_code != 0:
             raw_pytest = (
                 "\n".join(
@@ -1263,7 +1287,24 @@ class FactorySelfImprover:
                 self._redact(raw_pytest),
                 max_chars=max(200, 2500 - len(pytest_prefix)),
             )
+            record_safe_event(
+                component="self_improver",
+                stage="verify_pytest",
+                command=pytest_cmd_label,
+                duration_ms=pytest_ms,
+                exit_code=pytest_res.exit_code,
+                error_text=pytest_compact,
+                db_path=telemetry_db,
+            )
             return False, f"{pytest_prefix}{pytest_compact}"
+        record_safe_event(
+            component="self_improver",
+            stage="verify_pytest",
+            command=pytest_cmd_label,
+            duration_ms=pytest_ms,
+            exit_code=0,
+            db_path=telemetry_db,
+        )
         return True, ""
 
     def _rollback_savepoint(self, env: Mapping[str, str]) -> None:

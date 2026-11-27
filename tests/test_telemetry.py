@@ -767,3 +767,209 @@ def test_self_improver_records_live_telemetry_and_never_breaks_on_telemetry_fail
     assert res_still_ok["ok"] is True
     apply_still_ok = improver.apply_proposal("Otro cambio", proposal_title="Sin telemetria")
     assert apply_still_ok["applied"] is True
+
+
+def test_self_improver_memory_db_isolates_telemetry_and_records_verify_stages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In-memory FactorySelfImprover isolates telemetry to :memory: and _run_verification_gate records verify_ruff/verify_pytest."""
+    import subprocess
+    from collections.abc import Mapping, Sequence
+
+    from agent_factory.adapters.subprocess_runner import SubprocessRunner
+    from agent_factory.ports.runner import CommandResult
+    from agent_factory.self_improver import FactorySelfImprover
+
+    monkeypatch.delenv("AGENT_FACTORY_TELEMETRY_DB", raising=False)
+    mem_improver = FactorySelfImprover(db_path=":memory:", uploads_dir=tmp_path / "mem_uploads")
+    assert mem_improver._resolve_telemetry_db_path() == Path(":memory:")
+
+    repo_root = tmp_path / "repo_verify_tel"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "TestFactory"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.email", "factory@local"], cwd=repo_root, check=True)
+    (repo_root / "src" / "agent_factory").mkdir(parents=True, exist_ok=True)
+    (repo_root / "tests").mkdir(parents=True, exist_ok=True)
+    (repo_root / "src" / "agent_factory" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (repo_root / "tests" / "test_sample.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "chore: seed"], cwd=repo_root, check=True, capture_output=True)
+
+    telemetry_db = tmp_path / "verify_telemetry.db"
+    monkeypatch.setenv("AGENT_FACTORY_TELEMETRY_DB", str(telemetry_db))
+
+    real_runner = SubprocessRunner(default_timeout_seconds=15.0)
+    ruff_fail = [False]
+
+    class _VerifyTelemetryRunner(SubprocessRunner):
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            exe_stem = Path(command[0]).stem.lower()
+            if exe_stem == "agy":
+                (repo_root / "src" / "agent_factory" / "sample.py").write_text("VALUE = 2\n", encoding="utf-8")
+                return CommandResult(exit_code=0, stdout="ok")
+            if exe_stem == "ruff":
+                if ruff_fail[0]:
+                    return CommandResult(exit_code=1, stdout="ruff check failed: F401 unused import")
+                return CommandResult(exit_code=0, stdout="All checks passed!")
+            if exe_stem == "pytest":
+                return CommandResult(exit_code=0, stdout="1 passed")
+            return real_runner.run(command, cwd, timeout_seconds=timeout_seconds, env=env)
+
+    improver = FactorySelfImprover(
+        db_path=tmp_path / "verify_factory.db",
+        repo_root=repo_root,
+        uploads_dir=tmp_path / "verify_uploads",
+        runner=_VerifyTelemetryRunner(),
+        restart_fn=lambda _code: None,
+        restart_delay_seconds=0.01,
+    )
+
+    res_ok = improver.apply_proposal("Actualiza sample", proposal_title="Verify ok")
+    assert res_ok["applied"] is True
+
+    ruff_fail[0] = True
+    res_fail = improver.apply_proposal("Rompe lint", proposal_title="Verify ruff fail")
+    assert res_fail["rolled_back"] is True
+
+    conn = sqlite3.connect(str(telemetry_db))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT component, stage, exit_code, error_signature FROM execution_events "
+            "WHERE stage IN ('verify_ruff', 'verify_pytest') ORDER BY id ASC"
+        ).fetchall()
+        assert len(rows) >= 3
+        assert rows[0]["component"] == "self_improver"
+        assert rows[0]["stage"] == "verify_ruff"
+        assert rows[0]["exit_code"] == 0
+        assert rows[1]["stage"] == "verify_pytest"
+        assert rows[1]["exit_code"] == 0
+        failed_ruff = [r for r in rows if r["stage"] == "verify_ruff" and r["exit_code"] == 1]
+        assert len(failed_ruff) >= 1
+        assert failed_ruff[0]["error_signature"] == "syntax_or_lint"
+    finally:
+        conn.close()
+
+
+def test_orchestrator_records_live_telemetry_and_never_breaks_on_telemetry_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Orchestrator isolates in-memory telemetry, records lifecycle events/incidents in temp DB, and survives telemetry errors."""
+    import agent_factory.telemetry as telemetry_mod
+    from agent_factory.adapters.memory_store import MemoryEventStore
+    from agent_factory.domain.states import ProjectState
+
+    monkeypatch.delenv("AGENT_FACTORY_TELEMETRY_DB", raising=False)
+    mem_orch = Orchestrator(store=MemoryEventStore(), llm=FakeLLM())
+    assert mem_orch._resolve_telemetry_db_path() == Path(":memory:")
+
+    telemetry_db = tmp_path / "orch_live_telemetry.db"
+    monkeypatch.setenv("AGENT_FACTORY_TELEMETRY_DB", str(telemetry_db))
+
+    store = SqliteEventStore(db_path=tmp_path / "orch_events.db")
+    try:
+        orch = Orchestrator(store=store, llm=FakeLLM())
+        orch.create_project("proj-tel", "Validar telemetria viva en orquestacion")
+
+        started_ev = orch.record_background_op_started(
+            "proj-tel",
+            op_type="quality_improve",
+            stage="auditing",
+        )
+        op_id = str(started_ev.payload["op_id"])
+        orch.record_background_op_finished(
+            "proj-tel",
+            op_id=op_id,
+            op_type="quality_improve",
+            status="completed",
+            duration_seconds=1.25,
+        )
+        orch.record_background_op_finished(
+            "proj-tel",
+            op_id="bg-fail-1",
+            op_type="quality_improve",
+            status="failed",
+            reason="SyntaxError near ORCH_SECRET_123",
+            duration_seconds=0.5,
+            extra_secrets=("ORCH_SECRET_123",),
+        )
+        orch.record_phase_failure(
+            "proj-tel",
+            failed_state=ProjectState.BUILDING,
+            error=RuntimeError("ModuleNotFoundError: No module named 'foo' token ORCH_SECRET_123"),
+            agent="builder",
+            extra_secrets=("ORCH_SECRET_123",),
+        )
+
+        conn = sqlite3.connect(str(telemetry_db))
+        conn.row_factory = sqlite3.Row
+        try:
+            events = conn.execute(
+                "SELECT project_id, component, stage, duration_ms, exit_code, error_signature "
+                "FROM execution_events ORDER BY id ASC"
+            ).fetchall()
+            assert len(events) == 4
+            assert all(r["component"] == "orchestrator" for r in events)
+            assert all(r["project_id"] == "proj-tel" for r in events)
+            assert [r["stage"] for r in events] == [
+                "quality_improve_start",
+                "quality_improve_finish",
+                "quality_improve_finish",
+                "BUILDING",
+            ]
+            assert events[1]["duration_ms"] == 1250
+            assert events[1]["exit_code"] == 0
+            assert events[2]["exit_code"] == 1
+            assert events[2]["error_signature"] == "syntax_or_lint"
+            assert events[3]["exit_code"] == 1
+            assert events[3]["error_signature"] == "missing_module"
+
+            incidents = conn.execute(
+                "SELECT project_id, stage, error_signature, raw_error FROM incidents ORDER BY id ASC"
+            ).fetchall()
+            assert len(incidents) == 2
+            assert incidents[0]["project_id"] == "proj-tel"
+            assert incidents[0]["stage"] == "quality_improve"
+            assert incidents[0]["error_signature"] == "syntax_or_lint"
+            assert "ORCH_SECRET_123" not in incidents[0]["raw_error"]
+            assert "[REDACTED]" in incidents[0]["raw_error"]
+            assert incidents[1]["stage"] == "BUILDING"
+            assert incidents[1]["error_signature"] == "missing_module"
+            assert "ORCH_SECRET_123" not in incidents[1]["raw_error"]
+        finally:
+            conn.close()
+
+        # Telemetry failure must never interrupt Orchestrator callers
+        def _broken_record(*args: Any, **kwargs: Any) -> Any:
+            raise sqlite3.OperationalError("simulated orchestrator telemetry failure")
+
+        monkeypatch.setattr(telemetry_mod, "record_execution_event", _broken_record)
+        monkeypatch.setattr(telemetry_mod, "record_incident", _broken_record)
+
+        orch.create_project("proj-tel-2", "Sigue funcionando si telemetria falla")
+        ev2 = orch.record_background_op_started("proj-tel-2", op_type="build")
+        orch.record_background_op_finished(
+            "proj-tel-2",
+            op_id=str(ev2.payload["op_id"]),
+            op_type="build",
+            status="completed",
+            duration_seconds=0.2,
+        )
+        status_failed = orch.record_phase_failure(
+            "proj-tel-2",
+            failed_state=ProjectState.DEBATE,
+            error="debate boom",
+            agent="debate",
+        )
+        assert status_failed.state == ProjectState.FAILED
+    finally:
+        store.close()

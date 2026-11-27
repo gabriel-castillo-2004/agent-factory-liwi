@@ -51,6 +51,11 @@ from agent_factory.ports.publisher import RegistryPublishError, StatusPublisher
 from agent_factory.ports.runner import CommandTimeoutError
 from agent_factory.ports.store import EventStore
 from agent_factory.secrets import redact_secrets
+from agent_factory.telemetry import (
+    TELEMETRY_DB_ENV_VAR,
+    record_safe_event,
+    record_safe_incident,
+)
 from agent_factory.workspace import (
     DEFAULT_WORKSPACE_PYTEST_INI,
     WORKSPACE_GIT_TIMEOUT_SECONDS,
@@ -856,6 +861,7 @@ class Orchestrator:
         vcs: Any | None = None,
         recovery_agent: Any | None = None,
         notifier: Any | None = None,
+        telemetry_db_path: Path | str | None = None,
     ) -> None:
         self.store = store
         self.llm = llm
@@ -870,6 +876,9 @@ class Orchestrator:
         self.vcs = vcs
         self.recovery_agent = recovery_agent
         self.notifier = notifier
+        self._telemetry_db_path: Path | None = (
+            Path(telemetry_db_path) if telemetry_db_path is not None else None
+        )
         self._lock = threading.RLock()
         self._chat_io_lock = threading.RLock()
         self._bg_op_heal_lock = threading.RLock()
@@ -880,6 +889,22 @@ class Orchestrator:
         self._last_published_status: dict[str, tuple[object, ...]] = {}
         self._last_notified_state: dict[str, ProjectState] = {}
         self.build_worker: Any | None = None
+
+    def _resolve_telemetry_db_path(self) -> Path:
+        """Resolve telemetry SQLite path respecting explicit override, env var, and test isolation."""
+        if self._telemetry_db_path is not None:
+            return self._telemetry_db_path
+        env_val = os.environ.get(TELEMETRY_DB_ENV_VAR, "").strip()
+        if env_val:
+            return Path(env_val)
+        raw_db = getattr(self.store, "db_path", None)
+        if raw_db and str(raw_db) != ":memory:":
+            db_parent = Path(str(raw_db)).resolve().parent
+            repo_data_dir = Path("data").resolve()
+            if db_parent == repo_data_dir:
+                return (repo_data_dir / "telemetry.db").resolve()
+            return (db_parent / "telemetry.db").resolve()
+        return Path(":memory:")
 
     def _project_lock(self, project_id: str) -> threading.RLock:
         with self._lock:
@@ -1065,6 +1090,24 @@ class Orchestrator:
                 )
             )
         final_status = self.get_status(project_id, notify_notifier=False)
+        telemetry_db = self._resolve_telemetry_db_path()
+        record_safe_incident(
+            stage=stage_label,
+            raw_error=clean_msg,
+            project_id=project_id,
+            db_path=telemetry_db,
+        )
+        record_safe_event(
+            component="orchestrator",
+            stage=stage_label,
+            command=agent or "phase_failure",
+            duration_ms=0,
+            exit_code=1,
+            timed_out=isinstance(error, (CommandTimeoutError, TimeoutError)),
+            error_text=clean_msg,
+            project_id=project_id,
+            db_path=telemetry_db,
+        )
         self._notify_status_transition(final_status, summary=clean_msg, stage=stage_label)
         return final_status
 
@@ -1372,6 +1415,15 @@ class Orchestrator:
             at=now_dt,
         )
         self.store.append(ev)
+        eff_op_type = str(op_type or "background").strip()
+        record_safe_event(
+            component="orchestrator",
+            stage=f"{eff_op_type}_start",
+            command=str(stage or eff_op_type).strip(),
+            duration_ms=0,
+            project_id=project_id,
+            db_path=self._resolve_telemetry_db_path(),
+        )
         return ev
 
     def record_background_op_finished(
@@ -1408,6 +1460,33 @@ class Orchestrator:
             at=now_dt,
         )
         self.store.append(ev)
+        eff_op_type = str(op_type or "background").strip()
+        eff_status = str(status or "completed").strip().lower()
+        ok_status = eff_status in {"completed", "ok", "succeeded"}
+        dur_ms = max(0.0, float(duration_seconds) * 1000.0) if duration_seconds is not None else 0.0
+        clean_reason = str(payload.get("reason") or "").strip()
+        telemetry_db = self._resolve_telemetry_db_path()
+        record_safe_event(
+            component="orchestrator",
+            stage=f"{eff_op_type}_finish",
+            command=eff_op_type,
+            duration_ms=dur_ms,
+            exit_code=0 if ok_status else 1,
+            timed_out=(
+                (not ok_status)
+                and ("timeout" in clean_reason.lower() or "timed out" in clean_reason.lower())
+            ),
+            error_text=(None if ok_status else (clean_reason or eff_status)),
+            project_id=project_id,
+            db_path=telemetry_db,
+        )
+        if not ok_status and clean_reason:
+            record_safe_incident(
+                stage=eff_op_type,
+                raw_error=clean_reason,
+                project_id=project_id,
+                db_path=telemetry_db,
+            )
         return ev
 
     @staticmethod
@@ -3584,6 +3663,15 @@ class Orchestrator:
                 )
 
             debate_t0 = time.monotonic()
+            telemetry_db = self._resolve_telemetry_db_path()
+            record_safe_event(
+                component="orchestrator",
+                stage="debate_start",
+                command="run_debate",
+                duration_ms=0,
+                project_id=project_id,
+                db_path=telemetry_db,
+            )
             mediation_t0: float | None = None
             if resuming_mediation:
                 mediation_t0 = time.monotonic()
@@ -3753,6 +3841,15 @@ class Orchestrator:
                 )
             )
             waiting_status = self.get_status(project_id, notify_notifier=False)
+            record_safe_event(
+                component="orchestrator",
+                stage="debate_finish",
+                command="run_debate",
+                duration_ms=max(0.0, (time.monotonic() - debate_t0) * 1000.0),
+                exit_code=0,
+                project_id=project_id,
+                db_path=telemetry_db,
+            )
             self._notify_status_transition(waiting_status, summary=plan.summary)
             return waiting_status
 
