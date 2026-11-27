@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import posixpath
 import re
 import shutil
 import stat
@@ -11,7 +12,7 @@ import subprocess
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -35,8 +36,84 @@ _SAFE_WORKTREE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _SAFE_BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 _DEFAULT_GIT_TIMEOUT_SECONDS: float = 30.0
 
+DEFAULT_FORBIDDEN_DIFF_PREFIXES: tuple[str, ...] = (
+    ".env",
+    "MASTER_PROMPT.md",
+    "AGENTS.md",
+    "config/models.toml",
+    "data/",
+    "workspaces/",
+)
+DEFAULT_MAX_DIFF_FILES: int = 12
+
 _MANAGERS_LOCK = threading.Lock()
 _MANAGERS: dict[Path, StagingManager] = {}
+
+
+def _normalize_diff_path(raw_path: str) -> str:
+    cleaned = str(raw_path or "").strip().replace("\\", "/")
+    if not cleaned:
+        return ""
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    cleaned = cleaned.lstrip("/")
+    if not cleaned:
+        return ""
+    normalized = posixpath.normpath(cleaned)
+    if normalized == ".":
+        return ""
+    return normalized
+
+
+def validate_diff_scope(
+    changed_paths: list[str],
+    *,
+    forbidden_prefixes: tuple[str, ...] = DEFAULT_FORBIDDEN_DIFF_PREFIXES,
+    max_files: int = DEFAULT_MAX_DIFF_FILES,
+) -> tuple[bool, str]:
+    """Validate staging diff scope: reject empty diffs, forbidden paths, and oversized changes."""
+    normalized_paths: list[str] = []
+    seen: set[str] = set()
+    for raw in changed_paths:
+        norm = _normalize_diff_path(raw)
+        if not norm:
+            continue
+        if norm == ".." or norm.startswith("../"):
+            return False, f"Ruta prohibida fuera del repositorio en diff de staging: '{raw}'"
+        key = norm.casefold()
+        if key not in seen:
+            seen.add(key)
+            normalized_paths.append(norm)
+
+    if not normalized_paths:
+        return False, "Diff de staging vacío: no se detectaron archivos modificados."
+
+    normalized_prefixes: list[tuple[str, str]] = []
+    for raw_prefix in forbidden_prefixes:
+        norm_prefix = _normalize_diff_path(raw_prefix)
+        if norm_prefix:
+            normalized_prefixes.append((raw_prefix, norm_prefix.casefold()))
+
+    for path in normalized_paths:
+        path_cf = path.casefold()
+        for raw_prefix, prefix_cf in normalized_prefixes:
+            if (
+                path_cf == prefix_cf
+                or path_cf.startswith(f"{prefix_cf}/")
+                or (prefix_cf == ".env" and path_cf.startswith(".env."))
+            ):
+                return (
+                    False,
+                    f"Ruta prohibida en diff de staging ('{path}' coincide con '{raw_prefix}').",
+                )
+
+    if len(normalized_paths) > max_files:
+        return (
+            False,
+            f"El diff de staging modifica {len(normalized_paths)} archivos, excediendo el máximo permitido de {max_files}.",
+        )
+
+    return True, ""
 
 
 def _validate_worktree_name(worktree_name: str, repo_root: Path) -> tuple[str, Path]:
@@ -142,6 +219,8 @@ class StagingManager:
         executor: Callable[[Path, dict[str, Any]], Any] | None = None,
         on_restart: Callable[[], None] | None = None,
         db_path: Path | str | None = None,
+        forbidden_prefixes: tuple[str, ...] = DEFAULT_FORBIDDEN_DIFF_PREFIXES,
+        max_diff_files: int = DEFAULT_MAX_DIFF_FILES,
     ) -> None:
         self.repo_root = Path(repo_root).resolve()
         self.worktree_name, self.worktree_path = _validate_worktree_name(
@@ -153,6 +232,8 @@ class StagingManager:
         self._executor = executor
         self._on_restart = on_restart
         self._db_path = db_path
+        self.forbidden_prefixes: tuple[str, ...] = tuple(forbidden_prefixes)
+        self.max_diff_files: int = int(max_diff_files)
 
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
@@ -628,6 +709,62 @@ class StagingManager:
         commit_sha = head_res.stdout.strip() if head_res.returncode == 0 else None
         return True, commit_sha, ""
 
+    def _get_worktree_changed_files(self, worktree_path: Path) -> list[str]:
+        res = self._run_git(
+            ["-c", "core.quotepath=false", "status", "--porcelain", "-uall"],
+            cwd=worktree_path,
+        )
+        if res.returncode != 0 or not res.stdout:
+            return []
+        paths: list[str] = []
+        for raw_line in res.stdout.splitlines():
+            if len(raw_line) < 4:
+                continue
+            entry = raw_line[3:].strip()
+            if not entry:
+                continue
+            if " -> " in entry:
+                old_p, new_p = entry.split(" -> ", 1)
+                for part in (old_p, new_p):
+                    clean_part = part.strip().strip('"')
+                    if clean_part:
+                        paths.append(clean_part)
+            else:
+                clean_entry = entry.strip('"')
+                if clean_entry:
+                    paths.append(clean_entry)
+        return paths
+
+    def _get_staging_branch_changed_files(self) -> list[str]:
+        diff_res = self._run_git(
+            [
+                "-c",
+                "core.quotepath=false",
+                "diff",
+                "--name-only",
+                f"{self.base_branch}...{self.staging_branch}",
+            ],
+            cwd=self.repo_root,
+        )
+        if diff_res.returncode != 0:
+            diff_res = self._run_git(
+                [
+                    "-c",
+                    "core.quotepath=false",
+                    "diff",
+                    "--name-only",
+                    f"{self.base_branch}..{self.staging_branch}",
+                ],
+                cwd=self.repo_root,
+            )
+        if diff_res.returncode != 0 or not diff_res.stdout:
+            return []
+        return [
+            line.strip().strip('"')
+            for line in diff_res.stdout.splitlines()
+            if line.strip()
+        ]
+
     def _run_parallel_plan_in_worktree(
         self,
         worktree_path: Path,
@@ -641,8 +778,70 @@ class StagingManager:
         changed_files_inspector: ChangedFilesInspector | None = None,
         max_workers: int = 3,
         cleanup_on_failure: bool = True,
+        forbidden_prefixes: tuple[str, ...] | None = None,
+        max_diff_files: int | None = None,
     ) -> ParallelRunResult:
-        from agent_factory.parallel_improver import ParallelImprover as _ParallelImprover
+        from agent_factory.parallel_improver import (
+            ParallelImprover as _ParallelImprover,
+        )
+        from agent_factory.parallel_improver import (
+            ParallelRunResult as _ParallelRunResult,
+        )
+
+        effective_forbidden = (
+            tuple(forbidden_prefixes) if forbidden_prefixes is not None else self.forbidden_prefixes
+        )
+        effective_max_files = (
+            int(max_diff_files) if max_diff_files is not None else self.max_diff_files
+        )
+
+        planned_files = [f for st in plan.subtasks for f in st.assigned_files]
+        ok_plan_scope, plan_scope_err = validate_diff_scope(
+            planned_files,
+            forbidden_prefixes=effective_forbidden,
+            max_files=effective_max_files,
+        )
+        if not ok_plan_scope:
+            if cleanup_on_failure:
+                self._cleanup_worktree()
+            err_msg = redact_secrets(plan_scope_err)
+            with self._lock:
+                self._last_error = err_msg
+            return _ParallelRunResult(
+                success=False,
+                plan=plan,
+                worker_results=(),
+                pytest_ran=False,
+                pytest_ok=False,
+                pytest_output="",
+                target_tests=plan.target_tests,
+                out_of_partition_files=(),
+                error=err_msg,
+                commit_allowed=False,
+                commit_sha=None,
+            )
+
+        scope_blocked_errors: list[str] = []
+        active_improver: ParallelImprover
+
+        def _guarded_pytest_runner(tests: Sequence[str], wt_path: Path) -> tuple[bool, str]:
+            inspector = (
+                changed_files_inspector
+                if changed_files_inspector is not None
+                else self._get_worktree_changed_files
+            )
+            changed_paths = list(inspector(wt_path))
+            ok_scope, scope_err = validate_diff_scope(
+                changed_paths,
+                forbidden_prefixes=effective_forbidden,
+                max_files=effective_max_files,
+            )
+            if not ok_scope:
+                scope_blocked_errors.append(scope_err)
+                return False, scope_err
+            if pytest_runner is not None:
+                return pytest_runner(tests, wt_path)
+            return active_improver._default_pytest_runner(tests, wt_path)
 
         active_improver = (
             improver
@@ -652,11 +851,27 @@ class StagingManager:
                 max_workers=max_workers,
                 worker_runner=worker_runner,
                 ruff_runner=ruff_runner,
-                pytest_runner=pytest_runner,
+                pytest_runner=_guarded_pytest_runner,
                 changed_files_inspector=changed_files_inspector,
             )
         )
         run_result = active_improver.run(plan)
+        if scope_blocked_errors:
+            if cleanup_on_failure:
+                self._cleanup_worktree()
+            err_msg = redact_secrets(scope_blocked_errors[0])
+            with self._lock:
+                self._last_error = err_msg
+            return replace(
+                run_result,
+                success=False,
+                pytest_ran=False,
+                pytest_ok=False,
+                pytest_output="",
+                commit_allowed=False,
+                commit_sha=None,
+                error=err_msg,
+            )
         if not run_result.success or not run_result.commit_allowed:
             if cleanup_on_failure:
                 self._cleanup_worktree()
@@ -1052,6 +1267,20 @@ class StagingManager:
             commits = self._list_pending_commits()
             if not commits:
                 return result
+
+            changed_paths = self._get_staging_branch_changed_files()
+            scope_ok, scope_err = validate_diff_scope(
+                changed_paths,
+                forbidden_prefixes=self.forbidden_prefixes,
+                max_files=self.max_diff_files,
+            )
+            if not scope_ok:
+                err_msg = redact_secrets(
+                    f"Promoción bloqueada por guardián de alcance del diff: {scope_err}"
+                )
+                with self._lock:
+                    self._last_error = err_msg
+                raise RuntimeError(err_msg)
 
             branch_res = self._run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=self.repo_root)
             current_branch = branch_res.stdout.strip() if branch_res.returncode == 0 else ""

@@ -12,7 +12,13 @@ from typing import Any
 
 import pytest
 
-from agent_factory.staging_manager import StagingManager, get_staging_manager
+from agent_factory.parallel_improver import ParallelPlan, ParallelSubtask
+from agent_factory.staging_manager import (
+    DEFAULT_FORBIDDEN_DIFF_PREFIXES,
+    StagingManager,
+    get_staging_manager,
+    validate_diff_scope,
+)
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -760,5 +766,241 @@ def test_prune_stale_worktrees_handles_subprocess_errors_without_raising(
         assert any("not a git repository" in e for e in fail_summary["errors"])
     finally:
         manager.shutdown()
+
+
+def test_validate_diff_scope_accepts_valid_diffs_and_exact_limit() -> None:
+    ok, reason = validate_diff_scope(
+        [
+            "src/agent_factory/staging_manager.py",
+            "tests/test_staging_manager.py",
+            "src/agent_factory/data_utils.py",
+            "database/migrations.py",
+        ],
+        forbidden_prefixes=DEFAULT_FORBIDDEN_DIFF_PREFIXES,
+        max_files=12,
+    )
+    assert ok is True
+    assert reason == ""
+
+    exact_limit_paths = [f"src/agent_factory/mod_{i}.py" for i in range(12)]
+    ok_limit, reason_limit = validate_diff_scope(
+        exact_limit_paths,
+        forbidden_prefixes=DEFAULT_FORBIDDEN_DIFF_PREFIXES,
+        max_files=12,
+    )
+    assert ok_limit is True
+    assert reason_limit == ""
+
+
+def test_validate_diff_scope_rejects_empty_diff() -> None:
+    ok_empty, reason_empty = validate_diff_scope(
+        [],
+        forbidden_prefixes=DEFAULT_FORBIDDEN_DIFF_PREFIXES,
+    )
+    assert ok_empty is False
+    assert "vacío" in reason_empty.lower()
+
+    ok_blank, reason_blank = validate_diff_scope(
+        ["", "   ", "."],
+        forbidden_prefixes=DEFAULT_FORBIDDEN_DIFF_PREFIXES,
+    )
+    assert ok_blank is False
+    assert "vacío" in reason_blank.lower()
+
+
+@pytest.mark.parametrize(
+    "forbidden_path",
+    [
+        ".env",
+        ".env.local",
+        "MASTER_PROMPT.md",
+        "AGENTS.md",
+        "config/models.toml",
+        r"config\models.toml",
+        "data/factory.db",
+        r"data\nested\factory.db",
+        "workspaces/proj_a/app.py",
+        r"workspaces\proj_a\app.py",
+        "./data/state.json",
+        "src/../.env",
+    ],
+)
+def test_validate_diff_scope_rejects_forbidden_paths_with_slash_and_backslash(
+    forbidden_path: str,
+) -> None:
+    ok, reason = validate_diff_scope(
+        ["src/agent_factory/ok.py", forbidden_path],
+        forbidden_prefixes=DEFAULT_FORBIDDEN_DIFF_PREFIXES,
+        max_files=12,
+    )
+    assert ok is False
+    assert "prohibida" in reason.lower()
+
+
+def test_validate_diff_scope_rejects_excess_files() -> None:
+    too_many = [f"src/agent_factory/file_{i}.py" for i in range(13)]
+    ok, reason = validate_diff_scope(
+        too_many,
+        forbidden_prefixes=DEFAULT_FORBIDDEN_DIFF_PREFIXES,
+        max_files=12,
+    )
+    assert ok is False
+    assert "13" in reason
+    assert "12" in reason
+
+    ok_custom, reason_custom = validate_diff_scope(
+        ["a.py", "b.py", "c.py", "d.py"],
+        forbidden_prefixes=DEFAULT_FORBIDDEN_DIFF_PREFIXES,
+        max_files=3,
+    )
+    assert ok_custom is False
+    assert "4" in reason_custom
+    assert "3" in reason_custom
+
+
+def test_apply_parallel_plan_blocks_pytest_when_diff_scope_fails(
+    temp_git_repo: Path,
+) -> None:
+    manager = StagingManager(repo_root=temp_git_repo)
+    pytest_calls: list[list[str]] = []
+
+    def _spy_pytest(tests: list[str], _cwd: Path) -> tuple[bool, str]:
+        pytest_calls.append(list(tests))
+        return True, "ok"
+
+    try:
+        # 1. Empty diff produced by worker -> blocked before pytest runs
+        valid_plan = ParallelPlan(
+            title="No-op worker plan",
+            subtasks=(
+                ParallelSubtask(
+                    subtask_id="w-1",
+                    role="logic",
+                    assigned_files=("src/agent_factory/noop_mod.py",),
+                ),
+            ),
+            target_tests=("tests/test_staging_manager.py",),
+        )
+        res_empty = manager.apply_parallel_plan(
+            valid_plan,
+            worker_runner=lambda _st, _p, _wt: (True, "nothing written"),
+            ruff_runner=lambda _files, _cwd: (True, "ok"),
+            pytest_runner=_spy_pytest,
+        )
+        assert res_empty.success is False
+        assert res_empty.commit_allowed is False
+        assert res_empty.pytest_ran is False
+        assert "vacío" in res_empty.error.lower()
+        assert pytest_calls == []
+
+        # 2. Forbidden path in plan -> blocked immediately before workers or pytest
+        forbidden_plan = ParallelPlan(
+            title="Forbidden path plan",
+            subtasks=(
+                ParallelSubtask(
+                    subtask_id="w-1",
+                    role="logic",
+                    assigned_files=(r"config\models.toml",),
+                ),
+            ),
+            target_tests=("tests/test_staging_manager.py",),
+        )
+        worker_calls: list[str] = []
+        res_forbidden = manager.apply_parallel_plan(
+            forbidden_plan,
+            worker_runner=lambda st, _p, _wt: (worker_calls.append(st.subtask_id) or True, "ok"),
+            ruff_runner=lambda _files, _cwd: (True, "ok"),
+            pytest_runner=_spy_pytest,
+        )
+        assert res_forbidden.success is False
+        assert res_forbidden.commit_allowed is False
+        assert res_forbidden.pytest_ran is False
+        assert "prohibida" in res_forbidden.error.lower()
+        assert worker_calls == []
+        assert pytest_calls == []
+
+        # 3. Excess files in plan (> max_files) -> blocked immediately before pytest
+        oversized_files = tuple(f"src/agent_factory/mod_{i}.py" for i in range(13))
+        oversized_plan = ParallelPlan(
+            title="Oversized plan",
+            subtasks=(
+                ParallelSubtask(
+                    subtask_id="w-1",
+                    role="logic",
+                    assigned_files=oversized_files,
+                ),
+            ),
+            target_tests=("tests/test_staging_manager.py",),
+        )
+        res_oversized = manager.apply_parallel_plan(
+            oversized_plan,
+            worker_runner=lambda st, _p, _wt: (worker_calls.append(st.subtask_id) or True, "ok"),
+            ruff_runner=lambda _files, _cwd: (True, "ok"),
+            pytest_runner=_spy_pytest,
+        )
+        assert res_oversized.success is False
+        assert res_oversized.commit_allowed is False
+        assert res_oversized.pytest_ran is False
+        assert "13" in res_oversized.error
+        assert worker_calls == []
+        assert pytest_calls == []
+    finally:
+        manager.shutdown()
+
+
+def test_promote_staging_blocks_forbidden_empty_and_oversized_diffs(
+    temp_git_repo: Path,
+) -> None:
+    restart_calls: list[str] = []
+    manager = StagingManager(
+        repo_root=temp_git_repo,
+        on_restart=lambda: restart_calls.append("restarted"),
+    )
+    initial_main_sha = _git(temp_git_repo, "rev-parse", "main").stdout.strip()
+
+    try:
+        wt = manager.ensure_worktree()
+
+        # 1. Empty commit on staging -> rejected before promote
+        assert _git(wt, "commit", "--allow-empty", "-m", "chore: empty staging commit").returncode == 0
+        with pytest.raises(RuntimeError, match="vacío"):
+            manager.promote_staging_to_main(trigger_restart=True)
+        assert _git(temp_git_repo, "rev-parse", "main").stdout.strip() == initial_main_sha
+        assert restart_calls == []
+        assert manager.get_staging_status()["last_error"] is not None
+
+        # Reset staging back to main
+        assert _git(wt, "reset", "--hard", initial_main_sha).returncode == 0
+
+        # 2. Forbidden file committed on staging (data/leak.db) -> rejected before promote
+        leak_file = wt / "data" / "leak.db"
+        leak_file.parent.mkdir(parents=True, exist_ok=True)
+        leak_file.write_text("do not promote\n", encoding="utf-8")
+        assert _git(wt, "add", "data/leak.db").returncode == 0
+        assert _git(wt, "commit", "-m", "chore: touch forbidden data path").returncode == 0
+
+        with pytest.raises(RuntimeError, match="prohibida"):
+            manager.promote_staging_to_main(trigger_restart=True)
+        assert _git(temp_git_repo, "rev-parse", "main").stdout.strip() == initial_main_sha
+        assert restart_calls == []
+        assert manager.get_staging_status()["last_error"] is not None
+
+        # Reset staging back to main
+        assert _git(wt, "reset", "--hard", initial_main_sha).returncode == 0
+
+        # 3. Too many files committed on staging (13 > 12) -> rejected before promote
+        for i in range(13):
+            f = wt / f"batch_{i}.txt"
+            f.write_text(f"content {i}\n", encoding="utf-8")
+        assert _git(wt, "add", "-A").returncode == 0
+        assert _git(wt, "commit", "-m", "chore: too many files").returncode == 0
+
+        with pytest.raises(RuntimeError, match="13"):
+            manager.promote_staging_to_main(trigger_restart=True)
+        assert _git(temp_git_repo, "rev-parse", "main").stdout.strip() == initial_main_sha
+        assert restart_calls == []
+    finally:
+        manager.shutdown()
+
 
 
