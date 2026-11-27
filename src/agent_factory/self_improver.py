@@ -25,6 +25,7 @@ from agent_factory.adapters.subprocess_runner import SubprocessRunner, resolve_e
 from agent_factory.config import build_workspace_pytest_env
 from agent_factory.ports.clock import Clock
 from agent_factory.ports.runner import CommandTimeoutError, Runner
+from agent_factory.quota_meter import QuotaMeter
 from agent_factory.recovery_agent import (
     _parse_json_dict_loose,
     compact_pytest_failure_output,
@@ -53,6 +54,10 @@ MAX_UPLOAD_IMAGES_PER_MESSAGE: int = 4
 MAX_AUTO_QUEUED_IDEAS: int = 3
 DEFAULT_IDEA_STALE_SECONDS: int = 360
 MAX_IDEA_RETRIES: int = 2
+DEFAULT_QUOTA_PROBE_INTERVAL_SECONDS: float = 600.0
+DEFAULT_QUOTA_PROBE_TIMEOUT_SECONDS: float = 30.0
+QUOTA_RECOVERY_LOG_MESSAGE: str = "Cuota recuperada automáticamente; reanudando ciclo autónomo"
+_QUOTA_PROBE_PROMPT: str = 'MODO SONDA DE CUOTA (SOLO LECTURA, 1 TURNO CORTO): Responde únicamente "OK".'
 _MAX_INLINE_PROMPT_CHARS: int = 6000
 _QUEUE_WORKER_LOCK = threading.RLock()
 _QUEUE_WORKER: IdeaQueueWorker | None = None
@@ -426,6 +431,10 @@ class FactorySelfImprover:
         restart_delay_seconds: float = DEFAULT_RESTART_DELAY_SECONDS,
         pre_exit_hook: Callable[[], Any] | None = None,
         telemetry_db_path: Path | str | None = None,
+        quota_meter: QuotaMeter | None = None,
+        quota_probe_interval_seconds: float = DEFAULT_QUOTA_PROBE_INTERVAL_SECONDS,
+        quota_probe_fn: Callable[[], Any] | None = None,
+        llm: Any | None = None,
     ) -> None:
         self.clock: Clock = clock if clock is not None else _WallClock()
         self._raw_db_path = (
@@ -472,6 +481,11 @@ class FactorySelfImprover:
         self.restart_fn: Callable[[int], Any] = restart_fn if restart_fn is not None else os._exit
         self.restart_delay_seconds = float(restart_delay_seconds)
         self.pre_exit_hook = pre_exit_hook
+        self._explicit_quota_meter: QuotaMeter | None = quota_meter
+        self._quota_meter_cache: tuple[str, QuotaMeter] | None = None
+        self.quota_probe_interval_seconds: float = max(0.0, float(quota_probe_interval_seconds))
+        self._quota_probe_fn = quota_probe_fn
+        self._llm = llm
         self._apply_lock = threading.Lock()
         self._status_lock = threading.Lock()
         self._active_idea_id: int | None = None
@@ -505,6 +519,19 @@ class FactorySelfImprover:
                 return (repo_data_dir / "telemetry.db").resolve()
             return (db_parent / "telemetry.db").resolve()
         return Path(":memory:")
+
+    @property
+    def quota_meter(self) -> QuotaMeter:
+        """Return the active QuotaMeter bound to this improver's telemetry DB and clock."""
+        if self._explicit_quota_meter is not None:
+            return self._explicit_quota_meter
+        target_db = self._resolve_telemetry_db_path()
+        cache_key = str(target_db)
+        if self._quota_meter_cache is not None and self._quota_meter_cache[0] == cache_key:
+            return self._quota_meter_cache[1]
+        meter = QuotaMeter(db_path=target_db, clock=self.clock)
+        self._quota_meter_cache = (cache_key, meter)
+        return meter
 
     def _save_uploaded_images(self, images: Sequence[Mapping[str, Any]]) -> list[str]:
         if not images:
@@ -905,15 +932,281 @@ class FactorySelfImprover:
     ) -> None:
         try:
             from agent_factory.error_triage import is_quota_429_error
-            from agent_factory.idea_engine import record_agy_429_pause, record_agy_usage
 
-            db_path = self._resolve_telemetry_db_path()
+            now = self.clock.now()
             if exit_code != 0 and is_quota_429_error(output_text):
-                record_agy_429_pause(output_text, db_path=db_path)
+                self.quota_meter.record_429_pause(output_text, now=now)
             else:
-                record_agy_usage(prompt_len, len(output_text or ""), db_path=db_path)
+                self.quota_meter.record_usage(prompt_len, len(output_text or ""), now=now)
         except Exception as exc:  # noqa: BLE001
             logging.getLogger(__name__).debug("Quota telemetry skipped in self_improver: %s", exc)
+
+    def _run_quota_probe_call(
+        self,
+        *,
+        probe_fn: Callable[[], Any] | None = None,
+    ) -> tuple[bool, str]:
+        """Execute a minimal, read-only 1-turn AI probe without mutating quota_meter."""
+        from agent_factory.error_triage import is_quota_429_error
+
+        active_probe_fn = probe_fn if probe_fn is not None else self._quota_probe_fn
+        if active_probe_fn is not None:
+            try:
+                raw = active_probe_fn()
+            except Exception as exc:  # noqa: BLE001
+                return False, self._redact(str(exc) or type(exc).__name__)
+            if isinstance(raw, bool):
+                return raw, "OK" if raw else "Quota probe failed"
+            if isinstance(raw, Mapping):
+                detail = str(
+                    raw.get("technical_detail")
+                    or raw.get("error")
+                    or raw.get("stderr")
+                    or raw.get("stdout")
+                    or ""
+                ).strip()
+                if raw.get("quota_429") or is_quota_429_error(detail):
+                    return False, self._redact(detail or "HTTP 429 RESOURCE_EXHAUSTED")
+                ok = bool(raw.get("ok", True))
+                return ok, self._redact(detail or ("OK" if ok else "Quota probe failed"))
+            if hasattr(raw, "exit_code"):
+                exit_code = int(getattr(raw, "exit_code", 1))
+                out_text = str(getattr(raw, "stdout", "") or "")
+                err_text = str(getattr(raw, "stderr", "") or "")
+                combined = (err_text or out_text or f"exit code {exit_code}").strip()
+                if exit_code != 0 or is_quota_429_error(combined):
+                    return False, self._redact(combined)
+                return True, self._redact(out_text.strip() or "OK")
+            if isinstance(raw, str):
+                if is_quota_429_error(raw):
+                    return False, self._redact(raw)
+                return True, self._redact(raw.strip() or "OK")
+            return True, "OK"
+
+        if self._llm is not None and hasattr(self._llm, "complete"):
+            try:
+                resp = self._llm.complete([{"role": "user", "content": _QUOTA_PROBE_PROMPT}])
+                resp_text = json.dumps(resp, ensure_ascii=False) if isinstance(resp, Mapping) else str(resp or "")
+                if is_quota_429_error(resp_text):
+                    return False, self._redact(resp_text)
+                return True, "OK"
+            except Exception as exc:  # noqa: BLE001
+                return False, self._redact(str(exc) or type(exc).__name__)
+
+        base_cmd, _is_real_agy, err_reason = self._resolve_agy_cmd()
+        if base_cmd is None:
+            return False, self._redact(err_reason or "CLI 'agy' no disponible para sonda de cuota.")
+
+        clean_env = build_sanitized_cli_env()
+        cmd = [*base_cmd, "-p", _QUOTA_PROBE_PROMPT]
+        if self.model:
+            cmd.extend(["--model", self.model])
+        timeout_s = min(float(self.consult_timeout_seconds), DEFAULT_QUOTA_PROBE_TIMEOUT_SECONDS)
+        try:
+            with tempfile.TemporaryDirectory(prefix="af_liwi_quota_probe_") as ro_cwd:
+                res = self.runner.run(
+                    cmd,
+                    cwd=Path(ro_cwd),
+                    timeout_seconds=timeout_s,
+                    env=clean_env,
+                )
+        except Exception as exc:  # noqa: BLE001
+            return False, self._redact(str(exc) or type(exc).__name__)
+
+        combined = "\n".join(part for part in (res.stderr, res.stdout) if part and part.strip()).strip()
+        if res.exit_code != 0:
+            return False, self._redact(combined or f"exit code {res.exit_code}")
+        if is_quota_429_error(combined):
+            return False, self._redact(combined)
+        return True, self._redact((res.stdout or "OK").strip())
+
+    def _log_quota_recovery(
+        self,
+        *,
+        telemetry_db: Path | str | None,
+        duration_ms: float = 0.0,
+    ) -> None:
+        logging.getLogger(__name__).info(QUOTA_RECOVERY_LOG_MESSAGE)
+        record_safe_event(
+            component="self_improver",
+            stage="quota_recovery",
+            command=QUOTA_RECOVERY_LOG_MESSAGE,
+            duration_ms=duration_ms,
+            exit_code=0,
+            db_path=telemetry_db,
+        )
+        try:
+            self.memory_store.add_message(
+                role="assistant",
+                content=QUOTA_RECOVERY_LOG_MESSAGE,
+                status="ok",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).debug("Quota recovery chat log skipped: %s", exc)
+
+    def probe_quota_recovery(
+        self,
+        *,
+        now: datetime | None = None,
+        trigger_queue: bool = True,
+        executor: Callable[[dict[str, Any]], Any] | None = None,
+        probe_fn: Callable[[], Any] | None = None,
+        poll_interval_seconds: float = 0.5,
+        require_autonomous_enabled: bool = False,
+    ) -> dict[str, Any]:
+        """Probe quota recovery when paused/blocked, resetting quota_meter and resuming queue on recovery."""
+        from agent_factory.error_triage import is_quota_429_error
+
+        ref_now = now if now is not None else self.clock.now()
+        telemetry_db = self._resolve_telemetry_db_path()
+        meter = self.quota_meter
+
+        if require_autonomous_enabled:
+            try:
+                from agent_factory.idea_engine import get_autonomous_state
+
+                if not bool(get_autonomous_state(db_path=telemetry_db).get("autonomous_enabled", False)):
+                    return {
+                        "ok": True,
+                        "recovered": False,
+                        "status": "disabled",
+                        "reason": "autonomous_disabled",
+                        "quota_paused": meter.is_paused(now=ref_now),
+                        "quota": meter.peek_status(now=ref_now),
+                        "queue_triggered": False,
+                        "next_probe_seconds": 0.0,
+                    }
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger(__name__).debug("Autonomous state check skipped during quota probe: %s", exc)
+
+        snapshot = meter.peek_status(now=ref_now)
+
+        def _complete_recovery(reason: str, duration_ms: float) -> dict[str, Any]:
+            restored = meter.reset_pause(now=ref_now)
+            self._log_quota_recovery(telemetry_db=telemetry_db, duration_ms=duration_ms)
+            resume_res: dict[str, Any] | None = None
+            queue_triggered = False
+            if trigger_queue:
+                if (
+                    self._idea_queue_worker is not None
+                    and self._idea_queue_worker.is_alive
+                    and executor is None
+                ):
+                    self._idea_queue_worker.wake()
+                    queue_triggered = True
+                    resume_res = {
+                        "ok": True,
+                        "resumed": True,
+                        "worker_started": False,
+                        "worker_alive": True,
+                        "pause_reason": "ok",
+                    }
+                else:
+                    try:
+                        resume_res = resume_idea_queue(
+                            db_path=telemetry_db,
+                            executor=executor,
+                            improver=self,
+                            now=ref_now,
+                            quota_paused=False,
+                            poll_interval_seconds=poll_interval_seconds,
+                        )
+                        queue_triggered = bool(resume_res.get("resumed"))
+                    except Exception as exc:  # noqa: BLE001
+                        logging.getLogger(__name__).warning(
+                            "Queue resume after quota recovery failed safely: %s",
+                            self._redact(str(exc)),
+                        )
+                        resume_res = {"ok": False, "resumed": False, "error": self._redact(str(exc))}
+            return {
+                "ok": True,
+                "recovered": True,
+                "status": "recovered",
+                "reason": reason,
+                "quota_paused": False,
+                "quota": restored,
+                "log_message": QUOTA_RECOVERY_LOG_MESSAGE,
+                "queue_triggered": queue_triggered,
+                "resume_result": resume_res,
+                "next_probe_seconds": 0.0,
+            }
+
+        was_blocked = bool(
+            snapshot.get("was_paused")
+            or snapshot.get("was_exhausted")
+            or snapshot.get("was_reserve_reached")
+        )
+        if snapshot.get("window_expired") and was_blocked:
+            return _complete_recovery("window_expired", duration_ms=0.0)
+
+        if not snapshot.get("is_paused") and not snapshot.get("is_blocked"):
+            return {
+                "ok": True,
+                "recovered": False,
+                "status": "healthy",
+                "reason": "not_paused",
+                "quota_paused": False,
+                "quota": snapshot,
+                "queue_triggered": False,
+                "next_probe_seconds": 0.0,
+            }
+
+        probe_t0 = time.monotonic()
+        probe_ok, probe_detail = self._run_quota_probe_call(probe_fn=probe_fn)
+        probe_ms = max(0.0, (time.monotonic() - probe_t0) * 1000.0)
+
+        if probe_ok:
+            return _complete_recovery("probe_succeeded", duration_ms=probe_ms)
+
+        if is_quota_429_error(probe_detail):
+            updated = meter.record_429_pause(probe_detail, now=ref_now)
+            record_safe_event(
+                component="self_improver",
+                stage="quota_probe_429",
+                command="probe_quota_recovery",
+                duration_ms=probe_ms,
+                exit_code=429,
+                error_text=probe_detail,
+                db_path=telemetry_db,
+            )
+            return {
+                "ok": False,
+                "recovered": False,
+                "status": "quota_pause",
+                "reason": "quota_429",
+                "quota_paused": True,
+                "quota": updated,
+                "reset_seconds": updated.get("reset_seconds"),
+                "quota_paused_until": updated.get("quota_paused_until"),
+                "queue_triggered": False,
+                "next_probe_seconds": float(self.quota_probe_interval_seconds),
+                "error": probe_detail,
+            }
+
+        logging.getLogger(__name__).warning(
+            "Quota recovery probe hit non-quota transient error (keeping pause intact): %s",
+            probe_detail,
+        )
+        record_safe_event(
+            component="self_improver",
+            stage="quota_probe_transient_error",
+            command="probe_quota_recovery",
+            duration_ms=probe_ms,
+            exit_code=1,
+            error_text=probe_detail,
+            db_path=telemetry_db,
+        )
+        return {
+            "ok": False,
+            "recovered": False,
+            "status": "transient_error",
+            "reason": "transient_error",
+            "quota_paused": True,
+            "quota": snapshot,
+            "queue_triggered": False,
+            "next_probe_seconds": float(self.quota_probe_interval_seconds),
+            "error": probe_detail,
+        }
 
     def consult_message(
         self,
@@ -1850,10 +2143,7 @@ def is_quota_429_paused(
 ) -> bool:
     """Return True if an active 429 quota pause is persisted in SQLite quota_state."""
     try:
-        from agent_factory.idea_engine import get_quota_status
-
-        status = get_quota_status(db_path=db_path, now=now)
-        return bool(status.get("is_paused", False))
+        return QuotaMeter(db_path=db_path).is_cooldown_active(now=now)
     except Exception as exc:  # noqa: BLE001
         logging.getLogger(__name__).debug("is_quota_429_paused fallback False: %s", exc)
         return False
@@ -1912,6 +2202,10 @@ class IdeaQueueWorker:
         max_retries: int = MAX_IDEA_RETRIES,
         poll_interval_seconds: float = 0.5,
         clock: Clock | None = None,
+        quota_meter: QuotaMeter | None = None,
+        quota_probe_interval_seconds: float = DEFAULT_QUOTA_PROBE_INTERVAL_SECONDS,
+        probe_fn: Callable[[], Any] | None = None,
+        wait_fn: Callable[[float], Any] | None = None,
     ) -> None:
         self.db_path = db_path
         self._executor = executor
@@ -1920,11 +2214,24 @@ class IdeaQueueWorker:
         self.max_retries = max(0, int(max_retries))
         self.poll_interval_seconds = max(0.01, float(poll_interval_seconds))
         self.clock: Clock = clock if clock is not None else _WallClock()
+        self.quota_meter: QuotaMeter = (
+            quota_meter
+            if quota_meter is not None
+            else (
+                improver.quota_meter
+                if improver is not None
+                else QuotaMeter(db_path=db_path, clock=self.clock)
+            )
+        )
+        self.quota_probe_interval_seconds: float = max(0.0, float(quota_probe_interval_seconds))
+        self._probe_fn = probe_fn
+        self._wait_fn = wait_fn
 
         self._lock = threading.RLock()
         self._cond = threading.Condition(self._lock)
         self._stop_event = threading.Event()
         self._wakeup_event = threading.Event()
+        self._probe_wakeup_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._busy: bool = False
         self._active_idea_id: int | None = None
@@ -1967,20 +2274,44 @@ class IdeaQueueWorker:
             idea_id=int(idea["id"]),
         )
 
+    def _is_autonomous_enabled(self) -> bool:
+        try:
+            from agent_factory.idea_engine import get_autonomous_state
+
+            return bool(get_autonomous_state(db_path=self.db_path).get("autonomous_enabled", False))
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).debug("autonomous_enabled check skipped: %s", exc)
+            return False
+
+    def _is_quota_pause_blocking(self, quota_snapshot: Mapping[str, Any]) -> bool:
+        if quota_snapshot.get("cooldown_active"):
+            return True
+        return bool(quota_snapshot.get("is_exhausted") and self._is_autonomous_enabled())
+
     def drain_once(self) -> dict[str, Any]:
         """Execute at most one queued idea sequentially, updating heartbeat and handling 429/retries."""
         from agent_factory.error_triage import is_quota_429_error
         from agent_factory.idea_engine import (
             finish_idea_execution,
-            record_agy_429_pause,
             record_idea_heartbeat,
             select_next_queued_idea,
             start_idea_execution,
         )
 
         ref_now = self.clock.now()
-        if is_quota_429_paused(db_path=self.db_path, now=ref_now):
-            return {"status": "quota_pause", "processed": False}
+        quota_snapshot = self.quota_meter.peek_status(now=ref_now)
+        if quota_snapshot.get("window_expired") and (
+            quota_snapshot.get("was_paused")
+            or quota_snapshot.get("was_exhausted")
+            or quota_snapshot.get("was_reserve_reached")
+        ):
+            self.probe_quota_recovery(now=ref_now, trigger_queue=False)
+        elif self._is_quota_pause_blocking(quota_snapshot):
+            return {
+                "status": "quota_pause",
+                "processed": False,
+                "next_probe_seconds": self.quota_probe_interval_seconds,
+            }
 
         idea = select_next_queued_idea(db_path=self.db_path)
         if idea is None:
@@ -2015,8 +2346,8 @@ class IdeaQueueWorker:
                         or raw_res.get("error")
                         or "RESOURCE_EXHAUSTED 429"
                     )
-                    if not is_quota_429_paused(db_path=self.db_path, now=self.clock.now()):
-                        record_agy_429_pause(err_text, db_path=self.db_path, now=self.clock.now())
+                    if not self.quota_meter.is_cooldown_active(now=self.clock.now()):
+                        self.quota_meter.record_429_pause(err_text, now=self.clock.now())
                     finish_idea_execution(
                         idea_id,
                         status="queued",
@@ -2083,8 +2414,8 @@ class IdeaQueueWorker:
         except Exception as exc:  # noqa: BLE001
             err_msg = redact_secrets(str(exc) or type(exc).__name__)
             if is_quota_429_error(err_msg):
-                if not is_quota_429_paused(db_path=self.db_path, now=self.clock.now()):
-                    record_agy_429_pause(err_msg, db_path=self.db_path, now=self.clock.now())
+                if not self.quota_meter.is_cooldown_active(now=self.clock.now()):
+                    self.quota_meter.record_429_pause(err_msg, now=self.clock.now())
                 finish_idea_execution(
                     idea_id,
                     status="queued",
@@ -2115,8 +2446,54 @@ class IdeaQueueWorker:
                 self._current_step = ""
                 self._cond.notify_all()
 
+    def _wait_for_quota_probe(self, seconds: float) -> bool:
+        """Sleep for the quota probe interval while respecting stop_event cancellation."""
+        interval = max(0.0, float(seconds))
+        if self._stop_event.is_set():
+            return True
+        if self._wait_fn is not None:
+            stopped = bool(self._wait_fn(interval))
+            return stopped or self._stop_event.is_set()
+        self._probe_wakeup_event.clear()
+        self._probe_wakeup_event.wait(timeout=interval)
+        return self._stop_event.is_set()
+
+    def probe_quota_recovery(
+        self,
+        *,
+        now: datetime | None = None,
+        trigger_queue: bool = False,
+    ) -> dict[str, Any]:
+        """Run a quota recovery probe via the bound improver or standalone quota_meter."""
+        ref_now = now if now is not None else self.clock.now()
+        if self._improver is not None:
+            return self._improver.probe_quota_recovery(
+                now=ref_now,
+                trigger_queue=trigger_queue,
+                executor=self._executor,
+                probe_fn=self._probe_fn,
+                poll_interval_seconds=self.poll_interval_seconds,
+            )
+        standalone = FactorySelfImprover(
+            telemetry_db_path=self.db_path,
+            clock=self.clock,
+            quota_meter=self.quota_meter,
+            quota_probe_interval_seconds=self.quota_probe_interval_seconds,
+            quota_probe_fn=self._probe_fn,
+            restart_fn=lambda _code: None,
+            restart_delay_seconds=0.0,
+        )
+        return standalone.probe_quota_recovery(
+            now=ref_now,
+            trigger_queue=trigger_queue,
+            executor=self._executor,
+            probe_fn=self._probe_fn,
+            poll_interval_seconds=self.poll_interval_seconds,
+        )
+
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
+            result: dict[str, Any] = {"status": "error", "processed": False}
             try:
                 result = self.drain_once()
                 with self._cond:
@@ -2131,6 +2508,22 @@ class IdeaQueueWorker:
                 )
             if self._stop_event.is_set():
                 break
+            if result.get("status") == "quota_pause":
+                if self._wait_for_quota_probe(self.quota_probe_interval_seconds):
+                    break
+                if self._stop_event.is_set():
+                    break
+                try:
+                    probe_res = self.probe_quota_recovery(trigger_queue=False)
+                    with self._cond:
+                        self._last_result = probe_res
+                        self._cond.notify_all()
+                except Exception as exc:  # noqa: BLE001
+                    logging.getLogger(__name__).warning(
+                        "IdeaQueueWorker quota probe error: %s",
+                        redact_secrets(str(exc)),
+                    )
+                continue
             self._wakeup_event.clear()
             self._wakeup_event.wait(timeout=self.poll_interval_seconds)
 
@@ -2142,6 +2535,7 @@ class IdeaQueueWorker:
                 return self
             self._stop_event.clear()
             self._wakeup_event.set()
+            self._probe_wakeup_event.clear()
             self._thread = threading.Thread(
                 target=self._worker_loop,
                 name="liwi-idea-queue-worker",
@@ -2160,6 +2554,12 @@ class IdeaQueueWorker:
                 self.start()
                 return
             self._wakeup_event.set()
+            try:
+                snap = self.quota_meter.peek_status(now=self.clock.now())
+                if not self._is_quota_pause_blocking(snap):
+                    self._probe_wakeup_event.set()
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger(__name__).debug("wake quota check skipped: %s", exc)
             self._cond.notify_all()
 
     def wait_until_idle(self, timeout: float = 10.0) -> bool:
@@ -2171,7 +2571,7 @@ class IdeaQueueWorker:
             with self._cond:
                 busy = self._busy
             if not busy:
-                if is_quota_429_paused(db_path=self.db_path, now=self.clock.now()):
+                if self._is_quota_pause_blocking(self.quota_meter.peek_status(now=self.clock.now())):
                     with self._cond:
                         if not self._busy:
                             return True
@@ -2194,6 +2594,7 @@ class IdeaQueueWorker:
         with self._cond:
             self._stop_event.set()
             self._wakeup_event.set()
+            self._probe_wakeup_event.set()
             thread = self._thread
             self._cond.notify_all()
         if thread is not None and thread.is_alive():
@@ -2201,6 +2602,51 @@ class IdeaQueueWorker:
         with self._cond:
             if self._thread is not None and not self._thread.is_alive():
                 self._thread = None
+
+
+def probe_quota_recovery(
+    *,
+    db_path: Path | str | None = None,
+    improver: FactorySelfImprover | None = None,
+    quota_meter: QuotaMeter | None = None,
+    runner: Runner | None = None,
+    clock: Clock | None = None,
+    probe_fn: Callable[[], Any] | None = None,
+    executor: Callable[[dict[str, Any]], Any] | None = None,
+    now: datetime | None = None,
+    trigger_queue: bool = True,
+    quota_probe_interval_seconds: float = DEFAULT_QUOTA_PROBE_INTERVAL_SECONDS,
+    poll_interval_seconds: float = 0.5,
+    require_autonomous_enabled: bool = False,
+) -> dict[str, Any]:
+    """Module-level entrypoint to probe quota recovery and resume the queue automatically."""
+    if improver is not None:
+        return improver.probe_quota_recovery(
+            now=now,
+            trigger_queue=trigger_queue,
+            executor=executor,
+            probe_fn=probe_fn,
+            poll_interval_seconds=poll_interval_seconds,
+            require_autonomous_enabled=require_autonomous_enabled,
+        )
+    target = FactorySelfImprover(
+        telemetry_db_path=db_path,
+        runner=runner,
+        clock=clock,
+        quota_meter=quota_meter,
+        quota_probe_interval_seconds=quota_probe_interval_seconds,
+        quota_probe_fn=probe_fn,
+        restart_fn=lambda _code: None,
+        restart_delay_seconds=0.0,
+    )
+    return target.probe_quota_recovery(
+        now=now,
+        trigger_queue=trigger_queue,
+        executor=executor,
+        probe_fn=probe_fn,
+        poll_interval_seconds=poll_interval_seconds,
+        require_autonomous_enabled=require_autonomous_enabled,
+    )
 
 
 def get_idea_queue_worker() -> IdeaQueueWorker | None:

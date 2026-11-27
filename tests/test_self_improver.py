@@ -1375,5 +1375,413 @@ def test_factory_assistant_apply_uses_diff_selector_for_subpackages_and_respects
         store.close()
 
 
+class _FakeQuotaClock:
+    """Deterministic Clock double for quota probe tests without real time.sleep."""
+
+    def __init__(self, initial: Any) -> None:
+        self._now = initial
+        self.sleeps: list[float] = []
+
+    def now(self) -> Any:
+        return self._now
+
+    def advance(self, seconds: float) -> Any:
+        from datetime import timedelta
+
+        self._now = self._now + timedelta(seconds=float(seconds))
+        return self._now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(float(seconds))
+        self.advance(seconds)
+
+
+def test_quota_meter_parse_reset_delay_and_state_transitions(tmp_path: Path) -> None:
+    """QuotaMeter parses 'Resets in...', reports cooldown/window expiration, and resets pause restoring 100% balance."""
+    from datetime import UTC, datetime
+
+    from agent_factory.quota_meter import QuotaMeter, parse_reset_delay_seconds
+
+    assert parse_reset_delay_seconds("HTTP 429 RESOURCE_EXHAUSTED Resets in 14m32s") == 872
+    assert parse_reset_delay_seconds("Resets in 1h 20m 5s") == 4805
+    assert parse_reset_delay_seconds("Reset in 2 hours 10 minutes") == 7800
+    assert parse_reset_delay_seconds("HTTP 429 Too Many Requests") == 1800
+
+    t0 = datetime(2026, 11, 26, 12, 0, 0, tzinfo=UTC)
+    clock = _FakeQuotaClock(t0)
+    meter = QuotaMeter(db_path=tmp_path / "telemetry_qm.db", clock=clock)
+
+    initial = meter.peek_status()
+    assert initial["is_paused"] is False
+    assert initial["quota_remaining_pct"] == 100
+    assert meter.is_paused() is False
+    assert meter.is_window_expired() is False
+
+    # Record 429 with explicit Resets in 20m0s -> paused until 12:20:00 UTC
+    paused = meter.record_429_pause("HTTP 429 RESOURCE_EXHAUSTED Resets in 20m0s")
+    assert paused["is_paused"] is True
+    assert paused["quota_remaining_pct"] == 0
+    assert paused["quota_paused_until"] == "2026-11-26T12:20:00+00:00"
+    assert paused["reset_seconds"] == 1200
+    assert meter.is_paused() is True
+    assert meter.is_cooldown_active() is True
+    assert meter.is_window_expired() is False
+
+    # Update pause timer after another 429 at 12:10:00 with Resets in 45m30s -> 12:55:30 UTC
+    clock.advance(600)
+    updated = meter.record_429_pause("429 rate limit exceeded. Resets in 45m30s")
+    assert updated["is_paused"] is True
+    assert updated["quota_paused_until"] == "2026-11-26T12:55:30+00:00"
+    assert updated["reset_seconds"] == 2730
+
+    # Immediate reset clears cooldown and restores 100% cycle availability
+    restored = meter.reset_pause()
+    assert restored["is_paused"] is False
+    assert restored["quota_paused_until"] is None
+    assert restored["quota_remaining_pct"] == 100
+    assert restored["window_tokens_used"] == 0
+    assert restored["turns_used"] == 0
+    assert meter.is_paused() is False
+
+
+def test_quota_probe_recovery_retries_on_429_updates_timer_and_resumes_queue_on_success(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Periodic 600s quota probe updates timer & sleeps 600s on 429, then clears pause, logs exact bitacora message, and triggers queued idea immediately on success."""
+    import logging
+    import sqlite3
+    from datetime import UTC, datetime
+
+    from agent_factory import idea_engine, self_improver
+    from agent_factory.quota_meter import QuotaMeter
+
+    assert self_improver.DEFAULT_QUOTA_PROBE_INTERVAL_SECONDS == 600.0
+    expected_log = "Cuota recuperada automáticamente; reanudando ciclo autónomo"
+
+    db_path = tmp_path / "telemetry_probe.db"
+    t0 = datetime(2026, 11, 26, 20, 0, 0, tzinfo=UTC)
+    clock = _FakeQuotaClock(t0)
+    meter = QuotaMeter(db_path=db_path, clock=clock)
+
+    # Enable autonomous mode and seed a queued idea waiting for quota recovery
+    idea_engine.set_autonomous_config(autonomous_enabled=True, db_path=db_path)
+    saved = idea_engine.save_ideas(
+        [
+            {
+                "title": "⚡ Reanudar cola tras cuota",
+                "category": "Estabilidad",
+                "impact": "Alto",
+                "simple_description": "Prueba de reactivación automática de cuota.",
+                "technical_prompt": "Verifica recuperación automática de cuota.",
+            }
+        ],
+        source="auto",
+        db_path=db_path,
+    )
+    idea_id = int(saved[0]["id"])
+    idea_engine.update_idea_status(idea_id, "queued", db_path=db_path)
+
+    # Enter active 429 quota pause (Resets in 20m0s -> 20:20:00 UTC)
+    meter.record_429_pause("HTTP 429 RESOURCE_EXHAUSTED Resets in 20m0s", now=t0)
+    assert meter.is_paused(now=t0) is True
+
+    probe_cmds: list[list[str]] = []
+    probe_responses = [
+        CommandResult(
+            exit_code=1,
+            stderr="HTTP 429 RESOURCE_EXHAUSTED: Quota exceeded. Resets in 45m30s",
+        ),
+        CommandResult(exit_code=0, stdout="OK"),
+    ]
+
+    class _QuotaProbeRunner:
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            del cwd, timeout_seconds, env
+            probe_cmds.append(list(command))
+            return probe_responses.pop(0)
+
+    executed_ideas: list[int] = []
+    executed_event = threading.Event()
+    recorded_waits: list[float] = []
+    first_probe_timer_seen: list[str | None] = []
+
+    def _fake_executor(idea: dict[str, Any]) -> dict[str, Any]:
+        executed_ideas.append(int(idea["id"]))
+        executed_event.set()
+        return {"ok": True, "applied": True}
+
+    def _fake_wait(seconds: float) -> bool:
+        recorded_waits.append(float(seconds))
+        if len(recorded_waits) == 2:
+            # Verify state right after attempt 1 failed with 429 Resets in 45m30s at 20:10:00
+            snap = meter.peek_status(now=clock.now())
+            first_probe_timer_seen.append(snap["quota_paused_until"])
+            assert snap["is_paused"] is True
+            assert executed_ideas == []
+        clock.advance(seconds)
+        return False
+
+    improver = FactorySelfImprover(
+        db_path=tmp_path / "factory_probe.db",
+        telemetry_db_path=db_path,
+        repo_root=tmp_path,
+        uploads_dir=tmp_path / "uploads_probe",
+        runner=_QuotaProbeRunner(),
+        clock=clock,
+        quota_meter=meter,
+        quota_probe_interval_seconds=600.0,
+    )
+
+    worker = self_improver.IdeaQueueWorker(
+        db_path=db_path,
+        executor=_fake_executor,
+        improver=improver,
+        quota_meter=meter,
+        quota_probe_interval_seconds=600.0,
+        poll_interval_seconds=0.01,
+        clock=clock,
+        wait_fn=_fake_wait,
+    )
+
+    with caplog.at_level(logging.INFO):
+        worker.start()
+        try:
+            assert executed_event.wait(timeout=5.0) is True
+            assert worker.wait_until_idle(timeout=5.0) is True
+        finally:
+            worker.stop(timeout=2.0)
+
+    # Attempt 1 ran at 20:10:00 (after 600s) -> updated Resets in 45m30s -> 20:55:30 UTC and slept another 600s
+    assert recorded_waits == [600.0, 600.0]
+    assert first_probe_timer_seen == ["2026-11-26T20:55:30+00:00"]
+    assert len(probe_cmds) == 2
+    for cmd in probe_cmds:
+        assert "--dangerously-skip-permissions" not in cmd
+
+    # Attempt 2 succeeded at 20:20:00 (before 20:55:30!) -> cleared pause, logged exact message, ran queued idea
+    assert meter.is_paused(now=clock.now()) is False
+    final_status = meter.peek_status(now=clock.now())
+    assert final_status["quota_paused_until"] is None
+    assert final_status["quota_remaining_pct"] == 100
+    assert final_status["window_tokens_used"] == 0
+    assert executed_ideas == [idea_id]
+    assert idea_engine.get_idea(idea_id, db_path=db_path)["status"] == "aplicada"  # type: ignore[index]
+
+    assert expected_log in caplog.text
+    chat_msgs = improver.memory_store.list_messages()
+    assert any(m["content"] == expected_log for m in chat_msgs)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        ev_rows = conn.execute(
+            "SELECT stage, command FROM execution_events WHERE stage = 'quota_recovery';"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert any(row[1] == expected_log for row in ev_rows)
+
+
+def test_quota_probe_recovery_resets_automatically_when_rolling_window_expires(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the quota meter's rolling window expires, probe_quota_recovery resets pause without calling the AI adapter, logs exact message, and triggers the queue."""
+    import logging
+    from datetime import UTC, datetime
+
+    from agent_factory import idea_engine, self_improver
+    from agent_factory.quota_meter import DEFAULT_QUOTA_WINDOW_SECONDS, QuotaMeter
+
+    expected_log = "Cuota recuperada automáticamente; reanudando ciclo autónomo"
+    db_path = tmp_path / "telemetry_window.db"
+    t0 = datetime(2026, 11, 26, 10, 0, 0, tzinfo=UTC)
+    clock = _FakeQuotaClock(t0)
+    meter = QuotaMeter(db_path=db_path, clock=clock)
+
+    # Exhaust rolling window to 0% remaining without an explicit 429 timestamp
+    meter.record_usage(90000, 90000, now=t0)
+    assert meter.peek_status(now=t0)["quota_remaining_pct"] == 0
+    assert meter.is_paused(now=t0) is True
+    assert meter.is_window_expired(now=t0) is False
+
+    # Seed a queued idea waiting to run
+    saved = idea_engine.save_ideas(
+        [
+            {
+                "title": "🔄 Recuperar al expirar ventana móvil",
+                "category": "Estabilidad",
+                "impact": "Alto",
+                "simple_description": "Prueba expiración de ventana móvil de 5h.",
+                "technical_prompt": "Verifica recuperación al expirar ventana.",
+            }
+        ],
+        source="auto",
+        db_path=db_path,
+    )
+    idea_id = int(saved[0]["id"])
+    idea_engine.update_idea_status(idea_id, "queued", db_path=db_path)
+
+    ai_calls: list[list[str]] = []
+
+    class _NeverCalledRunner:
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            del cwd, timeout_seconds, env
+            ai_calls.append(list(command))
+            raise AssertionError("AI probe should not be called when rolling window already expired")
+
+    executed_ideas: list[int] = []
+    executed_event = threading.Event()
+
+    def _fake_executor(idea: dict[str, Any]) -> dict[str, Any]:
+        executed_ideas.append(int(idea["id"]))
+        executed_event.set()
+        return {"ok": True, "applied": True}
+
+    improver = FactorySelfImprover(
+        db_path=tmp_path / "factory_window.db",
+        telemetry_db_path=db_path,
+        repo_root=tmp_path,
+        uploads_dir=tmp_path / "uploads_window",
+        runner=_NeverCalledRunner(),
+        clock=clock,
+        quota_meter=meter,
+    )
+
+    # Advance clock past 5h rolling window (18000s + 1s -> 15:00:01 UTC)
+    clock.advance(DEFAULT_QUOTA_WINDOW_SECONDS + 1)
+    assert meter.is_window_expired(now=clock.now()) is True
+
+    try:
+        with caplog.at_level(logging.INFO):
+            res = improver.probe_quota_recovery(executor=_fake_executor)
+
+        assert res["ok"] is True
+        assert res["recovered"] is True
+        assert res["reason"] == "window_expired"
+        assert res["quota_paused"] is False
+        assert res["queue_triggered"] is True
+        assert res["log_message"] == expected_log
+        assert ai_calls == []
+
+        restored = meter.peek_status(now=clock.now())
+        assert restored["is_paused"] is False
+        assert restored["quota_remaining_pct"] == 100
+        assert restored["window_tokens_used"] == 0
+        assert expected_log in caplog.text
+
+        assert executed_event.wait(timeout=5.0) is True
+        worker = self_improver.get_idea_queue_worker()
+        assert worker is not None
+        assert worker.wait_until_idle(timeout=5.0) is True
+        assert executed_ideas == [idea_id]
+        assert idea_engine.get_idea(idea_id, db_path=db_path)["status"] == "aplicada"  # type: ignore[index]
+    finally:
+        self_improver.stop_idea_queue_worker(timeout=2.0)
+
+
+def test_quota_probe_recovery_keeps_pause_on_transient_errors_and_stops_cleanly(
+    tmp_path: Path,
+) -> None:
+    """Non-quota transient probe errors do not falsely clear quota pause or crash the worker loop, and stop signal cancels cleanly."""
+    from datetime import UTC, datetime
+
+    from agent_factory import self_improver
+    from agent_factory.quota_meter import QuotaMeter
+
+    db_path = tmp_path / "telemetry_transient.db"
+    t0 = datetime(2026, 11, 26, 22, 0, 0, tzinfo=UTC)
+    clock = _FakeQuotaClock(t0)
+    meter = QuotaMeter(db_path=db_path, clock=clock)
+    meter.record_429_pause("HTTP 429 RESOURCE_EXHAUSTED Resets in 30m0s", now=t0)
+
+    class _TransientErrorRunner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            del command, cwd, timeout_seconds, env
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("Temporary network connection reset")
+            return CommandResult(exit_code=1, stderr="503 Service Temporarily Unavailable")
+
+    runner = _TransientErrorRunner()
+    improver = FactorySelfImprover(
+        db_path=tmp_path / "factory_transient.db",
+        telemetry_db_path=db_path,
+        repo_root=tmp_path,
+        uploads_dir=tmp_path / "uploads_transient",
+        runner=runner,
+        clock=clock,
+        quota_meter=meter,
+        quota_probe_interval_seconds=600.0,
+    )
+
+    # Direct probe: raised exception -> keeps pause intact, does not crash
+    res1 = improver.probe_quota_recovery()
+    assert res1["ok"] is False
+    assert res1["recovered"] is False
+    assert res1["status"] == "transient_error"
+    assert res1["quota_paused"] is True
+    assert res1["next_probe_seconds"] == 600.0
+    assert meter.is_paused(now=t0) is True
+    assert meter.peek_status(now=t0)["quota_paused_until"] == "2026-11-26T22:30:00+00:00"
+
+    # Second transient error inside IdeaQueueWorker loop -> loop survives and stops cleanly on stop()
+    waits: list[float] = []
+    two_waits_seen = threading.Event()
+    worker_ref: list[self_improver.IdeaQueueWorker] = []
+
+    def _wait_then_stop(seconds: float) -> bool:
+        waits.append(float(seconds))
+        if len(waits) >= 2:
+            two_waits_seen.set()
+            worker_ref[0]._stop_event.set()
+            return True
+        return False
+
+    worker = self_improver.IdeaQueueWorker(
+        db_path=db_path,
+        improver=improver,
+        quota_meter=meter,
+        quota_probe_interval_seconds=600.0,
+        poll_interval_seconds=0.01,
+        clock=clock,
+        wait_fn=_wait_then_stop,
+    )
+    worker_ref.append(worker)
+    worker.start()
+    try:
+        assert two_waits_seen.wait(timeout=5.0) is True
+    finally:
+        worker.stop(timeout=2.0)
+
+    assert worker.is_alive is False
+    assert waits == [600.0, 600.0]
+    assert runner.calls == 2
+    assert meter.is_paused(now=t0) is True
+    assert meter.peek_status(now=t0)["quota_paused_until"] == "2026-11-26T22:30:00+00:00"
+
+
+
 
 
