@@ -21,7 +21,11 @@ from agent_factory.adapters.subprocess_runner import SubprocessRunner
 from agent_factory.dashboard import start_dashboard_server
 from agent_factory.orchestrator import Orchestrator
 from agent_factory.ports.runner import CommandResult
-from agent_factory.self_improver import FactoryMemoryStore, FactorySelfImprover
+from agent_factory.self_improver import (
+    FactoryMemoryStore,
+    FactorySelfImprover,
+    select_targeted_test_paths,
+)
 from agent_factory.supervisor import RESTART_EXIT_CODE, run_supervisor
 
 # Valid 1x1 transparent PNG bytes for screenshot upload tests
@@ -1191,6 +1195,185 @@ def test_factory_assistant_auto_repair_prompt_compacts_long_pytest_trace_and_sug
         assert "MID_SPAM_60" not in rep_prompt
     finally:
         store.close()
+
+
+def test_select_targeted_test_paths_root_subpackages_direct_unmatched_and_dedup() -> None:
+    """select_targeted_test_paths maps root, adapters/agents/domain subpackages, and direct test edits deterministically with deduplication and empty fallback."""
+    available_tests = [
+        "tests/test_telemetry.py",
+        "tests/test_orchestrator_state_machine.py",
+        "tests/test_orchestrator_approval.py",
+        "tests/test_agy_cli_adapter.py",
+        "tests/test_model_resolver.py",
+        "tests/test_interviewer.py",
+        "tests/test_debate_mediator.py",
+        "tests/test_states.py",
+        "tests/test_progress_and_projection.py",
+        "tests/adapters/test_sqlite_store.py",
+        "tests/test_dashboard.py",
+        "tests/conftest.py",
+    ]
+
+    # 1. Root package module (single and multiple matching test files, sorted)
+    assert select_targeted_test_paths(
+        ["src/agent_factory/telemetry.py"],
+        available_tests,
+    ) == ["tests/test_telemetry.py"]
+    assert select_targeted_test_paths(
+        ["src/agent_factory/orchestrator.py"],
+        available_tests,
+    ) == [
+        "tests/test_orchestrator_approval.py",
+        "tests/test_orchestrator_state_machine.py",
+    ]
+
+    # 2. Subpackage modules: adapters/, agents/, domain/
+    assert select_targeted_test_paths(
+        ["src/agent_factory/adapters/agy_cli_adapter.py"],
+        available_tests,
+    ) == ["tests/test_agy_cli_adapter.py"]
+    assert select_targeted_test_paths(
+        ["src/agent_factory/adapters/sqlite_store.py"],
+        available_tests,
+    ) == ["tests/adapters/test_sqlite_store.py"]
+    assert select_targeted_test_paths(
+        ["src/agent_factory/agents/interviewer.py"],
+        available_tests,
+    ) == ["tests/test_interviewer.py"]
+    assert select_targeted_test_paths(
+        ["src/agent_factory/agents/mediator.py"],
+        available_tests,
+    ) == ["tests/test_debate_mediator.py"]
+    assert select_targeted_test_paths(
+        ["src/agent_factory/domain/states.py"],
+        available_tests,
+    ) == ["tests/test_states.py"]
+    assert select_targeted_test_paths(
+        ["src/agent_factory/domain/progress.py"],
+        available_tests,
+    ) == ["tests/test_progress_and_projection.py"]
+
+    # 3. Direct change in a test file (existing kept, missing ignored)
+    assert select_targeted_test_paths(
+        ["tests/test_dashboard.py"],
+        available_tests,
+    ) == ["tests/test_dashboard.py"]
+    assert select_targeted_test_paths(
+        ["tests/test_nonexistent.py"],
+        available_tests,
+    ) == []
+
+    # 4. Files without associated test return empty list safely (and no substring false positives)
+    assert select_targeted_test_paths(
+        [
+            "src/agent_factory/orphan_module.py",
+            "src/agent_factory/__init__.py",
+            "src/agent_factory/domain/models.py",
+            "README.md",
+            "../tests/test_dashboard.py",
+        ],
+        available_tests,
+    ) == []
+    assert select_targeted_test_paths([], available_tests) == []
+    assert select_targeted_test_paths(["src/agent_factory/telemetry.py"], []) == []
+
+    # 5. Deduplication, Windows backslash & ./ normalization, and deterministic sorting
+    assert select_targeted_test_paths(
+        [
+            "src\\agent_factory\\domain\\states.py",
+            "./src/agent_factory/domain/states.py",
+            "tests/test_states.py",
+            "src/agent_factory/adapters/agy_cli_adapter.py",
+            "tests\\test_agy_cli_adapter.py",
+            "src/agent_factory/agents/interviewer.py",
+        ],
+        [
+            "tests\\test_states.py",
+            "tests/test_states.py",
+            "./tests/test_agy_cli_adapter.py",
+            "tests/test_interviewer.py",
+            "tests/test_dashboard.py",
+        ],
+    ) == [
+        "tests/test_agy_cli_adapter.py",
+        "tests/test_interviewer.py",
+        "tests/test_states.py",
+    ]
+
+
+def test_factory_assistant_apply_uses_diff_selector_for_subpackages_and_respects_explicit_tests(
+    tmp_path: Path,
+) -> None:
+    """Validation gate builds pytest -q --no-cov with diff-selected subpackage tests when no explicit list is provided, and honors explicit_tests when specified."""
+    repo_root = tmp_path / "repo_subpkg_selector"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "TestFactory"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.email", "factory@local"], cwd=repo_root, check=True)
+    (repo_root / "src" / "agent_factory" / "domain").mkdir(parents=True, exist_ok=True)
+    (repo_root / "src" / "agent_factory" / "adapters").mkdir(parents=True, exist_ok=True)
+    (repo_root / "tests").mkdir(parents=True, exist_ok=True)
+    (repo_root / "src" / "agent_factory" / "domain" / "states.py").write_text("S = 1\n", encoding="utf-8")
+    (repo_root / "src" / "agent_factory" / "adapters" / "orphan_adapter.py").write_text("A = 1\n", encoding="utf-8")
+    (repo_root / "tests" / "test_states.py").write_text("def test_s(): assert True\n", encoding="utf-8")
+    (repo_root / "tests" / "test_unrelated.py").write_text("def test_u(): assert True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "chore: seed subpkg repo"], cwd=repo_root, check=True, capture_output=True)
+
+    real_runner = SubprocessRunner(default_timeout_seconds=15.0)
+    recorded_pytest_cmds: list[list[str]] = []
+    edit_target = ["src/agent_factory/domain/states.py"]
+
+    class _SubpkgRunner(SubprocessRunner):
+        def run(
+            self,
+            command: Sequence[str],
+            cwd: Path,
+            timeout_seconds: float = 30.0,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
+            exe_stem = Path(command[0]).stem.lower()
+            if exe_stem == "agy":
+                (repo_root / edit_target[0]).write_text("UPDATED = True\n", encoding="utf-8")
+                return CommandResult(exit_code=0, stdout="ok")
+            if exe_stem == "ruff":
+                return CommandResult(exit_code=0, stdout="All checks passed!")
+            if exe_stem == "pytest":
+                recorded_pytest_cmds.append(list(command))
+                return CommandResult(exit_code=0, stdout="1 passed")
+            return real_runner.run(command, cwd, timeout_seconds=timeout_seconds, env=env)
+
+    store = SqliteEventStore(db_path=tmp_path / "subpkg.db")
+    try:
+        improver = FactorySelfImprover(
+            sqlite_store=store,
+            repo_root=repo_root,
+            uploads_dir=tmp_path / "uploads_subpkg",
+            runner=_SubpkgRunner(),
+            restart_fn=lambda _code: None,
+            restart_delay_seconds=0.01,
+        )
+
+        # 1. No explicit test list -> diff selector maps domain/states.py -> tests/test_states.py only
+        res_diff = improver.apply_proposal("Actualiza states.py", proposal_title="States update")
+        assert res_diff["applied"] is True
+        assert len(recorded_pytest_cmds) == 1
+        assert recorded_pytest_cmds[0][1:] == ["-q", "--no-cov", "tests/test_states.py"]
+
+        # 2. Explicit test list specified -> honors explicit list even for orphan adapter
+        recorded_pytest_cmds.clear()
+        edit_target[0] = "src/agent_factory/adapters/orphan_adapter.py"
+        res_explicit = improver.apply_proposal(
+            "Actualiza orphan_adapter.py",
+            proposal_title="Explicit test list",
+            explicit_tests=["tests/test_unrelated.py"],
+        )
+        assert res_explicit["applied"] is True
+        assert len(recorded_pytest_cmds) == 1
+        assert recorded_pytest_cmds[0][1:] == ["-q", "--no-cov", "tests/test_unrelated.py"]
+    finally:
+        store.close()
+
 
 
 

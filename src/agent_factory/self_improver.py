@@ -16,7 +16,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 from agent_factory.adapters.agy_cli_adapter import build_sanitized_cli_env
@@ -302,6 +302,98 @@ def _list_factory_source_files(repo_root: Path) -> list[str]:
         if len(files) >= 200:
             break
     return files
+
+
+def _normalize_repo_rel_path(raw: str) -> str:
+    """Normalize a repo-relative POSIX path and reject absolute paths or '..' traversal (INV-22)."""
+    norm = str(raw or "").strip().replace("\\", "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    if not norm or norm.startswith("/") or re.match(r"^[A-Za-z]:", norm):
+        return ""
+    parts = [part for part in norm.split("/") if part and part != "."]
+    if not parts or any(part == ".." for part in parts):
+        return ""
+    return "/".join(parts)
+
+
+def _list_available_test_files(repo_root: Path) -> list[str]:
+    """Return sorted relative POSIX paths for test_*.py files under tests/."""
+    tests_dir = (repo_root / "tests").resolve()
+    if not tests_dir.is_dir():
+        return []
+    repo_resolved = repo_root.resolve()
+    files: list[str] = []
+    for item in sorted(tests_dir.rglob("test_*.py")):
+        if item.is_symlink() or not item.is_file():
+            continue
+        if any(p in {"__pycache__", ".pytest_cache", ".git", ".venv"} for p in item.parts):
+            continue
+        try:
+            rel = item.resolve().relative_to(repo_resolved).as_posix()
+        except (OSError, ValueError):
+            continue
+        files.append(rel)
+    return files
+
+
+def select_targeted_test_paths(
+    changed_files: Sequence[str],
+    available_tests: Sequence[str],
+) -> list[str]:
+    """Pure, deterministic mapper from modified src/tests paths to existing targeted test files."""
+    norm_available: list[tuple[str, str, str]] = []
+    available_set: set[str] = set()
+    for raw_test in available_tests:
+        norm_test = _normalize_repo_rel_path(raw_test)
+        if not norm_test or norm_test in available_set:
+            continue
+        test_path = PurePosixPath(norm_test)
+        if (
+            not norm_test.startswith("tests/")
+            or test_path.suffix != ".py"
+            or not test_path.name.startswith("test_")
+        ):
+            continue
+        available_set.add(norm_test)
+        test_stem = test_path.stem
+        test_suffix = test_stem.removeprefix("test_")
+        norm_available.append((norm_test, test_stem, test_suffix))
+
+    if not norm_available or not changed_files:
+        return []
+
+    selected: set[str] = set()
+    for raw_changed in changed_files:
+        norm = _normalize_repo_rel_path(raw_changed)
+        if not norm:
+            continue
+        path = PurePosixPath(norm)
+        if (
+            norm.startswith("tests/")
+            and path.suffix == ".py"
+            and path.name.startswith("test_")
+        ):
+            if norm in available_set:
+                selected.add(norm)
+            continue
+        if not norm.startswith("src/agent_factory/") or path.suffix != ".py":
+            continue
+        stem = path.stem
+        if not stem or stem in {"__init__", "__main__"}:
+            continue
+        subpkg_parts = path.parts[2:-1]
+        qualified_stem = "_".join((*subpkg_parts, stem)) if subpkg_parts else ""
+        token_pattern = re.compile(rf"(?:^|_){re.escape(stem)}(?:$|_)")
+        for test_rel, test_stem, test_suffix in norm_available:
+            if (
+                test_stem == f"test_{stem}"
+                or (qualified_stem and test_stem == f"test_{qualified_stem}")
+                or token_pattern.search(test_suffix) is not None
+            ):
+                selected.add(test_rel)
+
+    return sorted(selected)
 
 
 class FactorySelfImprover:
@@ -994,44 +1086,64 @@ class FactorySelfImprover:
 
     def _select_targeted_pytest_targets(self, changed_paths: Sequence[str]) -> tuple[list[str], bool]:
         """Select targeted test files for modified src/tests modules; fall back only if a modified src module has no matching tests."""
-        tests_dir = self.repo_root / "tests"
-        selected: list[str] = []
-        seen: set[str] = set()
+        available_tests = _list_available_test_files(self.repo_root)
+        if not available_tests:
+            return [], False
+
+        available_set = set(available_tests)
+        selected: set[str] = set(select_targeted_test_paths(changed_paths, available_tests))
         has_unmatched_src = False
 
-        def _add_if_file(rel_path: str) -> bool:
-            norm = rel_path.replace("\\", "/")
-            if (self.repo_root / norm).is_file():
-                if norm not in seen:
-                    seen.add(norm)
-                    selected.append(norm)
-                return True
-            return False
-
-        _add_if_file("tests/test_self_improver.py")
-
         for rel in changed_paths:
-            norm = rel.replace("\\", "/")
-            name = Path(norm).name
-            if norm.startswith("tests/") and name.startswith("test_") and norm.endswith(".py"):
-                _add_if_file(norm)
-            elif norm.startswith("src/") and norm.endswith(".py"):
-                stem = Path(norm).stem
-                if not stem or stem == "__init__":
+            norm = _normalize_repo_rel_path(rel)
+            if not norm:
+                continue
+            path = PurePosixPath(norm)
+            if norm.startswith("src/") and path.suffix == ".py":
+                stem = path.stem
+                if not stem or stem in {"__init__", "__main__"}:
                     continue
-                matched_this_src = False
-                if tests_dir.is_dir():
-                    for match in sorted(tests_dir.glob(f"test_*{stem}*.py")):
-                        if _add_if_file(f"tests/{match.name}"):
-                            matched_this_src = True
-                if name == "cli.py" and _add_if_file("tests/test_dashboard.py"):
+                matched_this_src = bool(select_targeted_test_paths([norm], available_tests))
+                if path.name == "cli.py" and "tests/test_dashboard.py" in available_set:
+                    selected.add("tests/test_dashboard.py")
                     matched_this_src = True
                 if not matched_this_src:
                     has_unmatched_src = True
 
         if has_unmatched_src or not selected:
             return [], False
-        return selected, True
+
+        if "tests/test_self_improver.py" in available_set:
+            selected.add("tests/test_self_improver.py")
+
+        return sorted(selected), True
+
+    def _resolve_explicit_test_targets(
+        self,
+        explicit_tests: Sequence[str] | None,
+    ) -> list[str]:
+        """Validate and deduplicate explicit test paths strictly contained inside tests/ (INV-22)."""
+        if not explicit_tests:
+            return []
+        repo_resolved = self.repo_root.resolve()
+        tests_root = (repo_resolved / "tests").resolve()
+        if not tests_root.is_dir():
+            return []
+        resolved_targets: set[str] = set()
+        for raw in explicit_tests:
+            norm = _normalize_repo_rel_path(raw)
+            if not norm or not norm.startswith("tests/") or not norm.endswith(".py"):
+                continue
+            cand = repo_resolved / norm
+            if cand.is_symlink():
+                continue
+            try:
+                cand_resolved = cand.resolve()
+            except OSError:
+                continue
+            if cand_resolved.is_relative_to(tests_root) and cand_resolved.is_file():
+                resolved_targets.add(norm)
+        return sorted(resolved_targets)
 
     def _run_verification_gate(
         self,
@@ -1040,6 +1152,7 @@ class FactorySelfImprover:
         ws_env: Mapping[str, str],
         clean_title: str,
         started_at: datetime,
+        explicit_tests: Sequence[str] | None = None,
     ) -> tuple[bool, str]:
         """Run ruff check src tests followed by targeted (or full fallback) pytest."""
         self._set_apply_status(
@@ -1062,58 +1175,64 @@ class FactorySelfImprover:
             tail = (ruff_res.stdout or ruff_res.stderr or "ruff check failed").strip()[-1200:]
             return False, f"Falló ruff check src tests:\n{self._redact(tail)}"
 
-        changed_paths = self._collect_changed_src_tests(clean_env)
-        targeted_tests, has_targeted = self._select_targeted_pytest_targets(changed_paths)
-        norm_changed = [p.replace("\\", "/") for p in changed_paths]
-        touches_dashboard = "src/agent_factory/dashboard.py" in norm_changed
-        other_src_changed = any(
-            p.startswith("src/") and p.endswith(".py") and p != "src/agent_factory/dashboard.py"
-            for p in norm_changed
-        )
-
-        if has_targeted and touches_dashboard and "tests/test_dashboard.py" in targeted_tests:
-            if other_src_changed:
-                non_dash_tests = [t for t in targeted_tests if t != "tests/test_dashboard.py"]
-                if non_dash_tests:
-                    self._set_apply_status(
-                        running=True,
-                        step=2,
-                        total_steps=3,
-                        stage="Verificando calidad y pruebas",
-                        detail=f"Ejecutando pruebas dirigidas ({', '.join(non_dash_tests)})...",
-                        title=clean_title,
-                        started_at=started_at,
-                    )
-                    pre_res = self.runner.run(
-                        [*self._resolve_venv_tool("pytest"), "-q", "--no-cov", *non_dash_tests],
-                        cwd=self.repo_root,
-                        timeout_seconds=self.verify_timeout_seconds,
-                        env=ws_env,
-                    )
-                    if pre_res.exit_code != 0:
-                        raw_pre = (
-                            "\n".join(
-                                part for part in (pre_res.stdout, pre_res.stderr) if part and part.strip()
-                            ).strip()
-                            or "pytest failed"
-                        )
-                        pre_prefix = f"Falló pytest {' '.join(non_dash_tests)}:\n"
-                        pre_compact = compact_pytest_failure_output(
-                            self._redact(raw_pre),
-                            max_chars=max(200, 2500 - len(pre_prefix)),
-                        )
-                        return False, f"{pre_prefix}{pre_compact}"
-                pytest_args = [
-                    "-q",
-                    "--no-cov",
-                    "tests/test_dashboard.py",
-                    "-k",
-                    FAST_DASHBOARD_PYTEST_K,
-                ]
-            else:
-                pytest_args = ["-q", "--no-cov", *targeted_tests, "-k", FAST_DASHBOARD_PYTEST_K]
+        explicit_targets = self._resolve_explicit_test_targets(explicit_tests)
+        if explicit_targets:
+            targeted_tests = explicit_targets
+            has_targeted = True
+            pytest_args = ["-q", "--no-cov", *explicit_targets]
         else:
-            pytest_args = ["-q", "--no-cov", *targeted_tests] if has_targeted else ["-q", "--no-cov"]
+            changed_paths = self._collect_changed_src_tests(clean_env)
+            targeted_tests, has_targeted = self._select_targeted_pytest_targets(changed_paths)
+            norm_changed = [p.replace("\\", "/") for p in changed_paths]
+            touches_dashboard = "src/agent_factory/dashboard.py" in norm_changed
+            other_src_changed = any(
+                p.startswith("src/") and p.endswith(".py") and p != "src/agent_factory/dashboard.py"
+                for p in norm_changed
+            )
+
+            if has_targeted and touches_dashboard and "tests/test_dashboard.py" in targeted_tests:
+                if other_src_changed:
+                    non_dash_tests = [t for t in targeted_tests if t != "tests/test_dashboard.py"]
+                    if non_dash_tests:
+                        self._set_apply_status(
+                            running=True,
+                            step=2,
+                            total_steps=3,
+                            stage="Verificando calidad y pruebas",
+                            detail=f"Ejecutando pruebas dirigidas ({', '.join(non_dash_tests)})...",
+                            title=clean_title,
+                            started_at=started_at,
+                        )
+                        pre_res = self.runner.run(
+                            [*self._resolve_venv_tool("pytest"), "-q", "--no-cov", *non_dash_tests],
+                            cwd=self.repo_root,
+                            timeout_seconds=self.verify_timeout_seconds,
+                            env=ws_env,
+                        )
+                        if pre_res.exit_code != 0:
+                            raw_pre = (
+                                "\n".join(
+                                    part for part in (pre_res.stdout, pre_res.stderr) if part and part.strip()
+                                ).strip()
+                                or "pytest failed"
+                            )
+                            pre_prefix = f"Falló pytest {' '.join(non_dash_tests)}:\n"
+                            pre_compact = compact_pytest_failure_output(
+                                self._redact(raw_pre),
+                                max_chars=max(200, 2500 - len(pre_prefix)),
+                            )
+                            return False, f"{pre_prefix}{pre_compact}"
+                    pytest_args = [
+                        "-q",
+                        "--no-cov",
+                        "tests/test_dashboard.py",
+                        "-k",
+                        FAST_DASHBOARD_PYTEST_K,
+                    ]
+                else:
+                    pytest_args = ["-q", "--no-cov", *targeted_tests, "-k", FAST_DASHBOARD_PYTEST_K]
+            else:
+                pytest_args = ["-q", "--no-cov", *targeted_tests] if has_targeted else ["-q", "--no-cov"]
 
         if has_targeted:
             self._set_apply_status(
@@ -1185,6 +1304,7 @@ class FactorySelfImprover:
         message_id: str | None = None,
         github_token: str = "",
         preserve_on_quota_429: bool = False,
+        explicit_tests: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         """Tag HEAD, run agy (900s), gate with ruff + pytest (900s), rollback on failure, commit+push+exit 42 on pass."""
         clean_prompt = str(proposal_prompt or "").strip()
@@ -1264,6 +1384,7 @@ class FactorySelfImprover:
                     ws_env=ws_env,
                     clean_title=clean_title,
                     started_at=started_at,
+                    explicit_tests=explicit_tests,
                 )
                 if not verify_ok:
                     self._set_apply_status(
@@ -1321,6 +1442,7 @@ class FactorySelfImprover:
                             ws_env=ws_env,
                             clean_title=clean_title,
                             started_at=started_at,
+                            explicit_tests=explicit_tests,
                         )
                         if not verify_ok2:
                             failure_reason = verify_err2
