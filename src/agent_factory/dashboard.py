@@ -2497,14 +2497,21 @@ class DashboardController:
             return (db_parent / "telemetry.db").resolve()
         return None
 
-    def list_improvement_ideas(self) -> dict[str, Any]:
-        """Return active improvement ideas and persisted auto-generation interval."""
+    def list_improvement_ideas(self, *, status: str | None = None) -> dict[str, Any]:
+        """Return improvement ideas (optionally filtered by status), status counts, and auto-generation interval."""
         db_path = self._resolve_idea_db_path()
-        ideas = idea_engine.list_ideas(db_path=db_path)
+        result = idea_engine.list_ideas(
+            status=status,
+            include_counts=True,
+            db_path=db_path,
+        )
+        assert isinstance(result, dict)
         interval_hours = idea_engine.get_auto_interval_hours(db_path=db_path)
         return _scrub_value(
             {
-                "ideas": ideas,
+                "ideas": result["ideas"],
+                "counts": result["counts"],
+                "status": result["status"],
                 "auto_interval_hours": interval_hours,
             },
             self.secrets_to_redact,
@@ -2808,16 +2815,29 @@ class DashboardController:
             raise ProjectNotFoundError(f"Project '{project_id}' not found")
         return ws_mgr, ws_dir
 
-    def list_project_ideas(self, project_id: str) -> dict[str, Any]:
-        """List auto-improvement ideas for a generated project."""
+    def list_project_ideas(
+        self,
+        project_id: str,
+        *,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        """List auto-improvement ideas for a generated project with per-status counts."""
         self._assert_project_exists_for_ideas(project_id)
         db_path = self._resolve_idea_db_path()
-        ideas = idea_engine.list_project_ideas(project_id, db_path=db_path)
+        result = idea_engine.list_project_ideas(
+            project_id,
+            status=status,
+            include_counts=True,
+            db_path=db_path,
+        )
+        assert isinstance(result, dict)
         return _scrub_value(
             {
                 "ok": True,
                 "project_id": project_id,
-                "ideas": ideas,
+                "ideas": result["ideas"],
+                "counts": result["counts"],
+                "status": result["status"],
             },
             self.secrets_to_redact,
         )
@@ -15768,7 +15788,13 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if path == "/api/ideas":
-            self._send_controller_json(ctrl.list_improvement_ideas)
+            def _get_ideas() -> dict[str, Any]:
+                qs = urllib.parse.parse_qs(parsed_url.query, keep_blank_values=True)
+                raw_status = str(qs["status"][-1]).strip() if "status" in qs else ""
+                eff_status = raw_status or None
+                return ctrl.list_improvement_ideas(status=eff_status)
+
+            self._send_controller_json(_get_ideas)
             return
 
         if path == "/api/autonomous/status":
@@ -15804,7 +15830,13 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
 
         proj_ideas_pid, proj_ideas_action, _proj_idea_id = self._parse_project_ideas_route()
         if proj_ideas_pid is not None and proj_ideas_action == "list":
-            self._send_controller_json(lambda: ctrl.list_project_ideas(proj_ideas_pid))
+            def _get_project_ideas() -> dict[str, Any]:
+                qs = urllib.parse.parse_qs(parsed_url.query, keep_blank_values=True)
+                raw_status = str(qs["status"][-1]).strip() if "status" in qs else ""
+                eff_status = raw_status or None
+                return ctrl.list_project_ideas(proj_ideas_pid, status=eff_status)
+
+            self._send_controller_json(_get_project_ideas)
             return
 
         if path == "/api/factory/assistant/versions":

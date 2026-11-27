@@ -729,3 +729,363 @@ def test_project_ideas_crud_dedup_error_and_generate_readonly(
     assert updated["status"] == "implementando"
     assert len(idea_engine.list_project_ideas("mi-app", db_path=db_path)) == 2
 
+
+def test_list_ideas_filters_by_canonical_status_and_returns_exact_counts(tmp_path: Path) -> None:
+    db_path = tmp_path / "telemetry.db"
+
+    saved = idea_engine.save_ideas(
+        [
+            _sample_idea(title="💡 Pendiente A"),
+            _sample_idea(title="💡 Pendiente B"),
+            _sample_idea(title="📥 Encolada C"),
+            _sample_idea(title="🔧 Implementando D"),
+            _sample_idea(title="✅ Aplicada E"),
+            _sample_idea(title="🗑️ Descartada F"),
+        ],
+        source="manual",
+        db_path=db_path,
+    )
+    assert len(saved) == 6
+    by_title = {item["title"]: item["id"] for item in saved}
+
+    idea_engine.update_idea_status(by_title["📥 Encolada C"], "queued", db_path=db_path)
+    idea_engine.update_idea_status(by_title["🔧 Implementando D"], "implementing", db_path=db_path)
+    idea_engine.update_idea_status(by_title["✅ Aplicada E"], "implemented", db_path=db_path)
+    idea_engine.dismiss_idea(by_title["🗑️ Descartada F"], db_path=db_path)
+
+    expected_counts = {
+        "pending": 2,
+        "queued": 1,
+        "implementing": 1,
+        "implemented": 1,
+        "dismissed": 1,
+        "all": 6,
+    }
+
+    expected_by_filter = {
+        "pending": {"💡 Pendiente A", "💡 Pendiente B"},
+        "queued": {"📥 Encolada C"},
+        "implementing": {"🔧 Implementando D"},
+        "implemented": {"✅ Aplicada E"},
+        "dismissed": {"🗑️ Descartada F"},
+        "all": {
+            "💡 Pendiente A",
+            "💡 Pendiente B",
+            "📥 Encolada C",
+            "🔧 Implementando D",
+            "✅ Aplicada E",
+            "🗑️ Descartada F",
+        },
+    }
+
+    for status_filter, expected_titles in expected_by_filter.items():
+        res = idea_engine.list_ideas(
+            status=status_filter,
+            include_counts=True,
+            db_path=db_path,
+        )
+        assert isinstance(res, dict)
+        assert res["status"] == status_filter
+        assert {item["title"] for item in res["ideas"]} == expected_titles
+        assert res["counts"] == expected_counts
+
+    # Case/whitespace normalization and independence of counts from limit
+    trimmed = idea_engine.list_ideas(
+        status="  PENDING  ",
+        limit=1,
+        include_counts=True,
+        db_path=db_path,
+    )
+    assert trimmed["status"] == "pending"
+    assert len(trimmed["ideas"]) == 1
+    assert trimmed["counts"] == expected_counts
+
+    # Backward-compatible list return also exposes .counts and defaults to active ideas
+    default_list = idea_engine.list_ideas(db_path=db_path)
+    assert isinstance(default_list, list)
+    assert {item["title"] for item in default_list} == {
+        "💡 Pendiente A",
+        "💡 Pendiente B",
+        "📥 Encolada C",
+        "🔧 Implementando D",
+    }
+    assert default_list.counts == expected_counts
+
+    # Empty DB returns all-zero counts and equals []
+    empty_db = tmp_path / "empty.db"
+    empty_list = idea_engine.list_ideas(db_path=empty_db)
+    assert empty_list == []
+    assert empty_list.counts == {
+        "pending": 0,
+        "queued": 0,
+        "implementing": 0,
+        "implemented": 0,
+        "dismissed": 0,
+        "all": 0,
+    }
+
+    # Invalid status values fail safely with ValueError / TypeError
+    for bad_status in ("desconocido", "", "   "):
+        with pytest.raises(ValueError):
+            idea_engine.list_ideas(status=bad_status, db_path=db_path)
+
+    with pytest.raises(TypeError):
+        idea_engine.list_ideas(status=123, db_path=db_path)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError):
+        idea_engine.list_ideas(statuses=("nueva",), status="pending", db_path=db_path)
+
+
+def test_list_project_ideas_filters_by_canonical_status_and_returns_exact_counts(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "telemetry.db"
+
+    saved = idea_engine.save_project_ideas(
+        "mi-app",
+        [
+            {
+                "title": "🎨 Pendiente Uno",
+                "category": "UX",
+                "impact": "Alto",
+                "simple_description": "Desc 1",
+                "change_prompt": "Prompt 1",
+            },
+            {
+                "title": "🎨 Pendiente Dos",
+                "category": "UX",
+                "impact": "Medio",
+                "simple_description": "Desc 2",
+                "change_prompt": "Prompt 2",
+            },
+            {
+                "title": "📥 Encolada Tres",
+                "category": "Estabilidad",
+                "impact": "Alto",
+                "simple_description": "Desc 3",
+                "change_prompt": "Prompt 3",
+            },
+            {
+                "title": "🔧 Implementando Cuatro",
+                "category": "Rendimiento",
+                "impact": "Alto",
+                "simple_description": "Desc 4",
+                "change_prompt": "Prompt 4",
+            },
+            {
+                "title": "✅ Aplicada Cinco",
+                "category": "Seguridad",
+                "impact": "Alto",
+                "simple_description": "Desc 5",
+                "change_prompt": "Prompt 5",
+            },
+            {
+                "title": "🗑️ Descartada Seis",
+                "category": "Producto",
+                "impact": "Medio",
+                "simple_description": "Desc 6",
+                "change_prompt": "Prompt 6",
+            },
+        ],
+        source="manual",
+        db_path=db_path,
+    )
+    assert len(saved) == 6
+    by_title = {item["title"]: item["id"] for item in saved}
+
+    # Seed another project to guarantee slug isolation in counts and filtering
+    idea_engine.save_project_ideas(
+        "otro-app",
+        [
+            {
+                "title": "🔒 Idea de otro proyecto",
+                "category": "Seguridad",
+                "impact": "Alto",
+                "simple_description": "Otra app",
+                "change_prompt": "Prompt otra app",
+            }
+        ],
+        source="manual",
+        db_path=db_path,
+    )
+
+    idea_engine.update_project_idea_status(
+        by_title["📥 Encolada Tres"], "queued", project_slug="mi-app", db_path=db_path
+    )
+    idea_engine.update_project_idea_status(
+        by_title["🔧 Implementando Cuatro"], "implementing", project_slug="mi-app", db_path=db_path
+    )
+    idea_engine.update_project_idea_status(
+        by_title["✅ Aplicada Cinco"], "implemented", project_slug="mi-app", db_path=db_path
+    )
+    idea_engine.update_project_idea_status(
+        by_title["🗑️ Descartada Seis"], "dismissed", project_slug="mi-app", db_path=db_path
+    )
+
+    expected_counts = {
+        "pending": 2,
+        "queued": 1,
+        "implementing": 1,
+        "implemented": 1,
+        "dismissed": 1,
+        "all": 6,
+    }
+
+    expected_by_filter = {
+        "pending": {"🎨 Pendiente Uno", "🎨 Pendiente Dos"},
+        "queued": {"📥 Encolada Tres"},
+        "implementing": {"🔧 Implementando Cuatro"},
+        "implemented": {"✅ Aplicada Cinco"},
+        "dismissed": {"🗑️ Descartada Seis"},
+        "all": {
+            "🎨 Pendiente Uno",
+            "🎨 Pendiente Dos",
+            "📥 Encolada Tres",
+            "🔧 Implementando Cuatro",
+            "✅ Aplicada Cinco",
+            "🗑️ Descartada Seis",
+        },
+    }
+
+    for status_filter, expected_titles in expected_by_filter.items():
+        res = idea_engine.list_project_ideas(
+            "mi-app",
+            status=status_filter,
+            include_counts=True,
+            db_path=db_path,
+        )
+        assert isinstance(res, dict)
+        assert res["status"] == status_filter
+        assert {item["title"] for item in res["ideas"]} == expected_titles
+        assert res["counts"] == expected_counts
+
+    # Spanish status alias still works and limit does not alter counts
+    es_res = idea_engine.list_project_ideas(
+        "mi-app",
+        status="nueva",
+        limit=1,
+        include_counts=True,
+        db_path=db_path,
+    )
+    assert es_res["status"] == "pending"
+    assert len(es_res["ideas"]) == 1
+    assert es_res["counts"] == expected_counts
+
+    # Backward-compatible list return (default status=None returns all for slug) with .counts
+    default_items = idea_engine.list_project_ideas("mi-app", db_path=db_path)
+    assert isinstance(default_items, list)
+    assert len(default_items) == 6
+    assert default_items.counts == expected_counts
+
+    # Unknown/empty project returns empty list and zeroed counts
+    empty_res = idea_engine.list_project_ideas(
+        "sin-ideas",
+        include_counts=True,
+        db_path=db_path,
+    )
+    assert empty_res == {
+        "ideas": [],
+        "counts": {
+            "pending": 0,
+            "queued": 0,
+            "implementing": 0,
+            "implemented": 0,
+            "dismissed": 0,
+            "all": 0,
+        },
+        "status": "all",
+    }
+
+    # Invalid statuses raise ValueError / TypeError
+    for bad_status in ("invalido", "", "   "):
+        with pytest.raises(ValueError):
+            idea_engine.list_project_ideas(
+                "mi-app",
+                status=bad_status,
+                db_path=db_path,
+            )
+
+    with pytest.raises(TypeError):
+        idea_engine.list_project_ideas(
+            "mi-app",
+            status=42,  # type: ignore[arg-type]
+            db_path=db_path,
+        )
+
+
+def test_legacy_tables_migrate_to_support_all_five_idea_statuses(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy_statuses.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE improvement_ideas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                title TEXT NOT NULL,
+                category TEXT NOT NULL,
+                impact TEXT NOT NULL,
+                simple_description TEXT NOT NULL,
+                technical_prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'nueva'
+                    CHECK(status IN ('nueva', 'encolada', 'descartada')),
+                source TEXT NOT NULL DEFAULT 'manual'
+                    CHECK(source IN ('manual', 'auto', 'visual_qa'))
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO improvement_ideas (
+                created_at, title, category, impact,
+                simple_description, technical_prompt, status, source
+            ) VALUES (
+                '2026-01-01T00:00:00Z', 'Idea Legacy Factory', 'UX', 'Alto',
+                'Desc', 'Prompt', 'nueva', 'manual'
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE project_ideas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                project_slug TEXT NOT NULL,
+                title TEXT NOT NULL,
+                category TEXT NOT NULL,
+                impact TEXT NOT NULL,
+                simple_description TEXT NOT NULL,
+                change_prompt TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'manual'
+                    CHECK(source IN ('manual', 'runtime_error', 'audit')),
+                status TEXT NOT NULL DEFAULT 'nueva'
+                    CHECK(status IN ('nueva', 'implementando', 'aplicada', 'descartada'))
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO project_ideas (
+                created_at, project_slug, title, category, impact,
+                simple_description, change_prompt, source, status
+            ) VALUES (
+                '2026-01-01T00:00:00Z', 'mi-app', 'Idea Legacy Proyecto', 'UX', 'Alto',
+                'Desc', 'Prompt', 'manual', 'nueva'
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    updated_factory = idea_engine.update_idea_status(1, "implemented", db_path=db_path)
+    assert updated_factory["title"] == "Idea Legacy Factory"
+    assert updated_factory["status"] == "aplicada"
+
+    updated_proj = idea_engine.update_project_idea_status(
+        1, "queued", project_slug="mi-app", db_path=db_path
+    )
+    assert updated_proj["title"] == "Idea Legacy Proyecto"
+    assert updated_proj["status"] == "encolada"
+
+

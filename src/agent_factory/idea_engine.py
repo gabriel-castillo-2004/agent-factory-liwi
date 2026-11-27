@@ -38,7 +38,34 @@ from agent_factory.telemetry import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_IDEA_DB_PATH: Path = DEFAULT_TELEMETRY_DB_PATH
-IDEA_VALID_STATUSES: frozenset[str] = frozenset({"nueva", "encolada", "descartada"})
+IDEA_VALID_STATUSES: frozenset[str] = frozenset(
+    {"nueva", "encolada", "implementando", "aplicada", "descartada"}
+)
+IDEA_FILTER_STATUSES: tuple[str, ...] = (
+    "pending",
+    "queued",
+    "implementing",
+    "implemented",
+    "dismissed",
+)
+IDEA_VALID_FILTERS: frozenset[str] = frozenset((*IDEA_FILTER_STATUSES, "all"))
+_DEFAULT_ACTIVE_IDEA_STATUSES: tuple[str, ...] = ("nueva", "encolada", "implementando")
+_CANONICAL_TO_DB_STATUS: dict[str, str] = {
+    "pending": "nueva",
+    "queued": "encolada",
+    "implementing": "implementando",
+    "implemented": "aplicada",
+    "dismissed": "descartada",
+}
+_DB_TO_CANONICAL_STATUS: dict[str, str] = {
+    db_val: canonical for canonical, db_val in _CANONICAL_TO_DB_STATUS.items()
+}
+_STATUS_ALIAS_TO_DB: dict[str, str] = {
+    **_CANONICAL_TO_DB_STATUS,
+    **{db_val: db_val for db_val in _DB_TO_CANONICAL_STATUS},
+    "implementada": "aplicada",
+}
+_UNSET: Any = object()
 IDEA_VALID_SOURCES: frozenset[str] = frozenset({"manual", "auto", "visual_qa"})
 IDEA_VALID_IMPACTS: frozenset[str] = frozenset({"Alto", "Medio"})
 DEFAULT_AUTO_INTERVAL_HOURS: float = 0.0
@@ -63,7 +90,7 @@ DEFAULT_RESERVE_THRESHOLD_PCT: int = 30
 DEFAULT_AVG_TURN_TOKENS: int = 12000
 PROJECT_IDEA_VALID_SOURCES: frozenset[str] = frozenset({"manual", "runtime_error", "audit"})
 PROJECT_IDEA_VALID_STATUSES: frozenset[str] = frozenset(
-    {"nueva", "implementando", "aplicada", "descartada"}
+    {"nueva", "encolada", "implementando", "aplicada", "descartada"}
 )
 _PROJECT_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -102,9 +129,26 @@ CREATE TABLE IF NOT EXISTS improvement_ideas (
     simple_description TEXT NOT NULL,
     technical_prompt TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'nueva'
-        CHECK(status IN ('nueva', 'encolada', 'descartada')),
+        CHECK(status IN ('nueva', 'encolada', 'implementando', 'aplicada', 'descartada')),
     source TEXT NOT NULL DEFAULT 'manual'
         CHECK(source IN ('manual', 'auto', 'visual_qa'))
+);
+"""
+
+_CREATE_PROJECT_IDEAS_SQL = """
+CREATE TABLE IF NOT EXISTS project_ideas (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    project_slug TEXT NOT NULL,
+    title TEXT NOT NULL,
+    category TEXT NOT NULL,
+    impact TEXT NOT NULL,
+    simple_description TEXT NOT NULL,
+    change_prompt TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'manual'
+        CHECK(source IN ('manual', 'runtime_error', 'audit')),
+    status TEXT NOT NULL DEFAULT 'nueva'
+        CHECK(status IN ('nueva', 'encolada', 'implementando', 'aplicada', 'descartada'))
 );
 """
 
@@ -113,9 +157,14 @@ def _ensure_idea_schema(conn: sqlite3.Connection) -> None:
     existing = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='improvement_ideas';"
     ).fetchone()
+    existing_sql = str(existing["sql"] or "") if existing is not None else ""
     if existing is None:
         conn.execute(_CREATE_IMPROVEMENT_IDEAS_SQL)
-    elif "visual_qa" not in str(existing["sql"] or ""):
+    elif (
+        "visual_qa" not in existing_sql
+        or "implementando" not in existing_sql
+        or "aplicada" not in existing_sql
+    ):
         conn.execute("ALTER TABLE improvement_ideas RENAME TO _improvement_ideas_legacy;")
         conn.execute(_CREATE_IMPROVEMENT_IDEAS_SQL)
         conn.execute(
@@ -223,24 +272,28 @@ def _ensure_idea_schema(conn: sqlite3.Connection) -> None:
         """,
         (now_iso, DEFAULT_ESTIMATED_WINDOW_CAPACITY, DEFAULT_RESERVE_THRESHOLD_PCT, now_iso),
     )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS project_ideas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            project_slug TEXT NOT NULL,
-            title TEXT NOT NULL,
-            category TEXT NOT NULL,
-            impact TEXT NOT NULL,
-            simple_description TEXT NOT NULL,
-            change_prompt TEXT NOT NULL,
-            source TEXT NOT NULL DEFAULT 'manual'
-                CHECK(source IN ('manual', 'runtime_error', 'audit')),
-            status TEXT NOT NULL DEFAULT 'nueva'
-                CHECK(status IN ('nueva', 'implementando', 'aplicada', 'descartada'))
-        );
-        """
-    )
+    existing_proj = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='project_ideas';"
+    ).fetchone()
+    existing_proj_sql = str(existing_proj["sql"] or "") if existing_proj is not None else ""
+    if existing_proj is None:
+        conn.execute(_CREATE_PROJECT_IDEAS_SQL)
+    elif "encolada" not in existing_proj_sql:
+        conn.execute("ALTER TABLE project_ideas RENAME TO _project_ideas_legacy;")
+        conn.execute(_CREATE_PROJECT_IDEAS_SQL)
+        conn.execute(
+            """
+            INSERT INTO project_ideas (
+                id, created_at, project_slug, title, category, impact,
+                simple_description, change_prompt, source, status
+            )
+            SELECT
+                id, created_at, project_slug, title, category, impact,
+                simple_description, change_prompt, source, status
+            FROM _project_ideas_legacy;
+            """
+        )
+        conn.execute("DROP TABLE _project_ideas_legacy;")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_project_ideas_slug_status "
         "ON project_ideas(project_slug, status);"
@@ -283,13 +336,117 @@ def init_idea_db(db_path: Path | str | None = None) -> bool:
             conn.close()
 
 
-def _validate_status(status: str) -> str:
-    clean = str(status or "").strip().lower()
-    if clean not in IDEA_VALID_STATUSES:
-        raise ValueError(
-            f"Estado de idea inválido {status!r}; se esperaba uno de {sorted(IDEA_VALID_STATUSES)}."
+def _empty_status_counts() -> dict[str, int]:
+    return {
+        "pending": 0,
+        "queued": 0,
+        "implementing": 0,
+        "implemented": 0,
+        "dismissed": 0,
+        "all": 0,
+    }
+
+
+class IdeaList(list[dict[str, Any]]):
+    """Backward-compatible list of ideas that also carries per-status counts."""
+
+    def __init__(
+        self,
+        items: Sequence[dict[str, Any]] = (),
+        *,
+        counts: Mapping[str, int] | None = None,
+        status: str | None = None,
+    ) -> None:
+        super().__init__(items)
+        self.counts: dict[str, int] = dict(counts) if counts is not None else _empty_status_counts()
+        self.status_counts: dict[str, int] = self.counts
+        self.status: str | None = status
+
+
+def _validate_status(status: Any) -> str:
+    if not isinstance(status, str):
+        raise TypeError(
+            f"Estado de idea inválido {status!r}; se esperaba una cadena entre {sorted(IDEA_VALID_FILTERS)}."
         )
-    return clean
+    clean = status.strip().lower()
+    mapped = _STATUS_ALIAS_TO_DB.get(clean)
+    if mapped is None or mapped not in IDEA_VALID_STATUSES:
+        raise ValueError(
+            f"Estado de idea inválido {status!r}; se esperaba uno de {sorted(IDEA_VALID_FILTERS)}."
+        )
+    return mapped
+
+
+def _validate_status_filter(status: Any) -> tuple[str | None, str]:
+    """Validate a single status filter and return (db_status_or_None, canonical_filter_name)."""
+    if not isinstance(status, str):
+        raise TypeError(
+            f"Filtro de estado inválido {status!r}; se esperaba una cadena entre {sorted(IDEA_VALID_FILTERS)}."
+        )
+    clean = status.strip().lower()
+    if clean == "all":
+        return None, "all"
+    db_status = _validate_status(clean)
+    return db_status, _DB_TO_CANONICAL_STATUS[db_status]
+
+
+def _accumulate_status_counts(rows: Sequence[sqlite3.Row]) -> dict[str, int]:
+    counts = _empty_status_counts()
+    total = 0
+    for row in rows:
+        raw_status = str(row["status"] or "").strip().lower()
+        cnt = int(row["cnt"] or 0)
+        total += cnt
+        canonical = _DB_TO_CANONICAL_STATUS.get(raw_status)
+        if canonical is not None:
+            counts[canonical] += cnt
+    counts["all"] = total
+    return counts
+
+
+def _query_idea_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    rows = conn.execute(
+        "SELECT status, COUNT(*) AS cnt FROM improvement_ideas GROUP BY status;"
+    ).fetchall()
+    return _accumulate_status_counts(rows)
+
+
+def _query_project_idea_status_counts(
+    conn: sqlite3.Connection,
+    project_slug: str,
+) -> dict[str, int]:
+    rows = conn.execute(
+        "SELECT status, COUNT(*) AS cnt FROM project_ideas WHERE project_slug = ? GROUP BY status;",
+        (project_slug,),
+    ).fetchall()
+    return _accumulate_status_counts(rows)
+
+
+def count_ideas_by_status(db_path: Path | str | None = None) -> dict[str, int]:
+    """Return exact counts for every canonical status plus total ('all') in improvement_ideas."""
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        return _query_idea_status_counts(conn)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def count_project_ideas_by_status(
+    project_slug: str,
+    *,
+    db_path: Path | str | None = None,
+) -> dict[str, int]:
+    """Return exact counts for every canonical status plus total ('all') for a project's ideas."""
+    clean_slug = _validate_project_slug(project_slug)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        return _query_project_idea_status_counts(conn, clean_slug)
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def _validate_source(source: str) -> str:
@@ -404,43 +561,117 @@ def set_auto_interval_hours(
 
 
 def list_ideas(
-    statuses: Sequence[str] | str | None = ("nueva", "encolada"),
+    statuses: Sequence[str] | str | None = _UNSET,
     db_path: Path | str | None = None,
     *,
+    status: str | None = None,
     limit: int = DEFAULT_LIST_LIMIT,
-) -> list[dict[str, Any]]:
-    """List improvement ideas filtered by status, ordered most recent first."""
-    if isinstance(statuses, str):
-        status_tuple: tuple[str, ...] | None = (_validate_status(statuses),)
+    include_counts: bool = False,
+) -> IdeaList | dict[str, Any]:
+    """List improvement ideas filtered by status, ordered most recent first, with per-status counts."""
+    if statuses is not _UNSET and status is not None:
+        raise ValueError("No se puede especificar 'statuses' y 'status' al mismo tiempo.")
+
+    status_tuple: tuple[str, ...] | None
+    filter_label: str
+    if status is not None:
+        db_status, filter_label = _validate_status_filter(status)
+        status_tuple = None if db_status is None else (db_status,)
+    elif statuses is _UNSET:
+        status_tuple = _DEFAULT_ACTIVE_IDEA_STATUSES
+        filter_label = "active"
     elif statuses is None:
         status_tuple = None
+        filter_label = "all"
+    elif isinstance(statuses, str):
+        db_status, filter_label = _validate_status_filter(statuses)
+        status_tuple = None if db_status is None else (db_status,)
     else:
-        status_tuple = tuple(_validate_status(s) for s in statuses)
-        if not status_tuple:
-            return []
+        parsed_statuses: list[str] = []
+        has_all = False
+        for raw_item in statuses:
+            db_status, _canonical = _validate_status_filter(raw_item)
+            if db_status is None:
+                has_all = True
+            else:
+                parsed_statuses.append(db_status)
+        if has_all:
+            status_tuple = None
+            filter_label = "all"
+        else:
+            status_tuple = tuple(parsed_statuses)
+            if not status_tuple:
+                filter_label = ""
+            elif len(status_tuple) == 1:
+                filter_label = _DB_TO_CANONICAL_STATUS[status_tuple[0]]
+            else:
+                filter_label = ",".join(_DB_TO_CANONICAL_STATUS[s] for s in status_tuple)
 
     if isinstance(limit, bool) or not isinstance(limit, int):
         bounded_limit = DEFAULT_LIST_LIMIT
     else:
         bounded_limit = max(1, min(limit, MAX_LIST_LIMIT))
 
-    params: list[Any] = []
-    where_sql = ""
-    if status_tuple is not None:
-        placeholders = ", ".join("?" for _ in status_tuple)
-        where_sql = f"WHERE status IN ({placeholders})"
-        params.extend(status_tuple)
-    params.append(bounded_limit)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        counts = _query_idea_status_counts(conn)
+        if status_tuple == ():
+            items: list[dict[str, Any]] = []
+        else:
+            params: list[Any] = []
+            where_sql = ""
+            if status_tuple is not None:
+                placeholders = ", ".join("?" for _ in status_tuple)
+                where_sql = f"WHERE status IN ({placeholders})"
+                params.extend(status_tuple)
+            params.append(bounded_limit)
+            rows = conn.execute(
+                f"SELECT {_IDEA_SELECT_COLS} FROM improvement_ideas "
+                f"{where_sql} ORDER BY created_at DESC, id DESC LIMIT ?;",
+                tuple(params),
+            ).fetchall()
+            items = [_row_to_idea(row) for row in rows]
+        if include_counts:
+            return {
+                "ideas": items,
+                "counts": counts,
+                "status": filter_label,
+            }
+        return IdeaList(items, counts=counts, status=filter_label)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def update_idea_status(
+    idea_id: int,
+    status: str,
+    *,
+    db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Update status of a factory improvement idea, accepting canonical or DB status names."""
+    valid_id = _validate_idea_id(idea_id)
+    if valid_id is None:
+        raise ValueError(f"idea_id inválido: {idea_id!r}")
+    clean_status = _validate_status(status)
 
     conn: sqlite3.Connection | None = None
     try:
         conn = _open_connection(db_path)
-        rows = conn.execute(
-            f"SELECT {_IDEA_SELECT_COLS} FROM improvement_ideas "
-            f"{where_sql} ORDER BY created_at DESC, id DESC LIMIT ?;",
-            tuple(params),
-        ).fetchall()
-        return [_row_to_idea(row) for row in rows]
+        cursor = conn.execute(
+            "UPDATE improvement_ideas SET status = ? WHERE id = ?;",
+            (clean_status, valid_id),
+        )
+        conn.commit()
+        if cursor.rowcount <= 0:
+            raise KeyError(f"Idea {valid_id} no encontrada.")
+        row = conn.execute(
+            f"SELECT {_IDEA_SELECT_COLS} FROM improvement_ideas WHERE id = ?;",
+            (valid_id,),
+        ).fetchone()
+        assert row is not None
+        return _row_to_idea(row)
     finally:
         if conn is not None:
             conn.close()
@@ -2787,14 +3018,20 @@ def _validate_project_idea_source(source: str) -> str:
     return clean
 
 
-def _validate_project_idea_status(status: str) -> str:
-    clean = str(status or "").strip().lower()
-    if clean not in PROJECT_IDEA_VALID_STATUSES:
+def _validate_project_idea_status(status: Any) -> str:
+    if not isinstance(status, str):
+        raise TypeError(
+            f"status de project_idea inválido {status!r}; "
+            f"se esperaba una cadena entre {sorted(IDEA_VALID_FILTERS)}."
+        )
+    clean = status.strip().lower()
+    mapped = _STATUS_ALIAS_TO_DB.get(clean)
+    if mapped is None or mapped not in PROJECT_IDEA_VALID_STATUSES:
         raise ValueError(
             f"status de project_idea inválido {status!r}; "
-            f"se esperaba uno de {sorted(PROJECT_IDEA_VALID_STATUSES)}."
+            f"se esperaba uno de {sorted(IDEA_VALID_FILTERS)}."
         )
-    return clean
+    return mapped
 
 
 def _row_to_project_idea(row: sqlite3.Row) -> dict[str, Any]:
@@ -2818,15 +3055,26 @@ def list_project_ideas(
     status: str | None = None,
     limit: int = DEFAULT_LIST_LIMIT,
     db_path: Path | str | None = None,
-) -> list[dict[str, Any]]:
-    """List improvement ideas for a specific generated project ordered newest first."""
+    include_counts: bool = False,
+) -> IdeaList | dict[str, Any]:
+    """List improvement ideas for a specific generated project ordered newest first, with status counts."""
     clean_slug = _validate_project_slug(project_slug)
-    bounded_limit = max(1, min(int(limit), MAX_LIST_LIMIT))
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        bounded_limit = DEFAULT_LIST_LIMIT
+    else:
+        bounded_limit = max(1, min(limit, MAX_LIST_LIMIT))
+
+    if status is None:
+        clean_status: str | None = None
+        filter_label = "all"
+    else:
+        clean_status, filter_label = _validate_status_filter(status)
+
     conn: sqlite3.Connection | None = None
     try:
         conn = _open_connection(db_path)
-        if status is not None:
-            clean_status = _validate_project_idea_status(status)
+        counts = _query_project_idea_status_counts(conn, clean_slug)
+        if clean_status is not None:
             rows = conn.execute(
                 "SELECT id, created_at, project_slug, title, category, impact, "
                 "simple_description, change_prompt, source, status "
@@ -2842,7 +3090,14 @@ def list_project_ideas(
                 "ORDER BY id DESC LIMIT ?;",
                 (clean_slug, bounded_limit),
             ).fetchall()
-        return [_row_to_project_idea(row) for row in rows]
+        items = [_row_to_project_idea(row) for row in rows]
+        if include_counts:
+            return {
+                "ideas": items,
+                "counts": counts,
+                "status": filter_label,
+            }
+        return IdeaList(items, counts=counts, status=filter_label)
     finally:
         if conn is not None:
             conn.close()

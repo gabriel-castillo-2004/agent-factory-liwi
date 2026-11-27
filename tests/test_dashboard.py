@@ -8673,3 +8673,214 @@ def test_dashboard_projects_list_fault_tolerance_and_triage_ignores_transient_50
             thread.join(timeout=2.0)
         store.close()
 
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_dashboard_ideas_and_project_ideas_status_filters_and_counts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /api/ideas and GET /api/projects/<slug>/ideas support ?status= filtering and always expose exact counts."""
+    from agent_factory import idea_engine
+
+    telemetry_db = tmp_path / "telemetry_filters.db"
+    monkeypatch.setenv("AGENT_FACTORY_TELEMETRY_DB", str(telemetry_db))
+
+    store = SqliteEventStore(db_path=tmp_path / "dash_filters.db")
+    ws_mgr = WorkspaceManager(base_dir=tmp_path / "ws_filters")
+    orch = Orchestrator(store=store, llm=FakeLLM(), workspace_manager=ws_mgr)
+    pid = "filter-demo"
+    ws_mgr.create_workspace(pid)
+    orch.create_project(pid, "Filter Demo", "Demo project for idea filters")
+
+    # Seed factory ideas across all 5 canonical statuses
+    factory_saved = idea_engine.save_ideas(
+        [
+            {
+                "title": "💡 Factory Pending",
+                "category": "UX",
+                "impact": "Alto",
+                "simple_description": "Pending desc",
+                "technical_prompt": "Pending prompt",
+            },
+            {
+                "title": "📥 Factory Queued",
+                "category": "UX",
+                "impact": "Medio",
+                "simple_description": "Queued desc",
+                "technical_prompt": "Queued prompt",
+            },
+            {
+                "title": "🔧 Factory Implementing",
+                "category": "Estabilidad",
+                "impact": "Alto",
+                "simple_description": "Impl desc",
+                "technical_prompt": "Impl prompt",
+            },
+            {
+                "title": "✅ Factory Implemented",
+                "category": "Rendimiento",
+                "impact": "Alto",
+                "simple_description": "Done desc",
+                "technical_prompt": "Done prompt",
+            },
+            {
+                "title": "🗑️ Factory Dismissed",
+                "category": "Producto",
+                "impact": "Medio",
+                "simple_description": "Dismissed desc",
+                "technical_prompt": "Dismissed prompt",
+            },
+        ],
+        source="manual",
+        db_path=telemetry_db,
+    )
+    f_ids = {item["title"]: item["id"] for item in factory_saved}
+    idea_engine.update_idea_status(f_ids["📥 Factory Queued"], "queued", db_path=telemetry_db)
+    idea_engine.update_idea_status(f_ids["🔧 Factory Implementing"], "implementing", db_path=telemetry_db)
+    idea_engine.update_idea_status(f_ids["✅ Factory Implemented"], "implemented", db_path=telemetry_db)
+    idea_engine.dismiss_idea(f_ids["🗑️ Factory Dismissed"], db_path=telemetry_db)
+
+    # Seed project ideas across all 5 canonical statuses
+    proj_saved = idea_engine.save_project_ideas(
+        pid,
+        [
+            {
+                "title": "💡 Proj Pending",
+                "category": "UX",
+                "impact": "Alto",
+                "simple_description": "Pending",
+                "change_prompt": "Prompt 1",
+            },
+            {
+                "title": "📥 Proj Queued",
+                "category": "UX",
+                "impact": "Medio",
+                "simple_description": "Queued",
+                "change_prompt": "Prompt 2",
+            },
+            {
+                "title": "🔧 Proj Implementing",
+                "category": "Estabilidad",
+                "impact": "Alto",
+                "simple_description": "Implementing",
+                "change_prompt": "Prompt 3",
+            },
+            {
+                "title": "✅ Proj Implemented",
+                "category": "Rendimiento",
+                "impact": "Alto",
+                "simple_description": "Implemented",
+                "change_prompt": "Prompt 4",
+            },
+            {
+                "title": "🗑️ Proj Dismissed",
+                "category": "Producto",
+                "impact": "Medio",
+                "simple_description": "Dismissed",
+                "change_prompt": "Prompt 5",
+            },
+        ],
+        source="manual",
+        db_path=telemetry_db,
+    )
+    p_ids = {item["title"]: item["id"] for item in proj_saved}
+    idea_engine.update_project_idea_status(p_ids["📥 Proj Queued"], "queued", project_slug=pid, db_path=telemetry_db)
+    idea_engine.update_project_idea_status(p_ids["🔧 Proj Implementing"], "implementing", project_slug=pid, db_path=telemetry_db)
+    idea_engine.update_project_idea_status(p_ids["✅ Proj Implemented"], "implemented", project_slug=pid, db_path=telemetry_db)
+    idea_engine.update_project_idea_status(p_ids["🗑️ Proj Dismissed"], "dismissed", project_slug=pid, db_path=telemetry_db)
+
+    expected_counts = {
+        "pending": 1,
+        "queued": 1,
+        "implementing": 1,
+        "implemented": 1,
+        "dismissed": 1,
+        "all": 5,
+    }
+
+    server, thread, base_url = start_dashboard_server(
+        orchestrator=orch,
+        port=0,
+        workspace_manager=ws_mgr,
+    )
+    try:
+        # 1. Default GET /api/ideas returns active ideas + full counts
+        c_def, r_def = _http_json(f"{base_url}/api/ideas")
+        assert c_def == 200
+        assert {it["title"] for it in r_def["ideas"]} == {
+            "💡 Factory Pending",
+            "📥 Factory Queued",
+            "🔧 Factory Implementing",
+        }
+        assert r_def["counts"] == expected_counts
+        assert r_def["auto_interval_hours"] == 0.0
+
+        # 2. Filtered GET /api/ideas?status=...
+        for st, expected_titles in (
+            ("pending", {"💡 Factory Pending"}),
+            ("queued", {"📥 Factory Queued"}),
+            ("implementing", {"🔧 Factory Implementing"}),
+            ("implemented", {"✅ Factory Implemented"}),
+            ("dismissed", {"🗑️ Factory Dismissed"}),
+            (
+                "all",
+                {
+                    "💡 Factory Pending",
+                    "📥 Factory Queued",
+                    "🔧 Factory Implementing",
+                    "✅ Factory Implemented",
+                    "🗑️ Factory Dismissed",
+                },
+            ),
+        ):
+            code, data = _http_json(f"{base_url}/api/ideas?status={st}")
+            assert code == 200
+            assert data["status"] == st
+            assert {it["title"] for it in data["ideas"]} == expected_titles
+            assert data["counts"] == expected_counts
+
+        c_bad, _ = _http_json(f"{base_url}/api/ideas?status=invalido")
+        assert c_bad == 400
+
+        # 3. Default GET /api/projects/<slug>/ideas returns all ideas + full counts
+        cp_def, rp_def = _http_json(f"{base_url}/api/projects/{pid}/ideas")
+        assert cp_def == 200
+        assert rp_def["ok"] is True
+        assert len(rp_def["ideas"]) == 5
+        assert rp_def["counts"] == expected_counts
+
+        # 4. Filtered GET /api/projects/<slug>/ideas?status=...
+        for st, expected_titles in (
+            ("pending", {"💡 Proj Pending"}),
+            ("queued", {"📥 Proj Queued"}),
+            ("implementing", {"🔧 Proj Implementing"}),
+            ("implemented", {"✅ Proj Implemented"}),
+            ("dismissed", {"🗑️ Proj Dismissed"}),
+            (
+                "all",
+                {
+                    "💡 Proj Pending",
+                    "📥 Proj Queued",
+                    "🔧 Proj Implementing",
+                    "✅ Proj Implemented",
+                    "🗑️ Proj Dismissed",
+                },
+            ),
+        ):
+            code, data = _http_json(f"{base_url}/api/projects/{pid}/ideas?status={st}")
+            assert code == 200
+            assert data["status"] == st
+            assert {it["title"] for it in data["ideas"]} == expected_titles
+            assert data["counts"] == expected_counts
+
+        cp_bad, _ = _http_json(f"{base_url}/api/projects/{pid}/ideas?status=invalido")
+        assert cp_bad == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.controller.wait_for_idle(timeout=5.0)
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        store.close()
+
