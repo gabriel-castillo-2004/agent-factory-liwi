@@ -1089,3 +1089,525 @@ def test_legacy_tables_migrate_to_support_all_five_idea_statuses(tmp_path: Path)
     assert updated_proj["status"] == "encolada"
 
 
+def test_get_recent_commits_reads_git_log_and_handles_missing_non_git_or_failures(
+    tmp_path: Path,
+) -> None:
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+
+    git_runner = FakeRunner(
+        [
+            CommandResult(
+                exit_code=0,
+                stdout=(
+                    "a1b2c3d feat(radar): add telemetry cache\n"
+                    "e4f5a6b fix(dashboard): prevent modal flicker\n"
+                ),
+            )
+        ]
+    )
+    commits = idea_engine._get_recent_commits(repo_dir, limit=60, runner=git_runner)
+    assert commits == [
+        "a1b2c3d feat(radar): add telemetry cache",
+        "e4f5a6b fix(dashboard): prevent modal flicker",
+    ]
+    assert len(git_runner.calls) == 1
+    assert git_runner.calls[0]["command"] == ["git", "log", "--oneline", "-n", "60"]
+    assert git_runner.calls[0]["cwd"] == repo_dir.resolve()
+
+    # Non-existent folder returns [] without invoking runner
+    unused_runner = FakeRunner([])
+    assert idea_engine._get_recent_commits(tmp_path / "does-not-exist", runner=unused_runner) == []
+    assert unused_runner.calls == []
+
+    # Existing folder without .git returns [] cleanly with default runner
+    plain_dir = tmp_path / "plain_folder"
+    plain_dir.mkdir()
+    assert idea_engine._get_recent_commits(plain_dir) == []
+
+    # Non-zero exit code, timeout, and OSError all return [] without raising
+    error_runner = FakeRunner(
+        [
+            CommandResult(exit_code=128, stdout="", stderr="not a git repository"),
+            CommandTimeoutError("git log timed out"),
+            OSError("git executable missing"),
+        ]
+    )
+    assert idea_engine._get_recent_commits(repo_dir, runner=error_runner) == []
+    assert idea_engine._get_recent_commits(repo_dir, runner=error_runner) == []
+    assert idea_engine._get_recent_commits(repo_dir, runner=error_runner) == []
+
+
+def test_is_duplicate_idea_blocks_paraphrases_all_statuses_and_commits_and_accepts_new() -> None:
+    existing_items = [
+        {
+            "title": "⚡ Caché de Telemetría en SQLite",
+            "simple_description": "Guarda resúmenes recientes de consultas SQLite para acelerar el radar.",
+            "status": "pending",
+        },
+        {
+            "title": "🔔 Alertas de cuota agotada",
+            "simple_description": "Notifica en el panel cuando la cuota está agotada.",
+            "status": "queued",
+        },
+        {
+            "title": "📊 Exportar métricas a CSV",
+            "simple_description": "Permite descargar métricas históricas en formato CSV.",
+            "status": "implementing",
+        },
+        {
+            "title": "🌙 Modo Oscuro en el Dashboard",
+            "simple_description": "Activa un tema oscuro en la interfaz del dashboard.",
+            "status": "implemented",
+        },
+        {
+            "title": "🛡️ Rate limiting middleware for API",
+            "simple_description": "Protects API endpoints with per-client request rate limiting.",
+            "status": "applied",
+        },
+        {
+            "title": "🧹 Limpieza automática de worktrees huérfanos",
+            "simple_description": "Elimina worktrees de git abandonados al iniciar.",
+            "status": "dismissed",
+        },
+    ]
+    recent_commits = [
+        "a1b2c3d feat(auth): add oauth token rotation for webhooks",
+        "9f8e7d6 fix(idea_engine): agregar filtro de ideas duplicadas",
+        "1112223 fix: dashboard",
+    ]
+
+    # Spanish paraphrases with different emojis/accents/wording across all statuses
+    dup_es, reason_es = idea_engine.is_duplicate_idea(
+        "🚀 Implementar cache para consultas de telemetria SQLite",
+        "Acelera el radar con caché local sobre consultas de telemetría.",
+        existing_items,
+        recent_commits,
+    )
+    assert dup_es is True
+    assert reason_es
+
+    dup_implemented, reason_impl = idea_engine.is_duplicate_idea(
+        "🎨 Agregar soporte de modo oscuro al dashboard",
+        "Interruptor para tema oscuro en el dashboard.",
+        existing_items,
+        recent_commits,
+    )
+    assert dup_implemented is True
+    assert reason_impl
+
+    dup_dismissed, reason_dis = idea_engine.is_duplicate_idea(
+        "Limpieza de worktrees huerfanos de git",
+        "Borra worktrees abandonados automáticamente.",
+        existing_items,
+        recent_commits,
+    )
+    assert dup_dismissed is True
+    assert reason_dis
+
+    # English paraphrase against 'applied' idea
+    dup_en, reason_en = idea_engine.is_duplicate_idea(
+        "Implement API rate limit middleware",
+        "Adds request rate limiting protection to API endpoints.",
+        existing_items,
+        recent_commits,
+    )
+    assert dup_en is True
+    assert reason_en
+
+    # Match against git commit messages (ignoring leading commit hash)
+    dup_commit_en, reason_commit_en = idea_engine.is_duplicate_idea(
+        "🔐 OAuth token rotation for webhooks",
+        "Rotates OAuth tokens automatically for outbound webhooks.",
+        existing_items,
+        recent_commits,
+    )
+    assert dup_commit_en is True
+    assert reason_commit_en
+
+    dup_commit_es, reason_commit_es = idea_engine.is_duplicate_idea(
+        "🛡️ Filtro de ideas duplicadas",
+        "Evita repetir sugerencias en idea_engine.",
+        existing_items,
+        recent_commits,
+    )
+    assert dup_commit_es is True
+    assert reason_commit_es
+
+    # Genuinely new ideas must be accepted (even if sharing one generic word with a short commit)
+    is_dup_new_1, reason_new_1 = idea_engine.is_duplicate_idea(
+        "📈 Gráfica de latencia p95 en el dashboard",
+        "Muestra percentiles de respuesta por etapa para detectar regresiones.",
+        existing_items,
+        recent_commits,
+    )
+    assert is_dup_new_1 is False
+    assert reason_new_1 == ""
+
+    is_dup_new_2, reason_new_2 = idea_engine.is_duplicate_idea(
+        "🧪 Pruebas de contrato para adaptador Telegram",
+        "Valida reintentos y formato Markdown del cliente de notificaciones.",
+        existing_items,
+        recent_commits,
+    )
+    assert is_dup_new_2 is False
+    assert reason_new_2 == ""
+
+
+def test_generate_ideas_injects_history_commits_filters_paraphrases_and_completes_quota(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "telemetry.db"
+    repo_root = tmp_path / "repo"
+    (repo_root / "src" / "agent_factory").mkdir(parents=True)
+    (repo_root / "src" / "agent_factory" / "idea_engine.py").write_text("", encoding="utf-8")
+
+    # Seed historical ideas across all statuses
+    seeded = idea_engine.save_ideas(
+        [
+            _sample_idea(title="💡 Idea Pendiente Historial", simple_description="Mejora pendiente."),
+            _sample_idea(title="📥 Idea Encolada Historial", simple_description="Mejora en cola."),
+            _sample_idea(title="🔧 Idea Implementando Historial", simple_description="En progreso."),
+            _sample_idea(
+                title="🌙 Modo Oscuro en el Dashboard",
+                simple_description="Activa un tema oscuro persistente en el panel.",
+            ),
+            _sample_idea(
+                title="🧹 Limpieza automática de worktrees huérfanos",
+                simple_description="Limpia worktrees abandonados al arrancar.",
+            ),
+        ],
+        source="manual",
+        db_path=db_path,
+    )
+    by_title = {item["title"]: item["id"] for item in seeded}
+    idea_engine.update_idea_status(by_title["📥 Idea Encolada Historial"], "queued", db_path=db_path)
+    idea_engine.update_idea_status(
+        by_title["🔧 Idea Implementando Historial"], "implementing", db_path=db_path
+    )
+    idea_engine.update_idea_status(
+        by_title["🌙 Modo Oscuro en el Dashboard"], "implemented", db_path=db_path
+    )
+    idea_engine.dismiss_idea(
+        by_title["🧹 Limpieza automática de worktrees huérfanos"], db_path=db_path
+    )
+
+    commit_calls: list[tuple[Path, int]] = []
+
+    def _fake_get_commits(repo_path: Path | str, limit: int = 60) -> list[str]:
+        commit_calls.append((Path(repo_path), limit))
+        return [
+            "a1b2c3d feat(auth): add oauth token rotation for webhooks",
+            "b2c3d4e fix(staging): prune stale temp files",
+        ]
+
+    monkeypatch.setattr(idea_engine, "_get_recent_commits", _fake_get_commits)
+
+    round1_payload = {
+        "ideas": [
+            # Paraphrase of dismissed idea -> must be rejected
+            _sample_idea(
+                title="Limpieza de worktrees huerfanos",
+                simple_description="Borra worktrees abandonados automáticamente.",
+            ),
+            # Paraphrase of recent commit -> must be rejected
+            _sample_idea(
+                title="🔐 OAuth token rotation for webhooks",
+                simple_description="Rotates OAuth tokens automatically for webhooks.",
+            ),
+            # Genuinely new idea #1 -> accepted
+            _sample_idea(
+                title="📈 Percentiles p95 de latencia",
+                simple_description="Calcula percentiles de tiempo por etapa en telemetría.",
+            ),
+            # Intra-batch paraphrase of new idea #1 -> rejected
+            _sample_idea(
+                title="📊 Latencia p95 y percentiles por etapa",
+                simple_description="Mide percentiles p95 de latencia en telemetría.",
+            ),
+        ]
+    }
+    round2_payload = {
+        "ideas": [
+            _sample_idea(
+                title="🧭 Mapa de dependencias internas",
+                simple_description="Genera un grafo ligero de módulos importados para detectar ciclos.",
+            ),
+            _sample_idea(
+                title="🔔 Resumen semanal de incidentes",
+                simple_description="Agrupa fallos recurrentes por semana en un reporte compacto.",
+            ),
+        ]
+    }
+    agy_runner = FakeRunner(
+        [
+            CommandResult(exit_code=0, stdout=json.dumps(round1_payload)),
+            CommandResult(exit_code=0, stdout=json.dumps(round2_payload)),
+        ]
+    )
+
+    assert idea_engine.generate_ideas is idea_engine.generate_new_ideas
+    created = idea_engine.generate_ideas(
+        source="manual",
+        count=3,
+        db_path=db_path,
+        runner=agy_runner,
+        repo_root=repo_root,
+    )
+
+    assert len(commit_calls) == 1
+    assert commit_calls[0][1] == 60
+
+    # Round 1 + 1 complementary round
+    assert len(agy_runner.calls) == 2
+    prompt_round_1 = agy_runner.calls[0]["command"][-1]
+    prompt_round_2 = agy_runner.calls[1]["command"][-1]
+
+    # Round 1 prompt injects ALL historical ideas (every status) and commits
+    assert "💡 Idea Pendiente Historial" in prompt_round_1
+    assert "📥 Idea Encolada Historial" in prompt_round_1
+    assert "🔧 Idea Implementando Historial" in prompt_round_1
+    assert "🌙 Modo Oscuro en el Dashboard" in prompt_round_1
+    assert "🧹 Limpieza automática de worktrees huérfanos" in prompt_round_1
+    assert "a1b2c3d feat(auth): add oauth token rotation for webhooks" in prompt_round_1
+
+    # Round 2 prompt excludes rejected and already-accepted topics
+    assert "Limpieza de worktrees huerfanos" in prompt_round_2
+    assert "OAuth token rotation for webhooks" in prompt_round_2
+    assert "📈 Percentiles p95 de latencia" in prompt_round_2
+
+    assert [item["title"] for item in created] == [
+        "📈 Percentiles p95 de latencia",
+        "🧭 Mapa de dependencias internas",
+        "🔔 Resumen semanal de incidentes",
+    ]
+
+
+def test_generate_ideas_limits_complementary_round_to_at_most_one_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "telemetry.db"
+    idea_engine.save_ideas(
+        [
+            _sample_idea(
+                title="🌙 Modo Oscuro en el Dashboard",
+                simple_description="Activa tema oscuro en el panel.",
+            )
+        ],
+        db_path=db_path,
+    )
+    monkeypatch.setattr(idea_engine, "_get_recent_commits", lambda repo_path, limit=60: [])
+
+    # Both rounds return duplicates + only 1 new idea in round 2 -> must stop after 1 retry
+    round1_payload = {
+        "ideas": [
+            _sample_idea(
+                title="🎨 Agregar modo oscuro al dashboard",
+                simple_description="Soporte de tema oscuro en el panel.",
+            )
+        ]
+    }
+    round2_payload = {
+        "ideas": [
+            _sample_idea(
+                title="🎨 Tema oscuro para el dashboard",
+                simple_description="Activa modo oscuro en el panel.",
+            ),
+            _sample_idea(
+                title="🧪 Pruebas de contratos HTTP",
+                simple_description="Verifica códigos de estado y esquemas JSON en rutas públicas.",
+            ),
+        ]
+    }
+    agy_runner = FakeRunner(
+        [
+            CommandResult(exit_code=0, stdout=json.dumps(round1_payload)),
+            CommandResult(exit_code=0, stdout=json.dumps(round2_payload)),
+        ]
+    )
+
+    created = idea_engine.generate_new_ideas(
+        source="manual",
+        count=3,
+        db_path=db_path,
+        runner=agy_runner,
+        repo_root=tmp_path,
+    )
+
+    assert len(agy_runner.calls) == 2
+    assert [item["title"] for item in created] == ["🧪 Pruebas de contratos HTTP"]
+
+
+def test_generate_project_ideas_injects_history_commits_filters_and_completes_quota(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "telemetry.db"
+    ws_dir = tmp_path / "workspaces" / "mi-app"
+    ws_dir.mkdir(parents=True)
+    (ws_dir / "README.md").write_text("# Mi App\n", encoding="utf-8")
+
+    # Seed project ideas across all statuses for 'mi-app'
+    seeded = idea_engine.save_project_ideas(
+        "mi-app",
+        [
+            {
+                "title": "💡 Filtro de búsqueda pendiente",
+                "category": "UX",
+                "impact": "Medio",
+                "simple_description": "Agrega caja de búsqueda rápida.",
+                "change_prompt": "Implementa filtro.",
+            },
+            {
+                "title": "📥 Paginación en tabla",
+                "category": "Rendimiento",
+                "impact": "Medio",
+                "simple_description": "Pagina resultados en bloques de 20.",
+                "change_prompt": "Agrega paginación.",
+            },
+            {
+                "title": "🔧 Exportador PDF",
+                "category": "Producto",
+                "impact": "Alto",
+                "simple_description": "Exporta facturas a PDF.",
+                "change_prompt": "Agrega exportador.",
+            },
+            {
+                "title": "🌙 Modo Oscuro en la App",
+                "category": "UX",
+                "impact": "Alto",
+                "simple_description": "Permite alternar entre tema claro y oscuro.",
+                "change_prompt": "Agrega tema oscuro.",
+            },
+            {
+                "title": "🗑️ Sonidos en botones",
+                "category": "UX",
+                "impact": "Medio",
+                "simple_description": "Reproduce efectos de sonido al pulsar botones.",
+                "change_prompt": "Agrega audio.",
+            },
+        ],
+        source="manual",
+        db_path=db_path,
+    )
+    by_title = {item["title"]: item["id"] for item in seeded}
+    idea_engine.update_project_idea_status(
+        by_title["📥 Paginación en tabla"], "queued", project_slug="mi-app", db_path=db_path
+    )
+    idea_engine.update_project_idea_status(
+        by_title["🔧 Exportador PDF"], "implementing", project_slug="mi-app", db_path=db_path
+    )
+    idea_engine.update_project_idea_status(
+        by_title["🌙 Modo Oscuro en la App"], "implemented", project_slug="mi-app", db_path=db_path
+    )
+    idea_engine.update_project_idea_status(
+        by_title["🗑️ Sonidos en botones"], "dismissed", project_slug="mi-app", db_path=db_path
+    )
+
+    # Seed another project to guarantee isolation
+    idea_engine.save_project_ideas(
+        "otra-app",
+        [
+            {
+                "title": "🔒 Secreto de Otra App",
+                "category": "Seguridad",
+                "impact": "Alto",
+                "simple_description": "No debe aparecer en el prompt de mi-app.",
+                "change_prompt": "Prompt otra app.",
+            }
+        ],
+        source="manual",
+        db_path=db_path,
+    )
+
+    commit_calls: list[tuple[Path, int]] = []
+
+    def _fake_get_commits(repo_path: Path | str, limit: int = 60) -> list[str]:
+        commit_calls.append((Path(repo_path), limit))
+        return [
+            "c0ffee1 feat(ui): add keyboard shortcuts for modal navigation",
+        ]
+
+    monkeypatch.setattr(idea_engine, "_get_recent_commits", _fake_get_commits)
+
+    round1_payload = [
+        # Paraphrase of implemented idea -> rejected
+        {
+            "title": "🎨 Agregar modo oscuro para la app",
+            "category": "UX",
+            "impact": "Alto",
+            "simple_description": "Alterna entre tema claro y oscuro en la aplicación.",
+            "change_prompt": "Implementa variables CSS de tema oscuro.",
+        },
+        # Paraphrase of project commit -> rejected
+        {
+            "title": "⌨️ Keyboard shortcuts for modal navigation",
+            "category": "UX",
+            "impact": "Medio",
+            "simple_description": "Supports Escape and arrow keyboard shortcuts in modals.",
+            "change_prompt": "Add keydown listener for modal.",
+        },
+        # Genuinely new idea #1 -> accepted
+        {
+            "title": "📦 Caché offline con Service Worker",
+            "category": "Rendimiento",
+            "impact": "Alto",
+            "simple_description": "Permite consultar el catálogo sin conexión a internet.",
+            "change_prompt": "Registra service worker ligero para assets estáticos.",
+        },
+    ]
+    round2_payload = [
+        {
+            "title": "♿ Etiquetas ARIA en formularios",
+            "category": "UX",
+            "impact": "Medio",
+            "simple_description": "Mejora compatibilidad con lectores de pantalla en todos los inputs.",
+            "change_prompt": "Añade atributos aria-label y aria-describedby en formularios.",
+        }
+    ]
+    agy_runner = FakeRunner(
+        [
+            CommandResult(exit_code=0, stdout=json.dumps(round1_payload)),
+            CommandResult(exit_code=0, stdout=json.dumps(round2_payload)),
+        ]
+    )
+
+    created = idea_engine.generate_project_ideas(
+        "mi-app",
+        ws_dir,
+        count=2,
+        db_path=db_path,
+        runner=agy_runner,
+        agy_command=["agy"],
+    )
+
+    assert len(commit_calls) == 1
+    assert commit_calls[0] == (ws_dir.resolve(), 60)
+
+    assert len(agy_runner.calls) == 2
+    prompt_round_1 = agy_runner.calls[0]["command"][-1]
+    prompt_round_2 = agy_runner.calls[1]["command"][-1]
+
+    # Round 1 prompt includes all 'mi-app' historical ideas + commits, and excludes 'otra-app'
+    assert "💡 Filtro de búsqueda pendiente" in prompt_round_1
+    assert "📥 Paginación en tabla" in prompt_round_1
+    assert "🔧 Exportador PDF" in prompt_round_1
+    assert "🌙 Modo Oscuro en la App" in prompt_round_1
+    assert "🗑️ Sonidos en botones" in prompt_round_1
+    assert "c0ffee1 feat(ui): add keyboard shortcuts for modal navigation" in prompt_round_1
+    assert "Secreto de Otra App" not in prompt_round_1
+
+    # Round 2 prompt excludes rejected and accepted ideas
+    assert "Agregar modo oscuro para la app" in prompt_round_2
+    assert "Keyboard shortcuts for modal navigation" in prompt_round_2
+    assert "📦 Caché offline con Service Worker" in prompt_round_2
+
+    assert [item["title"] for item in created] == [
+        "📦 Caché offline con Service Worker",
+        "♿ Etiquetas ARIA en formularios",
+    ]
+
+
+

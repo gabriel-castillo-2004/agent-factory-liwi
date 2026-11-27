@@ -15,6 +15,7 @@ import time
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,7 @@ _DB_TO_CANONICAL_STATUS: dict[str, str] = {
 _STATUS_ALIAS_TO_DB: dict[str, str] = {
     **_CANONICAL_TO_DB_STATUS,
     **{db_val: db_val for db_val in _DB_TO_CANONICAL_STATUS},
+    "applied": "aplicada",
     "implementada": "aplicada",
 }
 _UNSET: Any = object()
@@ -73,6 +75,9 @@ DEFAULT_IDEATION_COUNT: int = 3
 MAX_IDEATION_COUNT: int = 10
 DEFAULT_IDEATION_TIMEOUT_SECONDS: float = 180.0
 DEFAULT_GIT_LOG_TIMEOUT_SECONDS: float = 10.0
+DEFAULT_RECENT_COMMITS_LIMIT: int = 60
+IDEA_DUPLICATE_SIMILARITY_THRESHOLD: float = 0.52
+_MAX_PROMPT_HISTORY_IDEAS: int = 80
 DEFAULT_POLL_INTERVAL_SECONDS: float = 30.0
 DEFAULT_LIST_LIMIT: int = 100
 MAX_LIST_LIMIT: int = 500
@@ -99,6 +104,45 @@ _MAX_INLINE_PROMPT_CHARS = 6000
 _FENCED_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9\s]+")
 _SAFE_COMMIT_HASH_RE = re.compile(r"^[0-9a-fA-F]{4,64}$")
+_COMMIT_HASH_PREFIX_RE = re.compile(r"^\s*[0-9a-fA-F]{4,40}\s+")
+_CONVENTIONAL_COMMIT_PREFIX_RE = re.compile(
+    r"^\s*(?:feat|fix|chore|refactor|perf|docs|test|tests|style|ci|build|revert)"
+    r"(?:\(([^)]+)\))?!?:\s*",
+    re.IGNORECASE,
+)
+_SEMANTIC_STOPWORDS: frozenset[str] = frozenset(
+    {
+        # Spanish functional stopwords
+        "a", "al", "algo", "algunas", "algunos", "ante", "antes", "asi", "aun", "aunque",
+        "bajo", "bien", "cada", "casi", "como", "con", "contra", "cual", "cuales", "cuando",
+        "de", "del", "desde", "donde", "durante", "e", "el", "ella", "ellas", "ello", "ellos",
+        "en", "entre", "era", "es", "esa", "esas", "ese", "eso", "esos", "esta", "estaba",
+        "estan", "estas", "este", "esto", "estos", "fue", "fueron", "ha", "hace", "hacer",
+        "hacia", "han", "hasta", "hay", "la", "las", "le", "les", "lo", "los", "mas", "me",
+        "mi", "mis", "mismo", "mucho", "muy", "ni", "no", "nos", "nuestra", "nuestro", "o",
+        "otra", "otras", "otro", "otros", "para", "pero", "poco", "por", "porque", "puede",
+        "pueden", "que", "quien", "se", "sea", "segun", "ser", "si", "sido", "siempre", "sin",
+        "sino", "sobre", "solo", "son", "su", "sus", "tambien", "tan", "te", "tener", "tiene",
+        "tienen", "toda", "todas", "todo", "todos", "tu", "tus", "un", "una", "unas", "uno",
+        "unos", "ya", "y",
+        # English functional stopwords
+        "about", "above", "after", "all", "also", "am", "an", "and", "any", "are", "as", "at",
+        "be", "because", "been", "before", "being", "between", "both", "but", "by", "can",
+        "could", "did", "do", "does", "doing", "done", "down", "each", "few", "for", "from",
+        "further", "get", "got", "had", "has", "have", "having", "he", "her", "here", "hers",
+        "him", "his", "how", "i", "if", "in", "into", "is", "it", "its", "just", "may",
+        "might", "more", "most", "must", "my", "nor", "not", "now", "of", "off", "on",
+        "once", "only", "or", "other", "our", "out", "over", "own", "same", "should", "so",
+        "some", "such", "than", "that", "the", "their", "them", "then", "there", "these",
+        "they", "this", "those", "through", "to", "too", "under", "until", "up", "use",
+        "using", "very", "was", "we", "were", "what", "when", "where", "which", "while",
+        "who", "why", "will", "with", "would", "you", "your",
+        # Generic ideation action boilerplate (prevents false positives on "Implementar soporte de X")
+        "agregar", "anadir", "implementar", "crear", "mejorar", "soporte", "sistema",
+        "nuevo", "nueva", "nuevos", "nuevas", "permitir", "habilitar", "incorporar", "incluir",
+        "add", "implement", "create", "improve", "support", "new", "allow", "enable",
+    }
+)
 _IDEA_SELECT_COLS = (
     "id, created_at, title, category, impact, simple_description, "
     "technical_prompt, status, source"
@@ -476,6 +520,176 @@ def normalize_idea_title(title: str) -> str:
     if alnum_only:
         return alnum_only
     return " ".join(lowered.split())
+
+
+def _extract_semantic_tokens(text: str) -> list[str]:
+    """Normalize ES/EN text (lowercase, NFKD without diacritics/emojis/punctuation) into unique keywords."""
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    decomposed = unicodedata.normalize("NFKD", raw)
+    without_marks = "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
+    lowered = without_marks.casefold()
+    alnum_tokens = [tok for tok in _NON_ALNUM_RE.sub(" ", lowered).split() if len(tok) >= 2]
+    if not alnum_tokens:
+        return []
+    filtered = [tok for tok in alnum_tokens if tok not in _SEMANTIC_STOPWORDS]
+    source_tokens = filtered if filtered else alnum_tokens
+    unique_tokens: list[str] = []
+    seen: set[str] = set()
+    for tok in source_tokens:
+        if tok not in seen:
+            seen.add(tok)
+            unique_tokens.append(tok)
+    return unique_tokens
+
+
+def _strip_commit_prefix(commit_line: str) -> str:
+    """Remove leading git hash and conventional commit type (preserving optional scope) from a log line."""
+    clean = str(commit_line or "").strip()
+    if not clean:
+        return ""
+    without_hash = _COMMIT_HASH_PREFIX_RE.sub("", clean)
+    without_type = _CONVENTIONAL_COMMIT_PREFIX_RE.sub(r"\1 ", without_hash)
+    return " ".join(without_type.split())
+
+
+def _semantic_tokens_match(token_a: str, token_b: str) -> bool:
+    if token_a == token_b:
+        return True
+    min_len = min(len(token_a), len(token_b))
+    if min_len >= 3 and (token_a + "s" == token_b or token_b + "s" == token_a):
+        return True
+    if min_len < 4:
+        return False
+    prefix_len = 0
+    for ch_a, ch_b in zip(token_a, token_b):
+        if ch_a != ch_b:
+            break
+        prefix_len += 1
+    if prefix_len < 4:
+        return False
+    max_len = max(len(token_a), len(token_b))
+    if prefix_len == min_len and min_len >= 5:
+        return True
+    if prefix_len >= 6 and (prefix_len / max_len) >= 0.60:
+        return True
+    return SequenceMatcher(None, token_a, token_b).ratio() >= 0.78
+
+
+def _semantic_similarity(text_a: str, text_b: str) -> float:
+    """Compute lightweight semantic similarity in [0.0, 1.0] combining keyword overlap and SequenceMatcher."""
+    tokens_a = _extract_semantic_tokens(text_a)
+    tokens_b = _extract_semantic_tokens(text_b)
+    if not tokens_a or not tokens_b:
+        return 0.0
+
+    matched_a = sum(1 for tok_a in tokens_a if any(_semantic_tokens_match(tok_a, tok_b) for tok_b in tokens_b))
+    matched_b = sum(1 for tok_b in tokens_b if any(_semantic_tokens_match(tok_b, tok_a) for tok_a in tokens_a))
+    min_matched = min(matched_a, matched_b)
+    min_len = min(len(tokens_a), len(tokens_b))
+    max_len = max(len(tokens_a), len(tokens_b))
+
+    joined_a = " ".join(tokens_a)
+    joined_b = " ".join(tokens_b)
+    if min_matched == 0:
+        return 0.4 * SequenceMatcher(None, joined_a, joined_b).ratio()
+
+    if min_matched == 1 and max_len > 1:
+        jaccard = 1.0 / (len(tokens_a) + len(tokens_b) - 1)
+        seq = SequenceMatcher(None, joined_a, joined_b).ratio()
+        return min(0.45, 0.55 * jaccard + 0.35 * seq)
+
+    dice = (matched_a + matched_b) / (len(tokens_a) + len(tokens_b))
+    containment = min_matched / min_len
+    overlap = 0.6 * dice + 0.4 * containment
+
+    sorted_a = " ".join(sorted(tokens_a))
+    sorted_b = " ".join(sorted(tokens_b))
+    seq_score = max(
+        SequenceMatcher(None, joined_a, joined_b).ratio(),
+        SequenceMatcher(None, sorted_a, sorted_b).ratio(),
+    )
+    return 0.6 * overlap + 0.4 * seq_score
+
+
+def _extract_existing_item_fields(item: Any) -> tuple[str, str, str]:
+    if isinstance(item, str):
+        return item.strip(), "", ""
+    if isinstance(item, Mapping):
+        title = str(item.get("title") or "").strip()
+        desc = str(item.get("simple_description") or item.get("description") or "").strip()
+        status = str(item.get("status") or "").strip()
+        return title, desc, status
+    title = str(getattr(item, "title", "") or "").strip()
+    desc = str(getattr(item, "simple_description", "") or getattr(item, "description", "") or "").strip()
+    status = str(getattr(item, "status", "") or "").strip()
+    return title, desc, status
+
+
+def is_duplicate_idea(
+    candidate_title: str,
+    candidate_desc: str,
+    existing_items: Sequence[Any],
+    recent_commits: Sequence[str],
+) -> tuple[bool, str]:
+    """Detect duplicate/paraphrased ideas against historical items (any status) and recent git commits."""
+    cand_title = str(candidate_title or "").strip()
+    cand_desc = str(candidate_desc or "").strip()
+    if not cand_title and not cand_desc:
+        return False, ""
+
+    cand_norm_title = normalize_idea_title(cand_title)
+    cand_combined = f"{cand_title} {cand_desc}".strip()
+
+    best_score = 0.0
+    best_reason = ""
+
+    for item in existing_items:
+        ref_title, ref_desc, ref_status = _extract_existing_item_fields(item)
+        if not ref_title and not ref_desc:
+            continue
+
+        ref_norm_title = normalize_idea_title(ref_title)
+        if cand_norm_title and ref_norm_title and cand_norm_title == ref_norm_title:
+            score = 1.0
+        else:
+            title_score = (
+                _semantic_similarity(cand_title, ref_title)
+                if cand_title and ref_title
+                else 0.0
+            )
+            ref_combined = f"{ref_title} {ref_desc}".strip()
+            combined_score = (
+                _semantic_similarity(cand_combined, ref_combined)
+                if cand_combined and ref_combined
+                else 0.0
+            )
+            score = max(title_score, combined_score)
+
+        if score >= IDEA_DUPLICATE_SIMILARITY_THRESHOLD and score > best_score:
+            best_score = score
+            label = ref_title or ref_desc[:80]
+            status_part = f" [{ref_status}]" if ref_status else ""
+            best_reason = f"Similitud {score:.2f} con idea existente{status_part}: {label}"
+
+    for raw_commit in recent_commits:
+        commit_line = str(raw_commit or "").strip()
+        commit_msg = _strip_commit_prefix(commit_line)
+        if not commit_msg:
+            continue
+
+        title_score = _semantic_similarity(cand_title, commit_msg) if cand_title else 0.0
+        combined_score = _semantic_similarity(cand_combined, commit_msg) if cand_combined else 0.0
+        score = max(title_score, combined_score)
+
+        if score >= IDEA_DUPLICATE_SIMILARITY_THRESHOLD and score > best_score:
+            best_score = score
+            best_reason = f"Similitud {score:.2f} con commit reciente: {commit_line}"
+
+    if best_score >= IDEA_DUPLICATE_SIMILARITY_THRESHOLD:
+        return True, best_reason
+    return False, ""
 
 
 def normalize_impact(raw_impact: Any) -> str:
@@ -960,13 +1174,40 @@ def _run_port_command(
     raise TypeError("runner debe implementar .run(...) o ser invocable.")
 
 
-def _fetch_recent_git_commits(
-    repo_root: Path,
+def _list_all_historical_ideas(db_path: Path | str | None = None) -> list[dict[str, Any]]:
+    """Return all improvement_ideas records across every status (pending/queued/implementing/implemented/dismissed)."""
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        rows = conn.execute(
+            f"SELECT {_IDEA_SELECT_COLS} FROM improvement_ideas ORDER BY id DESC;"
+        ).fetchall()
+        return [_row_to_idea(row) for row in rows]
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _get_recent_commits(
+    repo_path: Path | str,
+    limit: int = DEFAULT_RECENT_COMMITS_LIMIT,
     *,
-    commit_limit: int = 15,
     runner: Runner | None = None,
 ) -> list[str]:
-    cap = max(1, min(50, int(commit_limit)))
+    """Safely read recent git commits (`git log --oneline -n <limit>`) without ever raising."""
+    try:
+        resolved_path = Path(repo_path).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return []
+    if not resolved_path.is_dir():
+        return []
+    if runner is None and not (resolved_path / ".git").exists():
+        return []
+    try:
+        cap = max(1, min(200, int(limit)))
+    except (TypeError, ValueError):
+        cap = DEFAULT_RECENT_COMMITS_LIMIT
+
     active_runner: Any = (
         runner
         if runner is not None
@@ -977,7 +1218,7 @@ def _fetch_recent_git_commits(
         res = _run_port_command(
             active_runner,
             ["git", "log", "--oneline", "-n", str(cap)],
-            cwd=repo_root,
+            cwd=resolved_path,
             timeout_seconds=DEFAULT_GIT_LOG_TIMEOUT_SECONDS,
             env=clean_env,
         )
@@ -988,6 +1229,44 @@ def _fetch_recent_git_commits(
     return [redact_secrets(line.strip()) for line in res.stdout.splitlines() if line.strip()][:cap]
 
 
+def _call_get_recent_commits(
+    repo_path: Path | str,
+    *,
+    limit: int = DEFAULT_RECENT_COMMITS_LIMIT,
+    runner: Runner | None = None,
+) -> list[str]:
+    if runner is None:
+        return _get_recent_commits(repo_path, limit=limit)
+    return _get_recent_commits(repo_path, limit=limit, runner=runner)
+
+
+def _fetch_recent_git_commits(
+    repo_root: Path,
+    *,
+    commit_limit: int = 15,
+    runner: Runner | None = None,
+) -> list[str]:
+    return _call_get_recent_commits(repo_root, limit=commit_limit, runner=runner)
+
+
+def _format_negative_history_lines(
+    historical_ideas: Sequence[Mapping[str, Any]],
+    *,
+    max_items: int = _MAX_PROMPT_HISTORY_IDEAS,
+) -> list[str]:
+    formatted: list[str] = []
+    for item in list(historical_ideas)[:max_items]:
+        title = redact_secrets(str(item.get("title") or "").strip())
+        if not title:
+            continue
+        raw_status = str(item.get("status") or "").strip().lower()
+        canonical = _DB_TO_CANONICAL_STATUS.get(raw_status, raw_status or "unknown")
+        desc = redact_secrets(str(item.get("simple_description") or "").strip())
+        desc_excerpt = f" — {desc[:90]}" if desc else ""
+        formatted.append(f"   - [{canonical}] {title}{desc_excerpt}")
+    return formatted
+
+
 def build_ideation_context(
     db_path: Path | str | None = None,
     repo_root: Path | str | None = None,
@@ -995,17 +1274,27 @@ def build_ideation_context(
     runner: Runner | None = None,
     commit_limit: int = 15,
     telemetry_limit: int = 5,
+    recent_commits: Sequence[str] | None = None,
+    historical_ideas: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
-    """Build a compact context digest combining telemetry, recent commits, .py files, and all existing titles."""
+    """Build a compact context digest combining telemetry, recent commits, .py files, and all historical ideas."""
     resolved_root = Path(repo_root).resolve() if repo_root is not None else _default_repo_root()
     summary = get_telemetry_summary(limit=telemetry_limit, db_path=db_path)
-    commits = _fetch_recent_git_commits(
-        resolved_root,
-        commit_limit=commit_limit,
-        runner=runner,
+    commits = (
+        list(recent_commits)
+        if recent_commits is not None
+        else _fetch_recent_git_commits(
+            resolved_root,
+            commit_limit=commit_limit,
+            runner=runner,
+        )
     )
     py_files = _list_factory_python_files(resolved_root)
-    existing_titles = list_all_idea_titles(db_path=db_path)
+    all_ideas = (
+        list(historical_ideas)
+        if historical_ideas is not None
+        else _list_all_historical_ideas(db_path=db_path)
+    )
 
     lines: list[str] = ["=== CONTEXTO DEL RADAR DE AUTO-MEJORAS ==="]
 
@@ -1047,7 +1336,11 @@ def build_ideation_context(
             raw_err = redact_secrets(str(inc.get("raw_error") or ""))[:140]
             lines.append(f"     * [{state}] {inc.get('stage')} ({inc.get('error_signature')}): {raw_err}")
 
-    lines.append("\n2. Últimos commits (git log --oneline -n 15):")
+    commit_heading_count = len(commits) if recent_commits is not None and commits else commit_limit
+    lines.append(
+        f"\n2. Últimos commits ya implementados (git log --oneline -n {commit_heading_count}) "
+        "— PROHIBIDO proponer mejoras ya cubiertas aquí:"
+    )
     if commits:
         lines.extend(f"   - {commit}" for commit in commits)
     else:
@@ -1060,10 +1353,13 @@ def build_ideation_context(
         lines.append("   - (sin archivos .py detectados)")
 
     lines.append(
-        "\n4. Títulos de ideas ya existentes o descartadas (PROHIBIDO repetir o parafrasear):"
+        "\n4. Historial completo de ideas previas en CUALQUIER estado "
+        "(pending, queued, implementing, implemented/applied, dismissed) "
+        "— PROHIBIDO repetir, parafrasear o proponer equivalentes aunque cambie la redacción:"
     )
-    if existing_titles:
-        lines.extend(f"   - {redact_secrets(title)}" for title in existing_titles)
+    history_lines = _format_negative_history_lines(all_ideas)
+    if history_lines:
+        lines.extend(history_lines)
     else:
         lines.append("   - (ninguna idea previa registrada)")
 
@@ -1154,21 +1450,150 @@ def _resolve_agy_readonly_command(
     return cmd, ""
 
 
-def _build_ideation_prompt(context_text: str, count: int) -> str:
+def _build_ideation_prompt(
+    context_text: str,
+    count: int,
+    *,
+    excluded_topics: Sequence[str] = (),
+    accepted_titles: Sequence[str] = (),
+) -> str:
+    extra_block = ""
+    if excluded_topics or accepted_titles:
+        extra_lines: list[str] = [
+            "\nRONDA COMPLEMENTARIA (compleción de cupo — propone temas 100% NUEVOS y distintos):"
+        ]
+        if accepted_titles:
+            extra_lines.append("Ideas ya aceptadas en esta corrida (NO repetir ni parafrasear):")
+            extra_lines.extend(f"  - {redact_secrets(t)}" for t in accepted_titles)
+        if excluded_topics:
+            extra_lines.append(
+                "Temas RECHAZADOS por duplicidad con el historial o commits (STRICTAMENTE EXCLUIDOS):"
+            )
+            extra_lines.extend(f"  - {redact_secrets(topic)}" for topic in excluded_topics)
+        extra_block = "\n".join(extra_lines) + "\n"
+
     return (
         "MODO IDEACIÓN DE SOLO LECTURA (PROHIBIDO editar archivos o ejecutar comandos mutantes).\n"
         "Eres el Radar de Auto-Mejoras de Agent Factory.\n"
         f"Propón exactamente {count} mejoras atómicas, útiles y no repetidas basadas en el contexto real.\n\n"
-        f"{context_text}\n\n"
+        f"{context_text}\n"
+        f"{extra_block}\n"
         "REGLAS ESTRICTAS DE SALIDA:\n"
         "- Devuelve ÚNICAMENTE un JSON válido (sin comentarios ni explicaciones fuera del JSON).\n"
         '- Formato esperado: {"ideas": [{"title": "<emoji + nombre llamativo>", '
         '"category": "<categoría corta>", "impact": "Alto" | "Medio", '
         '"simple_description": "<explicación clara en español cotidiano>", '
         '"technical_prompt": "<instrucciones técnicas TDD acotadas, indicando correr ÚNICAMENTE pruebas dirigidas del módulo modificado y ruff check>"}]}\n'
-        "- NO repitas ni parafrasees ningún título listado en la sección 4.\n"
+        "- PROHIBIDO proponer mejoras ya cubiertas en commits recientes (sección 2) o ya registradas en cualquier estado (sección 4: pending, queued, implementing, implemented/applied, dismissed), ni equivalentes aunque cambie la redacción.\n"
         "- Cada technical_prompt debe ser atómico (<3 min), con pruebas dirigidas (`pytest -q --no-cov tests/test_<modulo>.py`) y sin modificar archivos prohibidos (.env, MASTER_PROMPT.md, AGENTS.md, config/models.toml, data/, workspaces/).\n"
     )
+
+
+def _filter_unique_candidates(
+    candidates: Sequence[dict[str, str]],
+    existing_items: Sequence[Mapping[str, Any]],
+    recent_commits: Sequence[str],
+    *,
+    already_accepted: Sequence[dict[str, str]] = (),
+    max_items: int | None = None,
+) -> tuple[list[dict[str, str]], list[tuple[str, str]]]:
+    """Filter candidate ideas with is_duplicate_idea against history, commits, and same-batch items."""
+    accepted: list[dict[str, str]] = []
+    rejected: list[tuple[str, str]] = []
+    comparison_pool: list[Mapping[str, Any]] = [*existing_items, *already_accepted]
+
+    for cand in candidates:
+        if max_items is not None and len(accepted) >= max_items:
+            break
+        is_dup, reason = is_duplicate_idea(
+            cand["title"],
+            cand["simple_description"],
+            comparison_pool,
+            recent_commits,
+        )
+        if is_dup:
+            rejected.append((cand["title"], reason))
+            continue
+        accepted.append(cand)
+        comparison_pool.append(cand)
+
+    return accepted, rejected
+
+
+def _invoke_readonly_agy(
+    prompt: str,
+    *,
+    base_cmd: Sequence[str],
+    active_runner: Any,
+    timeout_seconds: float,
+    model: str | None = None,
+    tmp_prefix: str = "af_idea_prompt_",
+    cwd_prefix: str = "af_idea_radar_",
+    db_path: Path | str | None = None,
+    log_label: str = "Idea generation",
+    best_effort: bool = False,
+) -> tuple[bool, list[dict[str, str]], bool]:
+    """Invoke agy in read-only mode, record quota/usage, and parse candidate ideas."""
+    is_batch = base_cmd[0].lower().endswith((".cmd", ".bat"))
+    clean_env = build_sanitized_cli_env()
+    tmp_prompt: Path | None = None
+
+    try:
+        if len(prompt) <= _MAX_INLINE_PROMPT_CHARS:
+            prompt_arg = re.sub(r"[\r\n]+", " ", prompt).strip() if is_batch else prompt
+        else:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                suffix=".txt",
+                prefix=tmp_prefix,
+                delete=False,
+            ) as tf:
+                tf.write(prompt)
+                tmp_prompt = Path(tf.name).resolve()
+            prompt_arg = f"Lee y sigue exactamente las instrucciones del archivo: {tmp_prompt}"
+
+        cmd = [*base_cmd, "-p", prompt_arg]
+        if isinstance(model, str) and model.strip():
+            cmd.extend(["--model", model.strip()])
+
+        with tempfile.TemporaryDirectory(prefix=cwd_prefix) as ro_cwd:
+            res = _run_port_command(
+                active_runner,
+                cmd,
+                cwd=Path(ro_cwd),
+                timeout_seconds=float(timeout_seconds),
+                env=clean_env,
+            )
+    except Exception as exc:
+        if not best_effort and not isinstance(exc, (CommandTimeoutError, OSError, RuntimeError, ValueError)):
+            raise
+        logger.warning("%s failed: %s", log_label, redact_secrets(str(exc)))
+        return False, [], False
+    finally:
+        if tmp_prompt is not None:
+            tmp_prompt.unlink(missing_ok=True)
+
+    if res.exit_code != 0 or not res.stdout.strip():
+        detail = redact_secrets((res.stderr or res.stdout or f"exit code {res.exit_code}").strip())
+        if is_quota_429_error(detail):
+            record_agy_429_pause(detail, db_path=db_path)
+            logger.warning("%s CLI hit quota 429: %s", log_label, detail)
+            return False, [], True
+        record_agy_usage(
+            len(prompt),
+            len(res.stdout or "") + len(res.stderr or ""),
+            db_path=db_path,
+        )
+        logger.warning("%s CLI returned non-zero/empty output: %s", log_label, detail)
+        return False, [], False
+
+    record_agy_usage(
+        len(prompt),
+        len(res.stdout or "") + len(res.stderr or ""),
+        db_path=db_path,
+    )
+    return True, parse_ideas_payload(res.stdout), False
 
 
 def generate_new_ideas(
@@ -1183,16 +1608,25 @@ def generate_new_ideas(
     model: str | None = None,
     timeout_seconds: float = DEFAULT_IDEATION_TIMEOUT_SECONDS,
 ) -> list[dict[str, Any]]:
-    """Invoke agy.EXE in read-only mode to propose new ideas, validate, deduplicate, and persist them."""
+    """Invoke agy.EXE in read-only mode to propose new ideas, filter semantic duplicates, and persist them."""
     eff_source = _validate_source(source)
     if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
         raise ValueError("count debe ser un entero positivo.")
     bounded_count = min(count, MAX_IDEATION_COUNT)
 
+    resolved_root = Path(repo_root).resolve() if repo_root is not None else _default_repo_root()
+    historical_ideas = _list_all_historical_ideas(db_path=db_path)
+    recent_commits = _call_get_recent_commits(
+        resolved_root,
+        limit=DEFAULT_RECENT_COMMITS_LIMIT,
+        runner=git_runner,
+    )
     context_text = build_ideation_context(
         db_path=db_path,
-        repo_root=repo_root,
-        runner=git_runner,
+        repo_root=resolved_root,
+        commit_limit=DEFAULT_RECENT_COMMITS_LIMIT,
+        recent_commits=recent_commits,
+        historical_ideas=historical_ideas,
     )
     prompt = _build_ideation_prompt(context_text, bounded_count)
 
@@ -1206,72 +1640,70 @@ def generate_new_ideas(
         logger.warning("Ideation skipped: %s", err_reason)
         return []
 
-    is_batch = base_cmd[0].lower().endswith((".cmd", ".bat"))
-    clean_env = build_sanitized_cli_env()
-    tmp_prompt: Path | None = None
-
-    try:
-        if len(prompt) <= _MAX_INLINE_PROMPT_CHARS:
-            prompt_arg = re.sub(r"[\r\n]+", " ", prompt).strip() if is_batch else prompt
-        else:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                suffix=".txt",
-                prefix="af_idea_prompt_",
-                delete=False,
-            ) as tf:
-                tf.write(prompt)
-                tmp_prompt = Path(tf.name).resolve()
-            prompt_arg = f"Lee y sigue exactamente las instrucciones del archivo: {tmp_prompt}"
-
-        cmd = [*base_cmd, "-p", prompt_arg]
-        if isinstance(model, str) and model.strip():
-            cmd.extend(["--model", model.strip()])
-
-        with tempfile.TemporaryDirectory(prefix="af_idea_radar_") as ro_cwd:
-            res = _run_port_command(
-                active_runner,
-                cmd,
-                cwd=Path(ro_cwd),
-                timeout_seconds=float(timeout_seconds),
-                env=clean_env,
-            )
-    except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
-        logger.warning("Idea generation failed: %s", redact_secrets(str(exc)))
-        return []
-    finally:
-        if tmp_prompt is not None:
-            tmp_prompt.unlink(missing_ok=True)
-
-    if res.exit_code != 0 or not res.stdout.strip():
-        detail = redact_secrets((res.stderr or res.stdout or f"exit code {res.exit_code}").strip())
-        if is_quota_429_error(detail):
-            record_agy_429_pause(detail, db_path=db_path)
-        else:
-            record_agy_usage(
-                len(prompt),
-                len(res.stdout or "") + len(res.stderr or ""),
-                db_path=db_path,
-            )
-        logger.warning("Idea generation CLI returned non-zero/empty output: %s", detail)
-        return []
-
-    record_agy_usage(
-        len(prompt),
-        len(res.stdout or "") + len(res.stderr or ""),
+    ok, parsed, hit_429 = _invoke_readonly_agy(
+        prompt,
+        base_cmd=base_cmd,
+        active_runner=active_runner,
+        timeout_seconds=timeout_seconds,
+        model=model,
+        tmp_prefix="af_idea_prompt_",
+        cwd_prefix="af_idea_radar_",
         db_path=db_path,
+        log_label="Idea generation",
+        best_effort=False,
     )
-    parsed = parse_ideas_payload(res.stdout)
-    if not parsed:
+    if not ok or hit_429 or not parsed:
+        return []
+
+    accepted, rejected = _filter_unique_candidates(
+        parsed,
+        historical_ideas,
+        recent_commits,
+        max_items=bounded_count,
+    )
+
+    if len(accepted) < bounded_count and rejected:
+        missing = bounded_count - len(accepted)
+        complementary_prompt = _build_ideation_prompt(
+            context_text,
+            missing,
+            excluded_topics=[f"{title} ({reason})" for title, reason in rejected],
+            accepted_titles=[item["title"] for item in accepted],
+        )
+        ok_retry, parsed_retry, _retry_429 = _invoke_readonly_agy(
+            complementary_prompt,
+            base_cmd=base_cmd,
+            active_runner=active_runner,
+            timeout_seconds=timeout_seconds,
+            model=model,
+            tmp_prefix="af_idea_prompt_",
+            cwd_prefix="af_idea_radar_",
+            db_path=db_path,
+            log_label="Idea generation complementary round",
+            best_effort=True,
+        )
+        if ok_retry and parsed_retry:
+            extra, _extra_rejected = _filter_unique_candidates(
+                parsed_retry,
+                historical_ideas,
+                recent_commits,
+                already_accepted=accepted,
+                max_items=missing,
+            )
+            accepted.extend(extra)
+
+    if not accepted:
         return []
 
     return save_ideas(
-        parsed,
+        accepted,
         source=eff_source,
         db_path=db_path,
         max_items=bounded_count,
     )
+
+
+generate_ideas = generate_new_ideas
 
 
 class AutoIdeaScheduler:
@@ -3338,6 +3770,82 @@ def _summarize_project_workspace(workspace_dir: Path) -> str:
     return f"Archivos del proyecto:\n{listing}{readme_excerpt}"
 
 
+def _list_all_historical_project_ideas(
+    project_slug: str,
+    *,
+    db_path: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    """Return all project_ideas records for project_slug across every status."""
+    clean_slug = _validate_project_slug(project_slug)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_connection(db_path)
+        rows = conn.execute(
+            "SELECT id, created_at, project_slug, title, category, impact, "
+            "simple_description, change_prompt, source, status "
+            "FROM project_ideas WHERE project_slug = ? ORDER BY id DESC;",
+            (clean_slug,),
+        ).fetchall()
+        return [_row_to_project_idea(row) for row in rows]
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _build_project_ideation_prompt(
+    project_slug: str,
+    summary: str,
+    count: int,
+    *,
+    historical_ideas: Sequence[Mapping[str, Any]] = (),
+    recent_commits: Sequence[str] = (),
+    excluded_topics: Sequence[str] = (),
+    accepted_titles: Sequence[str] = (),
+) -> str:
+    commits_lines = (
+        [f"  - {redact_secrets(c)}" for c in recent_commits]
+        if recent_commits
+        else ["  - (sin historial git disponible)"]
+    )
+    history_lines = _format_negative_history_lines(historical_ideas) or [
+        "  - (ninguna idea previa registrada)"
+    ]
+
+    extra_block = ""
+    if excluded_topics or accepted_titles:
+        extra_lines: list[str] = [
+            "\nRONDA COMPLEMENTARIA (compleción de cupo — propone temas 100% NUEVOS y distintos):"
+        ]
+        if accepted_titles:
+            extra_lines.append("Ideas ya aceptadas en esta corrida (NO repetir ni parafrasear):")
+            extra_lines.extend(f"  - {redact_secrets(t)}" for t in accepted_titles)
+        if excluded_topics:
+            extra_lines.append(
+                "Temas RECHAZADOS por duplicidad con el historial o commits (STRICTAMENTE EXCLUIDOS):"
+            )
+            extra_lines.extend(f"  - {redact_secrets(topic)}" for topic in excluded_topics)
+        extra_block = "\n".join(extra_lines) + "\n"
+
+    return (
+        f"Eres un Arquitecto de Producto revisando el proyecto '{project_slug}' de Agent Factory.\n"
+        "REGLAS: MODO SOLO LECTURA. PROHIBIDO modificar archivos o leer .env/secretos.\n"
+        f"Devuelve ÚNICAMENTE un arreglo JSON válido con exactamente {count} objetos.\n"
+        "Cada objeto debe tener exactamente: title (español con emoji), category "
+        "(Rendimiento|Seguridad|UX|Estabilidad|Producto), impact (Alto|Medio), "
+        "simple_description (máx 2 frases en español simple) y "
+        "change_prompt (instrucción concreta y realizable para implementar en el workspace).\n"
+        "PROHIBIDO proponer mejoras ya cubiertas en commits recientes, pendientes, encoladas, "
+        "en implementación, aplicadas/implementadas o descartadas, ni equivalentes aunque cambie la redacción.\n\n"
+        f"Contexto del proyecto '{project_slug}':\n{summary}\n\n"
+        "Últimos commits ya implementados en el proyecto (PROHIBIDO repetir):\n"
+        + "\n".join(commits_lines)
+        + "\n\nHistorial completo de ideas previas del proyecto en CUALQUIER estado "
+        "(pending, queued, implementing, implemented/applied, dismissed) — PROHIBIDO repetir o parafrasear:\n"
+        + "\n".join(history_lines)
+        + f"\n{extra_block}"
+    )
+
+
 def generate_project_ideas(
     project_slug: str,
     workspace_dir: Path | str,
@@ -3346,11 +3854,12 @@ def generate_project_ideas(
     source: str = "manual",
     db_path: Path | str | None = None,
     runner: Runner | None = None,
+    git_runner: Runner | None = None,
     agy_command: Sequence[str] | None = None,
     model: str | None = None,
     timeout_seconds: float = DEFAULT_IDEATION_TIMEOUT_SECONDS,
 ) -> list[dict[str, Any]]:
-    """Inspect a generated project's workspace in read-only mode via agy.EXE and store actionable improvements."""
+    """Inspect a generated project's workspace in read-only mode via agy.EXE, filter duplicates, and store ideas."""
     clean_slug = _validate_project_slug(project_slug)
     eff_source = _validate_project_idea_source(source)
     if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
@@ -3359,15 +3868,18 @@ def generate_project_ideas(
 
     ws_path = Path(workspace_dir).resolve()
     summary = _summarize_project_workspace(ws_path)
-    prompt = (
-        f"Eres un Arquitecto de Producto revisando el proyecto '{clean_slug}' de Agent Factory.\n"
-        "REGLAS: MODO SOLO LECTURA. PROHIBIDO modificar archivos o leer .env/secretos.\n"
-        f"Devuelve ÚNICAMENTE un arreglo JSON válido con exactamente {bounded_count} objetos.\n"
-        "Cada objeto debe tener exactamente: title (español con emoji), category "
-        "(Rendimiento|Seguridad|UX|Estabilidad|Producto), impact (Alto|Medio), "
-        "simple_description (máx 2 frases en español simple) y "
-        "change_prompt (instrucción concreta y realizable para implementar en el workspace).\n\n"
-        f"Contexto del proyecto '{clean_slug}':\n{summary}"
+    historical_ideas = _list_all_historical_project_ideas(clean_slug, db_path=db_path)
+    recent_commits = _call_get_recent_commits(
+        ws_path,
+        limit=DEFAULT_RECENT_COMMITS_LIMIT,
+        runner=git_runner,
+    )
+    prompt = _build_project_ideation_prompt(
+        clean_slug,
+        summary,
+        bounded_count,
+        historical_ideas=historical_ideas,
+        recent_commits=recent_commits,
     )
 
     active_runner: Any = (
@@ -3378,67 +3890,67 @@ def generate_project_ideas(
         logger.warning("Project ideation skipped for %s: %s", clean_slug, err_reason)
         return []
 
-    is_batch = base_cmd[0].lower().endswith((".cmd", ".bat"))
-    clean_env = build_sanitized_cli_env()
-    tmp_prompt: Path | None = None
-    try:
-        if len(prompt) <= _MAX_INLINE_PROMPT_CHARS:
-            prompt_arg = re.sub(r"[\r\n]+", " ", prompt).strip() if is_batch else prompt
-        else:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                suffix=".txt",
-                prefix="af_proj_idea_",
-                delete=False,
-            ) as tf:
-                tf.write(prompt)
-                tmp_prompt = Path(tf.name).resolve()
-            prompt_arg = f"Lee y sigue exactamente las instrucciones del archivo: {tmp_prompt}"
-
-        cmd = [*base_cmd, "-p", prompt_arg]
-        if isinstance(model, str) and model.strip():
-            cmd.extend(["--model", model.strip()])
-
-        with tempfile.TemporaryDirectory(prefix="af_proj_radar_") as ro_cwd:
-            res = _run_port_command(
-                active_runner,
-                cmd,
-                cwd=Path(ro_cwd),
-                timeout_seconds=float(timeout_seconds),
-                env=clean_env,
-            )
-    except (CommandTimeoutError, OSError, RuntimeError, ValueError) as exc:
-        logger.warning("Project idea generation failed for %s: %s", clean_slug, redact_secrets(str(exc)))
-        return []
-    finally:
-        if tmp_prompt is not None:
-            tmp_prompt.unlink(missing_ok=True)
-
-    if res.exit_code != 0 or not res.stdout.strip():
-        detail = redact_secrets((res.stderr or res.stdout or f"exit code {res.exit_code}").strip())
-        if is_quota_429_error(detail):
-            record_agy_429_pause(detail, db_path=db_path)
-        else:
-            record_agy_usage(
-                len(prompt),
-                len(res.stdout or "") + len(res.stderr or ""),
-                db_path=db_path,
-            )
-        logger.warning("Project ideation CLI error for %s: %s", clean_slug, detail)
-        return []
-
-    record_agy_usage(
-        len(prompt),
-        len(res.stdout or "") + len(res.stderr or ""),
+    ok, parsed, hit_429 = _invoke_readonly_agy(
+        prompt,
+        base_cmd=base_cmd,
+        active_runner=active_runner,
+        timeout_seconds=timeout_seconds,
+        model=model,
+        tmp_prefix="af_proj_idea_",
+        cwd_prefix="af_proj_radar_",
         db_path=db_path,
+        log_label=f"Project ideation ({clean_slug})",
+        best_effort=False,
     )
-    parsed = parse_ideas_payload(res.stdout)
-    if not parsed:
+    if not ok or hit_429 or not parsed:
         return []
+
+    accepted, rejected = _filter_unique_candidates(
+        parsed,
+        historical_ideas,
+        recent_commits,
+        max_items=bounded_count,
+    )
+
+    if len(accepted) < bounded_count and rejected:
+        missing = bounded_count - len(accepted)
+        complementary_prompt = _build_project_ideation_prompt(
+            clean_slug,
+            summary,
+            missing,
+            historical_ideas=historical_ideas,
+            recent_commits=recent_commits,
+            excluded_topics=[f"{title} ({reason})" for title, reason in rejected],
+            accepted_titles=[item["title"] for item in accepted],
+        )
+        ok_retry, parsed_retry, _retry_429 = _invoke_readonly_agy(
+            complementary_prompt,
+            base_cmd=base_cmd,
+            active_runner=active_runner,
+            timeout_seconds=timeout_seconds,
+            model=model,
+            tmp_prefix="af_proj_idea_",
+            cwd_prefix="af_proj_radar_",
+            db_path=db_path,
+            log_label=f"Project ideation complementary round ({clean_slug})",
+            best_effort=True,
+        )
+        if ok_retry and parsed_retry:
+            extra, _extra_rejected = _filter_unique_candidates(
+                parsed_retry,
+                historical_ideas,
+                recent_commits,
+                already_accepted=accepted,
+                max_items=missing,
+            )
+            accepted.extend(extra)
+
+    if not accepted:
+        return []
+
     return save_project_ideas(
         clean_slug,
-        parsed,
+        accepted,
         source=eff_source,
         db_path=db_path,
         max_items=bounded_count,
