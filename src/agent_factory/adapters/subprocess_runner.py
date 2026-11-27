@@ -112,6 +112,45 @@ def resolve_command(
 _resolve_command = resolve_command
 
 
+_TASKKILL_TIMEOUT_SECONDS: float = 5.0
+_WAIT_AFTER_KILL_SECONDS: float = 2.0
+
+
+def _terminate_process_tree(pid: int) -> bool:
+    """Terminate the full process tree for pid on Windows or POSIX without raising errors."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+
+    if os.name == "nt":
+        taskkill_cmd = resolve_command(["taskkill", "/F", "/T", "/PID", str(pid)])
+        try:
+            completed = subprocess.run(
+                taskkill_cmd,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                check=False,
+                timeout=_TASKKILL_TIMEOUT_SECONDS,
+            )
+            return getattr(completed, "returncode", 0) == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    try:
+        sig = getattr(signal, "SIGKILL", 9)
+        os.killpg(os.getpgid(pid), sig)
+        return True
+    except (OSError, AttributeError):
+        return False
+
+
+def _safe_kill_process(proc: subprocess.Popen[str]) -> None:
+    """Best-effort fallback kill that suppresses secondary cleanup errors."""
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
 def _close_pipes(proc: subprocess.Popen[str]) -> None:
     """Close subprocess stdio pipes cleanly after completion or timeout."""
     for stream in (proc.stdin, proc.stdout, proc.stderr):
@@ -167,33 +206,6 @@ class SubprocessRunner(Runner):
                 errors="replace",
                 env=dict(env) if env is not None else None,
             )
-            try:
-                stdout, stderr = proc.communicate(input=input_str, timeout=timeout)
-                return CommandResult(
-                    exit_code=proc.returncode,
-                    stdout=stdout or "",
-                    stderr=stderr or "",
-                    timed_out=False,
-                )
-            except subprocess.TimeoutExpired as exc:
-                taskkill_cmd = resolve_command(["taskkill", "/F", "/T", "/PID", str(proc.pid)])
-                try:
-                    subprocess.run(
-                        taskkill_cmd,
-                        stdin=subprocess.DEVNULL,
-                        capture_output=True,
-                        check=False,
-                    )
-                except OSError:
-                    pass
-                try:
-                    proc.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                _close_pipes(proc)
-                raise CommandTimeoutError(
-                    f"Command '{cmd_list}' timed out after {timeout} seconds"
-                ) from exc
         else:
             # On POSIX, use a new process group session
             proc = subprocess.Popen(
@@ -208,24 +220,31 @@ class SubprocessRunner(Runner):
                 start_new_session=True,
                 env=dict(env) if env is not None else None,
             )
+
+        try:
+            stdout, stderr = proc.communicate(input=input_str, timeout=timeout)
+            return CommandResult(
+                exit_code=proc.returncode,
+                stdout=stdout or "",
+                stderr=stderr or "",
+                timed_out=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            terminated = _terminate_process_tree(proc.pid)
+            if not terminated:
+                _safe_kill_process(proc)
             try:
-                stdout, stderr = proc.communicate(input=input_str, timeout=timeout)
-                return CommandResult(
-                    exit_code=proc.returncode,
-                    stdout=stdout or "",
-                    stderr=stderr or "",
-                    timed_out=False,
-                )
-            except subprocess.TimeoutExpired as exc:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except OSError:
-                    pass
-                try:
-                    proc.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                _close_pipes(proc)
-                raise CommandTimeoutError(
-                    f"Command '{cmd_list}' timed out after {timeout} seconds"
-                ) from exc
+                proc.wait(timeout=_WAIT_AFTER_KILL_SECONDS)
+            except subprocess.TimeoutExpired:
+                if terminated:
+                    _safe_kill_process(proc)
+                    try:
+                        proc.wait(timeout=1.0)
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+            except OSError:
+                pass
+            _close_pipes(proc)
+            raise CommandTimeoutError(
+                f"Command '{cmd_list}' timed out after {timeout} seconds"
+            ) from exc
