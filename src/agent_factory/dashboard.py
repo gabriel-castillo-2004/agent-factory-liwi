@@ -9,6 +9,7 @@ import email.policy
 import http.server
 import json
 import logging
+import math
 import os
 import threading
 import urllib.parse
@@ -2292,11 +2293,12 @@ class DashboardController:
             eff_timeout = visual_qa_agent.DEFAULT_STAGING_QA_TIMEOUT_SECONDS
         elif isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
             raise TypeError("El campo 'timeout_seconds' debe ser numérico.")
-        elif float(timeout_seconds) <= 0:
-            raise ValueError("El campo 'timeout_seconds' debe ser mayor que 0.")
         else:
+            parsed_timeout = float(timeout_seconds)
+            if not math.isfinite(parsed_timeout) or parsed_timeout <= 0:
+                raise ValueError("El campo 'timeout_seconds' debe ser finito y mayor que 0.")
             eff_timeout = min(
-                float(timeout_seconds),
+                parsed_timeout,
                 visual_qa_agent.MAX_STAGING_QA_TIMEOUT_SECONDS,
             )
 
@@ -2309,23 +2311,31 @@ class DashboardController:
 
         if mgr is None and explicit_url is None:
             return _scrub_value(
-                {
-                    "status": "skipped",
-                    "score": None,
-                    "issues": [],
-                    "screenshot_path": None,
-                    "reason": "staging_unavailable",
-                    "detail": "Staging no está inicializado o disponible para auditoría visual.",
-                    "base_url": str(default_base_url or ""),
-                    "timeout_seconds": eff_timeout,
-                    "viewports_audited": [],
-                },
+                visual_qa_agent._build_skipped_staging_qa_payload(
+                    reason="staging_unavailable",
+                    detail="Staging no está inicializado o disponible para auditoría visual.",
+                    base_url=str(default_base_url or ""),
+                    timeout_seconds=eff_timeout,
+                ),
                 self.secrets_to_redact,
             )
 
         staging_url: str | None = None
         if mgr is not None:
-            staging_status = self.get_self_improve_staging_status()
+            try:
+                staging_status = self.get_self_improve_staging_status()
+            except (OSError, RuntimeError) as exc:
+                if explicit_url is None:
+                    return _scrub_value(
+                        visual_qa_agent._build_skipped_staging_qa_payload(
+                            reason="staging_unavailable",
+                            detail=f"No se pudo consultar el estado de staging para auditoría visual: {exc}",
+                            base_url=str(default_base_url or ""),
+                            timeout_seconds=eff_timeout,
+                        ),
+                        self.secrets_to_redact,
+                    )
+                staging_status = {}
             for key in ("staging_url", "preview_url", "url"):
                 cand = staging_status.get(key)
                 if isinstance(cand, str) and cand.strip():
@@ -2333,42 +2343,33 @@ class DashboardController:
                     break
             raw_wt = getattr(mgr, "worktree_path", None)
             pending_count = int(staging_status.get("pending_count") or 0)
-            if (
-                explicit_url is None
-                and staging_url is None
-                and isinstance(raw_wt, Path)
-                and not raw_wt.is_dir()
-                and pending_count <= 0
-            ):
+            staging_uninitialized = staging_status.get("initialized") is False
+            worktree_missing = isinstance(raw_wt, Path) and not raw_wt.is_dir() and pending_count <= 0
+            if explicit_url is None and staging_url is None and (staging_uninitialized or worktree_missing):
+                detail_msg = (
+                    "Staging no está inicializado para auditoría visual."
+                    if staging_uninitialized
+                    else "El worktree local de staging no está disponible para auditoría visual."
+                )
                 return _scrub_value(
-                    {
-                        "status": "skipped",
-                        "score": None,
-                        "issues": [],
-                        "screenshot_path": None,
-                        "reason": "staging_unavailable",
-                        "detail": "El worktree local de staging no está disponible para auditoría visual.",
-                        "base_url": str(default_base_url or ""),
-                        "timeout_seconds": eff_timeout,
-                        "viewports_audited": [],
-                    },
+                    visual_qa_agent._build_skipped_staging_qa_payload(
+                        reason="staging_unavailable",
+                        detail=detail_msg,
+                        base_url=str(default_base_url or ""),
+                        timeout_seconds=eff_timeout,
+                    ),
                     self.secrets_to_redact,
                 )
 
         target_url = explicit_url or staging_url or (str(default_base_url).strip() if default_base_url else "")
         if not target_url:
             return _scrub_value(
-                {
-                    "status": "skipped",
-                    "score": None,
-                    "issues": [],
-                    "screenshot_path": None,
-                    "reason": "staging_unavailable",
-                    "detail": "No hay una URL local de staging disponible para auditoría visual.",
-                    "base_url": "",
-                    "timeout_seconds": eff_timeout,
-                    "viewports_audited": [],
-                },
+                visual_qa_agent._build_skipped_staging_qa_payload(
+                    reason="staging_unavailable",
+                    detail="No hay una URL local de staging disponible para auditoría visual.",
+                    base_url="",
+                    timeout_seconds=eff_timeout,
+                ),
                 self.secrets_to_redact,
             )
 

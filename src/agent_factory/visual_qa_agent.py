@@ -10,6 +10,7 @@ read-only mode to persist up to 2 deduplicated UX improvement ideas (source='vis
 from __future__ import annotations
 
 import logging
+import math
 import re
 import tempfile
 import threading
@@ -1128,9 +1129,10 @@ def run_staging_visual_qa(
     """Run bounded-timeout visual QA against a local staging preview with safe degradation."""
     if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
         raise TypeError("El parámetro 'timeout_seconds' debe ser numérico.")
-    if float(timeout_seconds) <= 0:
-        raise ValueError("El parámetro 'timeout_seconds' debe ser mayor que 0.")
-    bounded_timeout = min(float(timeout_seconds), MAX_STAGING_QA_TIMEOUT_SECONDS)
+    parsed_timeout = float(timeout_seconds)
+    if not math.isfinite(parsed_timeout) or parsed_timeout <= 0:
+        raise ValueError("El parámetro 'timeout_seconds' debe ser finito y mayor que 0.")
+    bounded_timeout = min(parsed_timeout, MAX_STAGING_QA_TIMEOUT_SECONDS)
 
     safe_url = _validate_local_staging_url(base_url)
     nav_timeout_ms = max(250, min(DEFAULT_NAV_TIMEOUT_MS, int(bounded_timeout * 500)))

@@ -1106,3 +1106,145 @@ def test_staging_visual_qa_endpoint_bounded_timeout_and_validation(
 
     assert code_bad_timeout == 400
     assert "error" in payload_bad_timeout
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1"])
+def test_staging_visual_qa_degrades_safely_on_staging_status_error_or_uninitialized(
+    tmp_path: Path,
+) -> None:
+    invoked = False
+
+    def _should_not_run(**_kwargs: Any) -> dict[str, Any]:
+        nonlocal invoked
+        invoked = True
+        return {"ok": True, "skipped": False}
+
+    class _BrokenStagingManager:
+        def get_staging_status(self) -> dict[str, Any]:
+            raise RuntimeError("git worktree unavailable")
+
+        def shutdown(self, timeout: float = 5.0) -> None:
+            _ = timeout
+
+    class _UninitializedStagingManager:
+        def get_staging_status(self) -> dict[str, Any]:
+            return {
+                "initialized": False,
+                "pending_count": 0,
+                "commits": [],
+                "is_building": False,
+                "queue_size": 0,
+                "last_error": None,
+                "current_task": None,
+            }
+
+        def shutdown(self, timeout: float = 5.0) -> None:
+            _ = timeout
+
+    # 1) Staging status raises RuntimeError -> graceful skipped response (HTTP 200)
+    store1 = SqliteEventStore(db_path=tmp_path / "broken_staging.db")
+    server1, thread1, base_url1 = start_dashboard_server(
+        orchestrator=Orchestrator(store=store1, llm=FakeLLM()),
+        port=0,
+        staging_manager=_BrokenStagingManager(),  # type: ignore[arg-type]
+        visual_qa_runner=_should_not_run,
+    )
+    try:
+        code1, payload1 = _post_json(f"{base_url1}/api/staging/visual-qa", {})
+    finally:
+        server1.shutdown()
+        server1.server_close()
+        thread1.join(timeout=2.0)
+        store1.close()
+
+    assert code1 == 200
+    assert invoked is False
+    assert payload1["status"] == "skipped"
+    assert payload1["score"] is None
+    assert payload1["issues"] == []
+    assert payload1["screenshot_path"] is None
+    assert payload1["reason"] == "staging_unavailable"
+
+    # 2) Staging reports initialized=False -> graceful skipped response without invoking QA
+    store2 = SqliteEventStore(db_path=tmp_path / "uninit_staging.db")
+    server2, thread2, base_url2 = start_dashboard_server(
+        orchestrator=Orchestrator(store=store2, llm=FakeLLM()),
+        port=0,
+        staging_manager=_UninitializedStagingManager(),  # type: ignore[arg-type]
+        visual_qa_runner=_should_not_run,
+    )
+    try:
+        code2, payload2 = _post_json(f"{base_url2}/api/staging/visual-qa", {})
+    finally:
+        server2.shutdown()
+        server2.server_close()
+        thread2.join(timeout=2.0)
+        store2.close()
+
+    assert code2 == 200
+    assert invoked is False
+    assert payload2["status"] == "skipped"
+    assert payload2["score"] is None
+    assert payload2["issues"] == []
+    assert payload2["screenshot_path"] is None
+    assert payload2["reason"] == "staging_unavailable"
+
+    # 3) Missing worktree_path with pending_count=0 -> graceful skipped response
+    store3 = SqliteEventStore(db_path=tmp_path / "missing_wt_staging.db")
+    missing_wt_mgr = _FakeStagingManager(
+        pending_count=0,
+        worktree_path=tmp_path / "nonexistent-worktree",
+    )
+    server3, thread3, base_url3 = start_dashboard_server(
+        orchestrator=Orchestrator(store=store3, llm=FakeLLM()),
+        port=0,
+        staging_manager=missing_wt_mgr,  # type: ignore[arg-type]
+        visual_qa_runner=_should_not_run,
+    )
+    try:
+        code3, payload3 = _post_json(f"{base_url3}/api/staging/visual-qa", {})
+    finally:
+        server3.shutdown()
+        server3.server_close()
+        thread3.join(timeout=2.0)
+        store3.close()
+
+    assert code3 == 200
+    assert invoked is False
+    assert payload3["status"] == "skipped"
+    assert payload3["score"] is None
+    assert payload3["issues"] == []
+    assert payload3["screenshot_path"] is None
+    assert payload3["reason"] == "staging_unavailable"
+
+
+def test_staging_visual_qa_rejects_non_finite_timeout(tmp_path: Path) -> None:
+    from agent_factory import visual_qa_agent
+    from agent_factory.dashboard import DashboardController
+
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        visual_qa_agent.run_staging_visual_qa(
+            "http://127.0.0.1:8123",
+            timeout_seconds=float("nan"),
+        )
+
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        visual_qa_agent.run_staging_visual_qa(
+            "http://127.0.0.1:8123",
+            timeout_seconds=float("inf"),
+        )
+
+    store = SqliteEventStore(db_path=tmp_path / "nan_timeout.db")
+    try:
+        ctrl = DashboardController(
+            orchestrator=Orchestrator(store=store, llm=FakeLLM()),
+            staging_manager=_FakeStagingManager(pending_count=1),  # type: ignore[arg-type]
+        )
+        with pytest.raises(ValueError, match="timeout_seconds"):
+            ctrl.run_staging_visual_qa(
+                base_url="http://127.0.0.1:8123",
+                timeout_seconds=float("nan"),
+            )
+    finally:
+        store.close()
